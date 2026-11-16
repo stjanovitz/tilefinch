@@ -373,6 +373,9 @@ static void browser_engine_youtube_note_request(
     BrowserEngine *engine, const char *url, const char *method,
     const char *body, size_t body_length)
 {
+    engine->youtube.accounts_request = site_identity_accounts_request(
+        url, engine->navigation.page.loaded
+                 ? engine->navigation.page.document_url : NULL);
     if (!engine->youtube.signin_diagnostics) return;
     unsigned target = browser_engine_youtube_signin_page_class(url);
     if (target == 0u) return;
@@ -444,7 +447,7 @@ bool browser_engine_youtube_signin_report(const BrowserEngine *engine, char *out
     }
     /* Only enum/boolean/count fields, never generic errors or identity hashes. */
     int n = snprintf(out, capacity,
-        "Tilefinch YouTube sign-in diagnostics v3\n"
+        "Tilefinch YouTube sign-in diagnostics v4\n"
         "stage=%u recovery-attempts=%u scripts-enabled=%u runtime-present=%u degraded=%u\n"
         "handoff-http-status=%ld handoff-service-origin=%u\n"
         "dynamic-transport-failures=%zu dynamic-authority-failures=%zu dynamic-source-failures=%zu allocation-refusals=%zu\n"
@@ -463,7 +466,8 @@ bool browser_engine_youtube_signin_report(const BrowserEngine *engine, char *out
         "frames-discovered=%zu frames-loaded=%zu frames-failed=%zu\n"
         "page-class=%u document-http-status=%ld text-present=%u auth-navigations=%u\n"
         "activations=%u activations-without-scripts=%u form-submits=%u forms-not-sent=%u text-edits=%u\n"
-        "form-posts=%u token-kind=%u token-length=%zu post-target=%u post-outcome=%u post-http-status=%ld post-landing=%u\n",
+        "form-posts=%u token-kind=%u token-length=%zu post-target=%u post-outcome=%u post-http-status=%ld post-landing=%u\n"
+        "accounts-refusals=%u refusal-class=%u refusal-reason=%u\n",
         engine->youtube.signin_state, engine->youtube.signin_retries,
         engine->navigation.scripts_enabled, engine->navigation.page.runtime != NULL,
         engine->navigation.page.script_degradation_observed,
@@ -519,7 +523,8 @@ bool browser_engine_youtube_signin_report(const BrowserEngine *engine, char *out
         trail->post_target, trail->post_outcome,
         trail->post_http_status >= 100 && trail->post_http_status <= 599
             ? trail->post_http_status : 0L,
-        trail->post_landing);
+        trail->post_landing,
+        trail->refusals, trail->refusal_class, trail->refusal_reason);
     if (n < 0 || (size_t) n >= capacity) { out[0] = '\0'; return false; }
     return true;
 }
@@ -1216,6 +1221,42 @@ static void browser_engine_youtube_on_commit(BrowserEngine *engine,
     if (committed) browser_engine_bind_youtube_controls(engine);
 }
 
+/* Where a finished top-level navigation left the page: the sign-in trail's
+   last POST, and Google refusing the browser on accounts.google.com. Its
+   rejection page commits like any page; the frontend adds its own notice
+   (BROWSER_YOUTUBE_LOGIN_REFUSED) and the attempt is over, with nothing
+   retried. An interstitial or HTTP 429 is only counted: Google's page says
+   what to do. */
+static void browser_engine_youtube_note_landing(
+    BrowserEngine *engine, BrowserNavigationJobStatus outcome)
+{
+    BrowserSigninTrail *trail = &engine->youtube.signin_trail;
+    if (trail->post_pending) {
+        trail->post_pending = false;
+        trail->post_outcome = (unsigned) outcome;
+        trail->post_http_status = engine->navigation.last_http_status;
+        trail->post_landing = browser_engine_youtube_signin_page_class(
+            engine->navigation.page.document_url);
+    }
+    bool accounts_request = engine->youtube.accounts_request;
+    engine->youtube.accounts_request = false;
+    if (outcome != BROWSER_NAVIGATION_JOB_SUCCEEDED) return;
+    unsigned reason = 0u;
+    SiteIdentityAccountsRefusal refusal = site_identity_accounts_refusal(
+        accounts_request, engine->navigation.page.document_url,
+        engine->navigation.last_http_status, &reason);
+    if (refusal == SITE_IDENTITY_ACCOUNTS_ACCEPTED) return;
+    if (engine->youtube.signin_diagnostics) {
+        trail->refusals++;
+        trail->refusal_class = (unsigned) refusal;
+        trail->refusal_reason = reason;
+    }
+    if (refusal != SITE_IDENTITY_ACCOUNTS_REJECTED) return;
+    engine->youtube.login_events |= BROWSER_YOUTUBE_LOGIN_REFUSED;
+    if (browser_engine_youtube_signin_pending(engine))
+        engine->youtube.signin_state = YOUTUBE_SIGNIN_FAILED;
+}
+
 static void browser_engine_youtube_on_finish(
     BrowserEngine *engine, BrowserNavigationJobStatus outcome,
     const SiteAdapterLoadMetrics *adapter)
@@ -1225,15 +1266,7 @@ static void browser_engine_youtube_on_finish(
         engine->youtube.handoff_http_status = adapter->handoff_http_status;
         engine->youtube.handoff_service_origin = adapter->handoff_service_origin;
     }
-    if (engine->youtube.signin_trail.post_pending) {
-        engine->youtube.signin_trail.post_pending = false;
-        engine->youtube.signin_trail.post_outcome = (unsigned) outcome;
-        engine->youtube.signin_trail.post_http_status =
-            engine->navigation.last_http_status;
-        engine->youtube.signin_trail.post_landing =
-            browser_engine_youtube_signin_page_class(
-                engine->navigation.page.document_url);
-    }
+    browser_engine_youtube_note_landing(engine, outcome);
     if (!browser_engine_youtube_signin_pending(engine)) return;
     if (outcome == BROWSER_NAVIGATION_JOB_CANCELLED) {
         engine->youtube.signin_state = YOUTUBE_SIGNIN_CANCELLED;

@@ -236,8 +236,17 @@
           "custom element form disabled",
         );
     };
+  /* The element's custom element state: its own, and not for the page's
+     enumeration to see. */
+  const setCustomElementState = (node, state) => {
+    Object.defineProperty(node, "__tilefinchCustomElementState", {
+      configurable: true,
+      writable: true,
+      value: state,
+    });
+  };
   const failUpgrade = (node, definition, error) => {
-    node.__tilefinchCustomElementState = "failed";
+    setCustomElementState(node, "failed");
     if (node.__handle !== undefined) __tilefinchSetCustomState(node.__handle, -1);
     if (globalThis.HTMLUnknownElement) {
       globalThis.__tilefinchPrepareNativePrototype?.(node);
@@ -275,7 +284,7 @@
     const wasConnected = connected(node),
       expectedDocument = node.ownerDocument,
       expectedLocalName = String(node.localName).toLowerCase();
-    node.__tilefinchCustomElementState = "precustomized";
+    setCustomElementState(node, "precustomized");
     Object.defineProperty(node, "__tilefinchCustomElementDefinition", {
       configurable: true,
       writable: true,
@@ -330,7 +339,7 @@
           "Custom element constructor changed its element",
           "NotSupportedError",
         );
-      node.__tilefinchCustomElementState = "custom";
+      setCustomElementState(node, "custom");
       if (node.__handle !== undefined) __tilefinchSetCustomState(node.__handle, 1);
       synchronizeFormOwner(node, definition);
       synchronizeDisabled(node, definition);
@@ -1025,17 +1034,19 @@
     },
     rules = () => {
       if (ruleModel) return ruleModel;
-      ensureRuleBootstrap();
-      const create = globalThis.__tilefinchCreateRuleModel;
-      delete globalThis.__tilefinchCreateRuleModel;
-      ruleModel = create(ruleToken, makeTextStyle, splitConstructedRules,
-        constructedSheetTextLimit, ruleList, validRuleText, assertSelector);
-      for (const name of ruleInterfaces)
-        Object.defineProperty(globalThis, name, {
-          configurable: true,
-          writable: true,
-          value: ruleModel.model[name],
-        });
+      /* In the module's marking window: the rule interfaces are its own. */
+      ensureRuleBootstrap(() => {
+        const create = globalThis.__tilefinchCreateRuleModel;
+        delete globalThis.__tilefinchCreateRuleModel;
+        ruleModel = create(ruleToken, makeTextStyle, splitConstructedRules,
+          constructedSheetTextLimit, ruleList, validRuleText, assertSelector);
+        for (const name of ruleInterfaces)
+          Object.defineProperty(globalThis, name, {
+            configurable: true,
+            writable: true,
+            value: ruleModel.model[name],
+          });
+      });
       return ruleModel;
     },
     parseRule = (text, sheet, parent) => rules().parseRule(text, sheet, parent);
@@ -1230,7 +1241,13 @@
         throw sheetQuotaError();
       const rules = this.__rules.slice();
       rules.splice(index, 0, parsed[0]);
-      this.__commit(rules);
+      /* A list the page has read gains the one new rule object; the
+         others keep their identity (rebuilding every object made each
+         insert cost the whole sheet). */
+      const live = this.__cssRulesRead && !this.__cssRulesStale,
+        inserted = live ? parseRule(parsed[0], this, null) : null;
+      this.__commit(rules, live);
+      if (live) this.__cssRules.splice(index, 0, inserted);
       return index;
     }
     deleteRule(index) {
@@ -1240,7 +1257,9 @@
         throw new DOMException("Invalid rule index", "IndexSizeError");
       const rules = this.__rules.slice();
       rules.splice(index, 1);
-      this.__commit(rules);
+      const live = this.__cssRulesRead && !this.__cssRulesStale;
+      this.__commit(rules, live);
+      if (live) this.__cssRules.splice(index, 1)[0].__sheet = null;
     }
   }
   globalThis.CSSStyleSheet = CSSStyleSheet;
@@ -1442,12 +1461,12 @@
       globalThis.__tilefinchPrepareNativePrototype?.(
         node, definition.constructor.prototype);
       Object.setPrototypeOf(node, definition.constructor.prototype);
-      node.__tilefinchCustomElementState = "custom";
+      setCustomElementState(node, "custom");
       node.__tilefinchCustomElementConnectedState = connected(node);
       return node;
     }
     if (state === 1) {
-      node.__tilefinchCustomElementState = "failed";
+      setCustomElementState(node, "failed");
       return node;
     }
     return upgradeOne(node, definition);
@@ -1713,7 +1732,7 @@
       node.setAttribute("is", definition.name);
     globalThis.__tilefinchPrepareNativePrototype?.(node, definition.prototype);
     Object.setPrototypeOf(node, definition.prototype);
-    node.__tilefinchCustomElementState = "custom";
+    setCustomElementState(node, "custom");
     if (node.__handle !== undefined) __tilefinchSetCustomState(node.__handle, 1);
     return node;
   };
@@ -1829,7 +1848,7 @@
         frameDocument.write(...values, "\n");
       frameDocument.close = () => {};
     }
-    view.getComputedStyle = (node, pseudo = null) => {
+    view.getComputedStyle = { getComputedStyle(node, pseudo = null) {
       const base = globalThis.getComputedStyle(node, pseudo);
       let framedColor = "";
       for (const style of frameDocument.querySelectorAll?.("style") || []) {
@@ -1856,7 +1875,7 @@
           return target[name];
         },
       });
-    };
+    } }.getComputedStyle;
     view.customElements = frameRegistry;
   };
   const nativeFrameWindow = globalThis.__tilefinchFrameWindow;

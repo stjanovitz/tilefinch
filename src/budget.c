@@ -1613,6 +1613,8 @@ struct BudgetQuickJSPool {
     BudgetQuickJSLimitGrowth limit_growth;
     void *limit_growth_opaque;
     size_t rejection_count;
+    /* Requests the limit admitted but the page Budget could not back. */
+    size_t budget_refusal_count;
     size_t largest_request;
     size_t peak_dump_watermark;
 #ifdef BUDGET_QUICKJS_ACTIVITY
@@ -2255,6 +2257,13 @@ void budget_quickjs_pool_report_rejects(FILE *stream)
     }
 }
 
+static void bellard_pool_note_budget_refusal(const JSMallocState *state)
+{
+    BudgetQuickJSPool *pool = state == NULL ? NULL : state->opaque;
+    if (pool != NULL && pool->budget_refusal_count != SIZE_MAX)
+        pool->budget_refusal_count++;
+}
+
 /* A request past the realm limit may still be admitted: the embedder
    raises the limit while the shared page Budget has room to spare. */
 static bool bellard_pool_growth_admitted(JSMallocState *state,
@@ -2291,6 +2300,7 @@ static void *bellard_pool_malloc(JSMallocState *state, size_t size)
     bellard_pool_note_request(state->opaque, size);
     bellard_pool_record_big_request(state, 0, size, 0);
     void *pointer = quickjs_pool_malloc(state->opaque, size);
+    if (pointer == NULL) bellard_pool_note_budget_refusal(state);
     if (pointer != NULL) {
         state->malloc_count++;
         state->malloc_size += quickjs_pool_requested_size(pointer);
@@ -2343,7 +2353,10 @@ static void *bellard_pool_realloc(JSMallocState *state, void *pointer,
     bellard_pool_record_big_request(state, old_size, size, 1);
     bellard_pool_capture_prefix(pointer, old_size, size);
     void *resized = quickjs_pool_realloc(state->opaque, pointer, size);
-    if (resized == NULL) return NULL;
+    if (resized == NULL) {
+        bellard_pool_note_budget_refusal(state);
+        return NULL;
+    }
     state->malloc_size -= old_size;
     state->malloc_size += quickjs_pool_requested_size(resized);
     bellard_pool_update_malloc_census(state->opaque, state->malloc_size);
@@ -2417,6 +2430,11 @@ size_t budget_quickjs_pool_js_malloc_current(const BudgetQuickJSPool *pool)
 size_t budget_quickjs_pool_rejection_count(const BudgetQuickJSPool *pool)
 {
     return pool == NULL ? 0 : pool->rejection_count;
+}
+
+size_t budget_quickjs_pool_budget_refusal_count(const BudgetQuickJSPool *pool)
+{
+    return pool == NULL ? 0 : pool->budget_refusal_count;
 }
 
 void budget_quickjs_pool_activity(const BudgetQuickJSPool *pool,

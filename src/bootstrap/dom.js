@@ -1623,29 +1623,24 @@ const __tilefinchObject = (() => {
   }, "isConnected"));
   class Attr extends Node {}
   class NamedNodeMap {}
-  Node.ELEMENT_NODE = 1;
-  Node.ATTRIBUTE_NODE = 2;
-  Node.TEXT_NODE = 3;
-  Node.CDATA_SECTION_NODE = 4;
-  Node.PROCESSING_INSTRUCTION_NODE = 7;
-  Node.COMMENT_NODE = 8;
-  Node.DOCUMENT_TYPE_NODE = 10;
-  Node.DOCUMENT_NODE = 9;
-  Node.DOCUMENT_FRAGMENT_NODE = 11;
-  Node.DOCUMENT_POSITION_DISCONNECTED = 1;
-  Node.DOCUMENT_POSITION_PRECEDING = 2;
-  Node.DOCUMENT_POSITION_FOLLOWING = 4;
-  Node.DOCUMENT_POSITION_CONTAINS = 8;
-  Node.DOCUMENT_POSITION_CONTAINED_BY = 16;
-  Node.DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC = 32;
-  Object.assign(Node.prototype, {
-    DOCUMENT_POSITION_DISCONNECTED: 1,
-    DOCUMENT_POSITION_PRECEDING: 2,
-    DOCUMENT_POSITION_FOLLOWING: 4,
-    DOCUMENT_POSITION_CONTAINS: 8,
-    DOCUMENT_POSITION_CONTAINED_BY: 16,
-    DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC: 32,
-  });
+  /* Web IDL constants: on the interface object and its prototype (so on
+     every node), enumerable and read-only. */
+  {
+    const names = ("ELEMENT_NODE ATTRIBUTE_NODE TEXT_NODE CDATA_SECTION_NODE " +
+        "ENTITY_REFERENCE_NODE ENTITY_NODE PROCESSING_INSTRUCTION_NODE " +
+        "COMMENT_NODE DOCUMENT_NODE DOCUMENT_TYPE_NODE " +
+        "DOCUMENT_FRAGMENT_NODE NOTATION_NODE").split(" ");
+    for (let at = 0; at < 18; at++) {
+      const constant = {
+        enumerable: true,
+        value: at < 12 ? at + 1 : 1 << (at - 12),
+      }, name = at < 12 ? names[at] : "DOCUMENT_POSITION_" +
+        ["DISCONNECTED", "PRECEDING", "FOLLOWING", "CONTAINS",
+         "CONTAINED_BY", "IMPLEMENTATION_SPECIFIC"][at - 12];
+      Object.defineProperty(Node, name, constant);
+      Object.defineProperty(Node.prototype, name, constant);
+    }
+  }
   Object.defineProperties(Attr.prototype, {
     name: {
       get() {
@@ -1829,6 +1824,8 @@ const __tilefinchObject = (() => {
     checkDoctypeName,
     contextFragment,
     removeSelectOption: null,
+    liveChildNodes: null,
+    detachedChildNodes: null,
   };
   __tilefinchRealmGlobal.__tilefinchDomShared = domShared;
   Object.defineProperties(HTMLElement.prototype, {
@@ -1992,6 +1989,57 @@ const __tilefinchObject = (() => {
       value: constructor,
     });
   }
+  /* No page text tracks are loaded or shown: every media element has an
+     empty TextTrackList of its own. */
+  class TextTrackList extends EventTarget {
+    constructor(token) {
+      if (token !== HTMLMediaElement)
+        throw new TypeError("Illegal constructor");
+      super();
+    }
+    get length() { return 0; }
+    getTrackById(_id) { return null; }
+  }
+  __tilefinchRealmGlobal.TextTrackList = TextTrackList;
+  Object.defineProperty(HTMLMediaElement.prototype, "textTracks", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      if (!this.__tilefinchTextTracks)
+        Object.defineProperty(this, "__tilefinchTextTracks", {
+          configurable: true,
+          value: new TextTrackList(HTMLMediaElement),
+        });
+      return this.__tilefinchTextTracks;
+    },
+  });
+  /* HTMLTableElement.rows: the thead rows, then the table's own and its
+     tbody rows in tree order, then the tfoot rows; a live HTMLCollection. */
+  Object.defineProperty(__tilefinchRealmGlobal.HTMLTableElement.prototype, "rows", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      const table = this;
+      if (!table.__tilefinchRowsCollection)
+        Object.defineProperty(table, "__tilefinchRowsCollection", {
+          configurable: true,
+          value: __tilefinchRealmGlobal.__tilefinchLiveHTMLCollection(() => {
+            const head = [], body = [], foot = [];
+            for (const child of table.children) {
+              const name = child.localName;
+              if (name === "tr") body.push(child);
+              else if (name === "thead" || name === "tbody" || name === "tfoot")
+                for (const row of child.children)
+                  if (row.localName === "tr")
+                    (name === "thead" ? head : name === "tfoot" ? foot : body)
+                      .push(row);
+            }
+            return head.concat(body, foot);
+          }),
+        });
+      return table.__tilefinchRowsCollection;
+    },
+  });
   /* Members HTML gives only some interfaces: `action` is HTMLFormElement's
      alone and `target` belongs to forms, links and <base>. On every element
      they made `'action' in div` true and let an <input>'s inline handler
@@ -2018,6 +2066,21 @@ const __tilefinchObject = (() => {
                              __tilefinchRealmGlobal.HTMLAreaElement.prototype,
                              __tilefinchRealmGlobal.HTMLBaseElement.prototype])
       Object.defineProperty(prototype, "target", target);
+    /* relList: a DOMTokenList over rel ([PutForwards=value]). */
+    const relList = {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return makeClassList(this, "rel");
+      },
+      set(value) {
+        this.setAttribute("rel", String(value));
+      },
+    };
+    for (const prototype of [HTMLAnchorElement.prototype,
+                             __tilefinchRealmGlobal.HTMLAreaElement.prototype,
+                             HTMLFormElement.prototype, HTMLLinkElement.prototype])
+      Object.defineProperty(prototype, "relList", relList);
   }
   /* " tag=index " into sharedLayerPrototypes, read once per tag name. */
   const sharedLayerTags =
@@ -2149,6 +2212,29 @@ const __tilefinchObject = (() => {
     }
   }
   class HTMLCollection {}
+  /* Geometry Interfaces: getClientRects() returns a DOMRectList. One box
+     per element or range here, or none for an empty one. */
+  class DOMRectList {
+    constructor() {
+      throw new TypeError("Illegal constructor");
+    }
+    item(index) {
+      return this[Number(index) >>> 0] ?? null;
+    }
+  }
+  DOMRectList.prototype[Symbol.iterator] = Array.prototype[Symbol.iterator];
+  __tilefinchRealmGlobal.DOMRectList = DOMRectList;
+  const rectList = (rect) => {
+    const list = Object.create(DOMRectList.prototype),
+      count = rect.width && rect.height ? 1 : 0;
+    if (count)
+      Object.defineProperty(list, 0, {
+        configurable: true, enumerable: true, value: rect,
+      });
+    Object.defineProperty(list, "length", { configurable: true, value: count });
+    return list;
+  };
+  domShared.rectList = rectList;
   let createLiveCollection;
   /* Lists read from the native DOM, memoized: `memoList(owner, read)`
      returns `read(owner)`'s result, reused for the same owner while the DOM
@@ -2205,12 +2291,25 @@ const __tilefinchObject = (() => {
       entry.task = task;
       return values;
     },
-    /* By index: a page's patch of Array.prototype.map never runs. */
-    readChildNodes = (node) => {
-      const handles = __tilefinchChildNodes(node.__handle), nodes = [];
-      for (let at = 0; at < handles.length; at++) nodes[at] = wrap(handles[at]);
-      return nodes;
-    };
+    /* A node's childNodes: its one live NodeList (live_node_list.inc),
+       over the native children of `source` (the node's handle, or 0 for
+       the document), or over the array `source()` returns for a
+       script-side tree. */
+    liveChildNodes = (node, source) => {
+      const list = __tilefinchLiveNodeList(node, source, NodeList.prototype,
+                                           wrap);
+      /* The window's document keeps its list itself (platform.js). */
+      if (node !== null) Object.defineProperty(node, "__tilefinchChildNodeList", {
+        configurable: true,
+        value: list,
+      });
+      return list;
+    },
+    detachedChildNodes = (node) =>
+      node.__tilefinchChildNodeList ||
+      liveChildNodes(node, () => node.__detachedChildren || []);
+  domShared.liveChildNodes = liveChildNodes;
+  domShared.detachedChildNodes = detachedChildNodes;
   class Window extends EventTarget {}
   const domInterfaces = {
     EventTarget,
@@ -2590,7 +2689,10 @@ const __tilefinchObject = (() => {
           configurable: true,
           enumerable: true,
           get() {
-            return nodeList(shadowLightChildren(this));
+            const host = this;
+            return this.__tilefinchChildNodeList ||
+              liveChildNodes(this, host.__handle > 0 ? host.__handle
+                : () => shadowLightChildren(host));
           },
         },
         children: {
@@ -2756,7 +2858,7 @@ const __tilefinchObject = (() => {
         configurable: true,
         enumerable: true,
         get() {
-          return nodeList(copyList(this.__detachedChildren || []));
+          return detachedChildNodes(this);
         },
       };
       rootDescriptors.children = {
@@ -2921,6 +3023,11 @@ const __tilefinchObject = (() => {
       "crossOrigin",
       crossOrigin,
     );
+    Object.defineProperty(
+      HTMLMediaElement.prototype,
+      "crossOrigin",
+      crossOrigin,
+    );
     /* HTMLOrSVGElement.nonce reflects the [[CryptographicNonce]] slot, which
        outlives the content attribute a header-delivered CSP hides. */
     const nonce = {
@@ -2937,12 +3044,16 @@ const __tilefinchObject = (() => {
     };
     Object.defineProperty(HTMLElement.prototype, "nonce", nonce);
     Object.defineProperty(SVGElement.prototype, "nonce", nonce);
-    /* `draggable` is left out on purpose: `'draggable' in element` is the
-       standard drag-and-drop feature test (Modernizr, Amazon's AUI) and
-       Tilefinch has no drag-and-drop input, so exposing it would claim
-       one. */
+    /* loading answers "auto" when the attribute is missing or invalid, as
+       Chromium does (its IDL also takes "auto" as a keyword). HTML has no
+       such keyword: its missing and invalid value default is the Eager
+       state, which Firefox and WebKit report as "eager". This matches the
+       dominant engine on purpose, because Google's sign-in check compares
+       the value with Chromium's; how an image or frame loads is unchanged
+       (an "auto" one loads as an eager one does). */
     const autofocus = reflectBoolean("autofocus"),
-      loading = reflectEnumerated("loading", ["lazy", "eager"], "eager");
+      loading = reflectEnumerated("loading", ["lazy", "eager", "auto"],
+        "auto");
     Object.defineProperties(HTMLElement.prototype, {
       dir: reflectEnumerated("dir", ["ltr", "rtl", "auto"]),
       inputMode: reflectEnumerated("inputMode", [
@@ -3085,99 +3196,12 @@ const __tilefinchObject = (() => {
     HTMLElement.prototype,
     SVGElement.prototype,
   ];
-  for (const type of [
-    "abort",
-    "animationcancel",
-    "animationend",
-    "animationiteration",
-    "animationstart",
-    "auxclick",
-    "beforeinput",
-    "beforetoggle",
-    "blur",
-    "cancel",
-    "canplay",
-    "change",
-    "click",
-    "close",
-    "contextmenu",
-    "compositionend",
-    "compositionstart",
-    "compositionupdate",
-    "copy",
-    "cut",
-    "dblclick",
-    "drag",
-    "dragend",
-    "dragenter",
-    "dragleave",
-    "dragover",
-    "dragstart",
-    "drop",
-    "durationchange",
-    "emptied",
-    "ended",
-    "error",
-    "focus",
-    "focusin",
-    "focusout",
-    "input",
-    "invalid",
-    "keydown",
-    "keypress",
-    "keyup",
-    "loadeddata",
-    "loadedmetadata",
-    "loadstart",
-    "load",
-    "mousedown",
-    "mouseenter",
-    "mouseleave",
-    "mousemove",
-    "mouseout",
-    "mouseover",
-    "mouseup",
-    "paste",
-    "pause",
-    "play",
-    "playing",
-    "pointerdown",
-    "pointerenter",
-    "pointerleave",
-    "pointermove",
-    "pointerout",
-    "pointerover",
-    "pointerup",
-    "ratechange",
-    "reset",
-    "scroll",
-    "select",
-    "selectionchange",
-    "seeking",
-    "seeked",
-    "stalled",
-    "submit",
-    "suspend",
-    "touchcancel",
-    "touchend",
-    "touchmove",
-    "touchstart",
-    "timeupdate",
-    "toggle",
-    "transitioncancel",
-    "transitionend",
-    "transitionrun",
-    "transitionstart",
-    "visibilitychange",
-    "volumechange",
-    "waiting",
-    "wheel",
-  ]) {
+  /* An event handler IDL attribute for `type`. Computed accessor keys name
+     the functions "get onclick" and "set onclick" as WebIDL attributes are;
+     literal accessors are already enumerable and configurable. */
+  const eventHandlerAttribute = (type) => {
     const name = "on" + type;
-    /* Computed accessor keys name the functions "get onclick" and
-       "set onclick" as WebIDL attributes are; literal accessors are already
-       enumerable and configurable. */
-    const descriptor = Object.getOwnPropertyDescriptor({
+    return Object.getOwnPropertyDescriptor({
         get [name]() {
           return inlineEventHandler(this, type, name);
         },
@@ -3194,9 +3218,50 @@ const __tilefinchObject = (() => {
           installEventHandler(this, type, callable);
         },
       }, name);
+  };
+  /* GlobalEventHandlers (HTML, with the Pointer Events, Selection API and
+     CSS Containment additions). */
+  for (const type of (
+    "abort animationcancel animationend animationiteration " +
+    "animationstart auxclick beforeinput beforetoggle blur cancel " +
+    "canplay change click close contextmenu copy cut dblclick drag " +
+    "dragend dragenter dragleave dragover dragstart drop " +
+    "durationchange emptied ended error focus " +
+    "input invalid keydown keypress keyup loadeddata " +
+    "loadedmetadata loadstart load mousedown mouseenter mouseleave " +
+    "mousemove mouseout mouseover mouseup paste pause play playing " +
+    "pointerdown pointerenter pointerleave pointermove pointerout " +
+    "pointerover pointerup ratechange reset scroll select " +
+    "selectionchange seeking seeked stalled submit suspend " +
+    "touchcancel touchend touchmove touchstart timeupdate toggle " +
+    "transitioncancel transitionend transitionrun transitionstart " +
+    "volumechange waiting wheel beforematch " +
+    "canplaythrough command contentvisibilityautostatechange " +
+    "contextlost contextrestored cuechange formdata " +
+    "gotpointercapture lostpointercapture pointercancel " +
+    "pointerrawupdate progress resize scrollend " +
+    "securitypolicyviolation selectstart slotchange " +
+    "webkitanimationend webkitanimationiteration " +
+    "webkitanimationstart webkittransitionend").split(" ")) {
+    const descriptor = eventHandlerAttribute(type);
     for (const prototype of globalEventHandlerPrototypes)
-      if (!(name in prototype))
-        Object.defineProperty(prototype, name, descriptor);
+      if (!(("on" + type) in prototype))
+        Object.defineProperty(prototype, "on" + type, descriptor);
+  }
+  /* Fullscreen puts its two on Element and Document; Pointer Lock's and
+     Page Visibility's are Document's alone. (The composition and focusin
+     events have no handler attribute in HTML.) */
+  for (const [type, prototypes] of [
+    ["fullscreenchange", [Element.prototype, Document.prototype]],
+    ["fullscreenerror", [Element.prototype, Document.prototype]],
+    ["pointerlockchange", [Document.prototype]],
+    ["pointerlockerror", [Document.prototype]],
+    ["visibilitychange", [Document.prototype]],
+  ]) {
+    const descriptor = eventHandlerAttribute(type);
+    for (const prototype of prototypes)
+      if (!(("on" + type) in prototype))
+        Object.defineProperty(prototype, "on" + type, descriptor);
   }
   Object.defineProperty(NodeList.prototype, Symbol.toStringTag, {
     configurable: true,
@@ -4239,6 +4304,17 @@ const __tilefinchObject = (() => {
           );
         return token;
       };
+  /* Space-delimited so a lookup is one includes(). */
+  const sandboxTokens = " allow-downloads allow-forms allow-modals " +
+      "allow-orientation-lock allow-pointer-lock allow-popups " +
+      "allow-popups-to-escape-sandbox allow-presentation allow-same-origin " +
+      "allow-scripts allow-top-navigation " +
+      "allow-top-navigation-by-user-activation " +
+      "allow-top-navigation-to-custom-protocols ",
+    linkRelTokens = " alternate canonical dns-prefetch icon manifest " +
+      "modulepreload preconnect prefetch preload stylesheet ",
+    anchorRelTokens = " noopener noreferrer opener ",
+    relTokenOwners = " a area form ";
   const writeClassTokens = (list, values) =>
     classListNode(list).setAttribute(list[tokenListAttribute], values.join(" "));
   /* DOMTokenList is a real interface: pages (and anti-adblock integrity
@@ -4338,8 +4414,18 @@ const __tilefinchObject = (() => {
       toString() {
         return this.value;
       },
+      /* Only sandbox and rel define supported tokens; any other list
+         throws, as the standard requires. */
       supports(token) {
-        throw new TypeError("classList does not define supported tokens");
+        const name = classListNode(this).localName,
+          attribute = this[tokenListAttribute],
+          tokens = attribute === "sandbox"
+            ? name === "iframe" && sandboxTokens
+            : attribute === "rel" &&
+              (name === "link" ? linkRelTokens : relTokenOwners.includes(` ${name} `) && anchorRelTokens);
+        if (!tokens) throw new TypeError("DOMTokenList has no supported tokens");
+        token = asciiLower(String(token));
+        return !/[\t\n\f\r ]/.test(token) && tokens.includes(` ${token} `);
       },
     }));
   /* WebIDL iterable: @@iterator is `values` itself, not enumerable. */
@@ -4730,6 +4816,15 @@ const __tilefinchObject = (() => {
   // Receiver-only operations share function objects across native wrappers.
   // Keep handle/rebinding and listener closures per node, and copy descriptors
   // (not values) so own-property accessors and subclass overrides are preserved.
+  /* img.width and height (unsigned long): the attribute's dimension, else
+     the natural size, else 0. A rendered image reports its attribute or
+     natural size, not its laid-out box. */
+  const imageDimension = (image, name) => {
+    const match = /^[\t\n\f\r ]*\+?([0-9]+)/.exec(image.getAttribute(name) ?? "");
+    return match && match[1].length < 11 && +match[1] <= 2147483647
+      ? +match[1]
+      : image[name === "width" ? "naturalWidth" : "naturalHeight"] || 0;
+  };
   const nativeNodeReceiverDescriptors = Object.getOwnPropertyDescriptors({
     get nodeValue() {
       return this.nodeType === Node.TEXT_NODE ||
@@ -4767,14 +4862,6 @@ const __tilefinchObject = (() => {
     },
     set className(value) {
       this.setAttribute("class", value);
-    },
-    get role() {
-      return this.getAttribute("role");
-    },
-    set role(value) {
-      value === null
-        ? this.removeAttribute("role")
-        : this.setAttribute("role", value);
     },
     get contentEditable() {
       const value = this.getAttribute("contenteditable");
@@ -4966,7 +5053,7 @@ const __tilefinchObject = (() => {
       this.__selectionDirection = ["forward", "backward"].includes(direction)
         ? direction
         : "none";
-      __tilefinchRealmGlobal.__tilefinchSelectionChanged?.();
+      __tilefinchRealmGlobal.__tilefinchSelectionChanged?.(this);
     },
     select() {
       if (this.selectionStart !== null) {
@@ -5062,9 +5149,15 @@ const __tilefinchObject = (() => {
         if (__tilefinchRealmGlobal.__tilefinchCanvasDimension)
           return __tilefinchRealmGlobal.__tilefinchCanvasDimension(this, "width");
       }
+      if (this instanceof HTMLImageElement) return imageDimension(this, "width");
       return this.getAttribute("width") || "";
     },
     set width(value) {
+      if (this instanceof HTMLImageElement) {
+        const size = Number(value) >>> 0;
+        this.setAttribute("width", String(size > 2147483647 ? 0 : size));
+        return;
+      }
       if (this instanceof HTMLCanvasElement) {
         __tilefinchRealmGlobal.__tilefinchEnsureCanvasBootstrap?.();
         if (__tilefinchRealmGlobal.__tilefinchSetCanvasDimension) {
@@ -5080,9 +5173,15 @@ const __tilefinchObject = (() => {
         if (__tilefinchRealmGlobal.__tilefinchCanvasDimension)
           return __tilefinchRealmGlobal.__tilefinchCanvasDimension(this, "height");
       }
+      if (this instanceof HTMLImageElement) return imageDimension(this, "height");
       return this.getAttribute("height") || "";
     },
     set height(value) {
+      if (this instanceof HTMLImageElement) {
+        const size = Number(value) >>> 0;
+        this.setAttribute("height", String(size > 2147483647 ? 0 : size));
+        return;
+      }
       if (this instanceof HTMLCanvasElement) {
         __tilefinchRealmGlobal.__tilefinchEnsureCanvasBootstrap?.();
         if (__tilefinchRealmGlobal.__tilefinchSetCanvasDimension) {
@@ -5097,22 +5196,6 @@ const __tilefinchObject = (() => {
     },
     set sandbox(value) {
       this.setAttribute("sandbox", String(value));
-    },
-    get ariaAtomic() {
-      return this.getAttribute("aria-atomic");
-    },
-    set ariaAtomic(value) {
-      value === null
-        ? this.removeAttribute("aria-atomic")
-        : this.setAttribute("aria-atomic", value);
-    },
-    get ariaLive() {
-      return this.getAttribute("aria-live");
-    },
-    set ariaLive(value) {
-      value === null
-        ? this.removeAttribute("aria-live")
-        : this.setAttribute("aria-live", value);
     },
     get defer() {
       return this.hasAttribute("defer");
@@ -5258,7 +5341,11 @@ const __tilefinchObject = (() => {
          offsetParent and turned ordinary author geometry walks into cycles. */
       const owner = this.ownerDocument;
       if (this === owner.documentElement || this === owner.body) return null;
-      const position = getComputedStyle(this).position;
+      /* No layout box (not in a document, or display: none): null. */
+      if (!this.isConnected) return null;
+      const own = getComputedStyle(this);
+      if (own.display === "none") return null;
+      const position = own.position;
       if (position === "fixed") {
         for (
           let at = this.parentElement, steps = 0;
@@ -5320,8 +5407,7 @@ const __tilefinchObject = (() => {
         );
     },
     getClientRects() {
-      const rect = this.getBoundingClientRect();
-      return rect.width && rect.height ? [rect] : [];
+      return rectList(this.getBoundingClientRect());
     },
     prepend(...values) {
       if (__tilefinchRealmGlobal.__tilefinchParentAppend)
@@ -6470,10 +6556,9 @@ const __tilefinchObject = (() => {
       return this.__tilefinchChildrenCollection;
     },
     get childNodes() {
-      /* Still a plain Array, but one read per script run between
-         mutations (see memoList): index loops over childNodes were
-         quadratic in native reads. */
-      return memoList(this, readChildNodes);
+      if (this.__tilefinchChildNodeList) return this.__tilefinchChildNodeList;
+      const handle = Number(this.__handle);
+      return liveChildNodes(this, handle > 0 ? handle : emptyElementQuery);
     },
     get content() {
       /* This receiver serves every native element, so it must also answer
@@ -6496,7 +6581,10 @@ const __tilefinchObject = (() => {
     },
     get contentWindow() {
       const nativeReceiver = this;
-      return String(this.tagName).toLowerCase() === "iframe"
+      /* No content navigable, so no WindowProxy, until the element is
+         connected (HTML, "the iframe element"). */
+      return String(this.tagName).toLowerCase() === "iframe" &&
+          this.isConnected
         ? __tilefinchRealmGlobal.__tilefinchFrameWindow?.(nativeReceiver.__handle) || null
         : null;
     },
@@ -7419,6 +7507,58 @@ const __tilefinchObject = (() => {
     writable: true,
     value: nativeNodeReceiverDescriptors.replaceChildren.value,
   });
+  /* Layer members only some interfaces have, by owner: an HTML element
+     interface's stem ("Input" is HTMLInputElement), "SVG" for the SVG
+     interfaces, or a whole interface name. A layer carries one only for
+     its own interface (nativeLayer), so an <img> has no value, href or
+     sandbox; each owner's prototype has the member as well, where the
+     standard puts it and where the interfaces that share HTMLElement's
+     layer find it. */
+  const layerMemberOwners = {
+    __proto__: null,
+    disabled: " Button FieldSet Input Link OptGroup Option Select Style TextArea SVG ",
+    value: " Button Data Input LI Meter Option Output Param Progress Select TextArea ",
+    name: " Anchor Button Details Embed FieldSet Form Frame IFrame Image Input Map Meta Object Output Param Select Slot TextArea ",
+    type: " Anchor Button Embed FieldSet Input Link LI Object OList Output Param Script Select Source Style TextArea UList SVG ",
+    checked: " Input ",
+    selected: " Option ",
+    placeholder: " Input TextArea ",
+    selectionStart: " Input TextArea ",
+    selectionEnd: " Input TextArea ",
+    selectionDirection: " Input TextArea ",
+    setSelectionRange: " Input TextArea ",
+    select: " Input TextArea ",
+    src: " Audio Video Media Embed Frame IFrame Image Input Script Source Track ",
+    href: " Anchor Area Base Link SVG ",
+    hreflang: " Anchor Link ",
+    rel: " Anchor Area Form Link ",
+    width: " Canvas Embed HR IFrame Image Input Marquee Object Pre Source Table TableCell TableCol Video SVG ",
+    height: " Canvas Embed IFrame Image Input Marquee Object Source TableCell Video SVG ",
+    sandbox: " IFrame ",
+    defer: " Script ",
+    async: " Script ",
+    content: " Meta Template ",
+    contentWindow: " Frame IFrame Object ",
+    contentDocument: " Frame IFrame Object ",
+    getElementById: " DocumentFragment ShadowRoot SVG ",
+  };
+  const layerStem = (base) => {
+    const name = String(base[Symbol.toStringTag]);
+    return name.startsWith("SVG") ? " SVG "
+      : " " + (name.startsWith("HTML") ? name.slice(4, -7) : name) + " ";
+  };
+  for (const name in layerMemberOwners) {
+    const stems = layerMemberOwners[name].split(" ");
+    for (let at = 1; at < stems.length - 1; at++) {
+      const prototype =
+        __tilefinchRealmGlobal["HTML" + stems[at] + "Element"]?.prototype;
+      if (prototype && !Object.hasOwn(prototype, name))
+        Object.defineProperty(prototype, name,
+                              nativeNodeReceiverDescriptors[name]);
+    }
+  }
+  /* The layer's own plumbing is not part of any interface. */
+  nativeNodeReceiverDescriptors.__tilefinchGeometryValue.enumerable = false;
   /* Likewise the rest of the layer's standard members, as the same
      functions (wrappers still find the layer first). Pages hook and
      capture them on the interface prototypes: Object.getOwnPropertyDescriptor
@@ -7428,13 +7568,8 @@ const __tilefinchObject = (() => {
      is missing. Members a prototype defines itself are kept. */
   for (const [prototype, names] of [
     [Node.prototype, "nodeType nodeName ownerDocument parentNode parentElement childNodes firstChild lastChild previousSibling nextSibling nodeValue textContent cloneNode removeChild replaceChild"],
-    [Element.prototype, "namespaceURI localName tagName id className attributes innerHTML children firstElementChild lastElementChild childElementCount previousElementSibling nextElementSibling before after replaceWith remove getBoundingClientRect getClientRects scrollIntoView scroll scrollTo scrollBy scrollTop scrollLeft scrollWidth scrollHeight clientTop clientLeft clientWidth clientHeight role ariaAtomic ariaLive"],
+    [Element.prototype, "namespaceURI localName tagName id className attributes innerHTML children firstElementChild lastElementChild childElementCount previousElementSibling nextElementSibling before after replaceWith remove getBoundingClientRect getClientRects scrollIntoView scroll scrollTo scrollBy scrollTop scrollLeft scrollWidth scrollHeight clientTop clientLeft clientWidth clientHeight"],
     [HTMLElement.prototype, "innerText hidden tabIndex contentEditable isContentEditable dataset offsetParent offsetTop offsetLeft offsetWidth offsetHeight"],
-    [HTMLIFrameElement.prototype, "src name width height contentDocument contentWindow"],
-    [HTMLScriptElement.prototype, "src type async defer"],
-    [HTMLAnchorElement.prototype, "href hreflang rel type"],
-    [HTMLImageElement.prototype, "src width height"],
-    [HTMLTemplateElement.prototype, "content"],
     [ShadowRoot.prototype, "innerHTML"],
   ])
     for (const name of names.split(" "))
@@ -7504,6 +7639,293 @@ const __tilefinchObject = (() => {
   }));
   const hiddenByDefaultTags = " area base basefont datalist head link meta " +
     "noembed noframes param rp script style template title ";
+  /* The rest of the standard surface every node or element has: DOM's
+     namespace lookups and baseURI, HTML's draggable, spellcheck, translate
+     and autocapitalize, CSS Shadow Parts' part, CSSOM View's img.x and y,
+     and Pointer Lock's request, which a PSP always refuses. */
+  {
+    const xmlnsNamespace = "http://www.w3.org/2000/xmlns/",
+      /* The element a node's lookup starts at (DOM, "locate a namespace"). */
+      lookupElement = (node) => {
+        const type = node.nodeType;
+        return type === 1 ? node
+          : type === 9 ? node.documentElement
+          : type === 10 || type === 11 ? null
+          : type === 2 ? node.ownerElement
+          : node.parentElement;
+      },
+      locateNamespace = (element, prefix) => {
+        if (prefix === "xml") return "http://www.w3.org/XML/1998/namespace";
+        if (prefix === "xmlns") return xmlnsNamespace;
+        for (let steps = 0; element && steps < ancestorLimit;
+             element = element.parentElement, steps++) {
+          if (element.namespaceURI !== null && element.prefix === prefix)
+            return element.namespaceURI;
+          const attributes = element.attributes;
+          for (let at = 0; attributes && at < attributes.length; at++) {
+            const attribute = attributes[at];
+            if (attribute.namespaceURI === xmlnsNamespace &&
+                (prefix === null
+                  ? attribute.prefix === null && attribute.localName === "xmlns"
+                  : attribute.prefix === "xmlns" &&
+                    attribute.localName === prefix))
+              return attribute.value || null;
+          }
+        }
+        return null;
+      },
+      nullable = (value) =>
+        value === null || value === undefined || value === ""
+          ? null : String(value),
+      /* An enumerated true/false attribute that inherits: the nearest
+         ancestor-or-self with a valid keyword decides, else true. */
+      inheritedFlag = (element, attribute, on, off) => {
+        for (let at = element, steps = 0; at && steps < ancestorLimit;
+             at = at.parentElement, steps++) {
+          const value = at.getAttribute?.(attribute);
+          if (value === null || value === undefined) continue;
+          const keyword = asciiLower(value);
+          if (keyword === "" || keyword === on) return true;
+          if (keyword === off) return false;
+        }
+        return true;
+      },
+      imageOffset = (image, side) => {
+        if (!image.isConnected) return 0;
+        const rect = image.getBoundingClientRect();
+        if (!rect.width && !rect.height && !rect.left && !rect.top) return 0;
+        return mathFloor(rect[side] + 0.5 + (Number(
+          side === "left" ? __tilefinchRealmGlobal.scrollX
+                          : __tilefinchRealmGlobal.scrollY) || 0));
+      },
+      autocapitalizeWords = " off=none none=none on=sentences " +
+        "sentences=sentences words=words characters=characters ",
+      autocapitalizeHint = (element) => {
+        const value = element.getAttribute("autocapitalize");
+        if (value === null) return null;
+        const at = autocapitalizeWords.indexOf(" " + asciiLower(value) + "=");
+        return at < 0 || value === "" ? "sentences"
+          : autocapitalizeWords.slice(
+              autocapitalizeWords.indexOf("=", at) + 1,
+              autocapitalizeWords.indexOf(" ", at + 1));
+      },
+      define = (prototype, members) => {
+        const descriptors = Object.getOwnPropertyDescriptors(members);
+        for (const name of Object.keys(descriptors))
+          if (!Object.hasOwn(prototype, name))
+            Object.defineProperty(prototype, name, descriptors[name]);
+      },
+      elementsByTagNameNS = (root, namespace, localName) => {
+        namespace = nullable(namespace);
+        localName = String(localName);
+        return __tilefinchRealmGlobal.__tilefinchLiveHTMLCollection(() => {
+          const all = root.querySelectorAll("*"), found = [];
+          for (let at = 0; at < all.length; at++) {
+            const element = all[at];
+            if ((namespace === "*" || element.namespaceURI === namespace) &&
+                (localName === "*" || element.localName === localName))
+              found[found.length] = element;
+          }
+          return found;
+        });
+      };
+    define(Node.prototype, {
+      /* The node document's base URL. Another document of this realm has
+         no <base> handling of its own: a frame's answers its URL (the
+         page's base while it is about:blank), one made by script its
+         about:blank. */
+      get baseURI() {
+        const owner = this.ownerDocument;
+        if (!owner || owner === document) return document.baseURI;
+        const url = owner.URL;
+        return typeof url !== "string" ? document.baseURI
+          : url === "about:blank" && owner.defaultView ? document.baseURI
+          : url;
+      },
+      lookupPrefix(namespace) {
+        namespace = nullable(namespace);
+        if (namespace === null) return null;
+        for (let element = lookupElement(this), steps = 0;
+             element && steps < ancestorLimit;
+             element = element.parentElement, steps++) {
+          if (element.namespaceURI === namespace && element.prefix !== null)
+            return element.prefix;
+          const attributes = element.attributes;
+          for (let at = 0; attributes && at < attributes.length; at++)
+            if (attributes[at].prefix === "xmlns" &&
+                attributes[at].value === namespace)
+              return attributes[at].localName;
+        }
+        return null;
+      },
+      lookupNamespaceURI(prefix) {
+        return locateNamespace(lookupElement(this), nullable(prefix));
+      },
+      isDefaultNamespace(namespace) {
+        return locateNamespace(lookupElement(this), null) ===
+          nullable(namespace);
+      },
+    });
+    define(Element.prototype, {
+      get part() {
+        return makeClassList(this, "part");
+      },
+      set part(value) {
+        this.setAttribute("part", String(value));
+      },
+      getElementsByTagNameNS(namespace, localName) {
+        return elementsByTagNameNS(this, namespace, localName);
+      },
+      /* No pointer can be locked on a PSP: the request fails as the
+         specification has a refused one fail. */
+      requestPointerLock() {
+        const owner = this.ownerDocument || document;
+        return new Promise((resolve, reject) => {
+          memoPromiseThen(memoPromiseResolve(), () => {
+            dispatchNodeEvent(owner, newEvent("pointerlockerror"));
+            reject(new DOMException("Pointer lock is not available",
+                                    "NotSupportedError"));
+          });
+        });
+      },
+    });
+    /* DOM: a legacy alias of matches, the same function. */
+    Object.defineProperty(Element.prototype, "webkitMatchesSelector", {
+      configurable: true, enumerable: true, writable: true,
+      value: Element.prototype.matches,
+    });
+    define(Document.prototype, {
+      getElementsByTagNameNS(namespace, localName) {
+        return elementsByTagNameNS(this, namespace, localName);
+      },
+      get pointerLockElement() {
+        return null;
+      },
+    });
+    define(HTMLElement.prototype, {
+      /* HTML's reflection of the content attribute (#dom-draggable). HTML
+         exempts no user agent without drag-and-drop input, which Tilefinch
+         has none of, and leaves what a drag is to the input modality
+         (#dnd), so the attribute stays, as it did in iOS Safari before
+         iPhones could drag. Pages that take `'draggable' in element` for
+         drag and drop (Amazon's AUI; Modernizr 2 also accepts the ondrag
+         handler attributes) see true. */
+      get draggable() {
+        const value = asciiLower(this.getAttribute("draggable") ?? "");
+        if (value === "true" || value === "false") return value === "true";
+        const name = this.localName;
+        return name === "img" || (name === "a" && this.hasAttribute("href"));
+      },
+      set draggable(value) {
+        this.setAttribute("draggable", value ? "true" : "false");
+      },
+      get spellcheck() {
+        return inheritedFlag(this, "spellcheck", "true", "false");
+      },
+      set spellcheck(value) {
+        this.setAttribute("spellcheck", value ? "true" : "false");
+      },
+      get translate() {
+        return inheritedFlag(this, "translate", "yes", "no");
+      },
+      set translate(value) {
+        this.setAttribute("translate", value ? "yes" : "no");
+      },
+      get autocapitalize() {
+        /* The element's own hint, else its form owner's, else none set. */
+        return autocapitalizeHint(this) ??
+          (this.form instanceof HTMLFormElement
+            ? autocapitalizeHint(this.form) : null) ?? "";
+      },
+      set autocapitalize(value) {
+        this.setAttribute("autocapitalize", String(value));
+      },
+    });
+    /* ARIA's element-reference attributes (the string ones are native,
+       reflected_attributes.inc): the elements set through the property
+       while they stay in scope, else the ones the content attribute's IDs
+       name in this element's tree. Installed with the string ones, only in
+       the realms of the sites site_identity_aria_reflection_site() names:
+       compat.js hands this installer to the host channel. */
+    domShared.ariaElementReferences = () => {
+      const ariaScope = (element, candidate) => {
+          const root = candidate.getRootNode();
+          for (let at = element.getRootNode(), steps = 0;
+               at && steps < ancestorLimit; steps++) {
+            if (at === root) return true;
+            at = at instanceof ShadowRoot ? at.host.getRootNode() : null;
+          }
+          return false;
+        },
+        ariaElements = (element, attribute) => {
+          const value = element.getAttribute(attribute);
+          if (value === null) return null;
+          const explicit = attributeState(element)?.ariaElements?.[attribute];
+          if (explicit) {
+            const kept = [];
+            for (let at = 0; at < explicit.length; at++)
+              if (ariaScope(element, explicit[at]))
+                kept[kept.length] = explicit[at];
+            return kept;
+          }
+          const root = element.getRootNode(), found = [],
+            ids = value.split(/[\t\n\f\r ]+/);
+          for (let at = 0; at < ids.length; at++) {
+            if (ids[at] === "") continue;
+            const match = typeof root.getElementById === "function"
+              ? root.getElementById(ids[at])
+              : root.querySelector("#" + CSS.escape(ids[at]));
+            if (match) found[found.length] = match;
+          }
+          return found;
+        },
+        setAriaElements = (element, attribute, elements) => {
+          const state = attributeState(element, true);
+          if (elements === null) {
+            if (state.ariaElements) delete state.ariaElements[attribute];
+            element.removeAttribute(attribute);
+            return;
+          }
+          for (let at = 0; at < elements.length; at++)
+            if (!(elements[at] instanceof Element))
+              throw new TypeError("An Element is required");
+          element.setAttribute(attribute, "");
+          (state.ariaElements ||= createAttributeState(null))[attribute] =
+            elements;
+        };
+      for (const entry of ("ActiveDescendantElement=activedescendant " +
+          "ControlsElements=controls DescribedByElements=describedby " +
+          "DetailsElements=details ErrorMessageElements=errormessage " +
+          "FlowToElements=flowto LabelledByElements=labelledby " +
+          "OwnsElements=owns").split(" ")) {
+        const cut = entry.indexOf("="), name = "aria" + entry.slice(0, cut),
+          attribute = "aria-" + entry.slice(cut + 1),
+          list = name.endsWith("s");
+        if (!Object.hasOwn(Element.prototype, name))
+          Object.defineProperty(Element.prototype, name,
+            Object.getOwnPropertyDescriptor({
+              get [name]() {
+                const elements = ariaElements(this, attribute);
+                return elements === null ? null
+                  : list ? Object.freeze(elements) : elements[0] ?? null;
+              },
+              set [name](value) {
+                setAriaElements(this, attribute,
+                  value === null || value === undefined ? null
+                    : list ? __tilefinchArrayFrom(value) : [value]);
+              },
+            }, name));
+      }
+    };
+    define(HTMLImageElement.prototype, {
+      get x() {
+        return imageOffset(this, "left");
+      },
+      get y() {
+        return imageOffset(this, "top");
+      },
+    });
+  }
   /* Transitions from stylesheets have no timeline of their own: the motion
      module watches an element once something listens for them. */
   __tilefinchRealmGlobal.__tilefinchNoteTransitionListener = (target, type) => {
@@ -7547,7 +7969,9 @@ const __tilefinchObject = (() => {
         );
     },
   });
+  nativeNodeEventDescriptors.__invokeEvent.enumerable = false;
   const nativePrototypes = new WeakMap();
+  let layerCommonDescriptors = null;
   const nativeLayer = (base) => {
     let prototype = layerGet(nativePrototypes, base);
     if (!prototype) {
@@ -7564,7 +7988,19 @@ const __tilefinchObject = (() => {
         prototype = createObject(base);
         nativeLayerAdd(nativeLayers, prototype);
         defineProperties(prototype, nativeNodeEventDescriptors);
-        defineProperties(prototype, nativeNodeReceiverDescriptors);
+        if (!layerCommonDescriptors) {
+          layerCommonDescriptors = {};
+          for (const name of Object.keys(nativeNodeReceiverDescriptors))
+            if (!layerMemberOwners[name])
+              layerCommonDescriptors[name] =
+                nativeNodeReceiverDescriptors[name];
+        }
+        defineProperties(prototype, layerCommonDescriptors);
+        const stem = layerStem(base);
+        for (const name in layerMemberOwners)
+          if (layerMemberOwners[name].includes(stem))
+            Object.defineProperty(prototype, name,
+                                  nativeNodeReceiverDescriptors[name]);
         /* A DocumentFragment has no innerHTML (a ShadowRoot has its own). */
         if (base === DocumentFragment.prototype) delete prototype.innerHTML;
         if (base === HTMLElement.prototype)
@@ -7593,7 +8029,8 @@ const __tilefinchObject = (() => {
              member table (or enumerating its keys) for every component. */
           for (const descriptors of [nativeNodeEventDescriptors, nativeNodeReceiverDescriptors])
             for (const name of Object.keys(descriptors))
-              if (!Object.hasOwn(HTMLElement.prototype, name))
+              if (!layerMemberOwners[name] &&
+                  !Object.hasOwn(HTMLElement.prototype, name))
                 Object.defineProperty(HTMLElement.prototype, name, descriptors[name]);
           sharedCustomElementMembers = true;
         } catch (_) { /* Frozen/refused bases keep per-instance fallback. */ }
@@ -7607,7 +8044,8 @@ const __tilefinchObject = (() => {
       };
       for (const descriptors of [nativeNodeEventDescriptors, nativeNodeReceiverDescriptors])
         for (const name of Object.keys(descriptors))
-          if (!Object.prototype.hasOwnProperty.call(node, name) &&
+          if (!layerMemberOwners[name] &&
+              !Object.prototype.hasOwnProperty.call(node, name) &&
               !(target && classDefined(name)))
             Object.defineProperty(node, name, descriptors[name]);
     },
@@ -8442,7 +8880,9 @@ const __tilefinchObject = (() => {
       { value: 0, writable: true, configurable: true },
     );
     const parseMargin = (text) => {
-      const source = String(text ?? "0px").trim() || "0px",
+      /* DOMString with the default "0px": only a missing member takes
+         the default (null is the string "null", which does not parse). */
+      const source = String(text === undefined ? "0px" : text).trim() || "0px",
         parts = source.split(/\s+/);
       if (parts.length > 4) throw new SyntaxError("Invalid rootMargin");
       const tokens = parts.map((part) => {
@@ -8468,16 +8908,24 @@ const __tilefinchObject = (() => {
           : token.value,
       );
     const normalizeThresholds = (threshold) => {
+      /* (double or sequence<double>), Web IDL union conversion: an
+         object with @@iterator is the sequence; anything else, a string
+         such as "1.00" included, converts to one double. */
       const values =
         threshold === undefined
           ? [0]
-          : typeof threshold === "number"
-            ? [threshold]
-            : __tilefinchArrayFrom(threshold);
+          : threshold !== null &&
+              (typeof threshold === "object" ||
+                typeof threshold === "function") &&
+              threshold[Symbol.iterator] != null
+            ? __tilefinchArrayFrom(threshold)
+            : [threshold];
       if (!values.length) values.push(0);
       for (let index = 0; index < values.length; index++) {
         const value = Number(values[index]);
-        if (!Number.isFinite(value) || value < 0 || value > 1)
+        if (!Number.isFinite(value))
+          throw new TypeError("threshold must be a finite number");
+        if (value < 0 || value > 1)
           throw new RangeError("threshold must be between 0 and 1");
         values[index] = value;
       }
@@ -8698,9 +9146,14 @@ const __tilefinchObject = (() => {
       });
     };
     __tilefinchRealmGlobal.IntersectionObserver = class IntersectionObserver {
-      constructor(callback, options = {}) {
+      constructor(callback, options) {
         if (typeof callback !== "function")
           throw new TypeError("callback required");
+        /* A dictionary: undefined and null are the empty one, any other
+           non-object is not convertible. */
+        if (options === undefined || options === null) options = {};
+        else if (typeof options !== "object" && typeof options !== "function")
+          throw new TypeError("options must be an object");
         const root = options.root ?? null;
         if (
           root !== null &&

@@ -96,6 +96,7 @@ int main(void)
     if (!test_script_clone_state_exhaustion_fails_safe(&budget)) {
         failures++;
     }
+    if (!test_refused_head_scripts_skip_relayout(&budget)) failures++;
     bool clean = budget.current == 0 && budget_uninstall_lexbor(&budget);
     if (!clean) {
         fprintf(stderr, "dynamic script tests left %zu owned bytes\n",

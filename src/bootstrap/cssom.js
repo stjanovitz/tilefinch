@@ -67,7 +67,9 @@
           if (typeof name === "symbol")
             return name === Symbol.iterator
               ? function* () { yield* names(); }
-              : undefined;
+              : name === Symbol.toStringTag
+                ? "CSSStyleDeclaration"
+                : undefined;
           if (name === "length") return names().length;
           if (/^(?:0|[1-9][0-9]*)$/.test(name)) return names()[Number(name)];
           return name in target ? target[name] : target.getPropertyValue(name);

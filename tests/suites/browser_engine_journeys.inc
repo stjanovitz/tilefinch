@@ -1440,7 +1440,8 @@ int test_form_submitter_overrides(void)
 }
 
 /* Finishing the native keyboard commits the field: input, then one bubbling
-   change, and none when the text did not change. */
+   change. Finishing it again with the text unchanged reports nothing, as
+   nothing was typed. */
 int test_keyboard_commit_fires_change(void)
 {
     static const char page[] =
@@ -1458,11 +1459,11 @@ int test_keyboard_commit_fires_change(void)
         "globalThis.pocSummary=seen.join(',')",
         "<seen>", &navigation->page.script_result));
     if (strcmp(navigation->page.script_result.summary,
-               "input:abc,change:abc,input:abc") != 0)
+               "input:abc,change:abc") != 0)
         fprintf(stderr, "keyboard commit events: %s\n",
                 navigation->page.script_result.summary);
     CHECK(strcmp(navigation->page.script_result.summary,
-                 "input:abc,change:abc,input:abc") == 0);
+                 "input:abc,change:abc") == 0);
     browser_engine_destroy(engine);
     return 0;
 }

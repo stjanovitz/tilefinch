@@ -2833,20 +2833,14 @@ static bool queue_stylesheet_link(ResourceContext *context,
         context->stats->failed++;
         return true;
     }
-    size_t integrity_length = 0, crossorigin_length = 0;
+    size_t integrity_length = 0;
     const char *integrity = document_attribute(
         node, STYLESHEET_INPUT_INTEGRITY, &integrity_length);
-    const char *crossorigin = document_attribute(
-        node, STYLESHEET_INPUT_CROSSORIGIN, &crossorigin_length);
     bool integrity_present = integrity != NULL && integrity_length != 0;
-    bool cors = crossorigin != NULL;
-    TilefinchCredentialsMode credentials = cors
-        && crossorigin_length == strlen("use-credentials")
-        && strncasecmp(crossorigin, "use-credentials",
-                       crossorigin_length) == 0
-            ? TILEFINCH_CREDENTIALS_INCLUDE
-            : cors ? TILEFINCH_CREDENTIALS_SAME_ORIGIN
-                   : TILEFINCH_CREDENTIALS_INCLUDE;
+    TilefinchCorsSettings cors_settings = document_cors_settings(node);
+    bool cors = cors_settings != TILEFINCH_CORS_SETTINGS_NONE;
+    TilefinchCredentialsMode credentials =
+        tilefinch_cors_settings_credentials(cors_settings, cors);
     uint32_t hash = hash_url(resolved);
     /* SRI is an element-scoped assertion. Do not allow a failed or differently
        annotated link to suppress a later link to the same URL. Ordinary

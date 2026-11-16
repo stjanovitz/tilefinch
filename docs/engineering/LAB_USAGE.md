@@ -463,6 +463,11 @@ reachable heap; visible text measured at commit; see
 Its first line's `memory-rescue=yes` says the page's realm ran out of
 memory, its server-rendered body was put back and the realm retired
 (the census records it as `heavy.memory_rescue`).
+The `signin-report` command turns on the PSP's YouTube sign-in diagnostics
+the first time it is used, and from then on prints the same report the PSP
+shows as a QR code ([Diagnostic QR codes](../DIAGNOSTIC_QR.md)) and whether
+the engine raised its "Google refused sign-in" notice since the last report.
+Lab form submissions feed the same counters as the PSP's.
 `--heavy-policy run|ask|refuse` sets the heavy-page policy (run by default,
 so a lab run never waits); with `ask`, `heavy-answer run` or
 `heavy-answer stop` answers the scripts that wait, and `stop-scripts`

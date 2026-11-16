@@ -453,4 +453,5 @@ static char *make_padded_script_source(const char *prefix, size_t length)
 #include "suites/dynamic_script_state.inc"
 #include "suites/dynamic_script_contextual_fragment.inc"
 #include "suites/dynamic_script_clone.inc"
+#include "suites/dynamic_script_refused_relayout.inc"
 #include "suites/dynamic_script_runner.inc"

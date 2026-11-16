@@ -695,18 +695,11 @@ static JSValue js_request_media(JSContext *context,
         memcpy(request.title, title, title_length);
         request.title[title_length] = '\0';
     }
-    size_t crossorigin_length = 0;
-    const char *crossorigin = document_attribute(
-        node, "crossorigin", &crossorigin_length);
-    if (crossorigin != NULL) {
+    TilefinchCorsSettings cors_settings = document_cors_settings(node);
+    if (cors_settings != TILEFINCH_CORS_SETTINGS_NONE) {
         request.mode = TILEFINCH_REQUEST_MODE_CORS;
         request.credentials =
-            crossorigin_length == sizeof("use-credentials") - 1u
-            && strncasecmp(
-                   crossorigin, "use-credentials",
-                   sizeof("use-credentials") - 1u) == 0
-                ? TILEFINCH_CREDENTIALS_INCLUDE
-                : TILEFINCH_CREDENTIALS_SAME_ORIGIN;
+            tilefinch_cors_settings_credentials(cors_settings, true);
     }
     if (argc >= 3) {
         size_t length = 0;
@@ -1059,47 +1052,6 @@ JS_RT_GUARDED_NATIVE(static, js_set_element_scroll)(JSContext *context,
     return JS_NewBool(context, intent != NULL || applied);
 }
 
-#ifdef JS_RT_TEST_INSTRUMENTS
-/* Lab telemetry for frame-eval (the host lab prints it with a page failure).
-   Best effort: a refused string never fails the evaluation. */
-static const char *frame_eval_value_type(JSContext *context,
-                                         JSValueConst value)
-{
-    if (JS_IsUndefined(value)) return "undefined";
-    if (JS_IsNull(value)) return "object";
-    if (JS_IsBool(value)) return "boolean";
-    if (JS_IsNumber(value)) return "number";
-    if (JS_IsString(value)) return "string";
-    if (JS_IsSymbol(value)) return "symbol";
-    if (JS_IsFunction(context, value)) return "function";
-    return "object";
-}
-
-static void set_frame_eval_telemetry(JSContext *context, uint64_t count,
-                                     int64_t source_length,
-                                     const char *state, uint64_t elapsed_ms)
-{
-    char telemetry[128];
-    if (elapsed_ms == UINT64_MAX) {
-        snprintf(telemetry, sizeof(telemetry), "%llu:%lld:%s",
-                 (unsigned long long) count, (long long) source_length, state);
-    } else {
-        snprintf(telemetry, sizeof(telemetry), "%llu:%lld:%s:%llums",
-                 (unsigned long long) count, (long long) source_length, state,
-                 (unsigned long long) elapsed_ms);
-    }
-    JSValue global = JS_GetGlobalObject(context);
-    if (JS_IsException(global)
-        || JS_SetPropertyStr(context, global,
-                             "__tilefinchFrameEvalTelemetry",
-                             JS_NewString(context, telemetry)) < 0) {
-        JSValue exception = JS_GetException(context);
-        JS_FreeValue(context, exception);
-    }
-    JS_FreeValue(context, global);
-}
-#endif
-
 static bool frame_realm_prepare(JSContext *caller, ScriptRuntime *host,
                                 size_t slot)
 {
@@ -1135,6 +1087,170 @@ static bool frame_realm_prepare(JSContext *caller, ScriptRuntime *host,
     return true;
 }
 
+/* What a frame realm's global inherits from: every name the embedding
+   page's global has, read through that global with its own receiver. It is
+   an ordinary exotic object, not a Proxy, so a name neither global has is
+   unresolvable: `missing` throws a ReferenceError, `typeof missing` is
+   "undefined" and `"missing" in window` is false. An assignment still
+   creates the frame's own binding. */
+static JSClassID frame_fallback_class_id;
+
+static int frame_fallback_get_own_property(JSContext *context,
+                                           JSPropertyDescriptor *descriptor,
+                                           JSValueConst object, JSAtom atom)
+{
+    (void) object;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL || bridge->host == NULL
+        || bridge->host->context == NULL) return 0;
+    JSValue page = JS_GetGlobalObject(bridge->host->context);
+    int present = JS_HasProperty(context, page, atom);
+    if (present > 0 && descriptor != NULL) {
+        JSValue value = JS_GetProperty(context, page, atom);
+        if (JS_IsException(value)) present = -1;
+        else {
+            descriptor->flags = JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE;
+            descriptor->value = value;
+            descriptor->getter = JS_UNDEFINED;
+            descriptor->setter = JS_UNDEFINED;
+        }
+    }
+    JS_FreeValue(context, page);
+    return present;
+}
+
+static JSClassExoticMethods frame_fallback_exotic = {
+    .get_own_property = frame_fallback_get_own_property,
+};
+
+static JSClassDef frame_fallback_class = {
+    .class_name = "Object",
+    .exotic = &frame_fallback_exotic,
+};
+
+static bool frame_realm_inherit_page_global(JSContext *realm, JSValueConst global)
+{
+    JSRuntime *runtime = JS_GetRuntime(realm);
+    if (frame_fallback_class_id == 0) JS_NewClassID(&frame_fallback_class_id);
+    if (!JS_IsRegisteredClass(runtime, frame_fallback_class_id)
+        && JS_NewClass(runtime, frame_fallback_class_id,
+                       &frame_fallback_class) < 0) return false;
+    JSValue fallback = JS_NewObjectProtoClass(realm, JS_NULL,
+                                              frame_fallback_class_id);
+    if (JS_IsException(fallback)) return false;
+    int set = JS_SetPrototype(realm, global, fallback);
+    JS_FreeValue(realm, fallback);
+    return set >= 0;
+}
+
+static bool legacy_define_frame_window_members(JSContext *realm,
+                                               JSValueConst global);
+
+/* A frame window owns the interface objects and members a top-level window
+   does. Its realm defines only the ECMAScript intrinsics and the frame's
+   own window bindings; every other browser name is the page's, reached
+   through frame_realm_inherit_page_global. The WindowProxy reports those
+   names as its own, taken from the page window as author code starts, so
+   Object.getOwnPropertyNames(frame) lists them and their descriptors read
+   the page's same objects (nothing is copied per frame). Names a page
+   script later adds to its own window are not the frame's. */
+static bool js_rt_capture_frame_page_names(ScriptRuntime *host, JSValueConst global)
+{
+    JSPropertyEnum *names = NULL;
+    uint32_t count = 0;
+    if (JS_GetOwnPropertyNames(host->context, &names, &count, global,
+                               JS_GPN_STRING_MASK) < 0) return false;
+    static const char private_prefix[] = "__tilefinch";
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = JS_AtomToCString(host->context, names[i].atom);
+        bool private_name = name == NULL
+            || strncmp(name, private_prefix, sizeof(private_prefix) - 1u) == 0;
+        if (name != NULL) JS_FreeCString(host->context, name);
+        else {
+            JSValue exception = JS_GetException(host->context);
+            JS_FreeValue(host->context, exception);
+        }
+        if (private_name) JS_FreeAtom(host->context, names[i].atom);
+        else names[kept++] = names[i];
+    }
+    host->frame_page_names = names;
+    host->frame_page_name_count = kept;
+    return true;
+}
+
+/* Whether atom is a page window name the frame global inherits: one of the
+   captured names that the page window still owns and the realm does not. */
+static int frame_scope_inherits(ScriptRuntime *host, JSContext *realm,
+                                JSValueConst realm_global,
+                                JSValueConst page_global, uint32_t index)
+{
+    JSAtom atom = host->frame_page_names[index].atom;
+    int own = JS_GetOwnProperty(realm, NULL, realm_global, atom);
+    if (own != 0) return own < 0 ? -1 : 0;
+    return JS_GetOwnProperty(host->context, NULL, page_global, atom);
+}
+
+/* frameScope(scope, true, true): the WindowProxy's own keys, the realm
+   global's followed by the inherited page names. frameScope(scope, true,
+   key): whether key is an inherited page name. */
+static JSValue frame_scope_keys(JSContext *context, ScriptRuntime *host,
+                                size_t slot, JSValueConst query)
+{
+    JSContext *realm = host->frame_realms[slot].context;
+    JSValueConst realm_global = host->frame_realms[slot].global;
+    JSValue page_global = JS_GetGlobalObject(host->context);
+    JSValue result = JS_UNDEFINED;
+    if (!JS_IsBool(query)) {
+        JSAtom atom = JS_ValueToAtom(context, query);
+        int found = 0;
+        if (atom == JS_ATOM_NULL) found = -1;
+        for (uint32_t i = 0; found == 0 && i < host->frame_page_name_count;
+             i++) {
+            if (host->frame_page_names[i].atom != atom) continue;
+            found = frame_scope_inherits(host, realm, realm_global,
+                                         page_global, i);
+            if (found == 0) break;
+        }
+        if (atom != JS_ATOM_NULL) JS_FreeAtom(context, atom);
+        JS_FreeValue(host->context, page_global);
+        return found < 0 ? JS_EXCEPTION : JS_NewBool(context, found > 0);
+    }
+    JSPropertyEnum *own = NULL;
+    uint32_t own_count = 0;
+    if (JS_GetOwnPropertyNames(realm, &own, &own_count, realm_global,
+                               JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK) < 0) {
+        JS_FreeValue(host->context, page_global);
+        return JS_Throw(context, JS_GetException(realm));
+    }
+    result = JS_NewArray(context);
+    uint32_t length = 0;
+    for (uint32_t i = 0; !JS_IsException(result) && i < own_count; i++) {
+        if (JS_SetPropertyUint32(context, result, length++,
+                                 JS_AtomToValue(context, own[i].atom)) < 0) {
+            JS_FreeValue(context, result);
+            result = JS_EXCEPTION;
+        }
+    }
+    JS_FreePropertyEnum(realm, own, own_count);
+    for (uint32_t i = 0; !JS_IsException(result)
+                         && i < host->frame_page_name_count; i++) {
+        int inherited = frame_scope_inherits(host, realm, realm_global,
+                                             page_global, i);
+        if (inherited < 0
+            || (inherited > 0
+                && JS_SetPropertyUint32(
+                       context, result, length++,
+                       JS_AtomToValue(context,
+                                      host->frame_page_names[i].atom)) < 0)) {
+            JS_FreeValue(context, result);
+            result = JS_EXCEPTION;
+        }
+    }
+    JS_FreeValue(host->context, page_global);
+    return result;
+}
+
 static JSValue js_frame_scope(JSContext *context, JSValueConst this_value,
                              int argc, JSValueConst *argv)
 {
@@ -1148,9 +1264,12 @@ static JSValue js_frame_scope(JSContext *context, JSValueConst this_value,
             if (!JS_IsObject(argv[0]) || !host->frame_realms[i].context
                 || JS_VALUE_GET_PTR(argv[0]) !=
                    JS_VALUE_GET_PTR(host->frame_realms[i].global)) continue;
-            if (argc > 1 && JS_ToBool(context, argv[1]))
-                return frame_realm_prepare(context, host, i)
-                    ? JS_UNDEFINED : JS_EXCEPTION;
+            if (argc > 1 && JS_ToBool(context, argv[1])) {
+                if (!frame_realm_prepare(context, host, i))
+                    return JS_EXCEPTION;
+                return argc > 2 ? frame_scope_keys(context, host, i, argv[2])
+                                : JS_UNDEFINED;
+            }
 #if defined(TILEFINCH_QUICKJS_DYNAMIC_CODE_POLICY)
             JS_RetireContext(host->frame_realms[i].context);
 #endif
@@ -1182,6 +1301,13 @@ static JSValue js_frame_scope(JSContext *context, JSValueConst this_value,
             realm, js_runtime_host_get_code_for_eval, NULL);
 #endif
         JSValue global = JS_GetGlobalObject(realm);
+        if (!frame_realm_inherit_page_global(realm, global)
+            || !legacy_define_frame_window_members(realm, global)) {
+            JSValue exception = JS_GetException(realm);
+            JS_FreeValue(realm, global);
+            JS_FreeContext(realm);
+            return JS_Throw(context, exception);
+        }
         host->frame_realms[i].context = realm;
         host->frame_realms[i].global = JS_DupValue(realm, global);
         host->frame_realms[i].dynamic_code_allowed =
@@ -1195,109 +1321,29 @@ static JSValue js_frame_scope(JSContext *context, JSValueConst this_value,
         : JS_ThrowRangeError(context, "frame realm quota exceeded");
 }
 
-static bool frame_eval_allowed(const DomBridge *bridge, JSValueConst scope)
-{
-    for (size_t i = 0; i < SCRIPT_FRAME_REALM_LIMIT; i++) {
-        if (bridge->host->frame_realms[i].context != NULL
-            && JS_VALUE_GET_PTR(bridge->host->frame_realms[i].global)
-                   == JS_VALUE_GET_PTR(scope)) {
-            return bridge->host->frame_realms[i].dynamic_code_allowed;
-        }
-    }
-    return bridge->dynamic_code_allowed;
-}
-
-static JSValue js_frame_eval(JSContext *context, JSValueConst this_value,
-                             int argc, JSValueConst *argv, int magic,
-                             JSValue *function_data)
-{
-    (void) this_value; (void) magic;
-    DomBridge *bridge = JS_GetContextOpaque(context);
-    if (bridge == NULL || !frame_eval_allowed(bridge, function_data[0])) {
-        return JS_ThrowTypeError(
-            context,
-            "dynamic code compilation disabled by Content Security Policy");
-    }
-    JSValue source = JS_ToString(context,
-        argc > 0 ? argv[0] : JS_UNDEFINED);
-    if (JS_IsException(source)) return source;
-
-    JSValue length_value = JS_GetPropertyStr(context, source, "length");
-    int64_t source_length = 0;
-    if (JS_IsException(length_value)
-        || JS_ToInt64(context, &source_length, length_value) < 0) {
-        JS_FreeValue(context, length_value);
-        JS_FreeValue(context, source);
-        return JS_EXCEPTION;
-    }
-    JS_FreeValue(context, length_value);
-    /* The same per-script admission a page script gets: anti-abuse VMs compile
-       more than 64 KiB here, padded by a random amount. */
-    size_t source_maximum =
-        bridge->execution_policy.maximum_host_compile_source_bytes;
-    if (source_maximum != 0 && source_length > 0
-        && (uint64_t) source_length > source_maximum) {
-        JS_FreeValue(context, source);
-        return JS_ThrowRangeError(context, "frame eval exceeds bounded size");
-    }
-
-#ifdef JS_RT_TEST_INSTRUMENTS
-    uint64_t count = bridge == NULL ? 0 : ++bridge->frame_eval_count;
-    uint64_t started = monotonic_time_ms();
-    set_frame_eval_telemetry(context, count, source_length, "running",
-                             UINT64_MAX);
-#endif
-    JSContext *realm = NULL;
-    for (size_t i = 0; i < SCRIPT_FRAME_REALM_LIMIT; i++) {
-        if (bridge->host->frame_realms[i].context != NULL
-            && JS_VALUE_GET_PTR(bridge->host->frame_realms[i].global)
-                   == JS_VALUE_GET_PTR(function_data[0])) {
-            if (!frame_realm_prepare(context, bridge->host, i)) {
-                JS_FreeValue(context, source);
-                return JS_EXCEPTION;
-            }
-            realm = bridge->host->frame_realms[i].context;
-            break;
-        }
-    }
-    size_t bytes = 0;
-    const char *text = JS_ToCStringLen(context, &bytes, source);
-    JSValue value;
-    if (text == NULL) value = JS_EXCEPTION;
-    else if (realm == NULL)
-        value = JS_ThrowTypeError(context, "frame realm is retired");
-    else {
-        /* A genuine persistent global environment retains live var/lexical
-           bindings and closures. The WindowProxy remains top-level this. */
-        value = JS_EvalThis(realm, function_data[1], text, bytes,
-                            "<frame-eval>", JS_EVAL_TYPE_GLOBAL);
-        if (JS_IsException(value))
-            value = JS_Throw(context, JS_GetException(realm));
-    }
-    if (text != NULL) JS_FreeCString(context, text);
-    JS_FreeValue(context, source);
-    if (JS_IsException(value)) return value;
-#ifdef JS_RT_TEST_INSTRUMENTS
-    set_frame_eval_telemetry(context, count, source_length,
-                             frame_eval_value_type(context, value),
-                             monotonic_time_ms() - started);
-#endif
-    return value;
-}
-
-static JSValue js_create_frame_eval(JSContext *context,
-                                    JSValueConst this_value,
-                                    int argc, JSValueConst *argv)
+/* __tilefinchBindFrameRealm(scope, proxy, handle): the frame's WindowProxy
+   becomes the realm's top-level this (its own eval and Function see it), and
+   the frame element stays addressable while the realm lives. The realm's
+   own eval is the frame's window.eval for every caller: a parent's
+   contentWindow.eval(source) is an indirect eval in the frame realm under
+   the frame's dynamic-code policy, as in other browsers. */
+static JSValue js_bind_frame_realm(JSContext *context,
+                                   JSValueConst this_value,
+                                   int argc, JSValueConst *argv)
 {
     (void) this_value;
-    if (argc < 2 || !JS_IsObject(argv[0])
-        || !JS_IsObject(argv[1])) {
+    if (argc < 2 || !JS_IsObject(argv[0]) || !JS_IsObject(argv[1]))
         return JS_ThrowTypeError(context,
-                                 "frame eval requires evaluator and scope");
-    }
+                                 "frame realm binding requires scope and proxy");
     DomBridge *bridge = JS_GetContextOpaque(context);
     if (bridge == NULL || bridge->host == NULL)
         return JS_ThrowInternalError(context, "frame runtime unavailable");
+#ifdef JS_RT_TEST_INSTRUMENTS
+    if (bridge->host->refused_frame_setups != 0) {
+        bridge->host->refused_frame_setups--;
+        return JS_ThrowInternalError(context, "frame setup refused");
+    }
+#endif
     int64_t frame_handle = 0;
     if (argc > 2 && JS_ToInt64(context, &frame_handle, argv[2]) < 0)
         return JS_EXCEPTION;
@@ -1313,18 +1359,27 @@ static JSValue js_create_frame_eval(JSContext *context,
             break;
         }
     }
-    JSValue function_data[2] = { argv[0], argv[1] };
-    JSValue function = JS_NewCFunctionData(context, js_frame_eval, 1, 0,
-                                           2, function_data);
-    if (JS_IsException(function)) return function;
-    if (JS_DefinePropertyValueStr(context, function, "name",
-                                  JS_NewString(context, "eval"),
-                                  JS_PROP_CONFIGURABLE) < 0) {
-        JS_FreeValue(context, function);
-        return JS_EXCEPTION;
-    }
-    return function;
+    return JS_UNDEFINED;
 }
+
+#ifdef JS_RT_TEST_INSTRUMENTS
+/* __tilefinchRefuseFrameSetups(count), host and validation realms only:
+   the next count frame realm setups fail in js_bind_frame_realm, after the
+   realm is published for its caller to retire. */
+static JSValue js_refuse_frame_setups(JSContext *context,
+                                      JSValueConst this_value,
+                                      int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    uint32_t count = 0;
+    if (bridge == NULL || bridge->host == NULL || argc < 1
+        || JS_ToUint32(context, &count, argv[0]) < 0)
+        return JS_ThrowTypeError(context, "frame setup refusal unavailable");
+    bridge->host->refused_frame_setups = count;
+    return JS_UNDEFINED;
+}
+#endif
 
 static JSValue js_storage_get(JSContext *context, JSValueConst this_value,
                               int argc, JSValueConst *argv)
@@ -3037,6 +3092,34 @@ static JSValue js_queue_checkpoint_continuation(
    shadowable by) the handler body or the scope objects, and the handler's
    own `this` stays the dispatch receiver.  `with` lives only in the
    enclosing function, so a body that opts into strict mode stays valid. */
+/* A compile's exception is the heap's refusal: QuickJS's out-of-memory
+   InternalError (its own message property, which no page code sets), or
+   null when even that could not be allocated. A compile runs none of the
+   handler's code, so neither comes from the page. */
+static bool inline_handler_compile_refused(JSContext *context,
+                                           JSValueConst error)
+{
+    if (JS_IsNull(error)) return true;
+    if (!JS_IsError(context, error)) return false;
+    JSPropertyDescriptor descriptor;
+    JSAtom atom = JS_NewAtom(context, "message");
+    bool refused = false;
+    if (atom != JS_ATOM_NULL
+        && JS_GetOwnProperty(context, &descriptor, error, atom) > 0) {
+        size_t length = 0;
+        const char *message = JS_IsString(descriptor.value)
+            ? JS_ToCStringLen(context, &length, descriptor.value) : NULL;
+        refused = message != NULL && length == 13u
+            && memcmp(message, "out of memory", 13u) == 0;
+        if (message != NULL) JS_FreeCString(context, message);
+        JS_FreeValue(context, descriptor.value);
+        JS_FreeValue(context, descriptor.getter);
+        JS_FreeValue(context, descriptor.setter);
+    }
+    if (atom != JS_ATOM_NULL) JS_FreeAtom(context, atom);
+    return refused;
+}
+
 static JSValue js_compile_inline_event_handler(JSContext *context,
                                                JSValueConst this_value,
                                                int argc,
@@ -3114,11 +3197,32 @@ static JSValue js_compile_inline_event_handler(JSContext *context,
     program[used++] = ')';
     program[used] = '\0';
     JS_FreeCString(context, source);
+#if !defined(__PSP__)
+    TilefinchTestFaults *faults = tilefinch_test_faults();
+    unsigned refuse = faults->inline_handler_refuse_allocation;
+    faults->inline_handler_refuse_allocation = 0;
+    if (refuse != 0) JS_TestRefuseAllocation(refuse);
+#endif
     JSValue function = JS_Eval(context, program, length,
                                "<inline-event-handler>",
                                JS_EVAL_TYPE_GLOBAL);
+#if !defined(__PSP__)
+    if (refuse != 0) JS_TestRefuseAllocation(0);
+#endif
     budget_free(bridge->host->budget, program);
-    if (scope_count == 0 || JS_IsException(function)) return function;
+    if (JS_IsException(function)) {
+        /* The heap refused the compile: the browser's refusal, not an
+           error in the page's handler, so it is not reported to the
+           page. The handler stays uncompiled and is compiled again at its
+           next dispatch. */
+        JSValue error = JS_GetException(context);
+        if (inline_handler_compile_refused(context, error)) {
+            JS_FreeValue(context, error);
+            return JS_NULL;
+        }
+        return JS_Throw(context, error);
+    }
+    if (scope_count == 0) return function;
     JSValue chain = JS_NewArray(context);
     for (size_t i = 0; i < scope_count && !JS_IsException(chain); i++)
         if (js_rt_define_index(context, chain, (uint32_t) i,

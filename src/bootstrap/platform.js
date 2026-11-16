@@ -910,6 +910,7 @@
       urlParamEncode(key) + "=" + urlParamEncode(value);
   /* Named as the interface: the class name is what `name` and toString()
      report. */
+  const paramSteps = { __proto__: null };
   const TilefinchURLSearchParams = class URLSearchParams {
     constructor(query = "", changed = null) {
       this.items = [];
@@ -925,7 +926,7 @@
           const at = part.indexOf("=");
           const key = at < 0 ? part : part.slice(0, at),
             value = at < 0 ? "" : part.slice(at + 1);
-          this._appendDecoded(key, value);
+          paramSteps.appendDecoded.call(this, key, value);
         }
         return;
       }
@@ -936,13 +937,13 @@
             throw new TypeError(
               "URLSearchParams sequence pair must contain exactly two items",
             );
-          this._append(tilefinchUSVString(values[0]), tilefinchUSVString(values[1]));
+          paramSteps.append.call(this, tilefinchUSVString(values[0]), tilefinchUSVString(values[1]));
         }
         return;
       }
       if (query !== null && typeof query === "object") {
         for (const key of Object.keys(query))
-          this._append(tilefinchUSVString(key), tilefinchUSVString(query[key]));
+          paramSteps.append.call(this, tilefinchUSVString(key), tilefinchUSVString(query[key]));
         return;
       }
       for (const part of String(query).replace(/^\?/, "").split("&")) {
@@ -950,7 +951,7 @@
         const at = part.indexOf("=");
         const key = at < 0 ? part : part.slice(0, at),
           value = at < 0 ? "" : part.slice(at + 1);
-        this._appendDecoded(key, value);
+        paramSteps.appendDecoded.call(this, key, value);
       }
     }
     _append(key, value) {
@@ -959,7 +960,7 @@
       this.items.push([key, value]);
     }
     _appendDecoded(key, value) {
-      this._append(decodeURLParam(key), decodeURLParam(value));
+      paramSteps.append.call(this, decodeURLParam(key), decodeURLParam(value));
     }
     _replace(query) {
       this.items.length = 0;
@@ -967,7 +968,7 @@
       for (const part of String(query).replace(/^\?/, "").split("&")) {
         if (!part) continue;
         const at = part.indexOf("=");
-        this._appendDecoded(
+        paramSteps.appendDecoded.call(this, 
           at < 0 ? part : part.slice(0, at),
           at < 0 ? "" : part.slice(at + 1),
         );
@@ -977,12 +978,12 @@
       key = tilefinchUSVString(key);
       value = tilefinchUSVString(value);
       const text = this._text;
-      this._append(key, value);
+      paramSteps.append.call(this, key, value);
       if (text !== null) {
         this._text = (text ? text + "&" : "") + urlParamPair(key, value);
         this._count = this.items.length;
       }
-      this.notify();
+      paramSteps.notify.call(this, );
     }
     delete(key, value) {
       key = tilefinchUSVString(key);
@@ -993,7 +994,7 @@
             && (!matchValue || this.items[index][1] === wanted))
           this.items.splice(index, 1);
       this._text = null;
-      this.notify();
+      paramSteps.notify.call(this, );
     }
     get(key) {
       key = tilefinchUSVString(key);
@@ -1027,14 +1028,14 @@
           index++;
         } else this.items.splice(index, 1);
       }
-      if (!seen) this._append(key, value);
+      if (!seen) paramSteps.append.call(this, key, value);
       this._text = null;
-      this.notify();
+      paramSteps.notify.call(this, );
     }
     sort() {
       this.items.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
       this._text = null;
-      this.notify();
+      paramSteps.notify.call(this, );
     }
     forEach(callback, thisArg) {
       for (const pair of this.items)
@@ -1118,6 +1119,7 @@
     return "?" + value.replace(
       /[^\x21-\x7e]|[ #]/gu, (char) => encodeURIComponent(char));
   };
+  const urlSteps = { __proto__: null };
   const TilefinchURL = class URL {
     /* Defined, not assigned, so an author setter on Object.prototype
        cannot capture a URL's parts; the browser reads location, origins
@@ -1149,16 +1151,16 @@
           baseURL = new TilefinchURL(baseRaw);
       }
       if (scheme === "blob" || (scheme && !(scheme in tilefinchURLSpecial))) {
-        this._set(scheme === "blob" ? tilefinchURLInput(raw) : raw);
+        urlSteps.set.call(this, scheme === "blob" ? tilefinchURLInput(raw) : raw);
         return;
       }
       if (baseURL && !scheme) {
         /* An opaque path takes only a fragment as relative input. */
         if (raw[0] !== "#" && baseURL._opaque)
           throw new TypeError("Invalid URL");
-        this._set(raw[0] === "#"
+        urlSteps.set.call(this, raw[0] === "#"
           ? baseURL._prefix + baseURL._pathname + baseURL._search + raw
-          : baseURL._resolve(raw));
+          : urlSteps.resolve.call(baseURL, raw));
         return;
       }
       /* http(s), ws(s), and relative input against a special base or the
@@ -1175,12 +1177,12 @@
               : tilefinchURLAsHTTP(
                   tilefinchURLEncode(baseRaw, /[^\x21-\x7e]/gu)), own);
       if (!resolved) throw new TypeError("Invalid URL");
-      this._setSpecial(target === "ws" || target === "wss"
+      urlSteps.setSpecial.call(this, target === "ws" || target === "wss"
         ? target + resolved.slice(resolved.indexOf(":"))
         : resolved);
     }
     _setSearchParams(search) {
-      if (this._searchParams) this._searchParams._replace(search);
+      if (this._searchParams) paramSteps.replace.call(this._searchParams, search);
       else
         /* A list change rewrites only the query: its serialization is
            already percent-encoded, so neither the search setter's encoding
@@ -1216,7 +1218,7 @@
       this._prefix = "blob:";
       this._opaque = true;
       this._href = "blob:" + pathname + search + hash;
-      this._setSearchParams(search);
+      urlSteps.setSearchParams.call(this, search);
     }
     /* A URL whose scheme is not special, by the URL Standard's rules: an
        optional //host[:port] (an opaque host; userinfo is refused, as
@@ -1266,7 +1268,7 @@
       this._origin = "null";
       this._prefix = this._protocol + (authority === undefined ? "" : "//" + host);
       this._href = this._prefix + path + search + hash;
-      this._setSearchParams(search);
+      urlSteps.setSearchParams.call(this, search);
     }
     /* Relative, non-fragment input against this hierarchical non-special
        URL, as an absolute URL for _setNonSpecial. */
@@ -1281,11 +1283,11 @@
       href = String(href);
       const scheme = tilefinchURLScheme(href);
       if (scheme === "blob") {
-        this._setBlob(href);
+        urlSteps.setBlob.call(this, href);
         return;
       }
-      if (!(scheme in tilefinchURLSpecial)) this._setNonSpecial(href);
-      else this._setSpecial(href);
+      if (!(scheme in tilefinchURLSpecial)) urlSteps.setNonSpecial.call(this, href);
+      else urlSteps.setSpecial.call(this, href);
     }
     _setSpecial(href) {
       const parsed = href.match(
@@ -1315,12 +1317,12 @@
       this._prefix = origin;
       this._opaque = false;
       this._href = origin + pathname + search + hash;
-      this._setSearchParams(search);
+      urlSteps.setSearchParams.call(this, search);
     }
     _setCandidate(value) {
       try {
         const next = new TilefinchURL(value, this._href);
-        this._set(next._href);
+        urlSteps.set.call(this, next._href);
         return true;
       } catch (_) {
         return false;
@@ -1331,7 +1333,7 @@
     }
     set href(value) {
       const next = new TilefinchURL(value, this._href);
-      this._set(next._href);
+      urlSteps.set.call(this, next._href);
     }
     get protocol() { return this._protocol; }
     set protocol(value) {
@@ -1340,7 +1342,7 @@
       /* A URL never changes between a special and a non-special scheme. */
       if (scheme && (scheme in tilefinchURLSpecial) ===
           (this._protocol.slice(0, -1) in tilefinchURLSpecial))
-        this._setCandidate(
+        urlSteps.setCandidate.call(this, 
           scheme + ":" + this._href.slice(this._protocol.length));
     }
     get hostname() { return this._hostname; }
@@ -1348,7 +1350,7 @@
       if (this._opaque) return;
       value = tilefinchUSVString(value);
       if (!value || /[\s\/?#@]/.test(value)) return;
-      this._setCandidate(this._protocol + "//" + value +
+      urlSteps.setCandidate.call(this, this._protocol + "//" + value +
         (this._port ? ":" + this._port : "") + this._pathname +
         this._search + this._hash);
     }
@@ -1359,7 +1361,7 @@
       if (value && (!/^[0-9]+$/.test(value) || Number(value) > 65535)) return;
       if (value === tilefinchURLSpecial[this._protocol.slice(0, -1)])
         value = "";
-      this._setCandidate(this._protocol + "//" + this._hostname +
+      urlSteps.setCandidate.call(this, this._protocol + "//" + this._hostname +
         (value ? ":" + value : "") + this._pathname +
         this._search + this._hash);
     }
@@ -1368,13 +1370,13 @@
       if (this._opaque) return;
       value = tilefinchUSVString(value);
       if (!value || /[\s\/?#@]/.test(value)) return;
-      this._setCandidate(this._protocol + "//" + value + this._pathname +
+      urlSteps.setCandidate.call(this, this._protocol + "//" + value + this._pathname +
         this._search + this._hash);
     }
     get pathname() { return this._pathname; }
     set pathname(value) {
       if (this._opaque) return;
-      this._setCandidate(this._prefix + tilefinchURLPath(value) +
+      urlSteps.setCandidate.call(this, this._prefix + tilefinchURLPath(value) +
         this._search + this._hash);
     }
     get hash() { return this._hash || ""; }
@@ -1401,7 +1403,7 @@
     set search(value) {
       const search = tilefinchURLSearch(value);
       this._search = search;
-      if (this._searchParams) this._searchParams._replace(search);
+      if (this._searchParams) paramSteps.replace.call(this._searchParams, search);
       if (this._href)
         this._href = this._prefix + this._pathname + search + this._hash;
     }
@@ -1412,8 +1414,18 @@
       return this._href;
     }
   };
-  /* The parser's own steps stay the browser's: an author cannot replace
-     or wrap them on the page-visible prototype. */
+  /* The parser's own steps are not members of the interface: they leave
+     the page-visible prototype for this private table. */
+  for (const name of ["setSearchParams", "resolve", "setCandidate",
+      "setSpecial", "setBlob", "setNonSpecial", "set"]) {
+    urlSteps[name] = TilefinchURL.prototype["_" + name];
+    delete TilefinchURL.prototype["_" + name];
+  }
+  for (const name of ["_append", "_appendDecoded", "_replace", "notify"]) {
+    paramSteps[name[0] === "_" ? name.slice(1) : name] =
+      TilefinchURLSearchParams.prototype[name];
+    delete TilefinchURLSearchParams.prototype[name];
+  }
   for (const key of Reflect.ownKeys(TilefinchURL.prototype))
     if (typeof key === "string" && key[0] === "_")
       Object.defineProperty(TilefinchURL.prototype, key, {
@@ -2506,7 +2518,7 @@
   Option.prototype = HTMLOptionElement.prototype;
   const textareaValues = controlStateTable(),
     textareaDefaultValue = (textarea) =>
-      (textarea.childNodes || [])
+      trustedArrayFrom(textarea.childNodes || [])
         .filter((node) => node.nodeType === Node.TEXT_NODE)
         .map((node) => node.data)
         .join(""),
@@ -3164,15 +3176,22 @@
       },
     },
   });
+  /* `labels` is a NodeList (HTML, "labelable elements"). */
   const labelsForControl = (control) => {
-    const labels = [],
+    const labels = Object.create(NodeList.prototype),
       id = String(control.id || "");
+    let count = 0;
     for (const label of document.querySelectorAll("label")) {
       if (!(label instanceof HTMLLabelElement)) continue;
       if (label.control === control || (id && label.htmlFor === id))
-        labels.push(label);
+        Object.defineProperty(labels, count++, {
+          configurable: true, enumerable: true, value: label,
+        });
     }
-    return selectList(labels);
+    Object.defineProperty(labels, "length", {
+      configurable: true, value: count,
+    });
+    return labels;
   };
   for (const prototype of [
     HTMLInputElement.prototype,
@@ -4116,7 +4135,7 @@
       const href = tilefinchCurrentDocumentURL();
       locationSynchronizing = true;
       try {
-        locationURL._set(trustedString(href));
+        urlSteps.set.call(locationURL, trustedString(href));
         locationRevision = revision;
       } finally {
         locationSynchronizing = false;
@@ -4125,7 +4144,7 @@
     setSynchronizedLocation = (href) => {
       locationSynchronizing = true;
       try {
-        locationURL._set(trustedString(href));
+        urlSteps.set.call(locationURL, trustedString(href));
         locationRevision = tilefinchDocumentURLRevision() >>> 0;
       } finally {
         locationSynchronizing = false;
@@ -4146,7 +4165,7 @@
         href.includes("#") &&
         withoutFragment(href) === withoutFragment(locationURL._href)
       )
-        locationURL._set(href);
+        urlSteps.set.call(locationURL, href);
       __tilefinchRequestNavigation(href, replace);
     },
     resolveLocationURL = (value) =>
@@ -4618,7 +4637,7 @@
           },
           childNodes: {
             get() {
-              return listCopy(this.__detachedChildren);
+              return domShared.detachedChildNodes(this);
             },
           },
           children: {
@@ -5205,7 +5224,7 @@
         },
         childNodes: {
           get() {
-            return listCopy(this.__detachedChildren);
+            return domShared.detachedChildNodes(this);
           },
         },
         children: {
@@ -5277,7 +5296,7 @@
           systemId: { value: String(systemId) },
           ownerDocument: { get() { return this.__detachedOwner; } },
           parentNode: { get() { return this.__detachedParent; } },
-          childNodes: { get() { return []; } },
+          childNodes: { get() { return domShared.detachedChildNodes(this); } },
         });
         node.cloneNode = function () {
           return this.__detachedOwner.createDocumentType(
@@ -5376,16 +5395,6 @@
       }
       return doc;
     };
-    __tilefinchRealmGlobal.__tilefinchCreateFrameDocument = (standards = true) =>
-      detachedDocument(
-        undefined,
-        false,
-        null,
-        null,
-        "",
-        true,
-        standards ? "CSS1Compat" : "BackCompat",
-      );
     /* new Document() asks for an XML document (type "xml", as the DOM
        standard's constructor makes); the template contents owner and the
        page's createElement fallback take an HTML one. */
@@ -5648,12 +5657,11 @@
       return documentReadyState;
     },
   });
+  let documentChildNodes;
   Object.defineProperty(document, "childNodes", {
     configurable: true,
     get() {
-      const handles = __tilefinchDocumentChildNodes(), nodes = [];
-      for (let at = 0; at < handles.length; at++) nodes[at] = wrap(handles[at]);
-      return nodes;
+      return documentChildNodes ||= domShared.liveChildNodes(null, 0);
     },
   });
   for (const [name, pick] of [
@@ -6203,8 +6211,7 @@
         : node?.parentElement?.getBoundingClientRect() || new DOMRect();
     }
     getClientRects() {
-      const rect = this.getBoundingClientRect();
-      return rect.width && rect.height ? [rect] : [];
+      return domShared.rectList(this.getBoundingClientRect());
     }
     detach() {}
   };
@@ -6291,11 +6298,26 @@
       return this._range?.toString() || "";
     },
   };
-  const selectionChanged = () =>
-    browserDispatch(document, newEvent("selectionchange"));
+  /* The browser's own event (isTrusted), whoever moved the selection: at
+     the document, or bubbling from a text control whose selection moved. */
+  const selectionChanged = (control) =>
+    browserDispatch(control || document, trustedEvent(
+      newEvent("selectionchange", { bubbles: !!control })));
   __tilefinchRealmGlobal.__tilefinchSelectionChanged = selectionChanged;
   const createRange = () => new Range();
   document.createRange = createRange;
+  /* A singleton the bootstrap keeps as a plain object (the selection,
+     history, performance.timing) gets its interface: a constructor that
+     throws, whose prototype the object inherits, so it has the interface's
+     class string and `instanceof` holds. Its members stay its own. */
+  const exposeInterface = (name, object) => {
+    const constructor = { [name]: function () {
+      throw new TypeError("Illegal constructor");
+    } }[name];
+    Object.setPrototypeOf(object, constructor.prototype);
+    __tilefinchRealmGlobal[name] = constructor;
+  };
+  exposeInterface("Selection", selection);
   /* Window and Document each expose their own getSelection function. */
   __tilefinchRealmGlobal.getSelection = { getSelection: () => selection }.getSelection;
   document.getSelection = { getSelection: () => selection }.getSelection;
@@ -6480,7 +6502,6 @@
           }
         },
       },
-      crossOrigin: reflectString("crossOrigin"),
       preload: reflectString("preload"),
       autoplay: reflectBoolean("autoplay"),
       loop: reflectBoolean("loop"),
@@ -6658,13 +6679,12 @@
       });
     HTMLMediaElement.prototype.canPlayType = function canPlayType(type) {
       type = String(type || "").toLowerCase();
-      if (
-        type.startsWith("video/mp4") &&
-        (!type.includes("codecs=") ||
-          type.includes("avc1") ||
-          type.includes("mp4a"))
-      )
-        return "probably";
+      /* Without a codecs parameter the container alone cannot be
+         "probably" (HTML, canPlayType). */
+      if (type.startsWith("video/mp4")) {
+        if (!type.includes("codecs=")) return "maybe";
+        if (type.includes("avc1") || type.includes("mp4a")) return "probably";
+      }
       if (type.startsWith("audio/mp4")) {
         if (!type.includes("codecs=")) return "maybe";
         if (type.includes("mp4a")) return "probably";
@@ -6822,11 +6842,13 @@
      (createHTMLDocument, DOMParser) from the page document's own node
      factories, captured here before custom-elements.js wraps them. */
   domShared.documentFactories = {
-    createElement: document.createElement,
-    createElementNS: document.createElementNS,
-    createTextNode: document.createTextNode,
-    createComment: document.createComment,
-    createDocumentFragment: document.createDocumentFragment,
+    /* Bound: they are Document.prototype members by the time they run,
+       and those take only a document as their receiver. */
+    createElement: document.createElement.bind(document),
+    createElementNS: document.createElementNS.bind(document),
+    createTextNode: document.createTextNode.bind(document),
+    createComment: document.createComment.bind(document),
+    createDocumentFragment: document.createDocumentFragment.bind(document),
     detach: (node) => detachNode?.(node),
   };
   const listenerCallable = (callback) =>
@@ -7511,11 +7533,15 @@
       },
     });
   }
+  /* A live HTMLCollection, as document.forms is. */
+  let documentScripts = null;
   Object.defineProperty(document, "scripts", {
     configurable: true,
     enumerable: true,
     get() {
-      return document.querySelectorAll("script");
+      return (documentScripts ||=
+        __tilefinchRealmGlobal.__tilefinchLiveHTMLCollection(
+          () => trustedArrayFrom(document.querySelectorAll("script"))));
     },
   });
   let cachedDocumentStyleSheets = null,
@@ -7888,6 +7914,7 @@
     forward() {},
     go(delta = 0) {},
   };
+  exposeInterface("History", __tilefinchRealmGlobal.history);
   __tilefinchRealmGlobal.__tilefinchCommitSameDocument = (url, oldURL) => {
     setSynchronizedLocation(url);
     historyLength++;
@@ -8849,7 +8876,9 @@
     };
     __tilefinchRealmGlobal.atob = atob;
   }
-  __tilefinchRealmGlobal.DOMRect = class DOMRect {
+  /* Geometry Interfaces: DOMRect inherits DOMRectReadOnly, which holds
+     toJSON. */
+  class DOMRectReadOnly {
     constructor(x = 0, y = 0, width = 0, height = 0) {
       this.x = Number(x);
       this.y = Number(y);
@@ -8872,7 +8901,9 @@
         left: this.left,
       };
     }
-  };
+  }
+  __tilefinchRealmGlobal.DOMRectReadOnly = DOMRectReadOnly;
+  __tilefinchRealmGlobal.DOMRect = class DOMRect extends DOMRectReadOnly {};
   const
     /* The element's font size, read only for a value that has an em term
        to resolve: the read costs a cascade the value itself did not. */
@@ -9837,16 +9868,21 @@
       responseEnd = responseComplete
         ? Math.max(responseStart, Number(responseEndUs) / 1000 || 0)
         : 0,
-      finalHopStart = measured && responseComplete
-        ? Math.max(0, responseEnd - Math.max(0, Number(totalUs) / 1000))
-        : 0,
-      at = microseconds => measured && responseComplete
-        ? Math.min(responseEnd,
+      /* The final hop started its first byte's time before the headers
+         arrived (or its total time before the response ended): the same
+         phases when the headers arrive and when the response completes. */
+      hop = measured && (responseComplete || responseStart > 0),
+      hopEnd = responseComplete ? responseEnd : responseStart,
+      finalHopStart = hop ? Math.max(0, responseStart
+        ? responseStart - Math.max(0, Number(firstByteUs) / 1000)
+        : responseEnd - Math.max(0, Number(totalUs) / 1000)) : 0,
+      at = microseconds => hop
+        ? Math.min(hopEnd,
           finalHopStart + Math.max(0, Number(microseconds) / 1000))
         : 0;
     state.base[2] = 0;
     resource.fetchStart = 0;
-    if (measured && responseComplete) {
+    if (hop) {
       resource.domainLookupStart = finalHopStart;
       resource.domainLookupEnd = at(nameLookupUs);
       resource.connectStart = at(nameLookupUs);
@@ -9855,10 +9891,8 @@
       resource.connectEnd = at(appconnectUs || connectUs);
       resource.requestStart = at(appconnectUs || connectUs);
       resource.responseStart = responseStart || at(firstByteUs);
-    } else if (responseStart > 0) {
-      resource.responseStart = responseStart;
-      resource.finalResponseHeadersStart = responseStart;
-    }
+    } else if (responseStart > 0) resource.responseStart = responseStart;
+    resource.finalResponseHeadersStart = resource.responseStart;
     resource.responseStatus = Math.max(0, Math.min(65535,
       Math.trunc(Number(responseStatus) || 0)));
     resource.nextHopProtocol = String(nextHopProtocol || "");
@@ -9867,7 +9901,6 @@
       resource.transferSize = 300;
     if (responseComplete) {
       resource.responseEnd = responseEnd;
-      resource.finalResponseHeadersStart = resource.responseStart;
       const encoded = encodedBodyBytesMeasured
         ? Math.max(0, Number(encodedBodyBytes) || 0) : 0,
         decoded = Math.max(0, Number(decodedBodyBytes) || 0);
@@ -9877,16 +9910,21 @@
     }
     const epoch = performanceTimeOrigin;
     performanceTimingState.fetchStart = epoch;
-    if (measured && responseComplete) {
+    if (hop) {
       performanceTimingState.domainLookupStart = epoch + finalHopStart;
       performanceTimingState.domainLookupEnd =
         epoch + resource.domainLookupEnd;
       performanceTimingState.connectStart = epoch + resource.connectStart;
       performanceTimingState.connectEnd = epoch + resource.connectEnd;
+      performanceTimingState.secureConnectionStart =
+        resource.secureConnectionStart && epoch + resource.secureConnectionStart;
       performanceTimingState.requestStart = epoch + resource.requestStart;
     }
-    if (resource.responseStart > 0)
+    if (resource.responseStart > 0) {
       performanceTimingState.responseStart = epoch + resource.responseStart;
+      performanceTimingState.domLoading = Math.max(
+        performanceTimingState.domLoading, epoch + resource.responseStart);
+    }
     if (responseComplete)
       performanceTimingState.responseEnd = epoch + resource.responseEnd;
     return navigationPerformanceEntry;
@@ -9929,27 +9967,32 @@
     enumerable: true,
     configurable: true,
   });
+  /* PerformanceTiming, in IDL order: the connection phases default to
+     fetchStart, a moment that has not come yet (the response's end, the
+     document's lifecycle) is 0, and domLoading is when this document
+     was created. */
   const performanceTimingState = {
       navigationStart: performanceTimeOrigin,
+      unloadEventStart: 0,
+      unloadEventEnd: 0,
+      redirectStart: 0,
+      redirectEnd: 0,
       fetchStart: performanceTimeOrigin,
       domainLookupStart: performanceTimeOrigin,
       domainLookupEnd: performanceTimeOrigin,
       connectStart: performanceTimeOrigin,
       connectEnd: performanceTimeOrigin,
+      secureConnectionStart: 0,
       requestStart: performanceTimeOrigin,
       responseStart: performanceTimeOrigin,
-      responseEnd: performanceTimeOrigin,
-      domLoading: performanceTimeOrigin,
-      domInteractive: performanceTimeOrigin,
-      domContentLoadedEventStart: performanceTimeOrigin,
-      domContentLoadedEventEnd: performanceTimeOrigin,
-      domComplete: performanceTimeOrigin,
-      loadEventStart: performanceTimeOrigin,
-      loadEventEnd: performanceTimeOrigin,
-      redirectStart: 0,
-      redirectEnd: 0,
-      unloadEventStart: 0,
-      unloadEventEnd: 0,
+      responseEnd: 0,
+      domLoading: performanceTimeOrigin + __tilefinchPerformanceSample(9),
+      domInteractive: 0,
+      domContentLoadedEventStart: 0,
+      domContentLoadedEventEnd: 0,
+      domComplete: 0,
+      loadEventStart: 0,
+      loadEventEnd: 0,
     },
     performanceTiming = {};
   for (const name of Object.keys(performanceTimingState))
@@ -9957,6 +10000,7 @@
       enumerable: true,
       get: () => performanceTimingState[name],
     });
+  exposeInterface("PerformanceTiming", performanceTiming);
   Object.freeze(performanceTiming);
   const performanceNavigation = Object.freeze({ type: 0, redirectCount: 0 });
   Object.defineProperties(Performance.prototype, {

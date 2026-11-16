@@ -170,7 +170,8 @@ static bool test_connected_src_mutation_and_namespaces(Budget *budget)
         "document.head.appendChild(htmlScript);"
         "const svgScript=document.createElementNS("
         "'http://www.w3.org/2000/svg','script');"
-        "globalThis.svgNamespaceDefaultAsync=svgScript.async===false;"
+        /* SVGScriptElement has no async member. */
+        "globalThis.svgNamespaceDefaultAsync=svgScript.async===undefined;"
         "svgScript.src='/svg-namespace.js';"
         "svgScript.addEventListener('load',()=>namespaceEvents.push("
         "'unexpected-svg-load'));"

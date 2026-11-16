@@ -979,6 +979,21 @@ if(PSP_BROWSER_BUILD_TESTS)
             LABELS "tilefinch;unit;security;update;tooling;network"
             TIMEOUT 30
             SKIP_RETURN_CODE 77)
+        # An aborted HTTP/2 redirect stream keeps its connection usable
+        # (a loopback Node HTTP/2 server; Skipped without node or openssl).
+        tilefinch_add_test_binary(tilefinch-http2-redirect-probe
+            tests/http2_redirect_probe.c)
+        target_link_libraries(tilefinch-http2-redirect-probe
+            PRIVATE tilefinch_core)
+        add_test(NAME tilefinch-http2-redirect-reuse-tests
+            COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_http2_redirect_reuse.py"
+                    $<TARGET_FILE:tilefinch-http2-redirect-probe>
+                    "${TILEFINCH_TEST_NODE_EXECUTABLE}")
+        set_tests_properties(tilefinch-http2-redirect-reuse-tests PROPERTIES
+            LABELS "tilefinch;unit;network"
+            TIMEOUT 60
+            SKIP_RETURN_CODE 77)
     endif()
 
     tilefinch_add_test_binary(tilefinch-session-persistence-tests
@@ -1293,6 +1308,14 @@ if(PSP_BROWSER_BUILD_TESTS)
         COMMAND tilefinch-popunder-guard-tests)
     set_tests_properties(tilefinch-popunder-guard-tests PROPERTIES
         LABELS "tilefinch;unit;navigation;security" TIMEOUT 30)
+
+    tilefinch_add_test_binary(tilefinch-input-events-tests
+        tests/test_input_events.c)
+    target_link_libraries(tilefinch-input-events-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-input-events-tests
+        COMMAND tilefinch-input-events-tests)
+    set_tests_properties(tilefinch-input-events-tests PROPERTIES
+        LABELS "tilefinch;unit;script;controls" TIMEOUT 30)
 
     tilefinch_add_test_binary(tilefinch-file-download-tests
         tests/test_file_download.c src/psp_offline_store.c)

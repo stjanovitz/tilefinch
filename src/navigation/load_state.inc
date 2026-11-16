@@ -140,6 +140,7 @@ static bool navigation_stream_headers(void *opaque,
             navigation_now_us() - stream->started_us;
     }
     if (stream != NULL) {
+        stream->response_header_timing = metadata->transport_timing;
         stream->response_status = metadata->status_code > 0
             && metadata->status_code <= UINT16_MAX
                 ? (uint16_t) metadata->status_code : 0;
@@ -340,22 +341,6 @@ static bool navigation_load_headers(void *opaque,
         snprintf(load->session->last_error,
                  sizeof(load->session->last_error), "%s",
                  "response effective URL is invalid");
-        return false;
-    }
-    /* Google refusing the honest identity on accounts.google.com
-       (site_identity.h) never commits either: the session returns to the
-       shipping identity there and the browser reloads the page once. A
-       form submission is never sent again; its source page is reloaded. */
-    if (site_identity_accounts_refusal(
-            load->requested_url, load->source_url, effective,
-            metadata->status_code)) {
-        site_identity_accounts_refused(
-            strcasecmp(load->method, "GET") == 0 ? load->requested_url
-                                                 : NULL,
-            load->source_url);
-        snprintf(load->session->last_error,
-                 sizeof(load->session->last_error), "%s",
-                 "Google didn't accept this browser");
         return false;
     }
     /* A refused opted-in Google search (site_identity.h) never commits:
@@ -2284,4 +2269,20 @@ bool navigation_load_url(NavigationSession *session, uint64_t generation,
                                    NULL, maximum_bytes, timeout_ms,
                                    viewport_width, fonts, images,
                                    record_history);
+}
+
+size_t navigation_yield_preloaded_scripts(NavigationLoad *load,
+                                          size_t needed)
+{
+    NavigationDocumentStream *stream =
+        load == NULL ? NULL : load->document_stream;
+    if (stream == NULL) return 0;
+    size_t freed = 0;
+    for (size_t i = 0; i < stream->preload_count && freed < needed; i++)
+        freed += navigation_stream_release_held_preload(
+            stream, &stream->preloads[i]);
+    if (freed < needed && !stream->runtime_transferred)
+        freed += script_runtime_release_preloaded_scripts(
+            stream->runtime, needed - freed);
+    return freed;
 }

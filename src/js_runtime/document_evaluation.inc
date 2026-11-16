@@ -497,6 +497,8 @@ bool script_runtime_finish_loading(ScriptRuntime *runtime,
     if (evaluated) evaluated = js_rt_runtime_refresh(runtime);
     if (!evaluated) capture_cached_error_source(runtime);
     runtime->result.dom_content_loaded_dispatched = evaluated;
+    /* The window's load event fired with DOMContentLoaded. */
+    js_rt_preloaded_scripts_note_load(&runtime->bridge);
     runtime->result.success = evaluated;
     js_rt_runtime_update_result(runtime, result);
     return evaluated;

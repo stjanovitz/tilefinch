@@ -534,6 +534,13 @@ suitable for network transport. The focused qualification lane is described in
 ## How the PSP path is built
 
 WebGL is a lazy, bounded command translator, not a software GLSL interpreter.
+Its interface objects (`WebGLRenderingContext` with its constants,
+`WebGLObject` and the object interfaces, `WebGLContextEvent`) come from a
+separate small module, `webgl-interfaces.js`, that loads the first time a page
+reads one of those names, so feature tests and constant reads do not load the
+translator; the translator loads it first and makes its contexts and objects
+instances of those interfaces. WebGL 2 is not exposed, so its interfaces are
+not defined.
 The JavaScript layer exposes the familiar object and state model, admits only
 the shader shapes above, combines a bounded chain of position-matrix uniforms,
 and snapshots each draw's buffers, attributes, transform, viewport, scissor,

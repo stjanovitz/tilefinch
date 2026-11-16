@@ -169,6 +169,15 @@ changed before construction or publication completed. A definite server
 sign-out revokes confirmation; transport, parsing, allocation and display
 failures do not.
 
+Version 4 adds Google refusing the browser during sign-in.
+`accounts-refusals` counts the top-level navigations that ended on such an
+answer while the switch was on. `refusal-class` names the last one: 1
+Google's sign-in rejection page ("Couldn't sign you in"), 2 its
+unusual-traffic interstitial, 3 HTTP 429 from the account site.
+`refusal-reason` is the reason number the rejection page's address carried,
+at most four digits, or 0 when there was none. Nothing else from that
+address is recorded: no account hint, no other parameter.
+
 The last completed feed hop also reports a numeric transport error, timeout
 flag, TLS verification result and whether that result was available. These
 fields contain no URL, certificate identity, cookie or response text. An

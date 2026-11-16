@@ -85,6 +85,9 @@ BOOTSTRAP_SOURCE(browser_bootstrap_serialize, "serialize.js",
 BOOTSTRAP_SOURCE(browser_bootstrap_frame_clone, "frame-clone.js",
                  "<browser-frame-clone>",
                  browser_bootstrap_frame_clone_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_webgl_interfaces, "webgl-interfaces.js",
+                 "<browser-webgl-interfaces>",
+                 browser_bootstrap_webgl_interfaces_bytecode)
 BOOTSTRAP_DIAGNOSTIC(browser_dpu_diagnostic, "dpu-diagnostic.js",
                      "<dpu-diagnostic>")
 BOOTSTRAP_DIAGNOSTIC(browser_eval_source_diagnostic,

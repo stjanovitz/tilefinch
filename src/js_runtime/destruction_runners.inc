@@ -74,6 +74,7 @@ void script_runtime_destroy(ScriptRuntime *runtime)
     js_rt_bridge_canvas_taints_free(&runtime->bridge);
     js_rt_event_sources_destroy(&runtime->bridge);
     js_rt_cors_preflights_destroy(&runtime->bridge);
+    js_rt_preloaded_scripts_destroy(&runtime->bridge);
     js_rt_websockets_destroy(&runtime->bridge);
     js_rt_multiplayer_destroy(&runtime->bridge);
     for (size_t i = 0; i < runtime->bridge.async_fetch_count; i++) {
@@ -152,6 +153,20 @@ void script_runtime_destroy(ScriptRuntime *runtime)
 #endif
         JS_FreeValue(runtime->context, runtime->media_update);
         JS_FreeValue(runtime->context, runtime->document_all_cache);
+        JS_FreeValue(runtime->context, runtime->window_name);
+        JS_FreeValue(runtime->context, runtime->window_status);
+        runtime->window_name = JS_UNDEFINED;
+        runtime->window_status = JS_UNDEFINED;
+        for (size_t i = 0; i < sizeof(runtime->reflect_hooks)
+                                   / sizeof(runtime->reflect_hooks[0]); i++) {
+            JS_FreeValue(runtime->context, runtime->reflect_hooks[i]);
+            runtime->reflect_hooks[i] = JS_UNDEFINED;
+        }
+        if (runtime->frame_page_names != NULL)
+            JS_FreePropertyEnum(runtime->context, runtime->frame_page_names,
+                                runtime->frame_page_name_count);
+        runtime->frame_page_names = NULL;
+        runtime->frame_page_name_count = 0;
         JS_FreeValue(runtime->context, runtime->opfs_storage_manager);
         JS_FreeValue(runtime->context, runtime->streams_writable_stream);
         runtime->streams_writable_stream = JS_UNDEFINED;

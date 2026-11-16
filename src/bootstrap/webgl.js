@@ -3,8 +3,12 @@
   /* Loaded after the page may have replaced these globals: build
      errors, promises and platform objects with the constructors
      hardening.js captured, and publish private hooks with its
-     defineProperty. */
-  const { defineProperty, Error, DOMException, Map, Set, WeakMap, WeakRef,
+     defineProperty. What runs while this module loads, and what makes
+     contexts and objects, uses its reflection too: a page's
+     Reflect.construct must never receive the implementation classes. */
+  const { defineProperty, getOwnPropertyDescriptor, ownKeys,
+    construct: reflectConstruct,
+    freeze, Error, DOMException, Map, Set, WeakMap, WeakRef,
     Array, ArrayBuffer, Uint8Array, Uint8ClampedArray, Int32Array,
     Uint32Array, Float32Array, Float64Array, RegExp, claimHooks } =
     globalThis.__tilefinchEventInterfaces;
@@ -12,6 +16,14 @@
      without reserved hooks takes plain globals. */
   const publish = claimHooks?.()
     || ((name, value) => { globalThis[name] = value; });
+  /* The interface objects, constants included, come from
+     webgl-interfaces.js, which the host loads first: page-visible names
+     exist before WebGL is used, and contexts and objects made here are
+     instances of those same interfaces. */
+  const { WebGLRenderingContext, WebGLBuffer, WebGLTexture, WebGLShader,
+    WebGLProgram, WebGLUniformLocation, WebGLActiveInfo,
+    WebGLShaderPrecisionFormat, WebGLFramebuffer, WebGLRenderbuffer,
+    WebGLContextEvent, stubs } = globalThis.__tilefinchWebGLInterfaces;
 
   /* Surface retirement also advances the native cache incarnation.  Page
      code never reads, selects, or serializes that process-issued identity. */
@@ -20,9 +32,7 @@
     publishNativeWebGLFrame = globalThis.__tilefinchWebGLPublishFrame,
     nativeIndexMaximum = globalThis.__tilefinchWebGLIndexMaximum,
     nativeFiniteFloat32 = globalThis.__tilefinchWebGLFiniteFloat32,
-    nativeCombineMatrix4 = globalThis.__tilefinchWebGLCombineMatrix4,
-    /* Loaded on first use, after the page may have replaced Event. */
-    createEvent = globalThis.__tilefinchCreateEvent;
+    nativeCombineMatrix4 = globalThis.__tilefinchWebGLCombineMatrix4;
 
   /* Tilefinch exposes the WebGL 1 object model, but deliberately translates
      only the fixed-function-compatible shader shapes the PSP GE can execute.
@@ -142,95 +152,11 @@
       profileWireInstancesMs: 0,
       profileWireRetainMs: 0,
     },
-    constants = {
-      DEPTH_BUFFER_BIT: 0x00000100,
-      STENCIL_BUFFER_BIT: 0x00000400,
-      COLOR_BUFFER_BIT: 0x00004000,
-      POINTS: 0x0000, LINES: 0x0001, LINE_LOOP: 0x0002,
-      LINE_STRIP: 0x0003, TRIANGLES: 0x0004,
-      TRIANGLE_STRIP: 0x0005, TRIANGLE_FAN: 0x0006,
-      ZERO: 0, NONE: 0, ONE: 1, SRC_COLOR: 0x0300,
-      ONE_MINUS_SRC_COLOR: 0x0301, SRC_ALPHA: 0x0302,
-      ONE_MINUS_SRC_ALPHA: 0x0303, DST_ALPHA: 0x0304,
-      ONE_MINUS_DST_ALPHA: 0x0305, DST_COLOR: 0x0306,
-      ONE_MINUS_DST_COLOR: 0x0307, SRC_ALPHA_SATURATE: 0x0308,
-      CONSTANT_COLOR: 0x8001, ONE_MINUS_CONSTANT_COLOR: 0x8002,
-      CONSTANT_ALPHA: 0x8003, ONE_MINUS_CONSTANT_ALPHA: 0x8004,
-      BLEND_COLOR: 0x8005, BLEND_DST_ALPHA: 0x80ca, BLEND_SRC_ALPHA: 0x80cb,
-      FUNC_ADD: 0x8006, FUNC_SUBTRACT: 0x800a,
-      FUNC_REVERSE_SUBTRACT: 0x800b, BLEND_EQUATION: 0x8009,
-      BLEND_EQUATION_RGB: 0x8009, BLEND_EQUATION_ALPHA: 0x883d,
-      ARRAY_BUFFER: 0x8892, ELEMENT_ARRAY_BUFFER: 0x8893,
-      ARRAY_BUFFER_BINDING: 0x8894, ELEMENT_ARRAY_BUFFER_BINDING: 0x8895,
-      STREAM_DRAW: 0x88e0, STATIC_DRAW: 0x88e4, DYNAMIC_DRAW: 0x88e8,
-      BUFFER_SIZE: 0x8764, BUFFER_USAGE: 0x8765,
-      CURRENT_VERTEX_ATTRIB: 0x8626,
-      VERTEX_ATTRIB_ARRAY_ENABLED: 0x8622,
-      VERTEX_ATTRIB_ARRAY_SIZE: 0x8623,
-      VERTEX_ATTRIB_ARRAY_STRIDE: 0x8624,
-      VERTEX_ATTRIB_ARRAY_TYPE: 0x8625,
-      VERTEX_ATTRIB_ARRAY_NORMALIZED: 0x886a,
-      VERTEX_ATTRIB_ARRAY_POINTER: 0x8645,
-      VERTEX_ATTRIB_ARRAY_BUFFER_BINDING: 0x889f,
-      VERTEX_ATTRIB_ARRAY_DIVISOR_ANGLE: 0x88fe,
-      VERTEX_ARRAY_BINDING_OES: 0x85b5,
-      BYTE: 0x1400, UNSIGNED_BYTE: 0x1401, SHORT: 0x1402,
-      UNSIGNED_SHORT: 0x1403, INT: 0x1404, UNSIGNED_INT: 0x1405,
-      FLOAT: 0x1406,
-      CULL_FACE: 0x0b44, BLEND: 0x0be2, DITHER: 0x0bd0,
-      STENCIL_TEST: 0x0b90, DEPTH_TEST: 0x0b71, SCISSOR_TEST: 0x0c11,
-      POLYGON_OFFSET_FILL: 0x8037, SAMPLE_ALPHA_TO_COVERAGE: 0x809e,
-      SAMPLE_COVERAGE: 0x80a0,
-      NO_ERROR: 0, INVALID_ENUM: 0x0500, INVALID_VALUE: 0x0501,
-      INVALID_OPERATION: 0x0502, OUT_OF_MEMORY: 0x0505,
-      CONTEXT_LOST_WEBGL: 0x9242,
-      CW: 0x0900, CCW: 0x0901, FRONT: 0x0404, BACK: 0x0405,
-      FRONT_AND_BACK: 0x0408,
-      NEVER: 0x0200, LESS: 0x0201, EQUAL: 0x0202, LEQUAL: 0x0203,
-      GREATER: 0x0204, NOTEQUAL: 0x0205, GEQUAL: 0x0206, ALWAYS: 0x0207,
-      TEXTURE_2D: 0x0de1, TEXTURE: 0x1702,
-      TEXTURE0: 0x84c0, ACTIVE_TEXTURE: 0x84e0,
-      TEXTURE_BINDING_2D: 0x8069,
-      TEXTURE_MAG_FILTER: 0x2800, TEXTURE_MIN_FILTER: 0x2801,
-      TEXTURE_WRAP_S: 0x2802, TEXTURE_WRAP_T: 0x2803,
-      NEAREST: 0x2600, LINEAR: 0x2601,
-      NEAREST_MIPMAP_NEAREST: 0x2700, LINEAR_MIPMAP_NEAREST: 0x2701,
-      NEAREST_MIPMAP_LINEAR: 0x2702, LINEAR_MIPMAP_LINEAR: 0x2703,
-      REPEAT: 0x2901, CLAMP_TO_EDGE: 0x812f, MIRRORED_REPEAT: 0x8370,
-      ALPHA: 0x1906, RGB: 0x1907, RGBA: 0x1908,
-      LUMINANCE: 0x1909, LUMINANCE_ALPHA: 0x190a,
-      UNPACK_ALIGNMENT: 0x0cf5, PACK_ALIGNMENT: 0x0d05,
-      UNPACK_FLIP_Y_WEBGL: 0x9240,
-      UNPACK_PREMULTIPLY_ALPHA_WEBGL: 0x9241,
-      UNPACK_COLORSPACE_CONVERSION_WEBGL: 0x9243,
-      BROWSER_DEFAULT_WEBGL: 0x9244,
-      VERTEX_SHADER: 0x8b31, FRAGMENT_SHADER: 0x8b30,
-      COMPILE_STATUS: 0x8b81, LINK_STATUS: 0x8b82,
-      VALIDATE_STATUS: 0x8b83, DELETE_STATUS: 0x8b80,
-      SHADER_TYPE: 0x8b4f, ATTACHED_SHADERS: 0x8b85,
-      ACTIVE_UNIFORMS: 0x8b86, ACTIVE_ATTRIBUTES: 0x8b89,
-      CURRENT_PROGRAM: 0x8b8d,
-      FLOAT_VEC2: 0x8b50, FLOAT_VEC3: 0x8b51, FLOAT_VEC4: 0x8b52,
-      INT_VEC2: 0x8b53, INT_VEC3: 0x8b54, INT_VEC4: 0x8b55,
-      BOOL: 0x8b56, BOOL_VEC2: 0x8b57, BOOL_VEC3: 0x8b58,
-      BOOL_VEC4: 0x8b59, FLOAT_MAT2: 0x8b5a, FLOAT_MAT3: 0x8b5b,
-      FLOAT_MAT4: 0x8b5c, SAMPLER_2D: 0x8b5e,
-      VENDOR: 0x1f00, RENDERER: 0x1f01, VERSION: 0x1f02,
-      SHADING_LANGUAGE_VERSION: 0x8b8c,
-      VIEWPORT: 0x0ba2, SCISSOR_BOX: 0x0c10,
-      COLOR_CLEAR_VALUE: 0x0c22, DEPTH_CLEAR_VALUE: 0x0b73,
-      DEPTH_FUNC: 0x0b74, BLEND_SRC_RGB: 0x80c9,
-      BLEND_DST_RGB: 0x80c8, CULL_FACE_MODE: 0x0b45,
-      FRONT_FACE: 0x0b46, LINE_WIDTH: 0x0b21,
-      MAX_TEXTURE_SIZE: 0x0d33, MAX_VIEWPORT_DIMS: 0x0d3a,
-      MAX_VERTEX_ATTRIBS: 0x8869, MAX_TEXTURE_IMAGE_UNITS: 0x8872,
-      MAX_COMBINED_TEXTURE_IMAGE_UNITS: 0x8b4d,
-      MAX_VERTEX_TEXTURE_IMAGE_UNITS: 0x8b4c,
-      MAX_VARYING_VECTORS: 0x8dfc, MAX_VERTEX_UNIFORM_VECTORS: 0x8dfb,
-      MAX_FRAGMENT_UNIFORM_VECTORS: 0x8dfd,
-      FRAMEBUFFER: 0x8d40, RENDERBUFFER: 0x8d41,
-      FRAMEBUFFER_COMPLETE: 0x8cd5,
-    },
+    /* WebGL 1.0's constants are the interface object's; the two extension
+       values (ANGLE_instanced_arrays, OES_vertex_array_object) are not. */
+    constants = WebGLRenderingContext,
+    VERTEX_ATTRIB_ARRAY_DIVISOR_ANGLE = 0x88fe,
+    VERTEX_ARRAY_BINDING_OES = 0x85b5,
     typeBytes = (type) => ({
       [constants.BYTE]: 1, [constants.UNSIGNED_BYTE]: 1,
       [constants.SHORT]: 2, [constants.UNSIGNED_SHORT]: 2,
@@ -806,7 +732,7 @@
       this._deleted = false;
     }
   }
-  class WebGLBuffer extends GLObject {
+  class WebGLBufferImpl extends GLObject {
     constructor(owner, id) {
       super(owner, id); this._data = new Uint8Array();
       this._generation = 1;
@@ -820,7 +746,7 @@
       this._commandIndex = makeCommandIndex();
     }
   }
-  class WebGLTexture extends GLObject {
+  class WebGLTextureImpl extends GLObject {
     constructor(owner, id) {
       super(owner, id); this._width = 0; this._height = 0;
       this._pixels = null; this._generation = 1;
@@ -829,13 +755,13 @@
       this._wrapT = constants.CLAMP_TO_EDGE;
     }
   }
-  class WebGLShader extends GLObject {
+  class WebGLShaderImpl extends GLObject {
     constructor(owner, id, type) {
       super(owner, id); this._type = type; this._source = "";
       this._compiled = false; this._log = "";
     }
   }
-  class WebGLProgram extends GLObject {
+  class WebGLProgramImpl extends GLObject {
     constructor(owner, id) {
       super(owner, id); this._shaders = []; this._linked = false;
       this._log = ""; this._attributes = []; this._uniforms = [];
@@ -849,24 +775,24 @@
       this._matrixCount = 0;
     }
   }
-  class WebGLUniformLocation {
+  class WebGLUniformLocationImpl {
     constructor(program, entry, offset = 0) {
       this._program = program; this._name = entry.name;
       this._type = entry.type; this._size = entry.size;
       this._offset = offset;
     }
   }
-  class WebGLActiveInfo {
+  class WebGLActiveInfoImpl {
     constructor(size, type, name) { this.size = size; this.type = type; this.name = name; }
   }
-  class WebGLShaderPrecisionFormat {
+  class WebGLShaderPrecisionFormatImpl {
     constructor(rangeMin, rangeMax, precision) {
       this.rangeMin = rangeMin; this.rangeMax = rangeMax;
       this.precision = precision;
     }
   }
-  class WebGLFramebuffer extends GLObject {}
-  class WebGLRenderbuffer extends GLObject {}
+  class WebGLFramebufferImpl extends GLObject {}
+  class WebGLRenderbufferImpl extends GLObject {}
   class WebGLVertexArrayOES extends GLObject {
     constructor(owner, id) {
       super(owner, id);
@@ -878,7 +804,7 @@
     constructor(context) {
       this._context = context;
       this.VERTEX_ATTRIB_ARRAY_DIVISOR_ANGLE =
-        constants.VERTEX_ATTRIB_ARRAY_DIVISOR_ANGLE;
+        VERTEX_ATTRIB_ARRAY_DIVISOR_ANGLE;
     }
     vertexAttribDivisorANGLE(index, divisor) {
       const context = this._context;
@@ -908,7 +834,7 @@
   class OesVertexArrayObject {
     constructor(context) {
       this._context = context;
-      this.VERTEX_ARRAY_BINDING_OES = constants.VERTEX_ARRAY_BINDING_OES;
+      this.VERTEX_ARRAY_BINDING_OES = VERTEX_ARRAY_BINDING_OES;
     }
     createVertexArrayOES() { return this._context._createVertexArray(); }
     deleteVertexArrayOES(array) { this._context._deleteVertexArray(array); }
@@ -2984,7 +2910,7 @@
         "WebGL program " + program._id + ": " + program._log);
     };
 
-  class WebGLRenderingContext {
+  class WebGLRenderingContextImpl {
     constructor(canvas, attributes = {}) {
       this.canvas = canvas;
       this._attributes = {
@@ -3153,8 +3079,8 @@
       this._contextLostPending = true;
       diagnostics.lostContexts++; diagnostics.nativeFailures++;
       this._nativeReleasePending = !this._releaseNativeSurface();
-      const event = createEvent("webglcontextlost", { cancelable: true });
-      Object.defineProperty(event, "statusMessage", { value: String(reason || "") });
+      const event = new WebGLContextEvent("webglcontextlost", {
+        __proto__: null, cancelable: true, statusMessage: reason || "" });
       const canceled = this.canvas?.dispatchEvent(event) === false;
       this._lossDispatching = false;
       if (!canceled) {
@@ -3209,7 +3135,8 @@
       this._surfaceReady = false; this._frameOpen = false;
       this._resize();
       if (!this._lost)
-        this.canvas.dispatchEvent(createEvent("webglcontextrestored"));
+        this.canvas.dispatchEvent(
+          new WebGLContextEvent("webglcontextrestored"));
     }
     _schedule() {
       if (this._flushQueued || this._lost) return;
@@ -4369,7 +4296,7 @@
     createBuffer() {
       if (this._lost) return null;
       if (this._bufferCount >= MAX_BUFFER_OBJECTS) { this._setError(constants.OUT_OF_MEMORY); return null; }
-      const buffer = new WebGLBuffer(this, this._nextId++);
+      const buffer = make.WebGLBuffer(this, this._nextId++);
       this._bufferCount++; this._resources.add(buffer); return buffer;
     }
     deleteBuffer(buffer) {
@@ -4538,7 +4465,7 @@
       if (this._shaderCount >= MAX_SHADER_OBJECTS) {
         this._setError(constants.OUT_OF_MEMORY); return null;
       }
-      const shader = new WebGLShader(this, this._nextId++, type);
+      const shader = make.WebGLShader(this, this._nextId++, type);
       this._shaderCount++; this._resources.add(shader); return shader;
     }
     shaderSource(shader, source) {
@@ -4577,7 +4504,7 @@
       if (this._programCount >= MAX_PROGRAM_OBJECTS) {
         this._setError(constants.OUT_OF_MEMORY); return null;
       }
-      const program = new WebGLProgram(this, this._nextId++);
+      const program = make.WebGLProgram(this, this._nextId++);
       this._programCount++; this._resources.add(program); return program;
     }
     attachShader(program, shader) {
@@ -4809,20 +4736,20 @@
       name = String(name);
       const element = /^(.*)\[(\d+)\]$/.exec(name),
         exact = program._uniforms.find((candidate) => candidate.name === name);
-      if (exact || !element) return exact ? new WebGLUniformLocation(program, exact) : null;
+      if (exact || !element) return exact ? make.WebGLUniformLocation(program, exact) : null;
       const entry = program._uniforms.find((candidate) =>
           candidate.name === element[1]),
         index = Number(element[2]);
       return entry && index < entry.size
-        ? new WebGLUniformLocation(program, entry, index) : null;
+        ? make.WebGLUniformLocation(program, entry, index) : null;
     }
     getActiveAttrib(program, index) {
       const entry = owned(this, program, WebGLProgram) ? program._attributes[index] : null;
-      return entry ? new WebGLActiveInfo(entry.size, glTypeFor(entry.type), entry.name) : null;
+      return entry ? make.WebGLActiveInfo(entry.size, glTypeFor(entry.type), entry.name) : null;
     }
     getActiveUniform(program, index) {
       const entry = owned(this, program, WebGLProgram) ? program._uniforms[index] : null;
-      return entry ? new WebGLActiveInfo(entry.size, glTypeFor(entry.type),
+      return entry ? make.WebGLActiveInfo(entry.size, glTypeFor(entry.type),
         entry.size > 1 ? entry.name + "[0]" : entry.name) : null;
     }
     /* Whether a set of this uniform should compare its value first: it is
@@ -5100,7 +5027,7 @@
       if (parameter === constants.VERTEX_ATTRIB_ARRAY_TYPE) return state.type;
       if (parameter === constants.VERTEX_ATTRIB_ARRAY_NORMALIZED) return state.normalized;
       if (parameter === constants.VERTEX_ATTRIB_ARRAY_BUFFER_BINDING) return state.buffer;
-      if (parameter === constants.VERTEX_ATTRIB_ARRAY_DIVISOR_ANGLE)
+      if (parameter === VERTEX_ATTRIB_ARRAY_DIVISOR_ANGLE)
         return state.divisor;
       if (parameter === constants.CURRENT_VERTEX_ATTRIB) return new Float32Array(state.constant);
       this._setError(constants.INVALID_ENUM); return null;
@@ -5114,7 +5041,7 @@
     createTexture() {
       if (this._lost) return null;
       if (this._textureCount >= MAX_TEXTURE_OBJECTS) { this._setError(constants.OUT_OF_MEMORY); return null; }
-      const texture = new WebGLTexture(this, this._nextId++);
+      const texture = make.WebGLTexture(this, this._nextId++);
       this._textureCount++; this._resources.add(texture); return texture;
     }
     deleteTexture(texture) {
@@ -6406,7 +6333,7 @@
         [constants.MAX_FRAGMENT_UNIFORM_VECTORS]: MAX_FRAGMENT_UNIFORM_VECTORS,
         [constants.ARRAY_BUFFER_BINDING]: this._arrayBuffer,
         [constants.ELEMENT_ARRAY_BUFFER_BINDING]: this._elementBuffer,
-        [constants.VERTEX_ARRAY_BINDING_OES]: this._vertexArray,
+        [VERTEX_ARRAY_BINDING_OES]: this._vertexArray,
         [constants.TEXTURE_BINDING_2D]: this._texture,
         [constants.ACTIVE_TEXTURE]: constants.TEXTURE0,
         [constants.CURRENT_PROGRAM]: this._program,
@@ -6434,7 +6361,7 @@
       if (capability) return (this._enabledMask & capability) !== 0;
       this._setError(constants.INVALID_ENUM); return null;
     }
-    getShaderPrecisionFormat() { return new WebGLShaderPrecisionFormat(127, 127, 23); }
+    getShaderPrecisionFormat() { return make.WebGLShaderPrecisionFormat(127, 127, 23); }
     getSupportedExtensions() {
       return ["ANGLE_instanced_arrays", "EXT_blend_minmax",
         "OES_vertex_array_object", "TILEFINCH_repeated_frame_commands"];
@@ -6466,7 +6393,7 @@
       if (this._framebufferCount >= MAX_FRAMEBUFFER_OBJECTS) {
         this._setError(constants.OUT_OF_MEMORY); return null;
       }
-      const framebuffer = new WebGLFramebuffer(this, this._nextId++);
+      const framebuffer = make.WebGLFramebuffer(this, this._nextId++);
       this._framebufferCount++; this._resources.add(framebuffer);
       return framebuffer;
     }
@@ -6475,7 +6402,7 @@
       if (this._renderbufferCount >= MAX_RENDERBUFFER_OBJECTS) {
         this._setError(constants.OUT_OF_MEMORY); return null;
       }
-      const renderbuffer = new WebGLRenderbuffer(this, this._nextId++);
+      const renderbuffer = make.WebGLRenderbuffer(this, this._nextId++);
       this._renderbufferCount++; this._resources.add(renderbuffer);
       return renderbuffer;
     }
@@ -6510,16 +6437,83 @@
     copyTexSubImage2D() { this._setError(constants.INVALID_OPERATION); }
   }
 
-  for (const [name, value] of Object.entries(constants))
-    Object.defineProperty(WebGLRenderingContext.prototype, name,
-      { configurable: false, enumerable: true, value, writable: false });
+  /* Instances take the interface prototypes; the context's members move
+     onto WebGLRenderingContext.prototype, where the constants and
+     webgl-interfaces.js's forwarding members already are. Only this module
+     constructs them (the interfaces' own constructors throw). */
+  const implementation = (Impl, Interface) =>
+      (...args) => reflectConstruct(Impl, args, Interface),
+    make = {
+      WebGLRenderingContext: implementation(
+        WebGLRenderingContextImpl, WebGLRenderingContext),
+      WebGLBuffer: implementation(WebGLBufferImpl, WebGLBuffer),
+      WebGLTexture: implementation(WebGLTextureImpl, WebGLTexture),
+      WebGLShader: implementation(WebGLShaderImpl, WebGLShader),
+      WebGLProgram: implementation(WebGLProgramImpl, WebGLProgram),
+      WebGLUniformLocation: implementation(
+        WebGLUniformLocationImpl, WebGLUniformLocation),
+      WebGLActiveInfo: implementation(WebGLActiveInfoImpl, WebGLActiveInfo),
+      WebGLShaderPrecisionFormat: implementation(
+        WebGLShaderPrecisionFormatImpl, WebGLShaderPrecisionFormat),
+      WebGLFramebuffer: implementation(WebGLFramebufferImpl, WebGLFramebuffer),
+      WebGLRenderbuffer: implementation(
+        WebGLRenderbufferImpl, WebGLRenderbuffer),
+    };
+  /* A member replaces webgl-interfaces.js's forwarding one, or fills an
+     empty slot; one a page defined itself stays, and so does every member
+     of a prototype the page froze (the forwarding ones then serve). The
+     forwarding members reach this module's through the table. The
+     context's internal members go where it alone reaches them: onto the
+     interface prototype when they can, else onto a prototype between it
+     and the contexts. */
+  {
+    const source = WebGLRenderingContextImpl.prototype,
+      target = WebGLRenderingContext.prototype,
+      keys = ownKeys(source),
+      methods = { __proto__: null },
+      internals = { __proto__: target };
+    let between = false;
+    for (let at = 0; at < keys.length; at++) {
+      const key = keys[at];
+      if (key === "constructor") continue;
+      const descriptor = getOwnPropertyDescriptor(source, key),
+        stub = stubs[key];
+      if (stub !== undefined)
+        methods[key] = descriptor.get === undefined
+          ? descriptor.value : descriptor.get;
+      const held = getOwnPropertyDescriptor(target, key);
+      let placed = false;
+      if (held === undefined
+          || (stub !== undefined
+              && (held.value === stub || held.get === stub))) {
+        try {
+          defineProperty(target, key, descriptor);
+          placed = true;
+        } catch {
+          /* Frozen by the page, or the page's own non-configurable
+             member. */
+        }
+      }
+      if (!placed && stub === undefined) {
+        defineProperty(internals, key, descriptor);
+        between = true;
+      }
+    }
+    publish("__tilefinchWebGLMethods", freeze(methods));
+    if (between) {
+      const Context = function () {};
+      Context.prototype = internals;
+      make.WebGLRenderingContext =
+        implementation(WebGLRenderingContextImpl, Context);
+    }
+  }
 
   publish("__tilefinchCreateWebGLContext", (canvas, attributes) => {
     let context = contextForCanvas(canvas);
     if (context) return context;
     if (activeContexts().length >= MAX_CONTEXTS) return null;
     if (!boundedDrawingSize(canvas.width, canvas.height)) return null;
-    context = new WebGLRenderingContext(canvas, attributes || {});
+    context = make.WebGLRenderingContext(canvas, attributes || {});
     contexts.set(canvas,
       typeof WeakRef === "function" ? new WeakRef(context) : context);
     liveContexts.push(typeof WeakRef === "function" ? new WeakRef(context) : context);
@@ -6544,10 +6538,13 @@
       pixels: new Uint8ClampedArray(snapshot.pixels), originClean: true,
       surfaceUnavailable: false } : null;
   });
-  Object.assign(globalThis, { WebGLRenderingContext, WebGLBuffer, WebGLTexture,
-    WebGLShader, WebGLProgram, WebGLUniformLocation, WebGLActiveInfo,
-    WebGLShaderPrecisionFormat, WebGLFramebuffer, WebGLRenderbuffer,
-    WebGLVertexArrayOES });
+  try {
+    defineProperty(globalThis, "WebGLVertexArrayOES", { __proto__: null,
+      configurable: true, enumerable: true, writable: true,
+      value: WebGLVertexArrayOES });
+  } catch {
+    /* A page's own non-configurable global of that name stays. */
+  }
   defineProperty(globalThis, "__tilefinchWebGLDiagnostics",
     { __proto__: null, value: diagnostics, configurable: false, enumerable: false });
 })();

@@ -199,12 +199,12 @@ int main(void)
     CHECK(TILEFINCH_UI_LANGUAGE_PORTUGUESE == 11);
     CHECK(TILEFINCH_UI_LANGUAGE_BENGALI == 12 && TILEFINCH_UI_LANGUAGE_ASSAMESE == 13);
     /* Hebrew comes last, so saved settings keep their numbers. It joined
-       in v18, which every language now reads. */
+       in immutable v18; every language now reads v19. */
     CHECK(TILEFINCH_UI_LANGUAGE_HEBREW == 14);
     CHECK(!strcmp(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_HEBREW)->code, "he"));
     CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_HEBREW)->glyphs
         == BROWSER_GLYPH_LANGUAGE_HEBREW);
-    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_HEBREW)->version == 18);
+    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_HEBREW)->version == 19);
     CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_HEBREW)->minimum_glyph_sequence == 1);
     /* Direction is a property of the language: Arabic and Hebrew read
        right to left, every other language (and an unknown one) does not. */
@@ -220,8 +220,8 @@ int main(void)
     CHECK(!strcmp(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_PORTUGUESE)->code, "pt"));
     CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_PORTUGUESE)->glyphs
         == BROWSER_GLYPH_LANGUAGE_EMBEDDED);
-    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_PORTUGUESE)->version == 18);
-    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_SPANISH)->version == 18);
+    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_PORTUGUESE)->version == 19);
+    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_SPANISH)->version == 19);
     char url[256];
     CHECK(!tilefinch_ui_language_url(0, url, sizeof(url)));
     CHECK(!tilefinch_ui_language_url(1, url, 4));
@@ -229,7 +229,7 @@ int main(void)
     /* The configured models repository (the default here), not a copy. */
     CHECK(tilefinch_ui_language_url(TILEFINCH_UI_LANGUAGE_SPANISH, url, sizeof(url))
           && !strcmp(url, "https://raw.githubusercontent.com/stjanovitz/"
-                          "tilefinch-models/main/translations/ui/v18/es.tful"));
+                          "tilefinch-models/main/translations/ui/v19/es.tful"));
     size_t length = 0;
     for (unsigned language = 1; language < TILEFINCH_UI_LANGUAGE_COUNT; language++) {
         const TilefinchUiLanguageSpec *spec = tilefinch_ui_language_spec(language);
@@ -280,7 +280,7 @@ int main(void)
             CHECK(!strcmp(tilefinch_ui_translation_text(t, "Subtitles"), "Legendas"));
         }
         if (language == TILEFINCH_UI_LANGUAGE_BENGALI || language == TILEFINCH_UI_LANGUAGE_ASSAMESE) {
-            CHECK(tilefinch_ui_language_spec(language)->version == 18);
+            CHECK(tilefinch_ui_language_spec(language)->version == 19);
             CHECK(!strcmp(tilefinch_ui_translation_text(t, "Bengali"), "বাংলা"));
             CHECK(!strcmp(tilefinch_ui_translation_text(t, "Assamese"), "অসমীয়া"));
         }

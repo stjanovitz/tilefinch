@@ -1465,12 +1465,15 @@ enum {
     BROWSER_YOUTUBE_LOGIN_FAILED = 4u,
     BROWSER_YOUTUBE_LOGIN_RECOVERING = 8u,
     BROWSER_YOUTUBE_LOGIN_STARTED = 16u,
-    BROWSER_YOUTUBE_LOGIN_REJECTED = 32u
+    BROWSER_YOUTUBE_LOGIN_REJECTED = 32u,
+    BROWSER_YOUTUBE_LOGIN_REFUSED = 64u
 };
 /* Native receipt after personalized API authentication, not DOM markers.
    SIGNED_OUT also reports the provider rejecting the jar's account outside a
    sign-in attempt, with REJECTED: either way a saved login for it must go,
-   and REJECTED says the user did not ask for it. */
+   and REJECTED says the user did not ask for it. REFUSED reports Google's
+   sign-in rejection page committing (site_identity_accounts_refusal): Google
+   will not sign this browser in, so the frontend says so once per landing. */
 unsigned browser_engine_take_youtube_login_events(BrowserEngine *engine);
 bool browser_engine_youtube_login_verified(const BrowserEngine *);
 /* Native consent binding only. Never export or log this opaque identity. */

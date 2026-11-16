@@ -2826,48 +2826,69 @@ static int test_google_accounts_identity(void)
               youtube, youtube, "https://accounts.google.com/_/bscframe",
               TILEFINCH_DESTINATION_FRAME) == NULL);
 
-    /* The refusal classifier: stable signals only. */
-    CHECK(!site_identity_accounts_refusal(accounts, NULL, accounts, 200)
-          && site_identity_accounts_refusal(accounts, NULL, accounts, 429)
-          && site_identity_accounts_refusal(youtube, NULL, accounts, 429)
-          && !site_identity_accounts_refusal(accounts, NULL, set_sid, 429)
-          && !site_identity_accounts_refusal(youtube, NULL, youtube, 429)
-          && site_identity_accounts_refusal(accounts, NULL, sorry, 200)
+    /* The refusal classifier: stable signals only, by where the response
+       landed. Only the rejection page carries a reason number. */
+    unsigned reason = 99u;
+    CHECK(site_identity_accounts_request(accounts, NULL)
+          && !site_identity_accounts_request(youtube, accounts)
+          && site_identity_accounts_request(sorry, accounts)
+          && !site_identity_accounts_request(sorry, youtube)
+          && !site_identity_accounts_request(
+                 "https://www.google.com/search?q=a", accounts));
+    CHECK(site_identity_accounts_refusal(true, accounts, 200, &reason)
+              == SITE_IDENTITY_ACCOUNTS_ACCEPTED && reason == 0u
+          && site_identity_accounts_refusal(true, accounts, 429, NULL)
+              == SITE_IDENTITY_ACCOUNTS_RATE_LIMITED
+          && site_identity_accounts_refusal(false, accounts, 429, NULL)
+              == SITE_IDENTITY_ACCOUNTS_RATE_LIMITED
+          && site_identity_accounts_refusal(true, set_sid, 429, NULL)
+              == SITE_IDENTITY_ACCOUNTS_ACCEPTED
+          && site_identity_accounts_refusal(false, youtube, 429, NULL)
+              == SITE_IDENTITY_ACCOUNTS_ACCEPTED
+          && site_identity_accounts_refusal(true, sorry, 200, &reason)
+              == SITE_IDENTITY_ACCOUNTS_INTERSTITIAL && reason == 0u
+          && site_identity_accounts_refusal(false, sorry, 200, NULL)
+              == SITE_IDENTITY_ACCOUNTS_ACCEPTED
           && site_identity_accounts_refusal(
-                 accounts, NULL,
-                 "https://accounts.google.com/v3/signin/rejected?rrk=1", 200)
+                 false, "https://accounts.google.com/sorry/index", 200, NULL)
+              == SITE_IDENTITY_ACCOUNTS_INTERSTITIAL
           && site_identity_accounts_refusal(
-                 accounts, NULL,
-                 "https://accounts.google.com/signin/rejected", 200)
-          && !site_identity_accounts_refusal(
-                 accounts, NULL,
-                 "https://accounts.google.com/v3/signin/challenge/pwd", 200)
-          && site_identity_accounts_refusal(sorry, accounts, sorry, 200)
-          && !site_identity_accounts_refusal(sorry, youtube, sorry, 200)
-          && !site_identity_accounts_refusal(
-                 "https://www.google.com/search?q=a", accounts, sorry, 200));
+                 true, "https://accounts.google.com/v3/signin/challenge/pwd",
+                 200, NULL) == SITE_IDENTITY_ACCOUNTS_ACCEPTED);
+    CHECK(site_identity_accounts_refusal(
+              true, "https://accounts.google.com/v3/signin/rejected"
+                    "?continue=https://www.youtube.com/&idnf=a@b.test"
+                    "&rhlk=le&rrk=46&service=youtube", 200, &reason)
+              == SITE_IDENTITY_ACCOUNTS_REJECTED && reason == 46u
+          && site_identity_accounts_refusal(
+                 false, "https://accounts.google.com/signin/rejected", 200,
+                 &reason) == SITE_IDENTITY_ACCOUNTS_REJECTED && reason == 0u
+          && site_identity_accounts_refusal(
+                 true, "https://accounts.google.com/v3/signin/rejected"
+                       "?xrrk=7&rrk=12345", 200, &reason)
+              == SITE_IDENTITY_ACCOUNTS_REJECTED && reason == 0u
+          && site_identity_accounts_refusal(
+                 true, "https://accounts.google.com/v3/signin/rejected"
+                       "?rrk=4a", 200, &reason)
+              == SITE_IDENTITY_ACCOUNTS_REJECTED && reason == 0u
+          && site_identity_accounts_refusal(
+                 true, "https://accounts.google.com/v3/signin/rejected"
+                       "?rrk=9999#rrk=1", 200, &reason)
+              == SITE_IDENTITY_ACCOUNTS_REJECTED && reason == 9999u);
 
-    /* A refusal returns accounts.google.com to the shipping identity for the
-       session, keeps one fallback, never a refusal page, and is not
-       classified again. Search's opt-in is untouched. */
-    site_identity_accounts_refused(
-        "https://accounts.google.com/v3/signin/rejected?rrk=1", accounts);
+    /* A refusal never changes the identity: accounts.google.com keeps the
+       honest one, and nothing is queued to load again. */
     char fallback[256];
-    CHECK(site_identity_user_agent_override(accounts) == NULL
-          && !site_identity_accounts_refusal(accounts, NULL, accounts, 429)
-          && site_identity_take_google_fallback(fallback, sizeof(fallback))
-          && strcmp(fallback, accounts) == 0
+    CHECK(google_identity_same(site_identity_user_agent_override(accounts),
+                               google_ua)
           && !site_identity_take_google_fallback(fallback, sizeof(fallback))
           && !site_identity_take_google_refusal_note()
           && !site_identity_google_opted_in());
     site_identity_google_opt_in();
     CHECK(google_identity_same(site_identity_user_agent_override(
               "https://www.google.com/search?q=PSP"), google_ua)
-          && site_identity_user_agent_override(accounts) == NULL);
-    site_identity_reset();
-    site_identity_accounts_refused(NULL, youtube);
-    CHECK(!site_identity_take_google_fallback(fallback, sizeof(fallback))
-          && site_identity_user_agent_override(accounts) == NULL);
+          && google_identity_same(
+                 site_identity_user_agent_override(accounts), google_ua));
     site_identity_reset();
 
     /* Through the engine, with every redirect hop on the replay lane as the
@@ -2888,6 +2909,12 @@ static int test_google_accounts_identity(void)
         "https://accounts.google.com/v3/signin/identifier?flowName=Limited";
     static const char sorried[] =
         "https://accounts.google.com/v3/signin/identifier?flowName=Sorry";
+    static const char identifier_post[] =
+        "https://accounts.google.com/v3/signin/identifier?flowName=Post";
+    static const char rejected[] =
+        "https://accounts.google.com/v3/signin/rejected"
+        "?continue=https://www.youtube.com/&idnf=someone@example.test"
+        "&rhlk=le&rrk=46&service=youtube";
     const GoogleIdentityRecord records[] = {
         {.url = "https://redirect.test/signin", .effective_url = accounts,
          .status = 200, .content_type = "text/html", .body = accounts_page},
@@ -2911,6 +2938,14 @@ static int test_google_accounts_identity(void)
         {.url = sorried, .effective_url = sorry, .status = 200,
          .content_type = "text/html", .body = refusal_page},
         {.url = sorry, .status = 200, .content_type = "text/html",
+         .body = refusal_page},
+        {.url = identifier_post, .method = "POST",
+         .effective_url = rejected, .status = 200,
+         .content_type = "text/html", .body = refusal_page},
+        {.url = identifier_post, .method = "POST",
+         .effective_url = rejected, .status = 200,
+         .content_type = "text/html", .body = refusal_page},
+        {.url = rejected, .status = 200, .content_type = "text/html",
          .body = refusal_page}
     };
     size_t record_count = sizeof(records) / sizeof(records[0]);
@@ -3010,61 +3045,130 @@ static int test_google_accounts_identity(void)
           && accounts_identity_realm(navigation->page.runtime, shipping_ua,
                                      result));
 
-    /* HTTP 429: reloaded once with the shipping identity. The reload's own
-       429 commits; nothing is retried again. */
+    /* HTTP 429 commits as Google sent it, asked for once with the honest
+       identity, which accounts.google.com keeps. It is counted, with no
+       notice: Google's page says what to do. */
+    char report[2304];
+    browser_engine_set_youtube_signin_diagnostics(engine, true);
+    (void) browser_engine_take_youtube_login_events(engine);
     accounts_identity_clear_requests();
     CHECK(browser_engine_begin_navigation_url(engine, limited, 1u * MIB,
                                               1000, true));
     BrowserNavigationJobStatus status = google_identity_pump(engine);
     unsigned limited_count = accounts_identity_requests(limited, agents);
-    if (status != BROWSER_NAVIGATION_JOB_SUCCEEDED || limited_count != 2u)
+    if (status != BROWSER_NAVIGATION_JOB_SUCCEEDED || limited_count != 1u)
         fprintf(stderr, "accounts 429 status=%d requests=%u error=%s\n",
                 (int) status, limited_count,
                 browser_engine_last_error(engine));
-    CHECK(status == BROWSER_NAVIGATION_JOB_SUCCEEDED && limited_count == 2u
+    CHECK(status == BROWSER_NAVIGATION_JOB_SUCCEEDED && limited_count == 1u
           && google_identity_same(agents[0], google_ua)
-          && google_identity_same(agents[1], shipping_ua)
           && strcmp(navigation->page.document_url, limited) == 0
           && strcmp(navigation->page.document.title, "Refused") == 0
-          && site_identity_user_agent_override(accounts) == NULL
-          && !site_identity_google_opted_in());
-    CHECK(browser_engine_begin_navigation_url(engine, accounts, 1u * MIB,
-                                              1000, true)
-          && google_identity_pump(engine) == BROWSER_NAVIGATION_JOB_SUCCEEDED
-          && google_identity_same(google_identity_replayed_user_agent(
-                 accounts), shipping_ua)
-          && accounts_identity_realm(navigation->page.runtime, shipping_ua,
-                                     result));
+          && google_identity_same(
+                 site_identity_user_agent_override(accounts), google_ua)
+          && browser_engine_take_youtube_login_events(engine) == 0u
+          && browser_engine_youtube_signin_report(engine, report,
+                                                  sizeof(report))
+          && strstr(report, "diagnostics v4\n") != NULL
+          && strstr(report, "\naccounts-refusals=1 refusal-class=3 "
+                            "refusal-reason=0\n") != NULL);
 
-    /* A redirect to /sorry/: the same, once. */
-    site_identity_reset();
+    /* A redirect to /sorry/: the same. */
     accounts_identity_clear_requests();
     CHECK(browser_engine_begin_navigation_url(engine, sorried, 1u * MIB,
                                               1000, true));
     status = google_identity_pump(engine);
     unsigned sorried_count = accounts_identity_requests(sorried, agents);
-    if (status != BROWSER_NAVIGATION_JOB_SUCCEEDED || sorried_count != 2u)
+    if (status != BROWSER_NAVIGATION_JOB_SUCCEEDED || sorried_count != 1u)
         fprintf(stderr, "accounts sorry status=%d requests=%u error=%s\n",
                 (int) status, sorried_count,
                 browser_engine_last_error(engine));
-    CHECK(status == BROWSER_NAVIGATION_JOB_SUCCEEDED && sorried_count == 2u
+    CHECK(status == BROWSER_NAVIGATION_JOB_SUCCEEDED && sorried_count == 1u
           && google_identity_same(agents[0], google_ua)
-          && google_identity_same(agents[1], shipping_ua)
-          && accounts_identity_requests(sorry, agents) == 2u
-          && google_identity_same(agents[0], shipping_ua)
-          && google_identity_same(agents[1], shipping_ua)
+          && accounts_identity_requests(sorry, agents) == 1u
           && strcmp(navigation->page.document_url, sorry) == 0
-          && site_identity_user_agent_override(accounts) == NULL);
+          && browser_engine_take_youtube_login_events(engine) == 0u
+          && browser_engine_youtube_signin_report(engine, report,
+                                                  sizeof(report))
+          && strstr(report, "\naccounts-refusals=2 refusal-class=2 "
+                            "refusal-reason=0\n") != NULL);
 
-    /* The synchronous load path falls back the same way, once. */
-    site_identity_reset();
-    accounts_identity_clear_requests();
-    CHECK(browser_engine_load_url_with_limits(engine, limited, 1u * MIB,
+    /* Google's sign-in rejection after the identifier form is posted: the
+       form goes once, Google's page commits, the engine raises the refusal
+       notice, and the report carries the class and Google's reason number
+       but nothing else from the address. Nothing is loaded again. */
+    CHECK(browser_engine_begin_navigation_url(engine, accounts, 1u * MIB,
                                               1000, true)
-          && accounts_identity_requests(limited, agents) == 2u
+          && google_identity_pump(engine) == BROWSER_NAVIGATION_JOB_SUCCEEDED);
+    (void) browser_engine_take_youtube_login_events(engine);
+    accounts_identity_clear_requests();
+    ControllerAction submit = {0};
+    submit.type = CONTROLLER_ACTION_FORM_SUBMIT;
+    snprintf(submit.url, sizeof(submit.url), "%s", identifier_post);
+    snprintf(submit.method, sizeof(submit.method), "POST");
+    snprintf(submit.content_type, sizeof(submit.content_type),
+             "application/x-www-form-urlencoded");
+    static const char submit_body[] =
+        "identifier=someone%40example.test&bgresponse=!synthetic&at=1";
+    submit.body_length = sizeof(submit_body) - 1u;
+    memcpy(submit.body, submit_body, submit.body_length);
+    CHECK(browser_engine_begin_navigation_action(engine, &submit, 1u * MIB,
+                                                 1000));
+    status = google_identity_pump(engine);
+    unsigned post_count = accounts_identity_requests(identifier_post, agents);
+    if (status != BROWSER_NAVIGATION_JOB_SUCCEEDED || post_count != 1u)
+        fprintf(stderr, "accounts rejected status=%d requests=%u error=%s\n",
+                (int) status, post_count, browser_engine_last_error(engine));
+    CHECK(status == BROWSER_NAVIGATION_JOB_SUCCEEDED && post_count == 1u
           && google_identity_same(agents[0], google_ua)
-          && google_identity_same(agents[1], shipping_ua)
-          && strcmp(navigation->page.document_url, limited) == 0);
+          && accounts_identity_requests(accounts, agents) == 0u
+          && strcmp(navigation->page.document_url, rejected) == 0
+          && strcmp(navigation->page.document.title, "Refused") == 0
+          && google_identity_same(
+                 site_identity_user_agent_override(accounts), google_ua)
+          && browser_engine_take_youtube_login_events(engine)
+                 == BROWSER_YOUTUBE_LOGIN_REFUSED
+          && browser_engine_take_youtube_login_events(engine) == 0u
+          && browser_engine_youtube_signin_report(engine, report,
+                                                  sizeof(report))
+          && strstr(report, "form-posts=1 token-kind=4 token-length=10 "
+                            "post-target=3 ") != NULL
+          && strstr(report, " post-landing=1\n") != NULL
+          && strstr(report, "\naccounts-refusals=3 refusal-class=1 "
+                            "refusal-reason=46\n") != NULL
+          && strstr(report, "example.test") == NULL
+          && strstr(report, "rhlk") == NULL
+          && strstr(report, "youtube.com") == NULL);
+
+    /* The lab's synchronous submission feeds the same counters and raises
+       the same notice. */
+    CHECK(browser_engine_load_url_with_limits(engine, accounts, 1u * MIB,
+                                              1000, true));
+    accounts_identity_clear_requests();
+    CHECK(browser_engine_execute_action(engine, &submit, 1u * MIB, 1000)
+          && accounts_identity_requests(identifier_post, agents) == 1u
+          && google_identity_same(agents[0], google_ua)
+          && strcmp(navigation->page.document_url, rejected) == 0
+          && browser_engine_take_youtube_login_events(engine)
+                 == BROWSER_YOUTUBE_LOGIN_REFUSED
+          && browser_engine_youtube_signin_report(engine, report,
+                                                  sizeof(report))
+          && strstr(report, "form-posts=2 token-kind=4 token-length=10 "
+                            "post-target=3 post-outcome=2 ") != NULL
+          && strstr(report, " post-landing=1\n") != NULL
+          && strstr(report, "\naccounts-refusals=4 refusal-class=1 "
+                            "refusal-reason=46\n") != NULL);
+
+    /* With the diagnostics off the notice is still raised, and there is no
+       report to read. */
+    browser_engine_set_youtube_signin_diagnostics(engine, false);
+    CHECK(browser_engine_begin_navigation_url(engine, rejected, 1u * MIB,
+                                              1000, true)
+          && google_identity_pump(engine) == BROWSER_NAVIGATION_JOB_SUCCEEDED
+          && browser_engine_take_youtube_login_events(engine)
+                 == BROWSER_YOUTUBE_LOGIN_REFUSED
+          && !browser_engine_youtube_signin_report(engine, report,
+                                                   sizeof(report)));
 
     fetch_trace_end();
     faults->replay_lane_runs_page_hops = false;

@@ -791,15 +791,13 @@ static const char element_members_probe[] =
     "e.setAttribute('dir','sideways');const c=e.dir==='';e.dir='Auto';"
     "return a&&b&&c&&e.getAttribute('dir')==='Auto'&&e.dir==='auto'"
     "&&'dir' in HTMLElement.prototype;});"
-    /* Not reflected: it is the drag-and-drop feature test, and Tilefinch
-       has no drag and drop. */
-    "t('no draggable',()=>!('draggable' in document.createElement('img')));"
     "t('loading',()=>{const r=[];for(const tag of ['img','iframe']){"
     "const e=document.createElement(tag);r.push(e.loading);"
     "e.setAttribute('loading','LAZY');r.push(e.loading);"
     "e.setAttribute('loading','soon');r.push(e.loading);"
-    "e.loading='lazy';r.push(e.getAttribute('loading'));}"
-    "return r.join()==='eager,lazy,eager,lazy,eager,lazy,eager,lazy'"
+    "e.loading='lazy';r.push(e.getAttribute('loading'));"
+    "e.setAttribute('loading','Auto');r.push(e.loading);}"
+    "return r.join()==='auto,lazy,auto,lazy,auto,auto,lazy,auto,lazy,auto'"
     "&&!('loading' in document.createElement('div'));});"
     "t('inputMode',()=>{const e=document.createElement('input');"
     "const a=e.inputMode==='';e.setAttribute('inputmode','NUMERIC');"
@@ -1595,6 +1593,28 @@ static const char init_event_probe[] =
     "pts','allow-forms');frame.sandbox.toggle('allow-forms');"
     "expect('sandbox list',frame.getAttribute('sandbox')==='allow-scripts'&&fra"
     "me.sandbox instanceof DOMTokenList&&frame.sandbox.length===1);"
+    /* supports(): sandbox and rel define supported tokens (ASCII
+       case-insensitive); every other list throws a TypeError. */
+    "expect('sandbox supports',frame.sandbox.supports('allow-scripts')&&frame"
+    ".sandbox.supports('ALLOW-SAME-ORIGIN')&&frame.sandbox.supports('allow-po"
+    "pups-to-escape-sandbox')&&!frame.sandbox.supports('allow-everything')&&!"
+    "frame.sandbox.supports('')&&!frame.sandbox.supports('allow-forms allow-m"
+    "odals'));"
+    "const link=document.createElement('link');link.rel='Stylesheet';"
+    "expect('link relList',link.relList instanceof DOMTokenList&&link.relList"
+    ".contains('Stylesheet')&&link.relList.supports('preload')&&link.relList."
+    "supports('STYLESHEET')&&!link.relList.supports('noopener')&&!link.relLis"
+    "t.supports('bogus'));"
+    "link.relList.add('preload');link.relList='icon';"
+    "expect('relList ops',link.rel==='icon'&&link.getAttribute('rel')==='icon"
+    "'&&link.relList.length===1);"
+    "expect('anchor relList',['a','area','form'].every((tag)=>{const e=docume"
+    "nt.createElement(tag);return e.relList instanceof DOMTokenList&&e.relLis"
+    "t.supports('noopener')&&e.relList.supports('noreferrer')&&e.relList.supp"
+    "orts('opener')&&!e.relList.supports('stylesheet')}));"
+    "expect('no supported tokens',throwsType(()=>list.supports('a'))&&throwsT"
+    "ype(()=>document.createElement('div').sandbox.supports('allow-scripts'))"
+    "&&!('relList' in document.createElement('div')));"
     "globalThis.pocSummary=failures.length?failures.length+' FAIL '+failures.jo"
     "in(' | '):'INIT-EVENTS-OK';";
 
@@ -1738,6 +1758,872 @@ static int test_writable_terminal_handoffs(void)
     return 0;
 }
 
+/* ---- Window and document members pages read as constants ---- */
+
+#define COMPAT_PRELUDE                                                       \
+    "const failures=[],t=(name,f)=>{try{if(!f())failures.push(name)}"        \
+    "catch(e){failures.push(name+':'+e)}};"
+#define COMPAT_SUMMARY(ok)                                                   \
+    "globalThis.pocSummary=failures.length?'FAIL '+failures.join(' | ')"     \
+    ":'" ok "';"
+
+/* The PSP window fills its screen at the origin; its browsing context is
+   open; window.name and status are settable strings; the move, resize,
+   focus and capture operations exist and do nothing. */
+static const char window_members_probe[] =
+    COMPAT_PRELUDE
+    "t('screen position',()=>screenX===0&&screenY===0&&screenLeft===0"
+    "&&screenTop===0);"
+    "t('outer size',()=>outerWidth===screen.width&&outerHeight===screen.height);"
+    "t('closed',()=>window.closed===false&&self.closed===false"
+    "&&typeof Object.getOwnPropertyDescriptor(window,'closed').get==='function');"
+    "t('name default',()=>name===''&&window.name==='');"
+    "name=42;t('name set',()=>name==='42'&&typeof name==='string');"
+    "name={toString(){return 'obj'}};t('name string',()=>window.name==='obj');"
+    "const d=Object.getOwnPropertyDescriptor(window,'name');"
+    "t('name accessor',()=>typeof d.get==='function'&&typeof d.set==='function'"
+    "&&d.enumerable&&d.configurable);"
+    "t('status',()=>status===''&&(status='busy',status==='busy'));"
+    "t('operations',()=>['stop','focus','blur','moveTo','moveBy','resizeTo',"
+    "'resizeBy','captureEvents','releaseEvents'].every(n=>"
+    "typeof window[n]==='function'&&window[n]()===undefined));"
+    "t('lengths',()=>moveTo.length===2&&resizeBy.length===2&&stop.length===0);"
+    "const f=document.createElement('iframe');f.name='child';"
+    "document.body.appendChild(f);const w=f.contentWindow;"
+    "t('frame members',()=>w.eval('[screenX,closed,typeof moveTo].join()')"
+    "==='0,false,function'&&w.name==='child'&&w.eval('name')==='child');"
+    "t('replaceable',()=>(window.screenX=5,screenX===5));"
+    COMPAT_SUMMARY("WINDOW-MEMBERS-OK");
+
+/* document.characterSet reports the encoding the parser chose (here from
+   the <meta> prescan), with charset and inputEncoding as aliases; documents
+   built from strings are UTF-8. */
+static const char character_set_probe[] =
+    COMPAT_PRELUDE
+    "t('main',()=>document.characterSet==='windows-1251'"
+    "&&document.charset==='windows-1251'"
+    "&&document.inputEncoding==='windows-1251');"
+    "t('on prototype',()=>!Object.hasOwn(document,'characterSet')"
+    "&&Object.getOwnPropertyDescriptor(Document.prototype,'characterSet')"
+    ".get.name==='get characterSet');"
+    "t('created',()=>document.implementation.createHTMLDocument('x')"
+    ".characterSet==='UTF-8'&&new DOMParser().parseFromString('<p>',"
+    "'text/html').charset==='UTF-8'&&new Document().inputEncoding==='UTF-8');"
+    "t('brand',()=>{try{Object.getOwnPropertyDescriptor(Document.prototype,"
+    "'characterSet').get.call({});return false}catch(e){"
+    "return e instanceof TypeError}});"
+    "const f=document.createElement('iframe');document.body.appendChild(f);"
+    "t('frame',()=>f.contentDocument.characterSet==='UTF-8');"
+    COMPAT_SUMMARY("CHARACTER-SET-OK");
+
+/* A frame window owns the names a top-level window does: Google's sign-in
+   check samples Object.getOwnPropertyNames(frame) and reads each name's
+   .prototype. The interface objects are the page's (shared, not copied);
+   the page's indexed child windows are its own, not the frame's;
+   the frame's own operations carry their WebIDL names. */
+static const char frame_global_names_probe[] =
+    COMPAT_PRELUDE
+    "const f=document.createElement('iframe');document.body.appendChild(f);"
+    "const w=f.contentWindow,names=Object.getOwnPropertyNames(w),"
+    "own=new Set(names);"
+    "t('superset',()=>Object.getOwnPropertyNames(window).every(n=>"
+    "own.has(n)||String(n>>>0)===n));"
+    "t('unique',()=>own.size===names.length);"
+    "t('no bridges',()=>!names.some(n=>n.startsWith('__tilefinch')));"
+    "t('inside',()=>w.eval('Object.getOwnPropertyNames(window).length')"
+    "===names.length&&w.eval('Object.hasOwn(window,\"HTMLElement\")'));"
+    "t('descriptors',()=>names.every(n=>!!Object.getOwnPropertyDescriptor(w,n)));"
+    "t('interfaces',()=>['HTMLElement','Event','Node','MutationObserver',"
+    "'CustomElementRegistry','Document'].every(n=>own.has(n)"
+    "&&typeof w[n].prototype==='object'&&w[n]===window[n]));"
+    "t('realm intrinsics',()=>w.Object!==Object&&w.Array.isArray(w.eval('[]')));"
+    "t('page globals stay',()=>(window.pageOnly=1,!Object.hasOwn(w,'pageOnly')));"
+    "t('operation names',()=>w.postMessage.name==='postMessage'"
+    "&&w.postMessage.length===1&&w.getComputedStyle.name==='getComputedStyle'"
+    "&&!('prototype' in w.postMessage));"
+    "t('focus close',()=>['close','focus','blur'].every(n=>"
+    "typeof w[n]==='function'&&w[n]!==window[n]&&w[n].name===n"
+    "&&w[n]()===undefined)&&w.closed===false&&typeof window.close==='function');"
+    COMPAT_SUMMARY("FRAME-GLOBAL-NAMES-OK");
+
+/* HTML's reflected attributes: strings, booleans, nullable and plain
+   enumerated keywords, (clamped, positive) integers and URLs resolved
+   against the document, through getAttribute/setAttribute. */
+static const char reflected_attributes_probe[] =
+    COMPAT_PRELUDE
+    "const img=document.createElement('img');"
+    "t('alt',()=>img.alt===''&&(img.alt='x',img.getAttribute('alt')==='x'&&img.alt==='x'));"
+    "t('co null',()=>img.crossOrigin===null);"
+    "t('co empty',()=>(img.setAttribute('crossorigin',''),img.crossOrigin==='anonymous'));"
+    "t('co uc',()=>(img.setAttribute('crossorigin','USE-credentials'),img.crossOrigin==='use-credentials'));"
+    "t('co bad',()=>(img.setAttribute('crossorigin','zz'),img.crossOrigin==='anonymous'));"
+    "t('co rm',()=>(img.crossOrigin=null,!img.hasAttribute('crossorigin')));"
+    /* crossOrigin on every element with a CORS settings attribute; the
+       parser keeps a bare attribute without a value. */
+    "for(const tag of['img','script','link','audio','video']){"
+    "const h=document.createElement('div');"
+    "h.innerHTML='<'+tag+' crossorigin>'+(tag==='img'||tag==='link'?'':'</'+tag+'>');"
+    "const e=h.firstChild;"
+    "t(tag+' co bare',()=>e.getAttribute('crossorigin')===''&&e.crossOrigin==='anonymous');"
+    "t(tag+' co values',()=>[['','anonymous'],['anonymous','anonymous'],"
+    "['use-credentials','use-credentials'],['USE-CREDENTIALS','use-credentials'],"
+    "['zz','anonymous']].every(([v,w])=>(e.setAttribute('crossorigin',v),e.crossOrigin===w)));"
+    "t(tag+' co set',()=>(e.crossOrigin='Use-Credentials',"
+    "e.getAttribute('crossorigin')==='Use-Credentials'&&e.crossOrigin==='use-credentials'));"
+    "t(tag+' co null',()=>(e.crossOrigin=null,!e.hasAttribute('crossorigin')&&e.crossOrigin===null));}"
+    "t('ismap',()=>!img.isMap&&(img.isMap=1,img.getAttribute('ismap')==='')&&(img.isMap=false,!img.hasAttribute('ismap')));"
+    "t('decoding',()=>img.decoding==='auto'&&(img.decoding='SYNC',img.decoding==='sync'));"
+    "t('hspace',()=>img.hspace===0&&(img.setAttribute('hspace',' 12px'),img.hspace===12)&&(img.setAttribute('hspace','-3'),img.hspace===0));"
+    "t('hspace set',()=>(img.hspace=-1,img.getAttribute('hspace')==='0'));"
+    "t('border',()=>(img.border=null,img.getAttribute('border')===''));"
+    "t('longDesc',()=>(img.setAttribute('longdesc','d.html'),img.longDesc==='https://conformance.test/d.html')&&(img.removeAttribute('longdesc'),img.longDesc===''));"
+    "t('names',()=>Object.getOwnPropertyDescriptor(HTMLImageElement.prototype,'alt').get.name==='get alt'&&Object.getOwnPropertyDescriptor(HTMLImageElement.prototype,'alt').enumerable);"
+    "const td=document.createElement('td');"
+    "t('colspan',()=>td.colSpan===1&&(td.setAttribute('colspan','5000'),td.colSpan===1000)&&(td.setAttribute('colspan','0'),td.colSpan===1));"
+    "t('rowspan',()=>td.rowSpan===1&&(td.setAttribute('rowspan','0'),td.rowSpan===0));"
+    "const ta=document.createElement('textarea');"
+    "t('cols',()=>ta.cols===20&&ta.rows===2);"
+    "t('cols0',()=>{try{ta.cols=0;return false}catch(e){return e.name==='IndexSizeError'}});"
+    "const b=document.createElement('button');"
+    "t('formAction',()=>b.formAction===location.href&&(b.formAction='/go',b.formAction==='https://conformance.test/go'));"
+    "t('formMethod',()=>b.formMethod===''&&(b.formMethod='POST',b.formMethod==='post')&&(b.formMethod='x',b.formMethod==='get'));"
+    "const a=document.createElement('a');a.textContent='hi';"
+    "t('a.text',()=>a.text==='hi'&&(a.text='yo',a.textContent==='yo'));"
+    "const ol=document.createElement('ol');"
+    "t('start',()=>ol.start===1&&(ol.start=-4,ol.getAttribute('start')==='-4'&&ol.start===-4));"
+    "t('form.autocomplete',()=>document.createElement('form').autocomplete==='on');"
+    "t('enterKeyHint',()=>document.createElement('div').enterKeyHint==='');"
+    "t('track',()=>document.createElement('track').kind==='subtitles');"
+    "t('frame img',()=>{const f=document.createElement('iframe');document.body.appendChild(f);return f.contentWindow.eval(\"const d=new DOMParser().parseFromString('<img alt=q>','text/html');d.querySelector('img').alt==='q'&&document.createElement('img').alt===''&&document!==parent.document\")});"
+    "t('brand',()=>{try{Object.getOwnPropertyDescriptor(HTMLImageElement.prototype,'alt').get.call({});return false}catch(e){return e instanceof TypeError}});"
+    COMPAT_SUMMARY("REFLECTED-ATTRIBUTES-OK");
+
+/* Web IDL constants and the members every node, element or UI event has:
+   Node's type constants on every node, a detached element without an
+   offsetParent, an uninitialised MouseEvent without a view and with which
+   as button + 1, img.loading's "auto" default (Chromium's; HTML's missing
+   and invalid value default is "eager", which Firefox and WebKit report),
+   MouseEvent's fromElement and toElement as Chromium and WebKit answer
+   them, draggable and the drag-and-drop feature tests that read it, and
+   the DOM, HTML, CSSOM View and Pointer Lock members that were missing. */
+static const char element_core_probe[] =
+    COMPAT_PRELUDE
+    "const img=document.createElement('img'),H='http://www.w3.org/1999/xhtml';"
+    "t('node constants',()=>img.ELEMENT_NODE===1&&img.ATTRIBUTE_NODE===2"
+    "&&img.TEXT_NODE===3&&img.CDATA_SECTION_NODE===4"
+    "&&img.ENTITY_REFERENCE_NODE===5&&img.ENTITY_NODE===6"
+    "&&img.PROCESSING_INSTRUCTION_NODE===7&&img.COMMENT_NODE===8"
+    "&&img.DOCUMENT_NODE===9&&img.DOCUMENT_TYPE_NODE===10"
+    "&&img.DOCUMENT_FRAGMENT_NODE===11&&img.NOTATION_NODE===12"
+    "&&Node.NOTATION_NODE===12&&document.COMMENT_NODE===8"
+    "&&document.createTextNode('').ELEMENT_NODE===1"
+    "&&img.DOCUMENT_POSITION_FOLLOWING===4);"
+    "t('constant shape',()=>{const d=Object.getOwnPropertyDescriptor("
+    "Node.prototype,'COMMENT_NODE'),s=Object.getOwnPropertyDescriptor(Node,"
+    "'COMMENT_NODE');return d.enumerable&&!d.writable&&!d.configurable"
+    "&&s.enumerable&&!s.writable&&!s.configurable});"
+    "t('constants enumerate',()=>{const seen=[];for(const k in img)"
+    "if(/_NODE$/.test(k))seen.push(k);return seen.length===12});"
+    "t('offsetParent detached',()=>img.offsetParent===null);"
+    "const shown=document.body.appendChild(document.createElement('p'));"
+    "t('offsetParent',()=>shown.offsetParent===document.body);"
+    "const hidden=document.body.appendChild(document.createElement('p'));"
+    "hidden.style.display='none';"
+    "t('offsetParent no box',()=>hidden.offsetParent===null);"
+    "const mouse=document.createEvent('MouseEvents');"
+    "t('view',()=>mouse.view===null&&new MouseEvent('x').view===null"
+    "&&new UIEvent('x',{view:window}).view===window);"
+    "t('init view',()=>(mouse.initMouseEvent('click',true,true,window,0,0,"
+    "0,0,0,false,false,false,false,1,null),mouse.view===window"
+    "&&mouse.which===2));"
+    "t('which',()=>new MouseEvent('x').which===1"
+    "&&new MouseEvent('x',{button:2}).which===3"
+    "&&new KeyboardEvent('k',{keyCode:65}).which===65"
+    "&&new UIEvent('x').which===0);"
+    "t('trusted view',()=>{let view;shown.addEventListener('click',"
+    "e=>{view=e.view});shown.click();return view===window});"
+    "t('loading',()=>img.loading==='auto'"
+    "&&(img.setAttribute('loading','LAZY'),img.loading==='lazy')"
+    "&&(img.setAttribute('loading','EAGER'),img.loading==='eager')"
+    "&&(img.setAttribute('loading','zz'),img.loading==='auto'));"
+    "t('from/to created',()=>mouse.fromElement===null"
+    "&&mouse.toElement===null"
+    "&&document.createEvent('MouseEvents').toElement===null"
+    "&&new MouseEvent('mouseover',{relatedTarget:shown}).fromElement===shown"
+    "&&new MouseEvent('mouseout',{relatedTarget:shown}).toElement===shown"
+    "&&new MouseEvent('mouseover',{relatedTarget:window}).fromElement"
+    "===null);"
+    "t('from/to fired',()=>{const seen=[],to=hidden;for(const type of"
+    "['mouseover','mouseenter','mouseout','mouseleave','click'])"
+    "{to.addEventListener(type,e=>seen.push(type+':'+(e.fromElement===shown"
+    "?'s':e.fromElement===to?'h':e.fromElement)+'>'+(e.toElement===shown"
+    "?'s':e.toElement===to?'h':e.toElement)),{once:true});"
+    "to.dispatchEvent(new MouseEvent(type,{relatedTarget:type==='click'"
+    "?null:shown}))}return seen.join()==="
+    "'mouseover:s>h,mouseenter:s>h,mouseout:h>s,mouseleave:h>s,click:null>h'"
+    "});"
+    "t('from/to shape',()=>['fromElement','toElement'].every(n=>{const d="
+    "Object.getOwnPropertyDescriptor(MouseEvent.prototype,n);"
+    "return d&&d.enumerable&&d.configurable&&!d.set&&d.get.name==='get '+n"
+    "&&!Object.hasOwn(mouse,n)&&n in new PointerEvent('x')"
+    "&&!(n in new Event('x'))}));"
+    "t('baseURI',()=>img.baseURI===document.baseURI"
+    "&&document.createTextNode('').baseURI===document.baseURI"
+    "&&document.implementation.createHTMLDocument('').createElement('p')"
+    ".baseURI==='about:blank'&&(()=>{const f=document.body.appendChild("
+    "document.createElement('iframe'));return f.contentDocument"
+    ".createElement('p').baseURI===document.baseURI})());"
+    "const div=document.createElement('div'),a=document.createElement('a');"
+    "t('draggable',()=>img.draggable===true&&div.draggable===false"
+    "&&a.draggable===false&&(a.href='/x',a.draggable===true)"
+    "&&(img.draggable=false,img.getAttribute('draggable')==='false'"
+    "&&img.draggable===false)&&(div.setAttribute('draggable','TRUE'),"
+    "div.draggable===true));"
+    "t('drag feature tests',()=>'draggable' in document.createElement('span')"
+    "&&(('draggable' in div)||('ondragstart' in div&&'ondrop' in div))"
+    "&&Object.hasOwn(HTMLElement.prototype,'draggable'));"
+    "const inner=div.appendChild(document.createElement('i'));"
+    "t('spellcheck',()=>inner.spellcheck===true"
+    "&&(div.spellcheck=false,div.getAttribute('spellcheck')==='false'"
+    "&&inner.spellcheck===false)&&(inner.setAttribute('spellcheck',''),"
+    "inner.spellcheck===true));"
+    "t('translate',()=>inner.translate===true"
+    "&&(div.translate=false,div.getAttribute('translate')==='no'"
+    "&&inner.translate===false)&&(inner.setAttribute('translate','yes'),"
+    "inner.translate===true));"
+    "const form=document.createElement('form'),"
+    "field=form.appendChild(document.createElement('input'));"
+    "t('autocapitalize',()=>div.autocapitalize===''"
+    "&&(div.autocapitalize='OFF',div.autocapitalize==='none')"
+    "&&(div.setAttribute('autocapitalize','on'),"
+    "div.autocapitalize==='sentences')"
+    "&&(div.setAttribute('autocapitalize','zz'),"
+    "div.autocapitalize==='sentences')"
+    "&&(form.setAttribute('autocapitalize','words'),"
+    "field.autocapitalize==='words'));"
+    "t('part',()=>img.part instanceof DOMTokenList&&img.part.length===0"
+    "&&(img.part.add('a'),img.getAttribute('part')==='a')"
+    "&&(img.part='b c',img.part.length===2&&img.part.contains('c')));"
+    "t('img x y',()=>img.x===0&&img.y===0&&(()=>{const placed="
+    "document.body.appendChild(document.createElement('img'));"
+    "placed.style.cssText='display:block;width:10px;height:10px';"
+    "const r=placed.getBoundingClientRect();"
+    "return placed.x===Math.round(r.left+scrollX)"
+    "&&placed.y===Math.round(r.top+scrollY)})());"
+    "t('lookups',()=>img.lookupNamespaceURI(null)===H"
+    "&&img.lookupNamespaceURI('xml')==='http://www.w3.org/XML/1998/namespace'"
+    "&&img.lookupNamespaceURI('nope')===null&&img.lookupPrefix(H)===null"
+    "&&img.isDefaultNamespace(H)&&!img.isDefaultNamespace('urn:x')"
+    "&&document.lookupNamespaceURI(null)===H"
+    "&&document.createDocumentFragment().lookupNamespaceURI(null)===null);"
+    "t('prefixed',()=>{const e=document.createElementNS('urn:x','p:e');"
+    "return e.lookupPrefix('urn:x')==='p'&&e.lookupNamespaceURI('p')==='urn:x'"
+    "&&!e.isDefaultNamespace('urn:x')});"
+    "t('byTagNameNS',()=>{const root=document.createElement('div');"
+    "root.innerHTML='<g></g><svg><g></g></svg>';"
+    "const html=root.getElementsByTagNameNS(H,'g'),"
+    "any=root.getElementsByTagNameNS('*','g');"
+    "const before=[html.length,any.length].join();"
+    "root.appendChild(document.createElement('g'));"
+    "return before==='1,2'&&html.length===2&&any.length===3"
+    "&&html instanceof HTMLCollection"
+    "&&document.getElementsByTagNameNS(H,'body').length===1});"
+    "t('webkitMatchesSelector',()=>img.webkitMatchesSelector('img')"
+    "&&!img.webkitMatchesSelector('p')"
+    "&&Object.hasOwn(Element.prototype,'webkitMatchesSelector'));"
+    "t('no typed om',()=>!('computedStyleMap' in img));"
+    "t('pointer lock',()=>typeof img.requestPointerLock==='function'"
+    "&&document.pointerLockElement===null);"
+    /* The request settles in a later microtask: the summary waits for it. */
+    "let lockError=0;document.onpointerlockerror=()=>{lockError++};"
+    "globalThis.pocSummary='PENDING';"
+    "img.requestPointerLock().then(()=>'locked',e=>e.name).then(result=>{"
+    "t('pointer lock refused',()=>result==='NotSupportedError'"
+    "&&lockError===1);"
+    COMPAT_SUMMARY("ELEMENT-CORE-OK")
+    "});";
+
+/* childNodes is a live NodeList, the same object on every read, for the
+   page's nodes, the document, fragments, shadow hosts and script-side
+   documents. */
+static const char child_nodes_probe[] =
+    COMPAT_PRELUDE
+    "const d=document.createElement('div');"
+    "d.innerHTML='<span>a</span>text<b>c</b>';"
+    "const c=d.childNodes;"
+    "t('type',()=>c instanceof NodeList&&!Array.isArray(c)"
+    "&&Object.prototype.toString.call(c)==='[object NodeList]'"
+    "&&c===d.childNodes);"
+    "t('read',()=>c.length===3&&c[0].localName==='span'&&c[1].nodeType===3"
+    "&&c.item(2).localName==='b'&&c[3]===undefined&&c.item(3)===null"
+    "&&2 in c&&!(3 in c)&&Object.keys(c).join()==='0,1,2');"
+    "t('live',()=>(d.appendChild(document.createElement('u')),c.length===4"
+    "&&c[3].localName==='u')&&(d.removeChild(d.firstChild),c.length===3"
+    "&&c[0].nodeType===3)&&(d.textContent='',c.length===0"
+    "&&c[0]===undefined));"
+    "d.innerHTML='<i></i><i></i><i></i>';"
+    "t('iterate',()=>[...c].length===3&&Array.from(c.keys()).join()==='0,1,2'"
+    "&&(()=>{let n=0;c.forEach((node,index,list)=>{n+=list===c&&"
+    "node===c[index]?1:0});return n===3})()"
+    "&&Array.prototype.indexOf.call(c,d.lastChild)===2);"
+    "t('read only',()=>(c[0]=null,c.length=0,c.length===3"
+    "&&c[0]===d.firstChild)&&(c.note=1,c.note===1));"
+    "t('empty',()=>{const e=document.createElement('img').childNodes;"
+    "return e instanceof NodeList&&e.length===0});"
+    "t('text',()=>document.createTextNode('x').childNodes.length===0);"
+    "t('document',()=>document.childNodes instanceof NodeList"
+    "&&document.childNodes===document.childNodes"
+    "&&document.childNodes[document.childNodes.length-1]"
+    "===document.documentElement);"
+    "t('fragment',()=>{const f=document.createDocumentFragment(),"
+    "l=f.childNodes;f.appendChild(document.createElement('p'));"
+    "return l instanceof NodeList&&l.length===1&&l===f.childNodes});"
+    "t('shadow host',()=>{const h=document.createElement('div');"
+    "h.attachShadow({mode:'open'}).innerHTML='<slot></slot>';"
+    "const l=h.childNodes;h.appendChild(document.createElement('p'));"
+    "return l instanceof NodeList&&l.length===1&&l===h.childNodes"
+    "&&h.shadowRoot.childNodes instanceof NodeList"
+    "&&h.shadowRoot.childNodes.length===1});"
+    "t('other document',()=>{const o=document.implementation"
+    ".createHTMLDocument('t'),l=o.body.childNodes,top=o.childNodes;"
+    "o.body.appendChild(o.createElement('p'));"
+    "return l instanceof NodeList&&l.length===1&&l===o.body.childNodes"
+    "&&top instanceof NodeList&&top.length===2&&top===o.childNodes});"
+    "t('parsed document',()=>{const o=new DOMParser().parseFromString("
+    "'<p>a</p><p>b</p>','text/html');"
+    "return o.body.childNodes instanceof NodeList"
+    "&&o.body.childNodes.length===2});"
+    COMPAT_SUMMARY("CHILD-NODES-OK");
+
+/* ARIAMixin, which only Google's sites get for now
+   (site_identity_aria_reflection_site): every string attribute reflects its
+   content attribute or is null, and the element-reference attributes
+   resolve IDs in the element's tree or hold the elements set through
+   them. */
+#define ARIA_STRING_NAMES                                                    \
+    "('role ariaAtomic ariaAutoComplete ariaBrailleLabel "                   \
+    "ariaBrailleRoleDescription ariaBusy ariaChecked ariaColCount "          \
+    "ariaColIndex ariaColIndexText ariaColSpan ariaCurrent ariaDescription " \
+    "ariaDisabled ariaExpanded ariaHasPopup ariaHidden ariaInvalid "         \
+    "ariaKeyShortcuts ariaLabel ariaLevel ariaLive ariaModal ariaMultiLine " \
+    "ariaMultiSelectable ariaOrientation ariaPlaceholder ariaPosInSet "      \
+    "ariaPressed ariaReadOnly ariaRelevant ariaRequired ariaRoleDescription "\
+    "ariaRowCount ariaRowIndex ariaRowIndexText ariaRowSpan ariaSelected "   \
+    "ariaSetSize ariaSort ariaValueMax ariaValueMin ariaValueNow "           \
+    "ariaValueText').split(' ')"
+#define ARIA_ELEMENT_NAMES                                                   \
+    "('ariaActiveDescendantElement ariaControlsElements "                    \
+    "ariaDescribedByElements ariaDetailsElements ariaErrorMessageElements "  \
+    "ariaFlowToElements ariaLabelledByElements ariaOwnsElements')"           \
+    ".split(' ')"
+/* Runs the probe in the <script type=text/x-probe> with this id inside a
+   same-origin child frame's realm, and reports the frame's summary. */
+#define aria_frame_probe(id)                                                  \
+    "const f=document.body.appendChild(document.createElement('iframe')),"   \
+    "w=f.contentWindow;w.eval(document.getElementById('" id "').textContent);" \
+    "globalThis.pocSummary=w.document!==document&&w!==window"                 \
+    "?String(w.pocSummary):'not a frame realm';"
+
+static const char aria_reflection_probe[] =
+    COMPAT_PRELUDE
+    "const names=" ARIA_STRING_NAMES ",elementNames=" ARIA_ELEMENT_NAMES ";"
+    /* A child frame's realm shares the page's DOM interfaces, whose
+       members throw the page's TypeError. */
+    "const isTypeError=e=>e instanceof TypeError||e instanceof parent.TypeError;"
+    "t('element names',()=>elementNames.every(n=>{const d=Object"
+    ".getOwnPropertyDescriptor(Element.prototype,n);"
+    "return d&&d.enumerable&&d.configurable&&d.get&&d.set}));"
+    "const img=document.createElement('img');"
+    "t('null',()=>names.every(n=>n in img&&img[n]===null));"
+    "t('on Element',()=>names.every(n=>{const d=Object"
+    ".getOwnPropertyDescriptor(Element.prototype,n);"
+    "return d&&d.enumerable&&d.configurable&&d.get.name==='get '+n}));"
+    "t('reflect',()=>names.every(n=>{const attr=n==='role'?n:'aria-'+"
+    "n.slice(4).toLowerCase();img[n]='v';const set=img.getAttribute(attr);"
+    "img.setAttribute(attr,'w');const got=img[n];img[n]=null;"
+    "return set==='v'&&got==='w'&&!img.hasAttribute(attr)}));"
+    "t('undefined removes',()=>(img.ariaLabel='x',img.ariaLabel=undefined,"
+    "!img.hasAttribute('aria-label')));"
+    "t('svg',()=>document.createElementNS('http://www.w3.org/2000/svg','g')"
+    ".ariaLabel===null);"
+    "t('brand',()=>{try{Object.getOwnPropertyDescriptor(Element.prototype,"
+    "'ariaLabel').get.call({});return false}"
+    "catch(e){return isTypeError(e)}});"
+    "const host=document.body.appendChild(document.createElement('div'));"
+    "host.innerHTML='<p id=one></p><p id=two></p><span id=owner></span>';"
+    "const owner=host.lastChild,one=host.firstChild,two=one.nextSibling;"
+    "t('element null',()=>owner.ariaActiveDescendantElement===null"
+    "&&owner.ariaLabelledByElements===null&&owner.ariaControlsElements===null"
+    "&&owner.ariaDescribedByElements===null&&owner.ariaDetailsElements===null"
+    "&&owner.ariaErrorMessageElements===null&&owner.ariaFlowToElements===null"
+    "&&owner.ariaOwnsElements===null);"
+    "t('ids',()=>(owner.setAttribute('aria-labelledby','two missing one'),"
+    "owner.ariaLabelledByElements.length===2"
+    "&&owner.ariaLabelledByElements[0]===two"
+    "&&owner.ariaLabelledByElements[1]===one"
+    "&&Object.isFrozen(owner.ariaLabelledByElements))"
+    "&&(owner.setAttribute('aria-activedescendant','two'),"
+    "owner.ariaActiveDescendantElement===two));"
+    "t('explicit',()=>(owner.ariaControlsElements=[one],"
+    "owner.getAttribute('aria-controls')===''"
+    "&&owner.ariaControlsElements.length===1"
+    "&&owner.ariaControlsElements[0]===one)"
+    "&&(owner.ariaActiveDescendantElement=one,"
+    "owner.getAttribute('aria-activedescendant')===''"
+    "&&owner.ariaActiveDescendantElement===one));"
+    "t('out of scope',()=>{const away=document.createElement('p');"
+    "owner.ariaControlsElements=[away];"
+    "return owner.ariaControlsElements.length===0});"
+    "t('clear',()=>(owner.ariaControlsElements=null,"
+    "!owner.hasAttribute('aria-controls')"
+    "&&owner.ariaControlsElements===null));"
+    "t('type',()=>{try{owner.ariaActiveDescendantElement={};return false}"
+    "catch(e){return isTypeError(e)}});"
+    COMPAT_SUMMARY("ARIA-REFLECTION-OK");
+
+/* Everywhere else only the ARIA members every site had before the set was
+   added (v0.1.50: role, ariaAtomic, ariaLive) exist, reflecting their
+   content attributes; no other ARIA member exists, on elements or their
+   prototypes, and the content attributes still work. */
+static const char aria_absent_probe[] =
+    COMPAT_PRELUDE
+    "const kept=['role','ariaAtomic','ariaLive'],names=" ARIA_STRING_NAMES
+    ".concat(" ARIA_ELEMENT_NAMES ").filter(n=>!kept.includes(n));"
+    "const img=document.createElement('img');"
+    "t('kept',()=>kept.every(n=>{const d=Object.getOwnPropertyDescriptor("
+    "Element.prototype,n),attr=n==='role'?n:'aria-'+n.slice(4).toLowerCase();"
+    "if(!d||!d.enumerable||!d.configurable||img[n]!==null)return false;"
+    "img[n]='dialog';const set=img.getAttribute(attr);"
+    "img.setAttribute(attr,'w');const got=img[n];img[n]=null;"
+    "return set==='dialog'&&got==='w'&&!img.hasAttribute(attr)"
+    "&&!Object.hasOwn(img,n)}));"
+    "t('absent',()=>names.every(n=>!(n in img)&&!(n in Element.prototype)"
+    "&&!(n in document.body)));"
+    "t('attributes',()=>(img.setAttribute('aria-label','x'),"
+    "img.getAttribute('aria-label')==='x'&&img.ariaLabel===undefined));"
+    "t('no host channel',()=>!('__tilefinchHostChannel' in globalThis));"
+    COMPAT_SUMMARY("ARIA-ABSENT-OK");
+
+/* Event handler IDL attributes: the standard GlobalEventHandlers on
+   elements, documents and windows, Fullscreen's on Element and Document,
+   and Pointer Lock's and Page Visibility's on Document alone. Each is null
+   until set and then runs for a dispatched event of its type. The handler
+   attributes HTML does not define are absent. */
+static const char event_handler_attributes_probe[] =
+    COMPAT_PRELUDE
+    "const added=('beforematch canplaythrough command "
+    "contentvisibilityautostatechange contextlost contextrestored cuechange "
+    "formdata gotpointercapture lostpointercapture pointercancel "
+    "pointerrawupdate progress resize scrollend securitypolicyviolation "
+    "selectstart slotchange webkitanimationend webkitanimationiteration "
+    "webkitanimationstart webkittransitionend').split(' ');"
+    "const img=document.createElement('img'),"
+    "svg=document.createElementNS('http://www.w3.org/2000/svg','g');"
+    "t('present',()=>added.every(type=>img['on'+type]===null"
+    "&&svg['on'+type]===null&&document['on'+type]===null"
+    "&&('on'+type) in window));"
+    "t('own interface',()=>added.every(type=>['HTMLElement','SVGElement',"
+    "'Document','Window'].every(name=>{const d=Object"
+    ".getOwnPropertyDescriptor(globalThis[name].prototype,'on'+type);"
+    "return name==='Window'&&type==='resize'&&!d"
+    "?Object.hasOwn(window,'onresize'):d&&d.enumerable"
+    "&&d.get.name==='get on'+type})));"
+    "t('dispatch',()=>added.every(type=>{let hits=0,self=null;"
+    "img['on'+type]=function(event){hits+=event.type===type?1:0;self=this};"
+    "img.dispatchEvent(new Event(type));const set=img['on'+type];"
+    "img['on'+type]=null;img.dispatchEvent(new Event(type));"
+    "return hits===1&&self===img&&typeof set==='function'"
+    "&&img['on'+type]===null}));"
+    "t('content attribute',()=>{const e=document.createElement('div');"
+    "e.setAttribute('onprogress','window.__progressHit=event.type');"
+    "e.dispatchEvent(new Event('progress'));"
+    "return window.__progressHit==='progress'"
+    "&&typeof e.onprogress==='function'});"
+    "t('document dispatch',()=>{let hit=0;document.onscrollend=()=>{hit++};"
+    "document.dispatchEvent(new Event('scrollend'));"
+    "document.onscrollend=null;return hit===1});"
+    "t('fullscreen',()=>img.onfullscreenchange===null"
+    "&&img.onfullscreenerror===null&&document.onfullscreenchange===null"
+    "&&svg.onfullscreenchange===null&&!('onfullscreenchange' in window)"
+    "&&Object.hasOwn(Element.prototype,'onfullscreenerror'));"
+    "t('document only',()=>document.onpointerlockchange===null"
+    "&&document.onpointerlockerror===null"
+    "&&document.onvisibilitychange===null&&!('onvisibilitychange' in img)"
+    "&&!('onpointerlockchange' in img)&&!('onvisibilitychange' in window));"
+    "t('not in HTML',()=>['oncompositionstart','oncompositionupdate',"
+    "'oncompositionend','onfocusin','onfocusout','onbeforecopy','onsearch',"
+    "'onmousewheel'].every(name=>!(name in img)&&!(name in document)));"
+    COMPAT_SUMMARY("EVENT-HANDLER-ATTRIBUTES-OK");
+
+/* What enumerating an element or event shows: no internal plumbing, no
+   member of another element's interface, and the Web IDL constants and
+   legacy Event members. Each such member is on its own interface's
+   prototype and its elements. */
+static const char member_ownership_probe[] =
+    COMPAT_PRELUDE
+    "const keys=object=>{const seen=[];for(const key in object)seen.push(key);"
+    "return seen};"
+    "const img=document.createElement('img'),imgKeys=keys(img);"
+    "t('no plumbing',()=>imgKeys.every(key=>!key.startsWith('__'))"
+    "&&keys(document.createEvent('MouseEvents')).every("
+    "key=>!key.startsWith('__'))"
+    "&&keys(document.createElement('div')).every(key=>!key.startsWith('__'))"
+    "&&keys(document.createTextNode('')).every(key=>!key.startsWith('__')));"
+    "const foreign=('async checked content contentDocument contentWindow "
+    "defer disabled getElementById href hreflang placeholder rel sandbox "
+    "select selected selectionDirection selectionEnd selectionStart "
+    "setSelectionRange type value').split(' ');"
+    "t('img',()=>foreign.every(name=>!(name in img)&&img[name]===undefined)"
+    "&&['src','width','height','name','alt','id','tagName'].every("
+    "name=>name in img));"
+    "t('div',()=>foreign.concat(['src','width','height','name']).every("
+    "name=>!(name in document.createElement('div'))));"
+    "t('text',()=>foreign.every(name=>!(name in document.createTextNode(''))));"
+    "t('expando',()=>{const div=document.createElement('div');div.value='x';"
+    "return div.value==='x'&&!div.hasAttribute('value')"
+    "&&Object.hasOwn(div,'value')});"
+    "const owners={value:'Input TextArea Select Option Button Output LI Data "
+    "Meter Progress Param',checked:'Input',selected:'Option',"
+    "placeholder:'Input TextArea',selectionStart:'Input TextArea',"
+    "select:'Input TextArea',disabled:'Input Button Select TextArea FieldSet "
+    "OptGroup Option Link Style',href:'Anchor Area Base Link',"
+    "hreflang:'Anchor Link',rel:'Anchor Area Link Form',"
+    "src:'Image IFrame Script Input Source Track Embed Audio Video',"
+    "sandbox:'IFrame',async:'Script',defer:'Script',content:'Meta Template',"
+    "contentWindow:'IFrame Frame Object',contentDocument:'IFrame Frame Object',"
+    "width:'Image Canvas IFrame Video Table',height:'Image Canvas IFrame Video',"
+    "name:'Input Form Button IFrame Image Anchor Meta Map',"
+    "type:'Input Button Script Style Link Anchor OList LI'};"
+    "const tags={Anchor:'a',Image:'img',TextArea:'textarea',OList:'ol',"
+    "OptGroup:'optgroup',FieldSet:'fieldset',IFrame:'iframe'};"
+    "t('owners',()=>Object.keys(owners).every(name=>owners[name].split(' ')"
+    ".every(stem=>{const element=document.createElement("
+    "tags[stem]||stem.toLowerCase());"
+    "return element instanceof globalThis['HTML'+stem+'Element']"
+    "&&name in element&&name in globalThis['HTML'+stem+'Element'].prototype"
+    "&&!Object.hasOwn(HTMLElement.prototype,name)})));"
+    "t('prototype setter',()=>{const input=document.createElement('input');"
+    "Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set"
+    ".call(input,'typed');return input.value==='typed'});"
+    "t('values',()=>{const li=document.createElement('li');li.value=3;"
+    "const a=document.createElement('a');a.href='/x';"
+    "const input=document.createElement('input');input.checked=true;"
+    "return li.getAttribute('value')==='3'&&a.href==='https://conformance.test/x'"
+    "&&input.checked&&input.type==='text'"
+    "&&document.createElement('template').content.nodeType===11"
+    "&&document.createDocumentFragment().getElementById('x')===null});"
+    "customElements.define('own-er',class extends HTMLElement{});"
+    "const custom=document.body.appendChild(document.createElement('own-er'));"
+    "t('custom element',()=>foreign.every(name=>!(name in custom))"
+    "&&custom.tagName==='OWN-ER'&&custom.childNodes.length===0"
+    "&&keys(custom).every(key=>!key.startsWith('__')));"
+    "const mouse=document.createEvent('MouseEvents'),mouseKeys=keys(mouse);"
+    "t('event members',()=>['NONE','CAPTURING_PHASE','AT_TARGET',"
+    "'BUBBLING_PHASE','cancelBubble','returnValue','srcElement'].every("
+    "name=>mouseKeys.includes(name))&&mouse.NONE===0&&mouse.AT_TARGET===2"
+    "&&Event.BUBBLING_PHASE===3&&Object.keys(Event).length===4"
+    "&&Object.keys(KeyboardEvent).length===4);"
+    COMPAT_SUMMARY("MEMBER-OWNERSHIP-OK");
+
+/* A frame's window.eval is its realm's own eval, for its scripts and its
+   parent alike: the same function everywhere, direct inside the frame and
+   indirect (frame realm, frame global scope) from the parent. */
+static const char frame_eval_identity_probe[] =
+    COMPAT_PRELUDE
+    "const f=document.createElement('iframe');document.body.appendChild(f);"
+    "const w=f.contentWindow;"
+    "t('stable',()=>w.eval===w.eval&&w.eval===f.contentWindow.eval);"
+    "t('inside',()=>w.eval('eval===window.eval&&eval===self.eval"
+    "&&eval===globalThis.eval'));"
+    "t('same function',()=>w.eval('eval')===w.eval&&w.eval!==eval);"
+    "t('realm',()=>w.eval('[]') instanceof w.Array"
+    "&&!(w.eval('[]') instanceof Array));"
+    "t('this',()=>w.eval('this')===w);"
+    "t('direct inside',()=>w.eval('(function(){var local=6;"
+    "return eval(\"local*7\")})()')===42);"
+    "t('indirect from parent',()=>{var local=1;"
+    "try{w.eval('local');return false}catch(e){return e.name==='ReferenceError'}});"
+    "t('lexical per call',()=>(w.eval('let once=1'),"
+    "w.eval('typeof once')==='undefined'));"
+    COMPAT_SUMMARY("FRAME-EVAL-OK");
+
+/* A frame's document is a typed document like the page's: its elements are
+   HTMLImageElement and the rest, with their members, and the document has
+   the frame's URL, Location, WindowProxy and the initial about:blank
+   document's quirks mode. */
+static const char frame_document_probe[] =
+    COMPAT_PRELUDE
+    "const f=document.createElement('iframe');document.body.appendChild(f);"
+    "const w=f.contentWindow,d=f.contentDocument;"
+    "t('same',()=>d===w.document&&d.defaultView===w);"
+    "t('url',()=>d.URL==='about:blank'&&d.documentURI==='about:blank'"
+    "&&d.location===w.location&&d.readyState==='complete');"
+    "t('quirks',()=>d.compatMode==='BackCompat'&&d.doctype===null);"
+    "t('tree',()=>d.documentElement instanceof HTMLHtmlElement"
+    "&&d.head instanceof HTMLHeadElement&&d.body instanceof HTMLBodyElement);"
+    "const img=d.createElement('img');"
+    "t('typed',()=>img instanceof HTMLImageElement"
+    "&&img.constructor===HTMLImageElement"
+    "&&d.createElement('div').constructor===HTMLDivElement"
+    "&&d.createElement('a') instanceof HTMLAnchorElement);"
+    "t('members',()=>img.name===''&&img.alt===''&&img.width===0"
+    "&&(img.width=12,img.width===12&&img.getAttribute('width')==='12')"
+    "&&new Image().height===0&&document.createElement('img').width===0"
+    "&&img.complete===true&&img.ownerDocument===d);"
+    "d.body.innerHTML='<img name=n alt=a><input type=checkbox checked>';"
+    "t('parsed',()=>d.querySelector('img') instanceof HTMLImageElement"
+    "&&d.querySelector('img').name==='n'&&d.querySelector('img').alt==='a'"
+    "&&d.querySelector('input').checked===true);"
+    "t('not page',()=>d!==document&&!document.contains(d.body)"
+    "&&d.body.ownerDocument===d);"
+    COMPAT_SUMMARY("FRAME-DOCUMENT-OK");
+
+/* WebGL's interface objects exist before any context does: feature tests
+   and constant reads find WebGLRenderingContext and its constants (on the
+   interface object and its prototype), the object interfaces throw
+   "Illegal constructor", and a context and its objects are instances of
+   those interfaces. WebGL 2 is not exposed, so neither is its interface. */
+static const char webgl_interfaces_probe[] =
+    COMPAT_PRELUDE
+    "const names=['WebGLObject','WebGLBuffer','WebGLFramebuffer',"
+    "'WebGLProgram','WebGLRenderbuffer','WebGLShader','WebGLTexture',"
+    "'WebGLUniformLocation','WebGLActiveInfo','WebGLShaderPrecisionFormat',"
+    "'WebGLRenderingContext','WebGLContextEvent'];"
+    "t('present',()=>names.every(n=>typeof window[n]==='function'"
+    "&&Object.getOwnPropertyNames(window).includes(n)));"
+    "const G=WebGLRenderingContext;"
+    "t('constants',()=>G.DEPTH_BUFFER_BIT===0x100&&G.COLOR_BUFFER_BIT===0x4000"
+    "&&G.TRIANGLES===4&&G.TEXTURE31===0x84df&&G.RGB565===0x8d62"
+    "&&G.prototype.STATIC_DRAW===0x88e4&&G.BROWSER_DEFAULT_WEBGL===0x9244"
+    "&&G.VERTEX_ARRAY_BINDING_OES===undefined);"
+    "t('constant descriptor',()=>{const d=Object.getOwnPropertyDescriptor(G,"
+    "'FLOAT');return d.value===0x1406&&d.enumerable&&!d.writable"
+    "&&!d.configurable});"
+    "t('illegal',()=>names.slice(0,11).every(n=>{try{new window[n]();"
+    "return false}catch(e){return e instanceof TypeError}}));"
+    "t('inheritance',()=>Object.getPrototypeOf(WebGLBuffer)===WebGLObject"
+    "&&Object.getPrototypeOf(WebGLTexture.prototype)===WebGLObject.prototype"
+    "&&Object.getPrototypeOf(WebGLContextEvent.prototype)===Event.prototype);"
+    "t('class string',()=>Object.prototype.toString.call(G.prototype)"
+    "==='[object WebGLRenderingContext]');"
+    "t('context event',()=>{const e=new WebGLContextEvent('webglcontextlost',"
+    "{statusMessage:'gone'});return e.type==='webglcontextlost'"
+    "&&e.statusMessage==='gone'&&e instanceof Event"
+    "&&new WebGLContextEvent('x').statusMessage===''});"
+    "t('no webgl2',()=>typeof WebGL2RenderingContext==='undefined'"
+    "&&document.createElement('canvas').getContext('webgl2')===null);"
+    "const gl=document.createElement('canvas').getContext('webgl');"
+    "t('context',()=>gl instanceof WebGLRenderingContext"
+    "&&Object.getPrototypeOf(gl)===G.prototype&&gl.TRIANGLES===4"
+    "&&typeof gl.drawArrays==='function'&&G.prototype.drawArrays===gl.drawArrays);"
+    "t('objects',()=>gl.createBuffer() instanceof WebGLBuffer"
+    "&&gl.createBuffer() instanceof WebGLObject"
+    "&&gl.createTexture() instanceof WebGLTexture"
+    "&&gl.createShader(gl.VERTEX_SHADER) instanceof WebGLShader"
+    "&&gl.createProgram() instanceof WebGLProgram"
+    "&&gl.createFramebuffer() instanceof WebGLFramebuffer"
+    "&&gl.createRenderbuffer() instanceof WebGLRenderbuffer"
+    "&&gl.getShaderPrecisionFormat(gl.FRAGMENT_SHADER,gl.HIGH_FLOAT)"
+    " instanceof WebGLShaderPrecisionFormat);"
+    "t('same names',()=>window.WebGLRenderingContext===G);"
+    COMPAT_SUMMARY("WEBGL-INTERFACES-OK");
+
+/* A page cannot reach into WebGL before its first context: the interface
+   table webgl.js builds from is frozen, a replaced Reflect.construct never
+   sees the context classes (so the context limit holds), and the members
+   are on WebGLRenderingContext.prototype already, forwarding to the
+   implementation once it loads. A wrapper the page put there first stays.
+   The context-lost event is a WebGLContextEvent. */
+static const char webgl_hardening_probe[] =
+    COMPAT_PRELUDE
+    "const G=WebGLRenderingContext,P=G.prototype,RC=Reflect.construct,"
+    "seen=[];Reflect.construct=function(T,a,N){seen.push(T.name);"
+    "return RC(T,a,N)};"
+    "const table=window.__tilefinchWebGLInterfaces,Fake=function(){};"
+    "t('table frozen',()=>Object.isFrozen(table));"
+    "try{table.WebGLProgram=Fake}catch(_){}"
+    "t('members first',()=>typeof P.drawArrays==='function'"
+    "&&P.drawArrays.length===3&&P.drawArrays.name==='drawArrays'"
+    "&&typeof Object.getOwnPropertyDescriptor(P,'drawingBufferWidth').get"
+    "==='function'&&!Object.getOwnPropertyDescriptor(P,'clear').enumerable);"
+    "t('member receiver',()=>{try{P.getError.call({});return false}"
+    "catch(e){return e.message==='Illegal invocation'}});"
+    "const real=P.getParameter;let wrapped=0;"
+    "P.getParameter=function(p){wrapped++;return real.call(this,p)};"
+    "const canvases=[];let made=0;"
+    "for(let i=0;i<4;i++){const c=document.createElement('canvas');"
+    "document.body.appendChild(c);canvases.push(c);"
+    "if(c.getContext('webgl'))made++}"
+    "const gl=canvases[0].getContext('webgl');"
+    "Reflect.construct=RC;"
+    "t('context limit',()=>made===2);"
+    "t('construct unseen',()=>seen.length===0);"
+    "t('real program',()=>{const p=gl.createProgram();"
+    "return p instanceof WebGLProgram&&!(p instanceof Fake)});"
+    "t('wrapper kept',()=>gl.getParameter(gl.MAX_TEXTURE_SIZE)>0"
+    "&&wrapped===1&&P.getParameter!==real);"
+    "t('forwarding',()=>{gl.clearColor(0,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT);"
+    "return gl.getError()===0&&gl.drawingBufferWidth===300});"
+    "let lost=null;gl.canvas.addEventListener('webglcontextlost',"
+    "e=>{lost=e});gl._lose('lost for the test');"
+    "t('lost event',()=>lost instanceof WebGLContextEvent"
+    "&&lost.statusMessage==='lost for the test'&&lost.cancelable);"
+    COMPAT_SUMMARY("WEBGL-HARDENING-OK");
+
+/* A page that froze WebGLRenderingContext.prototype before its first
+   context still gets working contexts. */
+static const char webgl_frozen_probe[] =
+    COMPAT_PRELUDE
+    "const G=WebGLRenderingContext;Object.freeze(G.prototype);"
+    "const gl=document.createElement('canvas').getContext('webgl');"
+    "t('context',()=>gl instanceof G&&gl.drawingBufferWidth===300);"
+    "t('draws',()=>{gl.clearColor(1,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT);"
+    "return gl.getError()===0&&gl.createBuffer() instanceof WebGLBuffer});"
+    "t('still frozen',()=>Object.isFrozen(G.prototype));"
+    COMPAT_SUMMARY("WEBGL-FROZEN-OK");
+
+/* Every promise-returning operation the receiver marking leaves unmarked
+   (runtime_promise_operations) names a real interface member once the
+   features that define them have loaded: a stale entry would be skipped
+   silently, and the operation would throw instead of rejecting. */
+static const char promise_operations_probe[] =
+    "void indexedDB;new ReadableStream();new WritableStream();"
+    "void navigator.mediaDevices;void document.fonts;"
+    "try{new AudioContext()}catch(_){}"
+    "navigator.storage.getDirectory().catch(()=>{});"
+    "void FileSystemHandle;"
+    "const left=__tilefinchUnresolvedPromiseOperations();"
+    "globalThis.pocSummary=left.length?'UNRESOLVED '+left.join(' ')"
+    ":'PROMISE-OPERATIONS-OK';";
+
+/* Navigation Timing's legacy performance.timing: its members in IDL order
+   (secureConnectionStart included), moments that have not come yet read 0
+   while the document parses, domLoading is the document's creation, and
+   after load every lifecycle moment is set, in order, and agrees with the
+   navigation entry. */
+static const char navigation_timing_probe[] =
+    COMPAT_PRELUDE
+    "const T=performance.timing,o=performance.timeOrigin,"
+    "n=performance.getEntriesByType('navigation')[0],"
+    "life=['domInteractive','domContentLoadedEventStart',"
+    "'domContentLoadedEventEnd','domComplete','loadEventStart',"
+    "'loadEventEnd'];"
+    "t('order',()=>Object.keys(T).join()==='navigationStart,unloadEventStart,"
+    "unloadEventEnd,redirectStart,redirectEnd,fetchStart,domainLookupStart,"
+    "domainLookupEnd,connectStart,connectEnd,secureConnectionStart,"
+    "requestStart,responseStart,responseEnd,domLoading,domInteractive,"
+    "domContentLoadedEventStart,domContentLoadedEventEnd,domComplete,"
+    "loadEventStart,loadEventEnd');"
+    "t('parsing',()=>document.readyState==='loading'&&life.every(k=>T[k]===0"
+    "&&n[k]===0)&&T.secureConnectionStart===0);"
+    "t('dom loading',()=>T.domLoading>=T.fetchStart&&T.domLoading<=o"
+    "+performance.now());"
+    "t('fetch phases',()=>T.navigationStart===o&&T.fetchStart===o"
+    "&&T.domainLookupStart===o&&T.requestStart===o);"
+    "globalThis.pocSummary='PENDING';"
+    "addEventListener('load',()=>queueMicrotask(()=>{"
+    "t('after load',()=>life.every(k=>T[k]===o+n[k]&&n[k]>0));"
+    "t('in order',()=>{const c=['fetchStart','domLoading',...life];"
+    "for(let i=1;i<c.length;i++)if(T[c[i]]<T[c[i-1]])return false;"
+    "return n.duration===n.loadEventEnd&&n.domInteractive"
+    ">=n.responseStart});"
+    COMPAT_SUMMARY("NAVIGATION-TIMING-OK") "}));";
+
+static int test_window_and_document_constants(void)
+{
+    puts("test: window position, name, status, no-op operations, characterSet, frame globals, reflected attributes, frame eval, frame documents, WebGL interfaces, navigation timing");
+    int failed = 0;
+    if (!run_probe("window-members", window_members_probe,
+                   "WINDOW-MEMBERS-OK"))
+        failed++;
+    if (!run_probe_after("character-set",
+                         "<meta charset=windows-1251><p>text</p>",
+                         character_set_probe, "CHARACTER-SET-OK"))
+        failed++;
+    if (!run_probe("reflected-attributes", reflected_attributes_probe,
+                   "REFLECTED-ATTRIBUTES-OK"))
+        failed++;
+    if (!run_probe("element-core", element_core_probe, "ELEMENT-CORE-OK"))
+        failed++;
+    if (!run_probe("child-nodes", child_nodes_probe, "CHILD-NODES-OK"))
+        failed++;
+    /* The ARIA reflections: present on google.com and its subdomains (the
+       sign-in page and its /_/bscframe child frame among them), absent
+       elsewhere, look-alike hosts included. */
+    static const char *const aria_sites[] = {
+        "https://accounts.google.com/v3/signin/identifier",
+        "https://accounts.google.com/_/bscframe",
+        "https://www.google.com/", "https://google.com/",
+    };
+    static const char *const aria_absent_sites[] = {
+        "https://conformance.test/start", "https://notgoogle.com/",
+        "https://google.com.example.test/", "https://www.youtube.com/",
+    };
+    for (size_t i = 0; i < sizeof(aria_sites) / sizeof(aria_sites[0]); i++)
+        if (!run_probe_at(aria_sites[i], aria_sites[i], "<p id=p>text</p>",
+                          aria_reflection_probe, "ARIA-REFLECTION-OK"))
+            failed++;
+    for (size_t i = 0; i < sizeof(aria_absent_sites)
+                               / sizeof(aria_absent_sites[0]); i++)
+        if (!run_probe_at(aria_absent_sites[i], aria_absent_sites[i],
+                          "<p id=p>text</p>", aria_absent_probe,
+                          "ARIA-ABSENT-OK"))
+            failed++;
+    /* The same probes in a child frame's realm: the sign-in page's frames
+       have the reflections, other pages' do not. */
+    {
+        static char body[24 * 1024];
+        int written = snprintf(body, sizeof(body),
+            "<p id=p>text</p><script type=text/x-probe id=present>%s"
+            "</script><script type=text/x-probe id=absent>%s</script>",
+            aria_reflection_probe, aria_absent_probe);
+        if (written < 0 || (size_t) written >= sizeof(body)) {
+            fprintf(stderr, "ARIA frame probe too large\n");
+            failed++;
+        } else {
+            if (!run_probe_at("aria-child-frame",
+                              "https://accounts.google.com/v3/signin/identifier",
+                              body, aria_frame_probe("present"),
+                              "ARIA-REFLECTION-OK"))
+                failed++;
+            if (!run_probe_at("aria-absent-child-frame",
+                              "https://conformance.test/start", body,
+                              aria_frame_probe("absent"), "ARIA-ABSENT-OK"))
+                failed++;
+        }
+    }
+    if (!run_probe("event-handler-attributes",
+                   event_handler_attributes_probe,
+                   "EVENT-HANDLER-ATTRIBUTES-OK"))
+        failed++;
+    if (!run_probe("member-ownership", member_ownership_probe,
+                   "MEMBER-OWNERSHIP-OK"))
+        failed++;
+    if (!run_probe("frame-document", frame_document_probe,
+                   "FRAME-DOCUMENT-OK"))
+        failed++;
+    if (!run_probe("frame-eval", frame_eval_identity_probe, "FRAME-EVAL-OK"))
+        failed++;
+    if (!run_probe("frame-global-names", frame_global_names_probe,
+                   "FRAME-GLOBAL-NAMES-OK"))
+        failed++;
+    if (!run_probe("webgl-interfaces", webgl_interfaces_probe,
+                   "WEBGL-INTERFACES-OK"))
+        failed++;
+    if (!run_probe("webgl-hardening", webgl_hardening_probe,
+                   "WEBGL-HARDENING-OK"))
+        failed++;
+    if (!run_probe("webgl-frozen", webgl_frozen_probe, "WEBGL-FROZEN-OK"))
+        failed++;
+    if (!run_probe("promise-operations", promise_operations_probe,
+                   "PROMISE-OPERATIONS-OK"))
+        failed++;
+    if (!run_probe("navigation-timing", navigation_timing_probe,
+                   "NAVIGATION-TIMING-OK"))
+        failed++;
+    return failed;
+}
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -1756,6 +2642,7 @@ int main(int argc, char **argv)
     failures += test_init_events_and_token_list();
     failures += test_large_character_data();
     failures += test_writable_terminal_handoffs();
+    failures += test_window_and_document_constants();
     if (failures != 0) return 1;
     puts("web conformance tests passed");
     return 0;

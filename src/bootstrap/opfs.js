@@ -2,8 +2,9 @@
   /* Loaded after the page may have replaced these globals: build
      errors, promises and platform objects with the constructors
      hardening.js captured. */
-  const { Error, TypeError, DOMException, Promise, ArrayBuffer, Uint8Array,
-    Blob, TextEncoder } = globalThis.__tilefinchEventInterfaces;
+  const { defineProperty, Error, TypeError, DOMException, Promise,
+    ArrayBuffer, Uint8Array, Blob, TextEncoder } =
+    globalThis.__tilefinchEventInterfaces;
   const command = globalThis.__tilefinchOpfsCommand,
     createPrivateWeakMap = globalThis.__tilefinchCreatePrivateWeakMap,
     blobBytes = globalThis.__tilefinchBlobBytes,
@@ -505,10 +506,10 @@
     [FileSystemWritableFileStream, "FileSystemWritableFileStream", ["write", "seek", "truncate"]],
     [FileSystemSyncAccessHandle, "FileSystemSyncAccessHandle", ["read", "write", "truncate", "getSize", "flush", "close"]],
   ]) {
-    Object.defineProperty(constructor.prototype, Symbol.toStringTag, {
+    defineProperty(constructor.prototype, Symbol.toStringTag, {
       configurable: true, value: tag,
     });
-    for (const name of methods) Object.defineProperty(
+    for (const name of methods) defineProperty(
       constructor.prototype, name, {
         ...Object.getOwnPropertyDescriptor(constructor.prototype, name),
         enumerable: true,
@@ -520,7 +521,7 @@
   globalThis.FileSystemDirectoryHandle = FileSystemDirectoryHandle;
   globalThis.FileSystemWritableFileStream = FileSystemWritableFileStream;
   globalThis.FileSystemSyncAccessHandle = FileSystemSyncAccessHandle;
-  Object.defineProperty(StorageManager.prototype, "getDirectory", {
+  defineProperty(StorageManager.prototype, "getDirectory", {
     configurable: true, enumerable: true, writable: true,
     value: function getDirectory() {
       /* Brand against the platform object captured at installation.  Looking

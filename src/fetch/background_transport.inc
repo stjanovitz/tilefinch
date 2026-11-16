@@ -209,6 +209,11 @@ typedef struct {
     bool suppress_high_client_hints;
     bool tls12_retry_attempted;
     bool response_headers_complete;
+    /* The transport timing as the published headers arrived (name lookup,
+       connect, TLS and first byte are final by then). Written before the
+       headers-ready release and read only after taking them; the result's
+       own timing is resampled at completion. */
+    FetchTransportTiming header_timing;
     size_t total_length;
     size_t response_cookie_bytes;
     size_t response_cookie_count;
@@ -639,6 +644,8 @@ static size_t fetch_background_receive_header(
             if (fetch_background_header_block_publishable(
                     slot->single_hop, slot->header_status,
                     slot->location[0] != '\0')) {
+                fetch_transport_timing_sample(
+                    slot->easy, &slot->header_timing);
                 atomic_store_explicit(
                     &slot->headers_state, FETCH_BACKGROUND_HEADERS_READY,
                     memory_order_release);
@@ -3240,6 +3247,7 @@ bool fetch_background_transport_take_headers(
             FETCH_BACKGROUND_HEADERS_TAKEN,
             memory_order_acq_rel, memory_order_acquire)) return false;
     fetch_background_copy_header_snapshot(metadata, &slot->result);
+    metadata->transport_timing = slot->header_timing;
     return true;
 }
 

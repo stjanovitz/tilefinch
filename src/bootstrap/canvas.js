@@ -1174,7 +1174,7 @@
   class DOMMatrixReadOnly {
     constructor(values = [1, 0, 0, 1, 0, 0]) {
       const list = domMatrixList(values);
-      Object.defineProperty(this, "_values", { value: list });
+      defineProperty(this, "_values", { value: list });
     }
     get a() { return this._values[0]; }
     get b() { return this._values[1]; }
@@ -1256,10 +1256,10 @@
   }
 
   class DOMMatrix extends DOMMatrixReadOnly {}
-  Object.defineProperty(DOMMatrixReadOnly.prototype, Symbol.toStringTag, {
+  defineProperty(DOMMatrixReadOnly.prototype, Symbol.toStringTag, {
     configurable: true, value: "DOMMatrixReadOnly",
   });
-  Object.defineProperty(DOMMatrix.prototype, Symbol.toStringTag, {
+  defineProperty(DOMMatrix.prototype, Symbol.toStringTag, {
     configurable: true, value: "DOMMatrix",
   });
 
@@ -1900,7 +1900,7 @@
     constructor(canvas) {
       if (!(canvas instanceof HTMLCanvasElement))
         throw new TypeError("CanvasRenderingContext2D requires a canvas");
-      Object.defineProperty(this, "canvas", {
+      defineProperty(this, "canvas", {
         enumerable: true,
         value: canvas,
       });

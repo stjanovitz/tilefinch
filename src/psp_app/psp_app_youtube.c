@@ -76,6 +76,15 @@ bool psp_app_youtube_login_poll(PspApp *app)
                 : "CONTINUING YOUTUBE SIGN-IN", 300);
         changed = true;
     }
+    if (events & BROWSER_YOUTUBE_LOGIN_REFUSED) {
+        /* Google's rejection page is on screen and blames the browser's
+           security; say plainly that this is Google's decision and that
+           nothing else is lost. Nothing is retried. */
+        psp_ui_show_status(&app->process->presentation.ui,
+            "Google refused sign-in from this browser\n"
+            "YouTube works without signing in", 420);
+        changed = true;
+    }
     if (events & BROWSER_YOUTUBE_LOGIN_SIGNED_OUT) {
         bool removed = psp_app_youtube_login_clear(app);
         /* A sign-out the user did not ask for says who did it. A saved login

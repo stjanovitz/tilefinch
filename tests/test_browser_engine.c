@@ -375,6 +375,7 @@ int main(int argc, char **argv)
         return test_native_history_step_cancels_idle_work();
     if (argc == 2 && strcmp(argv[1], "--page-media-only") == 0)
         return test_page_video_activation()
+            || test_page_video_cors_settings()
             || test_page_video_rendition_candidates()
             || test_page_video_script_candidates()
             || test_page_video_data_candidate_activation()
@@ -631,6 +632,7 @@ int main(int argc, char **argv)
     CHECK(test_frontend_page_queries_copy_engine_state() == 0);
     CHECK(test_post_mutation_document_refresh_refusal_retires_shell() == 0);
     CHECK(test_page_video_activation() == 0);
+    CHECK(test_page_video_cors_settings() == 0);
     CHECK(test_page_video_rendition_candidates() == 0);
     CHECK(test_page_video_script_candidates() == 0);
     CHECK(test_page_video_data_candidate_activation() == 0);

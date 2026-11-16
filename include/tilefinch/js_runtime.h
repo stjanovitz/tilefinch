@@ -268,6 +268,16 @@ typedef struct {
     size_t dynamic_script_source_failures;
     size_t dynamic_scripts_cancelled;
     size_t dynamic_scripts_cache_hits;
+    /* Of those, responses taken from a <link rel=preload as=script>. */
+    size_t dynamic_scripts_preload_hits;
+    /* Parser-inserted classic scripts that took a preload's response. */
+    size_t parser_scripts_preload_hits;
+    /* In-flight preloads the realm took over at the end of parsing. */
+    size_t preloaded_scripts_adopted;
+    /* Entries dropped unconsumed (memory pressure, the unused window after
+       load, the byte bound), and their lengths. */
+    size_t preloaded_scripts_released;
+    size_t preloaded_scripts_released_bytes;
     size_t dynamic_scripts_ordered_waits;
     size_t dynamic_scripts_peak_pending;
     size_t dynamic_scripts_nomodule_skipped;
@@ -277,6 +287,9 @@ typedef struct {
     /* document.getElementById calls the id memo could not answer, each a
        walk of the document. */
     size_t element_id_walks;
+    /* Children stepped over to reach a live childNodes index from the
+       list's starting point (first child, last child or its cursor). */
+    size_t node_list_index_steps;
     size_t dynamic_script_bytes;
     size_t dynamic_scripts_quota_rejected;
     /* Script-inserted scripts refused by Subresource Integrity. */
@@ -350,7 +363,6 @@ typedef struct {
     char summary[2048];
     char error[2048];
     char error_source_context[2048];
-    char frame_eval_telemetry[128];
     size_t performance_now_calls;
     double performance_now_last_ms;
     size_t date_now_calls;
@@ -464,6 +476,19 @@ typedef struct {
     size_t lazy_webpack_syntax_preflight_failures;
     size_t lazy_webpack_syntax_preflight_source_bytes;
     uint64_t lazy_webpack_syntax_preflight_total_us;
+    /* Factory text outside the heap (js_lazy_webpack.c): factory compiles
+       whose functions read their text through the external-source hooks,
+       those reads, the reads that decoded compressed text and the bytes
+       (and, outside shipping builds, microseconds) they decoded, plain
+       copies dropped for room, and reads that failed. */
+    size_t lazy_webpack_external_text_compiles;
+    size_t lazy_webpack_external_text_reads;
+    size_t lazy_webpack_external_text_read_bytes;
+    size_t lazy_webpack_external_text_decodes;
+    size_t lazy_webpack_external_text_decoded_bytes;
+    uint64_t lazy_webpack_external_text_decode_us;
+    size_t lazy_webpack_external_text_plain_drops;
+    size_t lazy_webpack_external_text_read_failures;
     /* Lazy webpack bundle records (script_runtime_lazy_webpack_plan):
        keyed lookups, hits (planner skipped), records queued for storing,
        and the time spent planning or restoring plans (lookups and digests
@@ -1248,6 +1273,27 @@ typedef struct {
     bool fixed_wall_clock;
 } ScriptDeterministicReplayDiagnostics;
 
+/* A top-level navigable's name (HTML's browsing context name), owned by the
+   navigation session so that window.name outlives the document that set it.
+   The navigation clears it when a top-level document of another site
+   replaces the one that set it (script_window_name_enter). A name longer
+   than SCRIPT_WINDOW_NAME_LIMIT bytes stays with its document and is not
+   carried to the next one. */
+#define SCRIPT_WINDOW_NAME_LIMIT (32u * 1024u)
+typedef struct ScriptWindowName {
+    Budget *budget;
+    char *value;
+    size_t length;
+    /* The schemeful site of the document that last set or kept it. */
+    char site[320];
+} ScriptWindowName;
+/* Prepares `name` for a top-level document at `url`: a document of another
+   site starts with an empty name. */
+void script_window_name_enter(ScriptWindowName *name, const char *url);
+bool script_window_name_store(ScriptWindowName *name, const char *value,
+                              size_t length);
+void script_window_name_release(ScriptWindowName *name);
+
 typedef struct {
     BrowserSession *session;
     /* Borrowed immutable application faces used by Canvas 2D. A NULL set is
@@ -1295,6 +1341,10 @@ typedef struct {
        Zero selects runtime creation for standalone and synthetic realms. */
     uint64_t navigation_started_us;
     const char *referrer_policy;
+    /* Borrowed for the runtime's lifetime: the top-level navigable's name,
+       read and written by window.name. NULL keeps the name in the realm
+       (a frame's, set with script_runtime_set_window_name). */
+    ScriptWindowName *window_name;
 } ScriptRuntimeOptions;
 
 /* Lab-only repeatability hook. It affects JavaScript entropy sources for
@@ -1460,6 +1510,70 @@ bool script_runtime_grow_heap_limit(ScriptRuntime *runtime,
 void script_runtime_refresh_result(ScriptRuntime *runtime,
                                    ScriptResult *result);
 size_t script_runtime_heap_rejections(const ScriptRuntime *runtime);
+/* Monotonic: the heap rejections above plus allocations the limit admitted
+   but the shared page Budget refused. Either one throws "out of memory". */
+size_t script_runtime_allocation_refusals(const ScriptRuntime *runtime);
+/* HTML's map of preloaded resources, for classic scripts: keeps the
+   completed response of the document's <link rel=preload as=script> under
+   its preload key (url, destination "script", mode, credentials mode) with
+   the link's integrity metadata (NULL or empty: none). The first
+   dynamically inserted classic script with the same key consumes it, as
+   HTML's "consume a preloaded resource" does, instead of fetching the URL
+   again. The caller has already authorized the response for a script
+   (CORS, MIME); the runtime takes its own reference to body. False when
+   nothing was kept (no room, a duplicate key, or out of memory). */
+/* Entries the map has room for: one for each preload a navigation keeps
+   (NAVIGATION_PRELOAD_LIMIT), so none of them is fetched a second time. */
+#define SCRIPT_PRELOADED_SCRIPT_LIMIT 8u
+/* Bytes of READY bodies the map may hold at once, and of the responses a
+   navigation holds for the map before the realm exists. HTML sets no
+   bound; login.live.com's bundle is 1.02 MiB. */
+#define SCRIPT_PRELOADED_SCRIPT_BYTE_LIMIT (2u * 1024u * 1024u)
+bool script_runtime_offer_preloaded_script(
+    ScriptRuntime *runtime, const char *url, TilefinchRequestMode mode,
+    TilefinchCredentialsMode credentials, const char *integrity,
+    BrowserSharedBody *body, size_t length, const char *response_url,
+    const char *content_type);
+/* Takes over the navigation's in-flight preload request_id on scheduler,
+   which must outlive the realm: the key gets a pending entry that its
+   first consumer waits for, as HTML's "consume a preloaded resource" does
+   with a response that is not yet available. False when nothing was
+   taken; the caller still owns the request. */
+bool script_runtime_adopt_preload_request(
+    ScriptRuntime *runtime, struct FetchScheduler *scheduler,
+    uint64_t request_id, const char *url, TilefinchRequestMode mode,
+    TilefinchCredentialsMode credentials, uint8_t csp_grant,
+    const char *integrity);
+/* Cancels and drops the adopted requests still in flight; before the
+   realm is retired while their scheduler lives on. */
+void script_runtime_cancel_preload_requests(ScriptRuntime *runtime);
+/* A preload response taken by a parser-inserted script. */
+typedef struct {
+    BrowserSharedBody *body;
+    size_t length;
+    /* NULL when the response came from the request URL. */
+    char *response_url;
+    /* The preload's response failed its own integrity metadata: the
+       script's fetch is a network error (no body). */
+    bool network_error;
+} ScriptPreloadedResponse;
+/* HTML's "consume a preloaded resource" for a parser-inserted classic
+   script: Fetch consults the map for every request, so the entry with the
+   script's key is taken when the script has no integrity metadata or the
+   preload's (integrity, integrity_length, as written). An entry still in
+   flight is waited for, up to timeout_ms, then cancelled. True moves the
+   response to out; script_runtime_preloaded_response_release frees it. */
+bool script_runtime_consume_preloaded_script(
+    ScriptRuntime *runtime, const char *url, TilefinchRequestMode mode,
+    TilefinchCredentialsMode credentials, const char *integrity,
+    size_t integrity_length, long timeout_ms, ScriptPreloadedResponse *out);
+void script_runtime_preloaded_response_release(
+    ScriptRuntime *runtime, ScriptPreloadedResponse *response);
+/* Memory pressure: drops unconsumed preload responses until about needed
+   bytes are free. Allocates nothing; returns the bytes freed (a body the
+   HTTP cache still shares frees nothing). */
+size_t script_runtime_release_preloaded_scripts(ScriptRuntime *runtime,
+                                                size_t needed);
 /* Fixed numeric diagnostics only; never includes script or account text. */
 void script_runtime_last_allocation_refusal(const ScriptRuntime *runtime,
     size_t *old_bytes, size_t *new_bytes, size_t *live_bytes);
@@ -2098,6 +2212,11 @@ bool script_runtime_dispatch_node(ScriptRuntime *runtime,
 bool script_runtime_dispatch_activation_node(ScriptRuntime *runtime,
                                              lxb_dom_node_t *node,
                                              ScriptResult *result);
+/* Phases: 1 move, 2 down, 3 up, 4 cancel, 5 the pointer's click (cursor
+   input); 0 a click alone (implicit submission's default button); 6 an
+   Enter press around a keyboard-style click (X on a highlighted element);
+   7 an Enter keydown and keypress, 8 its keyup, around a default the
+   caller performs. Returns false for a cancelled phase. */
 bool script_runtime_dispatch_pointer_node(
     ScriptRuntime *runtime, lxb_dom_node_t *node, unsigned phase,
     int client_x, int client_y, int offset_x, int offset_y,
@@ -2342,6 +2461,9 @@ void script_runtime_set_layout_region(ScriptRuntime *runtime, int region_end);
 /* Republishes the layout viewport to a realm created before the document's
    viewport metadata was scanned: the viewport globals, innerWidth and
    innerHeight follow the resolved CSS size. */
+/* A child navigable's initial name: its container's name attribute. */
+bool script_runtime_set_window_name(ScriptRuntime *runtime, const char *name,
+                                    size_t length);
 void script_runtime_set_viewport(ScriptRuntime *runtime, int css_width,
                                  int css_height, int device_width,
                                  int device_height);

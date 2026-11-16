@@ -45,6 +45,18 @@ int main(int argc, char **argv)
         RUN_TEST(test_frame_completion_author_error_keeps_realm);
         return 0;
     }
+    if (argc == 2 && strcmp(argv[1], "--child-realm-oom-only") == 0) {
+        RUN_TEST(test_child_realm_oom_stops_only_child);
+        RUN_TEST(test_child_realm_caught_refusal_keeps_realm);
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--preload-reuse-only") == 0) {
+        RUN_TEST(test_dynamic_script_consumes_preload);
+        RUN_TEST(test_preload_map_releases_under_pressure);
+        RUN_TEST(test_preload_map_releases_unused_after_load);
+        RUN_TEST(test_preload_map_byte_bound);
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--frame-local-replacement-only") == 0) {
         RUN_TEST(test_remote_frame_local_replacement);
         return 0;
@@ -274,6 +286,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_optional_initial_image_refusal_retains_page);
     RUN_TEST(test_initial_layout_pressure_uses_minimal_style);
     RUN_TEST(test_null_exception_reads_as_out_of_memory);
+    RUN_TEST(test_commit_stop_rule_needs_refusal_and_little_room);
     RUN_TEST(test_node_retirement_observer_relocates);
     RUN_TEST(test_runtime_navigation_releases_large_incumbent);
     RUN_TEST(test_mutation_layout_pressure_releases_invalid_incumbent);
@@ -355,6 +368,12 @@ int main(int argc, char **argv)
     RUN_TEST(test_frame_completion_oom_cleanup_cannot_erase_failure);
     RUN_TEST(test_frame_completion_author_error_keeps_realm);
     RUN_TEST(test_frame_load_event_oom_retires_realm);
+    RUN_TEST(test_child_realm_oom_stops_only_child);
+    RUN_TEST(test_child_realm_caught_refusal_keeps_realm);
+    RUN_TEST(test_dynamic_script_consumes_preload);
+    RUN_TEST(test_preload_map_releases_under_pressure);
+    RUN_TEST(test_preload_map_releases_unused_after_load);
+    RUN_TEST(test_preload_map_byte_bound);
     RUN_TEST(test_hidden_frame_snapshot_drawn_when_shown);
 #if defined(TILEFINCH_FRAME_LITE)
     RUN_TEST(test_frame_lite_lazy_realm);
@@ -420,6 +439,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_late_user_css_reaches_committed_sheet);
     RUN_TEST(test_critical_ch_body_is_not_page_visible);
     RUN_TEST(test_redirected_critical_ch_retries_final_origin);
+    RUN_TEST(test_window_name_follows_top_level_navigation);
     RUN_TEST(test_canvas_surface_survives_and_updates_without_relayout);
     RUN_TEST(test_canvas_fallback_text_mutation_remains_replaced);
     RUN_TEST(test_canvas_oversized_dimensions_are_bounded);

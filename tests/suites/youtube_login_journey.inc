@@ -205,7 +205,7 @@ static int test_youtube_login_report_trail(void)
     CHECK(!browser_engine_navigation_pending(engine) && nav->page.loaded);
     CHECK(browser_engine_render_frame(engine, NULL));
     CHECK(browser_engine_youtube_signin_report(engine, report, sizeof(report)));
-    CHECK(strstr(report, "diagnostics v3") && strstr(report, "script-stop=0 ")
+    CHECK(strstr(report, "diagnostics v4") && strstr(report, "script-stop=0 ")
         && strstr(report, "text-present=0") && strstr(report, "auth-navigations=1")
         && strstr(report, "form-posts=0") && !strstr(report, "budget-limit-kib=0 "));
 

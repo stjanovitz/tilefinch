@@ -3,7 +3,7 @@
   /* Loaded after the page may have replaced these globals: build
      errors, promises and platform objects with the constructors
      hardening.js captured. */
-  const { Error, TypeError, RangeError, Promise, Set, Array,
+  const { defineProperty, Error, TypeError, RangeError, Promise, Set, Array,
     ArrayBuffer, Uint8Array, claimHooks } =
     globalThis.__tilefinchEventInterfaces;
   /* This module's hook publisher, claimed first (hardening.js); a realm
@@ -100,7 +100,7 @@
           ? target.prototype : Constructor.prototype;
       Object.setPrototypeOf(error, prototype);
       if (options !== null && typeof options === "object" && "cause" in options)
-        Object.defineProperty(error, "cause", {
+        defineProperty(error, "cause", {
           configurable: true, writable: true, value: options.cause,
         });
       return error;
@@ -160,7 +160,7 @@
       return moduleInfoNative(moduleHandle(module), 2, toWasmString(sectionName));
     }
   }
-  Object.defineProperty(Module.prototype, Symbol.toStringTag, {
+  defineProperty(Module.prototype, Symbol.toStringTag, {
     configurable: true, value: "WebAssembly.Module",
   });
 
@@ -221,7 +221,7 @@
       return oldPages;
     }
   }
-  Object.defineProperty(Memory.prototype, Symbol.toStringTag, {
+  defineProperty(Memory.prototype, Symbol.toStringTag, {
     configurable: true, value: "WebAssembly.Memory",
   });
   const wrapMemory = (native) => {
@@ -307,7 +307,7 @@
       return old;
     }
   }
-  Object.defineProperty(Table.prototype, Symbol.toStringTag, {
+  defineProperty(Table.prototype, Symbol.toStringTag, {
     configurable: true, value: "WebAssembly.Table",
   });
 
@@ -346,7 +346,7 @@
     }
     valueOf() { return this.value; }
   }
-  Object.defineProperty(Global.prototype, Symbol.toStringTag, {
+  defineProperty(Global.prototype, Symbol.toStringTag, {
     configurable: true, value: "WebAssembly.Global",
   });
   const wrapGlobal = (native) => {
@@ -434,7 +434,7 @@
       return record.exports;
     }
   }
-  Object.defineProperty(Instance.prototype, Symbol.toStringTag, {
+  defineProperty(Instance.prototype, Symbol.toStringTag, {
     configurable: true, value: "WebAssembly.Instance",
   });
 
@@ -483,14 +483,14 @@
     ["Memory", Memory], ["Table", Table], ["Global", Global],
     ["CompileError", CompileError], ["LinkError", LinkError],
     ["RuntimeError", RuntimeError],
-  ]) Object.defineProperty(namespace, name, {
+  ]) defineProperty(namespace, name, {
     configurable: true, enumerable: namespaceFunctions.has(name),
     writable: true, value,
   });
-  Object.defineProperty(namespace, Symbol.toStringTag, {
+  defineProperty(namespace, Symbol.toStringTag, {
     configurable: true, value: "WebAssembly",
   });
-  Object.defineProperty(globalThis, "WebAssembly", {
+  defineProperty(globalThis, "WebAssembly", {
     value: namespace, writable: true, configurable: true,
   });
 
@@ -505,7 +505,7 @@
     [Global.prototype, ["value", "valueOf"]],
   ]) for (const name of names) {
     const descriptor = Object.getOwnPropertyDescriptor(owner, name);
-    if (descriptor) Object.defineProperty(owner, name, {
+    if (descriptor) defineProperty(owner, name, {
       ...descriptor, enumerable: true,
     });
   }

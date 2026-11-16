@@ -6232,6 +6232,78 @@ static bool test_null_exception_reads_as_out_of_memory(void)
         && !script_error_reports_out_of_memory("TypeError: Failed to fetch");
 }
 
+/* The commit's stop rule for an inline script that ran the realm out of
+   memory: the realm is retired when the script's error reads as out of
+   memory, the heap refused an allocation, and under 256 KiB is left. The
+   page fills its heap to about 200 KiB short of the limit in steps that
+   never reach it (performance.memory reports the limit and use the rule
+   reads), then ends its script one of four ways: filling the rest until
+   the heap refuses (retired), letting go of what it held and asking for
+   more than the limit (refused with room left: kept), and a thrown null
+   or "out of memory" string with no refusal (both kept: the page's own
+   errors, however little room is left). */
+static bool test_commit_stop_rule_needs_refusal_and_little_room(void)
+{
+    static const char fill[] =
+        "<body><p>kept</p><script>"
+        "globalThis.hold=[];const left=()=>{const m=performance.memory;"
+        "return m.jsHeapSizeLimit-m.usedJSHeapSize};"
+        "for(let i=0;i<4096;i++){const r=left();if(r<=200*1024)break;"
+        "hold.push('ab'.repeat(Math.min(8192,(r-160*1024)/4|0)))}"
+        "globalThis.leftAtEnd=left();";
+    static const char *const endings[] = {
+        "for(;;)hold.push(new Array(4096).fill(0))",
+        "hold.length=0;globalThis.big=new Array(1<<22).fill(0)",
+        "throw null",
+        "throw 'out of memory'",
+    };
+    static const bool retired[] = { true, false, false, false };
+    bool all_ok = true;
+    for (size_t mode = 0; mode < sizeof(endings) / sizeof(endings[0]);
+         mode++) {
+        Budget budget;
+        budget_init(&budget, 16 * MIB);
+        bool installed = budget_install_lexbor(&budget);
+        NavigationSession navigation = {0};
+        bool ready = installed && navigation_init(&navigation, &budget, 4);
+        if (ready) {
+            navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+            navigation_enable_document_scripts(&navigation, 4, 64 * 1024,
+                                                32 * 1024, 1000);
+            /* No memory-pressure growth: the 4 MiB limit is the limit. */
+            navigation.fixed_script_memory_limits = true;
+        }
+        char html[1024];
+        int length = snprintf(html, sizeof(html), "%s%s</script></body>",
+                              fill, endings[mode]);
+        bool loaded = ready && length > 0 && (size_t) length < sizeof(html)
+            && navigation_commit_html(&navigation,
+                   navigation_begin(&navigation), "https://stop-rule.test/",
+                   html, (size_t) length, 480, NULL, NULL, true);
+        bool kept = navigation.page.runtime != NULL;
+        /* In the null and string cases the realm is near its limit, so
+           only the missing refusal keeps it. */
+        bool near_limit = !kept || mode == 1
+            || script_runtime_heap_available(navigation.page.runtime)
+                   < 256u * 1024u;
+        bool ok = loaded && kept == !retired[mode] && near_limit
+            && (!retired[mode]
+                || navigation.page.script_stop.reason
+                       == NAVIGATION_SCRIPT_STOP_MEMORY);
+        if (!ok)
+            fprintf(stderr, "commit stop rule mode=%zu loaded=%d kept=%d "
+                    "near=%d available=%zu error=%s\n", mode, loaded, kept,
+                    near_limit, kept ? script_runtime_heap_available(
+                        navigation.page.runtime) : 0,
+                    navigation.page.script_result.error);
+        if (installed) navigation_destroy(&navigation);
+        ok = ok && budget.current == 0;
+        if (installed) ok = budget_uninstall_lexbor(&budget) && ok;
+        all_ok = all_ok && ok;
+    }
+    return all_ok;
+}
+
 /* After a promoted candidate session is moved, the realm's node-retirement
    observer must point at the new session: relocation updates an observer
    that is bound and leaves an unbound one unbound (load_state.inc; a stale

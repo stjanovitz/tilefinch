@@ -233,7 +233,7 @@ typedef struct {
     TilefinchDiagnosticSource sources[TILEFINCH_DIAGNOSTIC_QR_SOURCE_LIMIT];
     char paths[TILEFINCH_DIAGNOSTIC_QR_SOURCE_LIMIT]
               [TILEFINCH_INSTALL_PATH_LIMIT];
-    char signin_report[2048];
+    char signin_report[2304];
 } PspDiagnosticPathSet;
 
 /* Keep the five long install paths and zlib/QR setup out of the already-large

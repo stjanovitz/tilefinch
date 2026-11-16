@@ -38,6 +38,9 @@ static void navigation_stream_destroy_staging(
     if (!stream->runtime_transferred) {
         script_runtime_destroy(stream->runtime);
     }
+    /* Nothing below (the held preloads' release among it) may reach the
+       destroyed or transferred realm. */
+    stream->runtime = NULL;
     if (!stream->scheduler_transferred) {
         fetch_scheduler_destroy(stream->scheduler);
     }
@@ -46,8 +49,11 @@ static void navigation_stream_destroy_staging(
         budget_free(stream->session == NULL ? NULL : stream->session->budget,
                     stream->preloads[i].url);
         stream->preloads[i].url = NULL;
+        budget_free(stream->session == NULL ? NULL : stream->session->budget,
+                    stream->preloads[i].integrity);
+        stream->preloads[i].integrity = NULL;
+        navigation_stream_release_held_preload(stream, &stream->preloads[i]);
     }
-    stream->runtime = NULL;
     stream->scheduler = NULL;
     stream->fetch_domain = NULL;
 }
@@ -72,6 +78,9 @@ static void navigation_stream_shed_optional_work(
         script_runtime_destroy(stream->runtime);
         stream->runtime = NULL;
     }
+    /* The realm the held preload responses were for is gone. */
+    for (size_t i = 0; i < stream->preload_count; i++)
+        navigation_stream_release_held_preload(stream, &stream->preloads[i]);
     if (shed_resources) {
         fetch_scheduler_destroy(stream->scheduler);
         stream->scheduler = NULL;
@@ -171,7 +180,15 @@ static bool navigation_stream_prepare_runtime(NavigationDocumentStream *stream,
         &stream->script_result);
     if (stream->runtime != NULL) {
         if (stream->response_headers_elapsed_us != 0) {
+            const FetchTransportTiming *hop =
+                &stream->response_header_timing;
             const ScriptNavigationTiming navigation_timing = {
+                .measured = hop->measured,
+                .name_lookup_us = hop->name_lookup_us,
+                .connect_us = hop->connect_us,
+                .appconnect_us = hop->appconnect_us,
+                .first_byte_us = hop->first_byte_us,
+                .total_us = hop->total_us,
                 .response_start_us = stream->response_headers_elapsed_us,
                 .response_status = stream->response_status,
                 .next_hop_protocol = stream->next_hop_protocol,
@@ -184,6 +201,7 @@ static bool navigation_stream_prepare_runtime(NavigationDocumentStream *stream,
             stream->runtime, navigation_stream_flush_cssom_layout, stream);
         navigation_stream_bind_node_retirement(stream);
     }
+    navigation_stream_offer_held_preloads(stream, stream->runtime);
     if (stream->runtime == NULL) {
         navigation_stream_shed_optional_work(
             stream, "JavaScript stopped at the page memory limit", false);

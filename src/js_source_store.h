@@ -78,6 +78,11 @@ typedef struct ScriptSourceStoreStats {
 
 typedef struct ScriptSourceStore ScriptSourceStore;
 
+/* Ids the store returns are below this; the realm's external-source hooks
+   route ids at or above it to the lazy-webpack tier, which keeps factory
+   text itself (js_lazy_webpack.c). */
+#define SCRIPT_SOURCE_STORE_ID_LIMIT UINT32_C(0x80000000)
+
 ScriptSourceStore *script_source_store_create(
     Budget *budget, ScriptSourceStoreCompression compression);
 void script_source_store_destroy(ScriptSourceStore *store);

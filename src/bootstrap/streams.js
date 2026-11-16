@@ -2,7 +2,8 @@
   /* Loaded after the page may have replaced these globals: build
      errors, promises and platform objects with the constructors
      hardening.js captured. */
-  const { TypeError, RangeError, Promise, WeakSet, ArrayBuffer, Uint8Array,
+  const { defineProperty, getOwnPropertyDescriptor, ownKeys, push,
+    TypeError, RangeError, Promise, WeakSet, ArrayBuffer, Uint8Array,
     TextEncoder, TextDecoder } = globalThis.__tilefinchEventInterfaces;
   let readableState;
   const streamQueueLimit = 64,
@@ -764,7 +765,7 @@
       this.writable = new WritableStream(sink);
     }
   }
-  Object.defineProperty(ReadableStream.prototype, Symbol.toStringTag, {
+  defineProperty(ReadableStream.prototype, Symbol.toStringTag, {
     configurable: true,
     value: "ReadableStream",
   });
@@ -857,7 +858,7 @@
     ["__tilefinchConsumeBufferedReadableByteStream",
       consumeBufferedReadableByteStream],
   ]) {
-    Object.defineProperty(globalThis, name, {
+    defineProperty(globalThis, name, {
       configurable: false,
       enumerable: false,
       writable: false,
@@ -980,11 +981,11 @@
       return this.#transform.writable;
     }
   }
-  Object.defineProperty(CompressionStream.prototype, Symbol.toStringTag, {
+  defineProperty(CompressionStream.prototype, Symbol.toStringTag, {
     configurable: true,
     value: "CompressionStream",
   });
-  Object.defineProperty(DecompressionStream.prototype, Symbol.toStringTag, {
+  defineProperty(DecompressionStream.prototype, Symbol.toStringTag, {
     configurable: true,
     value: "DecompressionStream",
   });
@@ -1007,11 +1008,11 @@
     globalThis.TextDecoderStream,
   ];
   if (typeof compressionNative === "function")
-    nativeStreamConstructors.push(CompressionStream, DecompressionStream);
+    push(nativeStreamConstructors, CompressionStream, DecompressionStream);
   for (const constructor of nativeStreamConstructors) {
     markNative(constructor);
-    for (const key of Reflect.ownKeys(constructor.prototype)) {
-      const descriptor = Object.getOwnPropertyDescriptor(
+    for (const key of ownKeys(constructor.prototype)) {
+      const descriptor = getOwnPropertyDescriptor(
         constructor.prototype,
         key,
       );

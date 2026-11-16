@@ -2155,6 +2155,8 @@ static bool test_composed_toasts(PspUiState *ui, TilefinchGlyphProvider *provide
         "Bengali-Assamese\nLanguage pack installed",
         "Won't ask again. Install later from:\n"
             "Settings > Appearance > Language & emoji",
+        "Google refused sign-in from this browser\n"
+            "YouTube works without signing in",
         "CONTENT BLOCKER IS OFF\nSETTINGS > PRIVACY & SECURITY",
         "JAVASCRIPT IS OFF FOR ALL SITES\nSETTINGS > BROWSING & INPUT",
         "PAGE CONTROLS ON\nSTART+SELECT EXITS",

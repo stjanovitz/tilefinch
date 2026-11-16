@@ -1819,21 +1819,33 @@ bool stylesheet_tree_change_has_entries(const Stylesheet *sheet,
 
 /* ---- Changes inside the document's head. ----------------------------- */
 
+/* Finds a key of `head` or `html` that anchors a relevant entry: the
+   plan's sorted anchor rows answer each key, so the test costs one search
+   per key however many classes the root carries (feature-detection
+   libraries put dozens on <html>). */
 typedef struct {
-    uint32_t hash[32];
-    size_t count;
-    bool overflow;
-} HasKeyList;
+    const StyleHasPlan *plan;
+    const uint32_t *relevant; /* NULL: every entry */
+    uint32_t key;             /* an OTHER entry's anchor (see below) */
+} HasOutsideAnchor;
 
-static bool has_collect_key(void *context, uint32_t hash)
+static bool has_outside_anchor(void *context, uint32_t hash)
 {
-    HasKeyList *keys = context;
-    if (keys->count == sizeof(keys->hash) / sizeof(keys->hash[0])) {
-        keys->overflow = true;
-        return true;
+    const HasOutsideAnchor *search = context;
+    const StyleHasPlan *plan = search->plan;
+    for (size_t k = has_key_lower_bound(plan, hash);
+         k < plan->key_count && plan->keys[k].hash == hash; k++) {
+        if (plan->keys[k].role == HAS_ROLE_ANCHOR
+            && (search->relevant == NULL
+                || HAS_BIT(search->relevant, plan->keys[k].entry)))
+            return true;
     }
-    keys->hash[keys->count++] = hash;
     return false;
+}
+
+static bool has_outside_key(void *context, uint32_t hash)
+{
+    return ((const HasOutsideAnchor *) context)->key == hash;
 }
 
 /* Whether `head` or `html` matches the selector text before some :has()
@@ -1890,16 +1902,22 @@ bool stylesheet_head_change_reaches_outside(const Stylesheet *sheet,
     HasTreeProbe probe = {.plan = plan};
     bool all = node == NULL || node->parent == NULL
         || !has_tree_probe(&probe, node, node->parent);
-    HasKeyList keys = {0};
-    (void) has_element_keys(plan, head, has_collect_key, &keys);
-    (void) has_element_keys(plan, html, has_collect_key, &keys);
-    if (keys.overflow) return true;
+    HasOutsideAnchor anchors = {.plan = plan, .relevant = all ? NULL
+                                                         : probe.hit};
+    if (has_element_keys(plan, head, has_outside_anchor, &anchors)
+        || has_element_keys(plan, html, has_outside_anchor, &anchors))
+        return true;
     for (size_t i = 0; i < plan->entry_count; i++) {
         const StyleHasPlanEntry *entry = &plan->entries[i];
         if (!all && !HAS_BIT(probe.hit, i)) continue;
         if (entry->anchor_key != 0) {
-            for (size_t k = 0; k < keys.count; k++)
-                if (keys.hash[k] == entry->anchor_key) return true;
+            /* The plan indexes no anchor row for an unclassified relation:
+               test that entry's key directly. */
+            if (entry->relation != STYLE_HAS_RELATION_OTHER) continue;
+            anchors.key = entry->anchor_key;
+            if (has_element_keys(plan, head, has_outside_key, &anchors)
+                || has_element_keys(plan, html, has_outside_key, &anchors))
+                return true;
             continue;
         }
         size_t length = 0;

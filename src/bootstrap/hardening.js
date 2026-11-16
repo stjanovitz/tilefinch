@@ -104,7 +104,12 @@
      promiseThen and promiseReject are Object.defineProperty, Reflect.apply,
      Promise.prototype.then (call-bound) and Promise.reject as they were
      before author code ran; lazy modules publish their factories and
-     private hooks through defineProperty. */
+     private hooks through defineProperty. getOwnPropertyDescriptor, ownKeys
+     (the realm's own, not the reflection filter installed below), construct,
+     freeze and push (Array.prototype.push, call-bound: `push(array, value)`)
+     are the same: what a lazy module calls while it loads must not be a
+     page's patch, which would run page code inside the module's marking
+     window (runtime_platform_window_open). */
   const captured = {
       __proto__: null,
       ...eventInterfaces,
@@ -139,6 +144,11 @@
     eventTargetPrototype.removeEventListener);
   captured.dispatch = Function.call.bind(eventTargetPrototype.dispatchEvent);
   captured.defineProperty = defineProperty;
+  captured.getOwnPropertyDescriptor = getDescriptor;
+  captured.ownKeys = nativeOwnKeys;
+  captured.construct = Reflect.construct;
+  captured.freeze = freeze;
+  captured.push = Function.call.bind(Array.prototype.push);
   /* AbortController's own abort() and signal getter, and AbortSignal's
      reason getter, call-bound: worker.js ends a worker's lifetime signal
      with these, never with a page's patch of them. */
@@ -171,8 +181,9 @@
         [2, "BeginMotionObservation", "MotionRecheck", "MotionTreeChanged",
           "TransitionsDirty", "WatchTransitions"],
         [5, "CreateWebGLContext", "FlushWebGLSurfaces", "WebGLConnected",
-          "WebGLReadback", "WebGLResize"],
+          "WebGLMethods", "WebGLReadback", "WebGLResize"],
         [7, "CloneWasmModule"],
+        [19, "WebGLInterfaces"],
       ];
     for (let group = 0; group < features.length; group++)
       for (let at = 1; at < features[group].length; at++) {

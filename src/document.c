@@ -160,10 +160,16 @@ typedef struct {
 static DocumentShadowMiss document_shadow_misses[DOCUMENT_SHADOW_MISS_SLOTS];
 #if !defined(__PSP__)
 static size_t document_shadow_scan_visits;
+static size_t document_shadow_attribute_visits;
 
 size_t document_test_shadow_scan_visits(void)
 {
     return document_shadow_scan_visits;
+}
+
+size_t document_test_shadow_attribute_visits(void)
+{
+    return document_shadow_attribute_visits;
 }
 #endif
 #define DOCUMENT_SHADOW_CARRIER_ATTRIBUTE "data-tilefinch-shadow-root"
@@ -194,10 +200,22 @@ bool document_node_is_shadow_carrier(const lxb_dom_node_t *node)
     for (const lxb_dom_attr_t *attribute =
              lxb_dom_interface_element((lxb_dom_node_t *) node)->first_attr;
          attribute != NULL; attribute = attribute->next) {
+#if !defined(__PSP__)
+        document_shadow_attribute_visits++;
+#endif
         if (attribute->node.user == &document_shadow_carrier_marker)
             return true;
     }
     return false;
+}
+
+bool document_shadow_attribute_protected(const lxb_dom_node_t *node,
+                                          const char *name, size_t length)
+{
+    return name != NULL
+        && length == sizeof(DOCUMENT_SHADOW_CARRIER_ATTRIBUTE) - 1u
+        && strncasecmp(name, DOCUMENT_SHADOW_CARRIER_ATTRIBUTE, length) == 0
+        && document_node_is_shadow_carrier(node);
 }
 
 lxb_dom_node_t *document_shadow_carrier_of_host(const lxb_dom_node_t *host)
@@ -4441,7 +4459,16 @@ const char *document_attribute(lxb_dom_node_t *node, const char *name,
         return NULL;
     }
     lxb_dom_attr_t *attr = document_attribute_node(node, name, strlen(name));
-    return attr == NULL ? NULL : (const char *) lxb_dom_attr_value(attr, length);
+    if (attr == NULL) return NULL;
+    const char *value = (const char *) lxb_dom_attr_value(attr, length);
+    return value == NULL ? "" : value;
+}
+
+TilefinchCorsSettings document_cors_settings(lxb_dom_node_t *node)
+{
+    size_t length = 0;
+    const char *value = document_attribute(node, "crossorigin", &length);
+    return tilefinch_cors_settings(value, length);
 }
 
 bool document_is_refresh_meta(lxb_dom_node_t *node)

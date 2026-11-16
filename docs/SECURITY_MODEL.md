@@ -129,12 +129,27 @@ Tilefinch/0.1` instead:
 
 | Top-level host | When | Why | Refusal |
 |---|---|---|---|
-| `accounts.google.com` (exact host, default port) | Always | The usual UA gets Google's heavy sign-in page (about 3.9 MB of script, a 29.4 MB budget peak of 32 MB, a page script error, no anti-bot frame); the plain UA gets its light page of inline scripts (14.4 MB peak, anti-bot frame loads). Measured once per UA on 2026-11-11. | HTTP 429 from `accounts.google.com`, its `/signin/rejected` or `/v3/signin/rejected` page, or a `/sorry/` page that an `accounts.google.com` request redirects to or one of its pages opens. The page is not shown; `accounts.google.com` goes back to the usual UA until the browser restarts, and the browser loads the page once more (for a form submission, the page that sent it, so the form is never sent again). With the usual UA nothing is classified as a refusal, so the reload cannot repeat. A load that fails in the transport is not a refusal. |
+| `accounts.google.com` (exact host, default port) | Always | The usual UA gets Google's heavy sign-in page (about 3.9 MB of script, a 29.4 MB budget peak of 32 MB, a page script error, no anti-bot frame); the plain UA gets its light page of inline scripts (14.4 MB peak, anti-bot frame loads). Measured once per UA on 2026-11-11. | None changes the identity. Google's `/signin/rejected` or `/v3/signin/rejected` page, HTTP 429 from `accounts.google.com`, or a `/sorry/` page that an `accounts.google.com` request redirects to or one of its pages opens, is shown as Google sent it, and nothing is loaded again. For the rejection page the browser adds its own notice that Google refused the sign-in. |
 | `google.com`, `www.google.com` | After **Try Google anyway**, until the browser restarts | The usual UA gets a WAP "Update your browser" page. | HTTP 429, `/sorry/`, the XHTML-MP page, or a failed search load clears the choice and shows the local search page with a note. |
 
 YouTube (`www.youtube.com`, `accounts.youtube.com`), `gstatic.com` as a
 top-level page and every other Google host keep the usual UA. This is the only
 identity change: the browser claims no other browser, device or OS version.
+
+### Per-site ARIA properties
+
+The ARIA reflection properties, ARIAMixin's string attributes (`role`,
+`ariaLabel` and the rest) and its element-reference attributes
+(`ariaLabelledByElements`, `ariaActiveDescendantElement` and the rest),
+exist only in realms whose document is on `google.com` or one of its
+subdomains. The list is in `src/site_identity.c` and is a stopgap: Google's
+sign-in check compares an element's properties with a Chromium browser's,
+and on every other page the members would take resident bootstrap memory
+that no page known to the project reads. A realm's own document URL
+decides, so a frame from `accounts.google.com` (its `/_/bscframe` anti-bot
+frame) gets them inside any page, and a frame from another site inside a
+Google page does not. The `role` and `aria-*` content attributes work on
+every page; only the properties are absent.
 
 An HTTPS document cannot open an HTTP channel through scripts, stylesheets,
 frames, fonts, fetch/XHR, or other active content. Eligible image and media

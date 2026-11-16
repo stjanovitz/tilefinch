@@ -19,7 +19,6 @@ globalThis.__tilefinchInstallFrames = (support) => {
     newEvent =
       __tilefinchRealmGlobal.__tilefinchTrustedEventShare.createBrowserEvent;
   const reflectDescriptor = Reflect.getOwnPropertyDescriptor,
-    reflectKeys = Reflect.ownKeys,
     reflectDefine = Reflect.defineProperty,
     reflectDelete = Reflect.deleteProperty,
     reflectPrototype = Reflect.getPrototypeOf,
@@ -100,22 +99,17 @@ globalThis.__tilefinchInstallFrames = (support) => {
       /* Publish ownership before any author-replaceable intrinsic runs so the
        * caller can retire a partially initialized realm on failure. */
       state.scope = scope;
-      Object.setPrototypeOf(scope, new Proxy(Object.create(null), {
-        get: (_target, key) => globalThis[key],
-        has: (_target, key) => key in globalThis,
-      }));
+      /* The native scope already inherits this page's global names
+         (frame_realm_inherit_page_global). */
       scope.document = frameDocument ||
-        globalThis.__tilefinchCreateFrameDocument(true);
+        globalThis.__tilefinchCreateFrameDocument(false);
       scope.location = frameLocation || {
         href: "about:blank",
         protocol: "about:",
         origin: location.origin,
       };
-      scope.document.location = scope.location;
-      Object.defineProperty(scope.document, "defaultView", {
-        configurable: true,
-        value: proxy,
-      });
+      globalThis.__tilefinchBindFrameDocument(
+        scope.document, scope.location, proxy);
       scope.window = proxy;
       scope.self = proxy;
       scope.globalThis = proxy;
@@ -156,8 +150,13 @@ globalThis.__tilefinchInstallFrames = (support) => {
             : null;
         },
       });
-      scope.eval = __tilefinchCreateFrameEval(scope, proxy, handle);
-      scope.postMessage = function (data, targetOrigin = "/") {
+      /* The realm's own eval is window.eval for the frame's scripts and
+         for its parent alike: a child script's eval(source) is a direct
+         eval, a parent's contentWindow.eval(source) an indirect one in the
+         frame realm, with the proxy as top-level this. */
+      __tilefinchBindFrameRealm(scope, proxy, handle);
+      /* A WebIDL operation: named, length 1, not a constructor. */
+      scope.postMessage = { postMessage(data, targetOrigin = "/") {
         const current = wrap(handle);
         if (!state.active || !current?.isConnected) return;
         const normalizedTarget = normalizePostMessageTarget(
@@ -172,7 +171,7 @@ globalThis.__tilefinchInstallFrames = (support) => {
           globalThis.__tilefinchActiveTaskKind,
           globalThis.__tilefinchActiveTaskSequence,
         );
-      };
+      } }.postMessage;
       return scope;
     },
     replaceFrameRealm = (state, handle, proxy, documentValue, locationValue) => {
@@ -187,11 +186,8 @@ globalThis.__tilefinchInstallFrames = (support) => {
     adoptInitialFrameDocument = (state, proxy, documentValue, locationValue) => {
       state.scope.document = documentValue;
       state.scope.location = locationValue;
-      documentValue.location = locationValue;
-      Object.defineProperty(documentValue, "defaultView", {
-        configurable: true,
-        value: proxy,
-      });
+      globalThis.__tilefinchBindFrameDocument(
+        documentValue, locationValue, proxy);
     };
   globalThis.__tilefinchFrameWindow = (handle) => {
     handle = Number(handle);
@@ -219,7 +215,7 @@ globalThis.__tilefinchInstallFrames = (support) => {
       proxy = new Proxy(Object.create(null), {
         has(target, key) {
           if (key === "source" || key === "execute") return false;
-          if (state.sameOrigin) return true;
+          if (state.sameOrigin) return key in state.scope;
           return (
             key === "closed" ||
             key === "window" ||
@@ -253,7 +249,9 @@ globalThis.__tilefinchInstallFrames = (support) => {
                same-origin parent. Chromium exposes and permits this call
                for sandbox="allow-same-origin". Opaque-origin frames remain
                inaccessible through the same-origin gate below. */
-            return state.sameOrigin ? state.scope.eval : undefined;
+            return !state.sameOrigin
+              ? undefined
+              : (frameScope(state.scope, true), state.scope.eval);
           if (!state.sameOrigin) {
             if (key === "window" || key === "self" || key === "frames")
               return proxy;
@@ -290,13 +288,17 @@ globalThis.__tilefinchInstallFrames = (support) => {
         getOwnPropertyDescriptor(target, key) {
           if (!state.sameOrigin) throw new FrameTypeError("cross-origin frame");
           frameScope(state.scope, true);
-          const descriptor = reflectDescriptor(state.scope, key);
+          /* The page window's interface objects and members are the
+             frame's own too (frame_scope_keys); they are the same objects. */
+          const descriptor = reflectDescriptor(state.scope, key) ||
+            (frameScope(state.scope, true, key)
+              ? reflectDescriptor(globalThis, key)
+              : undefined);
           return descriptor ? { ...descriptor, configurable: true } : undefined;
         },
         ownKeys(target) {
           if (!state.sameOrigin) throw new FrameTypeError("cross-origin frame");
-          frameScope(state.scope, true);
-          return reflectKeys(state.scope);
+          return frameScope(state.scope, true, true);
         },
         defineProperty(target, key, descriptor) {
           if (!state.sameOrigin) return false;

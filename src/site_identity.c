@@ -6,13 +6,12 @@
 #include <string.h>
 #include <strings.h>
 
-/* One browsing session per process: the opt-in and an accounts refusal
-   last until the browser restarts. The PSP frontend is single-threaded for
-   navigation, and every reader runs on the browser thread. */
+/* One browsing session per process: the opt-in lasts until the browser
+   restarts. The PSP frontend is single-threaded for navigation, and every
+   reader runs on the browser thread. */
 static struct {
     bool google_opted_in;
     bool google_refusal_note;
-    bool accounts_refused;
     char google_fallback[TILEFINCH_URL_SERIALIZED_LIMIT];
 } site_identity_state;
 
@@ -149,13 +148,38 @@ bool site_identity_accounts_host(const char *url)
     return site_identity_parse(url, &parsed) == SITE_IDENTITY_ACCOUNTS;
 }
 
+/* TEMPORARY: the only sites whose realms get the ARIA reflections. Google's
+   sign-in check compares an element's properties with a Chromium
+   browser's, so its pages need them; no other page we know of reads them,
+   and every realm would pay about 30 KiB of resident bootstrap (of the
+   2 MiB bootstrap budget) for them. Drop this list, and install them
+   everywhere, once the bootstrap has the room. Each entry matches itself
+   and its subdomains. */
+static const char *const site_identity_aria_domains[] = { "google.com" };
+
+bool site_identity_aria_reflection_site(const char *document_url)
+{
+    TilefinchUrl parsed;
+    if (document_url == NULL || !tilefinch_url_parse(document_url, &parsed)
+        || parsed.ipv6_literal) return false;
+    for (size_t i = 0; i < sizeof(site_identity_aria_domains)
+                               / sizeof(site_identity_aria_domains[0]); i++) {
+        const char *domain = site_identity_aria_domains[i];
+        if (tilefinch_host_within(parsed.value + parsed.host_offset,
+                                  parsed.host_length, domain,
+                                  strlen(domain)))
+            return true;
+    }
+    return false;
+}
+
 const char *site_identity_user_agent_override(const char *document_url)
 {
     TilefinchUrl parsed;
     SiteIdentityHost host = site_identity_parse(document_url, &parsed);
     bool honest = host == SITE_IDENTITY_ACCOUNTS
-        ? !site_identity_state.accounts_refused
-        : host == SITE_IDENTITY_GOOGLE && site_identity_state.google_opted_in;
+        || (host == SITE_IDENTITY_GOOGLE
+            && site_identity_state.google_opted_in);
     return honest ? TILEFINCH_GOOGLE_USER_AGENT : NULL;
 }
 
@@ -180,47 +204,61 @@ static bool site_identity_google_sorry(const char *url)
         && site_identity_path_starts(&parsed, "/sorry/");
 }
 
-/* An accounts.google.com page that only says Google refused the browser. */
-static bool site_identity_accounts_refusal_page(const TilefinchUrl *parsed)
+/* Google's reason number from a rejection page's query (rrk), 0 if absent
+   or not a short run of digits. */
+static unsigned site_identity_rejection_reason(const TilefinchUrl *parsed)
 {
-    return site_identity_path_starts(parsed, "/signin/rejected")
-        || site_identity_path_starts(parsed, "/v3/signin/rejected")
-        || site_identity_path_starts(parsed, "/sorry/");
+    if (!parsed->has_query) return 0u;
+    const char *at = parsed->value + parsed->query_offset;
+    size_t left = parsed->query_length;
+    while (left != 0u) {
+        size_t span = 0u;
+        while (span < left && at[span] != '&') span++;
+        if (span > 4u && span <= 8u && memcmp(at, "rrk=", 4u) == 0) {
+            unsigned reason = 0u;
+            for (size_t i = 4u; i < span; i++) {
+                if (at[i] < '0' || at[i] > '9') return 0u;
+                reason = reason * 10u + (unsigned) (at[i] - '0');
+            }
+            return reason;
+        }
+        if (span == left) break;
+        at += span + 1u;
+        left -= span + 1u;
+    }
+    return 0u;
 }
 
-bool site_identity_accounts_refusal(
-    const char *request_url, const char *source_url,
-    const char *effective_url, long status)
+bool site_identity_accounts_request(const char *request_url,
+                                    const char *source_url)
 {
-    if (site_identity_state.accounts_refused) return false;
-    TilefinchUrl parsed;
-    /* Redirect hops take their target's identity, so the final response
-       answered the honest UA exactly when it came from accounts. */
-    if (site_identity_parse(effective_url, &parsed) == SITE_IDENTITY_ACCOUNTS)
-        return status == 429 || site_identity_accounts_refusal_page(&parsed);
-    if (!site_identity_google_sorry(effective_url)) return false;
     return site_identity_accounts_host(request_url)
         || (site_identity_accounts_host(source_url)
             && site_identity_google_sorry(request_url));
 }
 
-void site_identity_accounts_refused(const char *reload_url,
-                                    const char *source_url)
+SiteIdentityAccountsRefusal site_identity_accounts_refusal(
+    bool accounts_request, const char *effective_url, long status,
+    unsigned *reason)
 {
-    site_identity_state.accounts_refused = true;
-    site_identity_state.google_fallback[0] = '\0';
-    const char *const candidates[] = {reload_url, source_url};
-    for (size_t i = 0; i < 2u; i++) {
-        TilefinchUrl parsed;
-        const char *url = candidates[i];
-        if (site_identity_parse(url, &parsed) != SITE_IDENTITY_ACCOUNTS
-            || site_identity_accounts_refusal_page(&parsed)
-            || strlen(url) >= sizeof(site_identity_state.google_fallback))
-            continue;
-        snprintf(site_identity_state.google_fallback,
-                 sizeof(site_identity_state.google_fallback), "%s", url);
-        return;
+    if (reason != NULL) *reason = 0u;
+    TilefinchUrl parsed;
+    if (site_identity_parse(effective_url, &parsed)
+            == SITE_IDENTITY_ACCOUNTS) {
+        if (site_identity_path_starts(&parsed, "/signin/rejected")
+            || site_identity_path_starts(&parsed, "/v3/signin/rejected")) {
+            if (reason != NULL)
+                *reason = site_identity_rejection_reason(&parsed);
+            return SITE_IDENTITY_ACCOUNTS_REJECTED;
+        }
+        if (site_identity_path_starts(&parsed, "/sorry/"))
+            return SITE_IDENTITY_ACCOUNTS_INTERSTITIAL;
+        return status == 429 ? SITE_IDENTITY_ACCOUNTS_RATE_LIMITED
+                             : SITE_IDENTITY_ACCOUNTS_ACCEPTED;
     }
+    return accounts_request && site_identity_google_sorry(effective_url)
+        ? SITE_IDENTITY_ACCOUNTS_INTERSTITIAL
+        : SITE_IDENTITY_ACCOUNTS_ACCEPTED;
 }
 
 bool site_identity_google_refusal(
@@ -245,8 +283,7 @@ void site_identity_google_refused(const char *search_url)
 {
     site_identity_state.google_opted_in = false;
     site_identity_state.google_refusal_note = true;
-    /* Without a search, keep a fallback an accounts refusal of the same
-       navigation recorded; each navigation starts with none. */
+    /* Each navigation starts with no fallback. */
     if (site_identity_google_search_url(search_url)
         && strlen(search_url) < sizeof(site_identity_state.google_fallback))
         snprintf(site_identity_state.google_fallback,

@@ -487,10 +487,14 @@ static const char origin_probe[] =
     "t('history',()=>{history.replaceState(null,'','/moved');"
     "return location.origin===real&&location.pathname==='/moved'});"
     "delete Object.prototype._origin;"
-    "t('parser steps locked',()=>{try{URL.prototype._setSpecial=function(){"
-    "this._origin='https://bank.example'}}catch(_){}"
-    "return new URL('https://b.test/').origin==='https://b.test'"
-    "&&!delete URL.prototype._set});"
+    /* The parser's steps are not on the prototype at all: a page's
+       same-named method is never called. */
+    "t('parser steps locked',()=>{const own=Object.getOwnPropertyNames("
+    "URL.prototype).filter((k)=>k[0]==='_').length;"
+    "URL.prototype._setSpecial=URL.prototype._set=function(){"
+    "this._origin='https://bank.example'};"
+    "const ok=own===0&&new URL('https://b.test/').origin==='https://b.test';"
+    "delete URL.prototype._setSpecial;delete URL.prototype._set;return ok});"
     PROBE_SUMMARY("ORIGIN-OK");
 
 static int test_origin_unforgeable(void)

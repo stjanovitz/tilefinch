@@ -754,12 +754,10 @@ if(PSP)
             # (2026-11-08) and 5,556,000 (2026-11-07).
             set(TILEFINCH_PSP_TEXT_LIMIT 6200000)
         else()
-            # Ordinary: 5,500,000 bytes, user-approved 2026-11-08 so the
-            # page-audio, dialog, image and language-pack branches and their
-            # PGO build fit together; a no-PGO build of the image branch
-            # measured 5,174,232 bytes, and its PGO difference was recorded
-            # as +42,304. Previous limit 5,216,512 (2026-10-28).
-            set(TILEFINCH_PSP_TEXT_LIMIT 5500000)
+            # Ordinary: user-approved 9 KiB increase on 2026-11-16 for the
+            # integrated runtime safety fixes and bootstrap interfaces.
+            # Page-memory, download and cache limits are unchanged.
+            set(TILEFINCH_PSP_TEXT_LIMIT 5509216)
         endif()
         # Local size experiments only (an engine built at -O2 under PPSSPP,
         # for instance): a build directory that sets this is over the

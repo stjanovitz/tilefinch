@@ -597,19 +597,13 @@ static bool script_resource_grant(
 static TilefinchCredentialsMode script_cors_credentials(
     lxb_dom_node_t *node)
 {
-    size_t length = 0;
-    const char *value = document_attribute(node, "crossorigin", &length);
-    static const char use_credentials[] = "use-credentials";
-    return value != NULL && length == sizeof(use_credentials) - 1
-        && strncasecmp(value, use_credentials, length) == 0
-            ? TILEFINCH_CREDENTIALS_INCLUDE
-            : TILEFINCH_CREDENTIALS_SAME_ORIGIN;
+    return tilefinch_cors_settings_credentials(
+        document_cors_settings(node), true);
 }
 
 static bool script_crossorigin_present(lxb_dom_node_t *node)
 {
-    size_t length = 0;
-    return document_attribute(node, "crossorigin", &length) != NULL;
+    return document_cors_settings(node) != TILEFINCH_CORS_SETTINGS_NONE;
 }
 
 static bool script_integrity_present(lxb_dom_node_t *node)
@@ -1739,17 +1733,39 @@ static bool execute_external_node(
         initiator_opaque);
     request_context.csp_grant = csp_grant;
     const BrowserCacheEntry *cached = NULL;
+    /* Fetch consults the document's map of preloaded resources for every
+       request, a parser-inserted script's included (HTML "consume a
+       preloaded resource"): a <link rel=preload as=script> response with
+       this key serves the script, waited for if still in flight. */
+    ScriptPreloadedResponse preloaded = {0};
+    size_t node_integrity_length = 0;
+    const char *node_integrity = module ? NULL : document_attribute(
+        node, "integrity", &node_integrity_length);
+    bool from_preload = !module && script_runtime_consume_preloaded_script(
+        runtime, resolved,
+        cors ? TILEFINCH_REQUEST_MODE_CORS : TILEFINCH_REQUEST_MODE_NO_CORS,
+        module_credentials, node_integrity, node_integrity_length,
+        timeout_ms, &preloaded);
+    if (from_preload && preloaded.network_error) {
+        /* The preload's response failed its own integrity metadata. */
+        script_runtime_preloaded_response_release(runtime, &preloaded);
+        script_runtime_script_quota_abort(runtime, &quota);
+        metrics->failed++;
+        (void) script_runtime_dispatch_node(runtime, node, "error", NULL);
+        return true;
+    }
     /* An installed app's classic script restored as bytecode only runs
        without reading its source unless integrity metadata needs the bytes. */
     size_t deferred_length = 0;
-    bool deferred = !module && !cors && session != NULL
+    bool deferred = !from_preload && !module && !cors && session != NULL
         && !script_integrity_present(node)
         && !content_blocker_would_block(
                session->content_blocker, resolved, document_url,
                "script", "no-cors")
         && browser_session_offline_script_match(
             session, resolved, &request_context, &deferred_length);
-    BrowserCacheStatus cache_status = deferred ? BROWSER_CACHE_FRESH
+    BrowserCacheStatus cache_status = deferred || from_preload
+        ? BROWSER_CACHE_FRESH
         : module
         ? script_module_cache_match(
             session, resolved, initiator_origin, top_level_url,
@@ -1765,8 +1781,11 @@ static bool execute_external_node(
     }
     if (cache_status == BROWSER_CACHE_FRESH) {
         size_t fresh_length = deferred ? deferred_length
+            : from_preload ? preloaded.length
             : cached == NULL ? 0 : cached->length;
-        if ((cached == NULL && !deferred) || fresh_length > response_limit) {
+        if ((cached == NULL && !deferred && !from_preload)
+            || fresh_length > response_limit) {
+            script_runtime_preloaded_response_release(runtime, &preloaded);
             script_runtime_script_quota_abort(runtime, &quota);
             metrics->skipped_quota++; script_trace_skip(resolved);
             if (fresh_length > maximum_file_bytes)
@@ -1782,7 +1801,15 @@ static bool execute_external_node(
         ScriptCacheSource cached_source = {
             .length = deferred_length, .budget = budget
         };
-        if (!deferred
+        if (from_preload) {
+            /* An empty body is an empty script, never a NULL source (an
+               installed app's bytecode). */
+            cached_source.data = preloaded.body == NULL
+                ? "" : (const char *) preloaded.body->data;
+            cached_source.length = preloaded.length;
+            cached_source.body = preloaded.body;
+            preloaded.body = NULL;
+        } else if (!deferred
             && !script_cache_source_acquire(budget, cached, &cached_source)) {
             script_runtime_script_quota_abort(runtime, &quota);
             metrics->failed++;
@@ -1795,6 +1822,7 @@ static bool execute_external_node(
                 runtime, &quota, cached_length)) {
             script_runtime_script_quota_abort(runtime, &quota);
             script_cache_source_release(&cached_source);
+            script_runtime_preloaded_response_release(runtime, &preloaded);
             metrics->skipped_quota++; script_trace_skip(resolved);
             (void) script_runtime_dispatch_node(
                 runtime, node, "error", NULL);
@@ -1817,6 +1845,7 @@ static bool execute_external_node(
             }
             if (has_lazy_plan) script_lazy_webpack_plan_destroy(&lazy_plan);
             script_cache_source_release(&cached_source);
+            script_runtime_preloaded_response_release(runtime, &preloaded);
             (void) script_runtime_dispatch_node(
                 runtime, node, "error", NULL);
             return true;
@@ -1837,12 +1866,15 @@ static bool execute_external_node(
         bool ok = script_evaluate_external_node(
             runtime, budget, node, cached_source.data, cached_length,
             resolved,
-            module ? cached->module_effective_url : resolved,
+            module ? cached->module_effective_url
+                : preloaded.response_url != NULL
+                ? preloaded.response_url : resolved,
             module, module_policy, module_credentials, cached_source.body,
             has_lazy_plan ? &lazy_plan : NULL, false, metrics);
         (void) script_runtime_withdraw_source_release(runtime);
         if (has_lazy_plan) script_lazy_webpack_plan_destroy(&lazy_plan);
         script_cache_source_release(&cached_source);
+        script_runtime_preloaded_response_release(runtime, &preloaded);
         if (ok) {
             metrics->loaded++; metrics->bytes += cached_length;
             (void) script_runtime_record_resource_timing(runtime, resolved,

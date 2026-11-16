@@ -1536,6 +1536,36 @@ static int test_head_script_dependency_cache(void)
     stylesheet_destroy(&sheet);
     document_destroy(&document);
     CHECK(budget.current == 0);
+
+    /* A feature-detection class list on <html>: dozens of keys, none an
+       anchor, decide nothing; the last of them anchoring is still found. */
+    static const char featured_html[] =
+        "<!doctype html><html lang=en dir=ltr data-feature=yes class=\""
+        "f0 f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12 f13 f14 f15 f16 f17 f18 "
+        "f19 f20 f21 f22 f23 f24 f25 f26 f27 f28 f29 f30 f31 f32 f33 f34 "
+        "f35 f36 f37 f38 f39\"><head><title>F</title></head><p>body</p>";
+    PocDocument featured = {0};
+    CHECK(document_parse(&featured, &budget, featured_html,
+                         sizeof(featured_html) - 1u, 17));
+    Stylesheet featured_sheet = {0};
+    CHECK(stylesheet_build(&featured_sheet, &budget, &featured, 480));
+    static const char featured_css[] =
+        ".card :has(:not(a)){color:red}.observer:has(script) p{color:red}"
+        "[data-absent]:has(script){color:red}";
+    CHECK(stylesheet_add_css(&featured_sheet, featured_css,
+                             sizeof(featured_css) - 1u));
+    lxb_dom_node_t *featured_head = lxb_dom_interface_node(
+        lxb_html_document_head_element(featured.html));
+    CHECK(!stylesheet_head_scripts_affect_ancestors(
+        &featured_sheet, featured_head, NULL));
+    static const char last_class[] = ".f39:has(script){color:blue}";
+    CHECK(stylesheet_add_css(&featured_sheet, last_class,
+                             sizeof(last_class) - 1u));
+    CHECK(stylesheet_head_scripts_affect_ancestors(
+        &featured_sheet, featured_head, NULL));
+    stylesheet_destroy(&featured_sheet);
+    document_destroy(&featured);
+    CHECK(budget.current == 0);
     return 0;
 }
 
@@ -6583,8 +6613,15 @@ static int test_document_attribute_matches_by_name(void)
             const lxb_char_t *want = lxb_dom_element_get_attribute(
                 lxb_dom_interface_element(nodes[n]),
                 (const lxb_char_t *) names[i], strlen(names[i]), &want_length);
-            CHECK((const lxb_char_t *) got == want
-                  && got_length == want_length);
+            /* lexbor keeps no value for a valueless attribute (`empty`);
+               document_attribute reads it as present and empty, as
+               `bare=''` is. */
+            bool valueless = want == NULL && lxb_dom_element_has_attribute(
+                lxb_dom_interface_element(nodes[n]),
+                (const lxb_char_t *) names[i], strlen(names[i]));
+            CHECK(valueless ? got != NULL && got_length == 0
+                            : (const lxb_char_t *) got == want
+                                  && got_length == want_length);
         }
     }
 

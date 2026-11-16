@@ -1600,25 +1600,6 @@ void js_rt_record_exception(JSContext *context, ScriptResult *result)
     if (tilefinch_trace_census()) census_print_error("census-exception",
                                                      result->error);
 #endif
-#ifdef JS_RT_TEST_INSTRUMENTS
-    JSValue global = JS_GetGlobalObject(context);
-    JSValue frame_eval_value = JS_GetPropertyStr(
-        context, global, "__tilefinchFrameEvalTelemetry");
-    const char *frame_eval = JS_IsString(frame_eval_value)
-                             ? JS_ToCString(context, frame_eval_value) : NULL;
-    if (frame_eval != NULL && frame_eval[0] != '\0') {
-        snprintf(result->frame_eval_telemetry,
-                 sizeof(result->frame_eval_telemetry), "%s", frame_eval);
-        size_t used = strlen(result->error);
-        if (used + 20 < sizeof(result->error)) {
-            snprintf(result->error + used, sizeof(result->error) - used,
-                     "\nframe eval: %s", frame_eval);
-        }
-        JS_FreeCString(context, frame_eval);
-    }
-    JS_FreeValue(context, frame_eval_value);
-    JS_FreeValue(context, global);
-#endif
     JS_FreeValue(context, exception);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     DomBridge *bridge = JS_GetContextOpaque(context);
@@ -2393,11 +2374,19 @@ static const ScriptSourceStoreConfig *script_source_store_config(void)
     return &config;
 }
 
+/* The engine's external-source hooks. Ids at or above
+   SCRIPT_SOURCE_STORE_ID_LIMIT name lazy-webpack factory text, which that
+   tier keeps itself (js_lazy_webpack.c, "Factory text outside the heap");
+   it is never required, since its compressed copy outlives every function
+   compiled from it. */
 static int js_rt_source_store_read(void *opaque, uint32_t source_id,
                                    uint32_t offset, uint32_t length,
                                    char *dest)
 {
     ScriptRuntime *runtime = opaque;
+    if (source_id >= SCRIPT_SOURCE_STORE_ID_LIMIT)
+        return js_lazy_webpack_text_read(runtime, source_id, offset, length,
+                                         dest);
     return script_source_store_read(runtime->source_store, source_id, offset,
                                     length, dest);
 }
@@ -2406,6 +2395,9 @@ static int js_rt_source_store_query(void *opaque, uint32_t source_id,
                                     uint32_t offset, uint32_t length)
 {
     ScriptRuntime *runtime = opaque;
+    if (source_id >= SCRIPT_SOURCE_STORE_ID_LIMIT)
+        return js_lazy_webpack_text_query(runtime, source_id, offset,
+                                          length);
     return script_source_store_query(runtime->source_store, source_id, offset,
                                      length);
 }
@@ -2413,6 +2405,10 @@ static int js_rt_source_store_query(void *opaque, uint32_t source_id,
 static void js_rt_source_store_release(void *opaque, uint32_t source_id)
 {
     ScriptRuntime *runtime = opaque;
+    if (source_id >= SCRIPT_SOURCE_STORE_ID_LIMIT) {
+        js_lazy_webpack_text_release(runtime, source_id);
+        return;
+    }
     script_source_store_release(runtime->source_store, source_id);
 }
 
@@ -2420,6 +2416,7 @@ static void js_rt_source_store_pin(void *opaque, uint32_t source_id,
                                    int required)
 {
     ScriptRuntime *runtime = opaque;
+    if (source_id >= SCRIPT_SOURCE_STORE_ID_LIMIT) return;
     script_source_store_require(runtime->source_store, source_id,
                                 required != 0);
 }
@@ -2452,6 +2449,11 @@ static ScriptSourceStore *js_rt_source_store(ScriptRuntime *runtime)
     return runtime->source_store;
 }
 
+bool js_rt_external_source_hooks(ScriptRuntime *runtime)
+{
+    return js_rt_source_store(runtime) != NULL;
+}
+
 /* Adds `source` to the realm's store; returns its id, or 0 (the text
    stays in the heap). */
 static uint32_t js_rt_source_store_add(ScriptRuntime *runtime,
@@ -2467,17 +2469,29 @@ static uint32_t js_rt_source_store_add(ScriptRuntime *runtime,
     return source_id;
 }
 
+/* Plain lazy-webpack factory text goes first: dropping it costs no
+   compression, and its compressed copy stays. */
 size_t js_rt_source_store_relieve(ScriptRuntime *runtime, size_t needed)
 {
-    return runtime == NULL ? 0
-        : script_source_store_relieve(runtime->source_store, needed);
+    if (runtime == NULL) return 0;
+    size_t plain = runtime->lazy_webpack_plain_text_bytes;
+    size_t released = js_lazy_webpack_text_trim(
+        runtime, plain > needed ? plain - needed : 0);
+    if (released >= needed) return released;
+    return released + script_source_store_relieve(runtime->source_store,
+                                                  needed - released);
 }
 
 void js_rt_source_store_safe_point(ScriptRuntime *runtime, bool refused)
 {
     if (runtime == NULL || runtime->source_store == NULL) return;
-    script_source_store_balance(runtime->source_store,
-        refused ? 0 : js_rt_source_store_room(runtime) / 4u);
+    size_t allowance = refused ? 0 : js_rt_source_store_room(runtime) / 4u;
+    script_source_store_balance(runtime->source_store, allowance);
+    ScriptSourceStoreStats stats;
+    script_source_store_stats(runtime->source_store, &stats);
+    (void) js_lazy_webpack_text_trim(
+        runtime, allowance > stats.plain_bytes
+                     ? allowance - stats.plain_bytes : 0);
 }
 
 /* The restore reserves an id without copying: a miss, a compile still

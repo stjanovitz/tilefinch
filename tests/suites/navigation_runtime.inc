@@ -17,6 +17,60 @@ static void script_frontier_probe(void *opaque, size_t script_index,
     probe->active_calls++;
 }
 
+/* window.name is the tab's browsing context name: a same-site document
+   that replaces the one that set it reads it, a document of another site
+   starts with an empty name (HTML clears it on a cross-site top-level
+   navigation), and a frame's name is its container's name attribute. */
+static bool test_window_name_follows_top_level_navigation(void)
+{
+    static const char first[] =
+        "<!doctype html><script>globalThis.pocSummary=JSON.stringify(name);"
+        "name='kept \\u00e9';</script>";
+    static const char second[] =
+        "<!doctype html><script>globalThis.pocSummary=JSON.stringify(name);"
+        "name='crossing';</script>";
+    static const char third[] =
+        "<!doctype html><script>globalThis.pocSummary=JSON.stringify(name)"
+        "+','+closed+','+screenX+','+typeof stop;</script>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(
+            &navigation, NAVIGATION_RUNTIME_JS_HEAP, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 32 * 1024, 16 * 1024, 1000);
+    }
+    char summaries[3][64] = {{0}};
+    const char *const pages[3] = { first, second, third };
+    const char *const urls[3] = {
+        "https://www.name.test/a", "https://shop.name.test/b",
+        "https://other.test/c"
+    };
+    bool ok = ready;
+    for (int i = 0; ok && i < 3; i++) {
+        ok = navigation_commit_html(
+            &navigation, navigation_begin(&navigation), urls[i], pages[i],
+            strlen(pages[i]), 480, NULL, NULL, true);
+        if (ok)
+            snprintf(summaries[i], sizeof(summaries[i]), "%s",
+                     navigation.page.script_result.summary);
+    }
+    ok = ok && strcmp(summaries[0], "\"\"") == 0
+        && strcmp(summaries[1], "\"kept \u00e9\"") == 0
+        && strcmp(summaries[2], "\"\",false,0,function") == 0;
+    if (!ok)
+        fprintf(stderr, "window.name ready=%d summaries=[%s][%s][%s] "
+                "error=\"%s\"\n", ready, summaries[0], summaries[1],
+                summaries[2], navigation.page.script_result.error);
+    navigation_destroy(&navigation);
+    ok = ok && budget.current == 0;
+    budget_uninstall_lexbor(&budget);
+    return ok;
+}
+
 static bool test_canvas_surface_survives_and_updates_without_relayout(void)
 {
     static const char html[] =

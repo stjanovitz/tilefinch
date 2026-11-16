@@ -234,7 +234,7 @@
       return text + ">";
     },
     method = (target, name, value) =>
-      Object.defineProperty(target, name, {
+      defineProperty(target, name, {
         configurable: true,
         writable: true,
         value,
@@ -272,7 +272,7 @@
       next.remove();
     }
   };
-  Object.defineProperty(HTMLElement.prototype, "outerText", {
+  defineProperty(HTMLElement.prototype, "outerText", {
     configurable: true,
     enumerable: true,
     get() {

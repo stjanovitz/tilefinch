@@ -24,12 +24,15 @@ typedef struct {
     size_t length;
     size_t headers;
     size_t stalls;
+    /* The transport timing the headers callback saw. */
+    FetchTransportTiming header_timing;
 } Consumer;
 
 static bool headers(void *opaque, const FetchResult *metadata)
 {
     Consumer *consumer = opaque;
     consumer->headers++;
+    consumer->header_timing = metadata->transport_timing;
     return metadata->status_code == 200
         && strstr(metadata->content_type, "text/html") != NULL;
 }
@@ -1667,7 +1670,11 @@ static bool run_trickle(bool answer, bool *success, FetchResult *result,
 
 /* chatgpt.com's answer page streams for longer than the navigation
    deadline while bytes keep flowing; the deadline bounds only the wait for
-   headers. A server that never answers still fails at that deadline. */
+   headers. A server that never answers still fails at that deadline. The
+   headers callback already sees the hop's measured connection timing
+   (Navigation Timing reads it while the body still streams): its first
+   byte came before the three-second trickle, and the completed result's
+   timing still covers the whole transfer. */
 static bool test_stream_deadline_bounds_headers(void)
 {
     /* A client that gives up closes the socket mid-trickle; report that as
@@ -1687,14 +1694,25 @@ static bool test_stream_deadline_bounds_headers(void)
     bool ok = ran && flowing_success && flowing.length == 12
         && memcmp(flowing.bytes, "abcdefghijkl", 12) == 0
         && flowing_us > UINT64_C(2500000)
+        && flowing.header_timing.measured
+        && flowing.header_timing.connect_us
+               <= flowing.header_timing.first_byte_us
+        && flowing.header_timing.first_byte_us < UINT32_C(2000000)
+        && flowing_result.transport_timing.measured
+        && flowing_result.transport_timing.total_us > UINT32_C(2500000)
         && !silent_success && silent_result.timed_out
         && silent.headers == 0 && silent_us < UINT64_C(3500000);
     if (!ok)
         fprintf(stderr,
                 "stream-deadline: ran=%d flowing=%d/%zu %lluus \"%s\" "
+                "header-timing=%d/%u/%u total=%u "
                 "silent=%d timed_out=%d %lluus\n",
                 ran ? 1 : 0, flowing_success ? 1 : 0, flowing.length,
                 (unsigned long long) flowing_us, flowing_result.error,
+                flowing.header_timing.measured ? 1 : 0,
+                (unsigned) flowing.header_timing.connect_us,
+                (unsigned) flowing.header_timing.first_byte_us,
+                (unsigned) flowing_result.transport_timing.total_us,
                 silent_success ? 1 : 0, silent_result.timed_out ? 1 : 0,
                 (unsigned long long) silent_us);
     fetch_result_destroy(&flowing_result);

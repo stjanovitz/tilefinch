@@ -554,6 +554,8 @@ the page after its bootstrap and again once its document has loaded, and, like
 every realm, allocates its mutation journal only at its first connected
 mutation.
 
+An `<iframe>` that is not connected has no content navigable:
+`contentWindow` and `contentDocument` are null until it is inserted.
 Every connected `<iframe>` and `<frame>` is a child navigable, loaded or not:
 `window.length`, `window[i]`, and `window[name]` answer the same WindowProxy
 `contentWindow` returns, but a WindowProxy and its realm are created only
@@ -561,7 +563,18 @@ when read, so hidden frames no script touches (such as consent-management
 locator frames) cost no realm. A same-origin frame evaluates in a persistent
 QuickJS context whose global `this` is the child WindowProxy, and QuickJS
 itself owns global and lexical bindings, so no source-scanning or
-declaration-copying pass runs per evaluation. The installer lives in
+declaration-copying pass runs per evaluation. The realm's own `eval` is the
+frame's `window.eval` for every caller: in frame code `eval(source)` is a
+direct eval that sees the calling function's bindings, and a parent's
+`contentWindow.eval(source)` is an indirect eval in the frame realm under the
+frame's dynamic-code policy (reading it prepares the realm's intrinsics).
+The frame's global inherits the embedding page's global names from a native
+object (`frame_realm_inherit_page_global`), not a Proxy, so a name neither
+global defines is unresolvable: reading it throws a `ReferenceError` and it
+is absent from `in`. The WindowProxy reports the page window's names, as
+taken when author code starts, as the frame's own
+(`Object.getOwnPropertyNames`, descriptors); they are the page's objects, not
+per-frame copies. The installer lives in
 `frames.js`, which `platform.js` calls with its private helpers and deletes.
 
 Frames and workers share one retirement boundary. A failed setup or
@@ -596,6 +609,33 @@ checkpoint and schedules the next only after that one finishes, which keeps an
 endpoint's messages in order even when a listener posts back synchronously.
 Author-dispatched events remain synchronous.
 
+Page input events describe the press the user made, in browser order, and
+are all trusted. X on a highlighted element is the Enter key of a TV or
+console browser: `keydown` and `keypress` (key `Enter`, keyCode 13) at the
+focused element, then the keyboard-style `click` (a `PointerEvent` with
+`pointerId` -1, an empty `pointerType` and `detail` 0, no coordinates), then
+`keyup` after the press's defaults such as a form's `submit`. A cancelled
+`keydown` or `keypress` cancels the activation. A highlighted element that
+cannot take focus receives the click, and the keys go to the body rather than
+to a field focused earlier. Enter in a text field (Start, or the keyboard's
+Done on a form's only field) is the same press around implicit submission;
+outside a form it is the keys alone. X with the analog cursor showing is a
+mouse button instead: `pointerdown`/`mousedown` on the press and
+`pointerup`/`mouseup` on the release at the cursor (`pointerType` `mouse`),
+then the pointer's `click` with `detail` 1, and no key events. Text from the
+on-screen keyboards arrives as a phone keyboard's does. The keyboard
+session's Done commits one composition: `keydown` (key `Unidentified`, keyCode
+229), `compositionstart`, `beforeinput` (`insertCompositionText`,
+`isComposing`, not cancelable), `compositionupdate`, the change,
+`compositionend`, `input`, `keyup`. Done with the text unchanged fires
+nothing. The desktop lab's typed text is a plain commit (keydown 229,
+`textInput`, cancelable `beforeinput` `insertText`, `input`, keyup), and
+Backspace is its own key (keyCode 8, `deleteContentBackward`; its keydown can
+cancel the deletion). Each edit leaves the caret after the text and fires a
+trusted `selectionchange`, bubbling from an `input` or `textarea` and at the
+document for contenteditable. `scheduler.js` builds these sequences;
+`src/controller.c` orders them around the native defaults.
+
 User activation is a timed realm state, not a flag held during one dispatch.
 Trusted input opens a five-second transient window and sets a sticky "has been
 active" bit, both exposed through `navigator.userActivation`.
@@ -625,6 +665,36 @@ lazy module needs before author code runs and passes it through a temporary
 global that is deleted immediately, and `Event.isTrusted` is a
 non-configurable own accessor backed by the same private state. New Web API
 surface is expected to follow this pattern.
+
+One check is not written per member. Web IDL makes every operation and
+attribute throw a `TypeError` for a receiver that does not implement the
+interface, and pages (sign-in security checks among them) call prototype
+members on `{}` to tell a browser's own functions from patched ones. The
+engine holds two object flags for this: after the eager bootstrap, and before
+any page script, the host marks the prototype of every constructor on the
+global as an interface prototype and each function among its members as an
+interface member (`runtime_mark_platform_interfaces`, QuickJS
+`JS_MarkPlatformInterfaces`). Calling a marked member with a receiver that has
+no interface prototype on its prototype chain, or that is one, throws
+"Illegal invocation" before the member runs. The same pass gives each
+interface prototype its class string (`@@toStringTag`). What stays as the
+bootstrap wrote it: promise-returning operations, which reject instead; the
+`on*` handler attributes of Window, Document and the element interfaces,
+which share their accessors and answer as `[LegacyLenientThis]` does; and a
+value iterator's `keys`, `values` and `entries`. The check accepts an object
+that merely inherits from an interface prototype
+(`Object.create(Node.prototype)`), and a Proxy; the members' own private
+checks above still apply there. A lazy module's interfaces and members are
+marked when it loads, and only what the module itself defined: before it
+runs, the host snapshots the global's constructors and the functions on the
+marked prototypes (`JS_SnapshotPlatformInterfaces`), and afterwards marks
+only what is new (`runtime_platform_window_open` and `_close`). A page's
+class on the global, or a method or native a page put on an interface
+(`NodeList.prototype.each = Array.prototype.map`), was there before and stays
+as it is, however it was compiled: a large ES module and restored bytecode
+keep no source text, so a function's form says nothing about its owner. A
+module whose interfaces a factory builds after it loads (the CSSOM rules)
+has its ensure native run that step in the same window.
 
 WeakMap values must not retain their own keys, because this collector cannot
 reclaim that ephemeron cycle. Attr and NamedNodeMap caches and generic
@@ -840,7 +910,9 @@ whose factories are most of its bytes) is not compiled whole. The planner
 registration replaces each with a small native trampoline and keeps its exact
 source compressed (`src/js_lazy_webpack.c`); a factory is compiled the first
 time it runs and its bytecode is dropped after the call, so the many factories
-a page never runs cost no compile. Anything the planner does not take, and any
+a page never runs cost no compile. The functions a factory leaves behind read
+their text from that compressed copy rather than keeping their own in the
+heap ([Function source outside the heap](#function-source-outside-the-heap)). Anything the planner does not take, and any
 bundle whose plan fails or whose registration does not compile, goes through
 the ordinary eager path, one compile of the whole script. A bundle record
 ([Storage](STORAGE.md#compiled-script-caches)) lets a later load of the same
@@ -873,8 +945,19 @@ Budget, counted as JavaScript memory. Each function records only where its
 text is (`JS_SetExternalSourceHooks`, `third_party/quickjs/README.md`).
 `toString()` returns what it returned before, a lazy function reads its body
 from the store on its first call, and stacks keep file:line:col. Modules
-(which keep no text at 8 KiB or more), lazy-webpack factories, eval,
-`Function`, and worker scripts are unchanged.
+(which keep no text at 8 KiB or more), eval, `Function`, and worker scripts
+are unchanged.
+
+A [lazy-webpack](#lazy-webpack-bundles) factory of 1 KiB or more compiles
+the same way, but its text does not go to the store: the lazy tier already
+keeps it compressed, for as long as the bundle lives. Its functions read a
+plain copy of it (the compile's own program text, kept) or, once that copy
+is gone, decode the compressed copy from its start up to what they need
+into a new plain copy. Plain factory text follows the store's rule below
+(it counts against the same quarter of the room, after the store's own
+plain text) and is the first to go when the realm's growth would be
+refused, since dropping it costs no compression. The text itself is never
+dropped, so a factory's `toString()` never falls back to `[native code]`.
 
 The key rules:
 
@@ -894,8 +977,9 @@ The key rules:
   `[native code]` form without allocating.
 - **Admission sees the text as if it were in the heap.** The compile floor,
   the loader's pressure gate, and the heavy-page estimate subtract the stored
-  text from their room, so a page admits the same scripts and the freed room
-  goes to the scripts it already runs.
+  text, and factory text read from the lazy tier, from their room, so a page
+  admits the same scripts and the freed room goes to the scripts it already
+  runs.
 - **A failed lazy compile is bounded.** A lazily compiled function that cannot
   compile at the wall fails its call uncatchably and stays uncompiled; inside
   a promise reaction the checkpoint ends at that job and the rest of the queue
@@ -907,7 +991,8 @@ The key rules:
   would have no text does not restore; the script compiles from source.
 
 `TILEFINCH_JS_SOURCE_STORE` (lab builds) selects other policies for A/B
-measurement, `tilefinch-js-bench --only source_store,tostring` measures the
+measurement, `TILEFINCH_LAZY_WEBPACK_FACTORY_TEXT=heap` keeps factory text
+in the heap, `tilefinch-js-bench --only source_store,tostring` measures the
 copy, encode, compile, and `toString()` costs, and the census prints a
 `census source-store` line per realm.
 

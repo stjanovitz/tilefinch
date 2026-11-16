@@ -15,7 +15,8 @@ globalThis.__tilefinchEventInterfaces.defineProperty(globalThis,
     /* Loaded after the page may have replaced these globals: build
        errors, promises and platform objects with the constructors
        hardening.js captured. */
-    const { TypeError, DOMException } = globalThis.__tilefinchEventInterfaces;
+    const { defineProperty, TypeError, DOMException } =
+      globalThis.__tilefinchEventInterfaces;
     const quotaError = () =>
         new DOMException("Stylesheet exceeds bounded size", "QuotaExceededError"),
       mediaList = (text) => {
@@ -86,7 +87,7 @@ globalThis.__tilefinchEventInterfaces.defineProperty(globalThis,
     ];
     for (let at = 0; at < types.length; at += 2)
       for (const target of [CSSRule, CSSRule.prototype])
-        Object.defineProperty(target, types[at], {
+        defineProperty(target, types[at], {
           enumerable: true,
           value: types[at + 1],
         });

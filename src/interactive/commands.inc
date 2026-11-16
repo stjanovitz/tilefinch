@@ -464,6 +464,7 @@ static const LabCommand lab_commands[] = {
     {"cross", LAB_INPUT | LAB_PRIVATE, "cross|activate"},
     {"activate", LAB_INPUT | LAB_PRIVATE, NULL},
     {"type", LAB_INPUT, "type TEXT"},
+    {"osk", LAB_INPUT, "osk TEXT"},
     {"backspace", LAB_INPUT, "backspace"},
     {"profile", 0u, "profile [LABEL]"},
     {"work", 0u, "work [LABEL]"},
@@ -505,6 +506,7 @@ static const LabCommand lab_commands[] = {
     {"mark-steady", 0u, "mark-steady"},
     {"script-report", 0u, "script-report"},
     {"refresh-status", 0u, "refresh-status"},
+    {"signin-report", 0u, "signin-report"},
     {"help", 0u, "help"},
     {"quit", LAB_PRIVATE, "quit"},
     {"exit", LAB_PRIVATE, NULL},
@@ -995,8 +997,9 @@ static bool private_console_set_text(BrowserEngine *engine,
     }
     bool ok = valid && browser_engine_replace_text(engine, text, length / 2);
     if (ok) {
-        /* A cancelled beforeinput can report successful event dispatch without
-           accepting the value. Return only equality, never the field contents. */
+        /* Event dispatch can succeed while the page refuses the value (its
+           input handler clears or rewrites it). Return only equality, never
+           the field contents. */
         char observed[1024];
         size_t observed_length = 0;
         ok = controller_text_value(controller, observed,
@@ -1900,6 +1903,26 @@ static bool run_command_loop(FILE *commands, bool interactive,
                    js->max_nonpreemptible_compile_bytes);
             changed = false;
         }
+        else if (strcmp(line, "signin-report") == 0) {
+            /* The PSP's YouTube sign-in diagnostics (docs/DIAGNOSTIC_QR.md).
+               The first use turns them on, as the PSP setting does: the
+               trail counts from there. Later uses print the report and
+               whether the engine raised its refusal notice since the last
+               one. */
+            static char report[4096];
+            if (browser_engine_youtube_signin_report(
+                    engine, report, sizeof(report))) {
+                unsigned events =
+                    browser_engine_take_youtube_login_events(engine);
+                printf("signin-report-begin\n%ssignin-report-end "
+                       "refusal-notice=%d\n", report,
+                       (events & BROWSER_YOUTUBE_LOGIN_REFUSED) != 0);
+            } else {
+                browser_engine_set_youtube_signin_diagnostics(engine, true);
+                puts("signin-report enabled");
+            }
+            changed = false;
+        }
         else if (strcmp(line, "refresh-status") == 0) {
             const NavigationRefresh *refresh = &navigation->page.refresh;
             const NavigationRefreshStats *stats = &navigation->refresh;
@@ -2118,6 +2141,13 @@ static bool run_command_loop(FILE *commands, bool interactive,
                 ok = navigation_dispatch_event(
                     navigation, argument, "click");
             }
+        } else if (strcmp(line, "osk") == 0 && argument != NULL) {
+            /* The PSP on-screen keyboard's Done: TEXT replaces the focused
+               field's value as one committed composition (keydown 229,
+               the composition events, beforeinput, input, keyup, change),
+               where `type` inserts it as plain typed text. */
+            ok = browser_engine_replace_text(
+                engine, argument, strlen(argument));
         } else if (strcmp(line, "type") == 0 && argument != NULL) {
             ok = browser_engine_insert_text(
                 engine, argument, strlen(argument));

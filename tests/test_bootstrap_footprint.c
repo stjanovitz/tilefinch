@@ -152,8 +152,9 @@ int main(void)
         {"intl", "typeof Intl.NumberFormat"},
         {"traversal", "typeof document.createTreeWalker"},
         {"serialize", "typeof XMLSerializer"},
+        {"webgl-ifaces", "typeof WebGLRenderingContext"},
     };
-    size_t before = used_bytes(runtime);
+    size_t before = used_bytes(runtime), loads_before = 0;
     for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); i++) {
         char source[256];
         snprintf(source, sizeof(source),
@@ -164,9 +165,16 @@ int main(void)
             runtime, source, "<footprint-lazy>", &probe_result));
         size_t after = used_bytes(runtime);
         size_t delta = after > before ? after - before : 0u;
-        printf("footprint: lazy %-12s retained=%zu (%zu KiB)\n",
-               probes[i].name, delta, delta / KIB);
+        printf("footprint: lazy %-12s retained=%zu (%zu KiB) "
+               "lazy-loads=%zu\n", probes[i].name, delta, delta / KIB,
+               probe_result.bootstrap_lazy_module_loads);
         CHECK(delta <= FOOTPRINT_LAZY_MODULE_LIMIT_BYTES);
+        /* Reading WebGL's interface objects loads their small module, not
+           webgl.js. */
+        if (strcmp(probes[i].name, "webgl-ifaces") == 0)
+            CHECK(probe_result.bootstrap_lazy_module_loads
+                  == loads_before + 1);
+        loads_before = probe_result.bootstrap_lazy_module_loads;
         before = after;
     }
 

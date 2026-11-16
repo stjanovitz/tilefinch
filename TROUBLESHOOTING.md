@@ -220,6 +220,12 @@ that site's. Deleting the `data/script-cache/` folder over USB does the same.
 
 ## YouTube sign-in does nothing
 
+If Google shows **Couldn't sign you in — This browser or app may not be
+secure** and Tilefinch says **Google refused sign-in from this browser**,
+Google has declined to sign this browser in. That is Google's decision about
+the browser, not a fault in your account or password, and trying again gives
+the same answer. Searching and watching work without signing in.
+
 If signing in ends on a Google page instead of returning to YouTube, choose
 **Menu → Page tools → Continue to YouTube**. Tilefinch counts you as signed
 in only once YouTube itself confirms the login; until then it does not offer

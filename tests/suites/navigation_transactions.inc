@@ -1550,6 +1550,464 @@ static bool test_frame_load_event_oom_retires_realm(void)
     return ok && clean;
 }
 
+/* A child realm that runs out of memory stops on its own: the page realm
+   keeps running, the frame keeps its document, and the child's heap goes
+   back to the page Budget at once. `budget_bound` gives both realms a heap
+   limit above what the 16 MiB Budget can back, so the child is refused by
+   the shared Budget (as login.live.com's fingerprint frame was on the PSP)
+   rather than by its own limit. `in_timer` runs the child out in a timer
+   (the runtime pump) instead of its load listener (frame completion). */
+static bool frame_realm_oom_stops_only_child(bool budget_bound, bool in_timer)
+{
+    static const char html[] =
+        "<!doctype html><title>Child OOM</title><body><main>"
+        "<h1>Survivor heading</h1><p>The page and its realm go on although "
+        "a third-party frame ran its own realm out of memory.</p></main>"
+        "<iframe id=victim src='https://frame-oom-child.test/a.html'></iframe>"
+        "<script>globalThis.ticks=0;setInterval(()=>ticks++,10)</script>"
+        "</body>";
+    /* Hoard 64 KiB buffers until refused, then ask for 1 MiB: refused
+       too, with room left for the error, as a canvas encode is. The hoard
+       stays reachable, so only stopping the realm returns it. */
+#define CHILD_OOM_JS \
+    "globalThis.hoard=null;const fill=()=>{let h=null;try{for(;;)" \
+    "h={b:new ArrayBuffer(65536),n:h}}catch(e){}globalThis.hoard=h;" \
+    "new ArrayBuffer(1<<20)};"
+    static const char child_load[] =
+        "<!doctype html><body><p>Child document</p><script>" CHILD_OOM_JS
+        "addEventListener('load',fill)</script></body>";
+    static const char child_timer[] =
+        "<!doctype html><body><p>Child document</p><script>" CHILD_OOM_JS
+        "setTimeout(fill,0)</script></body>";
+#undef CHILD_OOM_JS
+    const char *child = in_timer ? child_timer : child_load;
+    size_t child_length = in_timer ? sizeof(child_timer) - 1u
+                                   : sizeof(child_load) - 1u;
+    Budget budget;
+    bool lexbor_installed = false;
+    NavigationSession navigation = {0};
+    bool ready = frame_oom_session_init(&budget, &navigation,
+                                        &lexbor_installed);
+    if (ready && budget_bound) navigation_enable_scripts(&navigation,
+                                                         24 * MIB, 1000);
+    bool committed = ready && frame_completion_oom_commit(
+        &navigation, html, sizeof(html) - 1u, NULL);
+    bool completed = committed && navigation_test_complete_frame(
+        &navigation, &navigation.page.frames[0], 200, child, child_length);
+    bool advanced = completed;
+    for (unsigned tick = 0; advanced && tick < 4; tick++)
+        advanced = navigation_advance_runtime(&navigation, 16, 4);
+    const NavigationFrame *frame = &navigation.page.frames[0];
+    bool stopped = advanced && frame->loaded && !frame->retired
+        && frame->runtime == NULL && frame->realm_memory_stopped
+        && frame->document.html != NULL
+        && navigation.frames_memory_stopped == 1u
+        && strcmp(frame->script_result.summary,
+                  "JavaScript stopped at its memory limit") == 0;
+    /* The page realm still runs its timers. When the Budget refused the
+       child, the page takes back memory the child held: 2 MiB, more than
+       the Budget had left at that refusal. */
+    ScriptResult probe = {0};
+    bool alive = advanced && navigation.page.runtime != NULL
+        && !navigation.page.script_memory_limited
+        && navigation.page.script_stop.reason == 0
+        && frame_oom_layout_has_text(&navigation, "Survivor")
+        && script_runtime_evaluate_diagnostic(
+               navigation.page.runtime,
+               budget_bound
+                   ? "if(!(ticks>0))throw Error('page timers stopped');"
+                     "globalThis.kept=new Uint8Array(2<<20);kept[1]=1;"
+                   : "if(!(ticks>0))throw Error('page timers stopped');"
+                     "globalThis.kept=new Uint8Array(64<<10);kept[1]=1;",
+               "frame-oom-test", &probe)
+        && navigation_advance_runtime(&navigation, 16, 4)
+        && navigation.page.runtime != NULL;
+    if (!stopped || !alive)
+        fprintf(stderr,
+                "child realm OOM budget=%d timer=%d: completed=%d "
+                "advanced=%d stopped=%d alive=%d frame-runtime=%p "
+                "loaded=%d retired=%d memory-stopped=%zu summary=\"%s\" "
+                "frame-error=\"%.120s\" page-summary=\"%s\" probe=\"%.120s\" "
+                "last=\"%.160s\"\n",
+                budget_bound, in_timer, completed, advanced, stopped, alive,
+                (void *) frame->runtime, frame->loaded, frame->retired,
+                navigation.frames_memory_stopped,
+                frame->script_result.summary, frame->script_result.error,
+                navigation.page.script_result.summary, probe.error,
+                navigation.last_error);
+    bool clean = frame_oom_session_clean(&budget, &navigation, ready,
+                                         lexbor_installed);
+    return stopped && alive && clean;
+}
+
+static bool test_child_realm_oom_stops_only_child(void)
+{
+    bool own_limit_load = frame_realm_oom_stops_only_child(false, false);
+    bool own_limit_timer = frame_realm_oom_stops_only_child(false, true);
+    bool budget_load = frame_realm_oom_stops_only_child(true, false);
+    bool budget_timer = frame_realm_oom_stops_only_child(true, true);
+    return own_limit_load && own_limit_timer && budget_load && budget_timer;
+}
+
+/* A child that catches its refusal and leaves room keeps its realm. */
+static bool test_child_realm_caught_refusal_keeps_realm(void)
+{
+    static const char html[] =
+        "<!doctype html><body><p>Survivor</p>"
+        "<iframe id=victim src='https://frame-oom-child.test/a.html'></iframe>"
+        "</body>";
+    static const char child[] =
+        "<!doctype html><body><script>globalThis.caught=0;"
+        "addEventListener('load',()=>{try{new ArrayBuffer(64<<20)}"
+        "catch(e){caught++}})</script></body>";
+    Budget budget;
+    bool lexbor_installed = false;
+    NavigationSession navigation = {0};
+    bool ready = frame_oom_session_init(&budget, &navigation,
+                                        &lexbor_installed);
+    bool committed = ready && frame_completion_oom_commit(
+        &navigation, html, sizeof(html) - 1u, NULL);
+    bool completed = committed && navigation_test_complete_frame(
+        &navigation, &navigation.page.frames[0], 200,
+        child, sizeof(child) - 1u)
+        && navigation_advance_runtime(&navigation, 16, 4);
+    const NavigationFrame *frame = &navigation.page.frames[0];
+    ScriptResult probe = {0};
+    bool kept = completed && frame->runtime != NULL
+        && !frame->realm_memory_stopped
+        && navigation.frames_memory_stopped == 0u
+        && script_runtime_evaluate_diagnostic(
+               frame->runtime, "if(caught!==1)throw Error('not caught')",
+               "frame-oom-test", &probe);
+    if (!kept)
+        fprintf(stderr, "child caught refusal: completed=%d runtime=%p "
+                "stopped=%zu probe=\"%.120s\"\n", completed,
+                (void *) frame->runtime, navigation.frames_memory_stopped,
+                probe.error);
+    bool clean = frame_oom_session_clean(&budget, &navigation, ready,
+                                         lexbor_installed);
+    return kept && clean;
+}
+
+/* A script that page code inserts takes the response of a matching
+   <link rel=preload as=script> instead of fetching it again (HTML "consume
+   a preloaded resource"): same URL, request mode and credentials mode, and
+   either no consumer integrity or the preload's own. Each entry serves one
+   consumer. */
+static bool offer_test_preload(NavigationSession *navigation, Budget *budget,
+                               const char *url, TilefinchRequestMode mode,
+                               const char *integrity, const char *source)
+{
+    size_t length = strlen(source);
+    unsigned char *data = budget_malloc(budget, length + 1u);
+    if (data == NULL) return false;
+    memcpy(data, source, length + 1u);
+    BrowserSharedBody *body = browser_shared_body_take(budget, data, length);
+    if (body == NULL) {
+        budget_free(budget, data);
+        return false;
+    }
+    bool offered = script_runtime_offer_preloaded_script(
+        navigation->page.runtime, url, mode,
+        mode == TILEFINCH_REQUEST_MODE_CORS
+            ? TILEFINCH_CREDENTIALS_SAME_ORIGIN
+            : TILEFINCH_CREDENTIALS_INCLUDE,
+        integrity, body, length, url, "text/javascript");
+    browser_shared_body_release(body);
+    return offered;
+}
+
+static bool test_dynamic_script_consumes_preload(void)
+{
+    static const char html[] =
+        "<!doctype html><body><p>Preload</p>"
+        "<script>globalThis.ran=[];globalThis.failed=[]</script></body>";
+    static const char d_integrity[] =
+        "sha256-WcThaqTDY2isW1P4rD/FulAmCLxOlIP1wJfvv2NsQCw=";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool lexbor_installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = lexbor_installed && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
+        navigation_enable_document_scripts(&navigation, 16, 64 * 1024,
+                                           32 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_html(
+        &navigation, generation, "https://preload.test/", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true)
+        && navigation.page.runtime != NULL;
+    bool offered = committed
+        && offer_test_preload(&navigation, &budget,
+                              "https://preload.test/a.js",
+                              TILEFINCH_REQUEST_MODE_CORS, NULL,
+                              "ran.push('a')")
+        /* One entry per key. */
+        && !offer_test_preload(&navigation, &budget,
+                               "https://preload.test/a.js",
+                               TILEFINCH_REQUEST_MODE_CORS, NULL,
+                               "ran.push('a2')")
+        && offer_test_preload(&navigation, &budget,
+                              "https://preload.test/b.js",
+                              TILEFINCH_REQUEST_MODE_CORS, NULL,
+                              "ran.push('b')")
+        && offer_test_preload(&navigation, &budget,
+                              "https://preload.test/c.js",
+                              TILEFINCH_REQUEST_MODE_CORS, d_integrity,
+                              "ran.push('c')")
+        && offer_test_preload(&navigation, &budget,
+                              "https://preload.test/d.js",
+                              TILEFINCH_REQUEST_MODE_CORS, d_integrity,
+                              "ran.push('d')");
+    /* a: consumed by the CORS consumer; the second a.js consumer finds the
+       entry gone. b: a no-cors consumer is another key. c: the body fails
+       the preload's own integrity, so Fetch made the preload's response a
+       network error (HTML "consume a preloaded resource" then hands that
+       to the consumer): a consumer with other integrity leaves the entry
+       and fetches for itself, and a consumer without integrity takes the
+       network error and fires error, so c.js never runs. d: the same
+       integrity takes it and the body passes that check. */
+    ScriptResult probe = {0};
+    bool inserted = offered && script_runtime_evaluate_diagnostic(
+        navigation.page.runtime,
+        "const add=(src,cors,integrity)=>{const s=document.createElement("
+        "'script');s.src=src;if(cors)s.crossOrigin='anonymous';"
+        "if(integrity)s.integrity=integrity;s.onerror=()=>failed.push(src);"
+        "document.head.appendChild(s)};"
+        "add('/a.js',true);add('/b.js',false);"
+        "add('/c.js',true,'sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=');"
+        "add('/c.js',true);"
+        "add('/d.js',true,'sha256-WcThaqTDY2isW1P4rD/FulAmCLxOlIP1wJfvv2NsQCw=');"
+        "add('/a.js',true);",
+        "preload-test", &probe);
+    bool advanced = inserted;
+    for (unsigned tick = 0; advanced && tick < 4; tick++)
+        advanced = navigation_advance_runtime(&navigation, 16, 4);
+    ScriptResult check = {0};
+    bool consumed = advanced
+        && navigation.page.script_result.dynamic_scripts_preload_hits == 2u
+        && navigation.page.script_result
+               .dynamic_scripts_integrity_rejected == 1u
+        && script_runtime_evaluate_diagnostic(
+               navigation.page.runtime,
+               "if(ran.slice().sort().join()!=='a,d'"
+               "||!failed.includes('/c.js'))"
+               "throw Error('ran '+ran.join()+' failed '+failed.join())",
+               "preload-test", &check);
+    if (!consumed && advanced && check.error[0] == '\0')
+        (void) script_runtime_evaluate_diagnostic(
+            navigation.page.runtime,
+            "throw Error('ran '+ran.join()+' failed '+failed.join())",
+            "preload-test", &check);
+    if (!consumed)
+        fprintf(stderr,
+                "preload reuse: committed=%d offered=%d inserted=%d "
+                "advanced=%d hits=%zu started=%zu completed=%zu quota=%zu "
+                "integrity=%zu probe=\"%.120s\" check=\"%.160s\" last=\"%.160s\"\n",
+                committed, offered, inserted, advanced,
+                navigation.page.script_result.dynamic_scripts_preload_hits,
+                navigation.page.script_result.dynamic_scripts_started,
+                navigation.page.script_result.dynamic_scripts_completed,
+                navigation.page.script_result.dynamic_scripts_quota_rejected,
+                navigation.page.script_result
+                    .dynamic_scripts_integrity_rejected,
+                probe.error, check.error, navigation.last_error);
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0;
+    if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return consumed && clean;
+}
+
+/* A committed page for the map-of-preloaded-resources tests below; with
+   deterministic, the realm's clock moves only by navigation_advance_runtime
+   elapsed time. */
+static bool preload_map_page(Budget *budget, NavigationSession *navigation,
+                             bool *lexbor_installed, bool deterministic)
+{
+    static const char html[] =
+        "<!doctype html><body><p>Preload</p>"
+        "<script>globalThis.ran=[];globalThis.failed=[]</script></body>";
+    budget_init(budget, 16 * MIB);
+    *lexbor_installed = budget_install_lexbor(budget);
+    bool ready = *lexbor_installed && navigation_init(navigation, budget, 4);
+    if (!ready) return false;
+    navigation_enable_scripts(navigation, 3 * MIB, 1000);
+    navigation_enable_document_scripts(navigation, 16, 64 * 1024,
+                                       32 * 1024, 1000);
+    if (deterministic) script_runtime_configure_deterministic_replay(true, 42);
+    uint64_t generation = navigation_begin(navigation);
+    bool committed = navigation_commit_html(
+        navigation, generation, "https://preload.test/", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true)
+        && navigation->page.runtime != NULL;
+    if (deterministic) script_runtime_configure_deterministic_replay(false, 1);
+    return committed;
+}
+
+static bool preload_map_page_done(Budget *budget,
+                                  NavigationSession *navigation,
+                                  bool lexbor_installed, bool ready)
+{
+    if (ready) navigation_destroy(navigation);
+    bool clean = budget->current == 0
+        && budget_active_allocations(budget, NULL) == 0;
+    if (lexbor_installed) clean = budget_uninstall_lexbor(budget) && clean;
+    return clean;
+}
+
+/* Inserts a CORS dynamic script for url, then advances until it settled. */
+static bool preload_map_insert(NavigationSession *navigation, const char *url)
+{
+    char source[256];
+    snprintf(source, sizeof(source),
+             "{const s=document.createElement('script');s.src='%s';"
+             "s.crossOrigin='anonymous';s.onerror=()=>failed.push('%s');"
+             "document.head.appendChild(s)}", url, url);
+    ScriptResult probe = {0};
+    bool inserted = script_runtime_evaluate_diagnostic(
+        navigation->page.runtime, source, "preload-test", &probe);
+    for (unsigned tick = 0; inserted && tick < 4; tick++)
+        inserted = navigation_advance_runtime(navigation, 16, 4);
+    return inserted;
+}
+
+/* Memory pressure releases unconsumed entries (the realm's growth hook and
+   the engine's reclaim hook both call this); a later consumer then fetches
+   the URL itself. */
+static bool test_preload_map_releases_under_pressure(void)
+{
+    Budget budget;
+    bool lexbor_installed = false;
+    NavigationSession navigation = {0};
+    bool ready = preload_map_page(&budget, &navigation, &lexbor_installed,
+                                  false);
+    static const char source[] = "ran.push('a')";
+    bool offered = ready
+        && offer_test_preload(&navigation, &budget,
+                              "https://preload.test/a.js",
+                              TILEFINCH_REQUEST_MODE_CORS, NULL, source);
+    size_t freed = offered ? script_runtime_release_preloaded_scripts(
+        navigation.page.runtime, 1) : 0;
+    const ScriptResult *result = &navigation.page.script_result;
+    bool released = offered
+        && freed == sizeof(source) - 1u
+        && script_runtime_release_preloaded_scripts(
+               navigation.page.runtime, SIZE_MAX) == 0
+        && preload_map_insert(&navigation, "/a.js")
+        && result->dynamic_scripts_preload_hits == 0u
+        && result->preloaded_scripts_released == 1u
+        && result->preloaded_scripts_released_bytes == sizeof(source) - 1u;
+    if (!released)
+        fprintf(stderr, "preload pressure: ready=%d offered=%d freed=%zu "
+                "hits=%zu released=%zu\n", ready, offered, freed,
+                result->dynamic_scripts_preload_hits,
+                result->preloaded_scripts_released);
+    bool clean = preload_map_page_done(&budget, &navigation,
+                                       lexbor_installed, ready);
+    return released && clean;
+}
+
+/* An entry no script consumed is released SCRIPT_PRELOADED_SCRIPT_UNUSED_MS
+   (Chromium's kUnusedPreloadTimeout, 3 s) after the load event, and kept
+   until then. */
+static bool test_preload_map_releases_unused_after_load(void)
+{
+    Budget budget;
+    bool lexbor_installed = false;
+    NavigationSession navigation = {0};
+    bool ready = preload_map_page(&budget, &navigation, &lexbor_installed,
+                                  true);
+    bool offered = ready
+        && offer_test_preload(&navigation, &budget,
+                              "https://preload.test/a.js",
+                              TILEFINCH_REQUEST_MODE_CORS, NULL,
+                              "ran.push('a')")
+        && offer_test_preload(&navigation, &budget,
+                              "https://preload.test/b.js",
+                              TILEFINCH_REQUEST_MODE_CORS, NULL,
+                              "ran.push('b')");
+    const ScriptResult *result = &navigation.page.script_result;
+    bool kept = offered;
+    for (unsigned tick = 0; kept && tick < 29; tick++)
+        kept = navigation_advance_runtime(&navigation, 100, 4);
+    /* 2.9 s after load: both kept; a consumes its entry. */
+    kept = kept && result->preloaded_scripts_released == 0u
+        && preload_map_insert(&navigation, "/a.js")
+        && result->dynamic_scripts_preload_hits == 1u;
+    bool released = kept;
+    for (unsigned tick = 0; released && tick < 2; tick++)
+        released = navigation_advance_runtime(&navigation, 100, 4);
+    released = released && result->preloaded_scripts_released == 1u
+        && preload_map_insert(&navigation, "/b.js")
+        && result->dynamic_scripts_preload_hits == 1u;
+    if (!released)
+        fprintf(stderr, "preload unused: ready=%d offered=%d kept=%d "
+                "hits=%zu released=%zu dcl=%d\n", ready, offered, kept,
+                result->dynamic_scripts_preload_hits,
+                result->preloaded_scripts_released,
+                result->dom_content_loaded_dispatched);
+    bool clean = preload_map_page_done(&budget, &navigation,
+                                       lexbor_installed, ready);
+    return released && clean;
+}
+
+/* The map holds at most SCRIPT_PRELOADED_SCRIPT_BYTE_LIMIT bytes of
+   bodies: an offer past it is refused, a small one still fits, and the
+   refused size fits again once the large entry goes. */
+static bool test_preload_map_byte_bound(void)
+{
+    Budget budget;
+    bool lexbor_installed = false;
+    NavigationSession navigation = {0};
+    bool ready = preload_map_page(&budget, &navigation, &lexbor_installed,
+                                  false);
+    size_t length = SCRIPT_PRELOADED_SCRIPT_BYTE_LIMIT / 2u + 1024u;
+    char *source = ready ? malloc(length + 1u) : NULL;
+    if (source != NULL) {
+        static const char head[] = "ran.push('big');//";
+        memcpy(source, head, sizeof(head) - 1u);
+        memset(source + sizeof(head) - 1u, 'x', length - sizeof(head) + 1u);
+        source[length] = '\0';
+    }
+    const ScriptResult *result = &navigation.page.script_result;
+    bool first = source != NULL
+        && offer_test_preload(&navigation, &budget,
+                              "https://preload.test/a.js",
+                              TILEFINCH_REQUEST_MODE_CORS, NULL, source);
+    bool bounded = first
+        && !offer_test_preload(&navigation, &budget,
+                               "https://preload.test/b.js",
+                               TILEFINCH_REQUEST_MODE_CORS, NULL, source)
+        && offer_test_preload(&navigation, &budget,
+                              "https://preload.test/c.js",
+                              TILEFINCH_REQUEST_MODE_CORS, NULL,
+                              "ran.push('c')")
+        /* The page's result copies the realm's counters on an advance. */
+        && preload_map_insert(&navigation, "/c.js")
+        && result->dynamic_scripts_preload_hits == 1u
+        && result->preloaded_scripts_released == 1u
+        && result->preloaded_scripts_released_bytes == length
+        /* Room again once a's entry goes. */
+        && script_runtime_release_preloaded_scripts(
+               navigation.page.runtime, SIZE_MAX) == length
+        && offer_test_preload(&navigation, &budget,
+                              "https://preload.test/b.js",
+                              TILEFINCH_REQUEST_MODE_CORS, NULL, source);
+    if (!bounded)
+        fprintf(stderr, "preload bound: ready=%d first=%d hits=%zu "
+                "released=%zu bytes=%zu\n", ready, first,
+                result->dynamic_scripts_preload_hits,
+                result->preloaded_scripts_released,
+                result->preloaded_scripts_released_bytes);
+    free(source);
+    bool clean = preload_map_page_done(&budget, &navigation,
+                                       lexbor_installed, ready);
+    return bounded && clean;
+}
+
 static bool test_frame_completion_error_event_oom_retires_realm(void)
 {
     /* The frame's response fails (404), and the error listener the

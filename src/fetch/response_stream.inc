@@ -732,6 +732,36 @@ static void write_context_set_effective_url(WriteContext *context,
     }
 }
 
+/* The macOS system libcurl (8.7.1) breaks a multiplexed HTTP/2 connection
+   when a callback aborts one of its streams that is not the connection's
+   first: the next stream decodes shifted HPACK fields ("Invalid HTTP header
+   field was received ... content-length: [DENY]"), and so does every later
+   one. 8.22.0, the PSP's owned transport, resets only the aborted stream.
+   Versions in between are untested, so any host libcurl older than 8.22.0
+   reads and discards an HTTP/2 redirect body instead, up to
+   FETCH_REDIRECT_DRAIN_LIMIT; a longer one is still aborted. */
+#define FETCH_REDIRECT_DRAIN_LIMIT (64u * 1024u)
+
+static bool fetch_redirect_abort_unsafe(CURL *easy)
+{
+#if defined(__PSP__)
+    (void) easy;
+    return false;
+#else
+    static int affected = -1;
+    if (affected < 0) {
+        const curl_version_info_data *info =
+            curl_version_info(CURLVERSION_NOW);
+        affected = info != NULL && info->version_num < 0x081600 ? 1 : 0;
+    }
+    long version = 0;
+    return affected == 1 && easy != NULL
+        && curl_easy_getinfo(easy, CURLINFO_HTTP_VERSION, &version)
+               == CURLE_OK
+        && version == CURL_HTTP_VERSION_2_0;
+#endif
+}
+
 static size_t receive_data(char *data, size_t size, size_t count, void *opaque)
 {
     WriteContext *context = opaque;
@@ -741,8 +771,18 @@ static size_t receive_data(char *data, size_t size, size_t count, void *opaque)
     /* A redirect representation is never page-visible.  Stop the transfer at
        its first body byte so a slow or unbounded redirect body cannot consume
        the request deadline; the easy and multi drivers recognize this one
-       internal write abort and immediately advance the validated hop. */
+       internal write abort and immediately advance the validated hop. Where
+       that abort would break a shared HTTP/2 connection
+       (fetch_redirect_abort_unsafe), up to FETCH_REDIRECT_DRAIN_LIMIT bytes
+       are read and discarded instead, and a larger body is aborted all the
+       same. */
     if (context->redirect_response) {
+        if (context->redirect_drain
+            && received <= FETCH_REDIRECT_DRAIN_LIMIT
+                               - context->redirect_drained_bytes) {
+            context->redirect_drained_bytes += received;
+            return received;
+        }
         context->redirect_callback_aborted = true;
         return 0;
     }
@@ -1467,6 +1507,13 @@ static size_t receive_header(char *data, size_t size, size_t count,
     WriteContext *context = opaque;
     if (size != 0 && count > SIZE_MAX / size) return 0;
     size_t length = size * count;
+    /* After a drained redirect's headers, libcurl hands its trailers (and
+       the blank line ending them) to this callback too. They are not the
+       redirect's headers: a set-cookie there is never staged. Only the next
+       hop's status line is read. */
+    if (context->redirect_drain
+        && !(length >= 5 && strncasecmp(data, "HTTP/", 5) == 0))
+        return length;
     const char *colon = memchr(data, ':', length);
     if (colon == NULL) {
         if (length >= 5 && strncasecmp(data, "HTTP/", 5) == 0) {
@@ -1487,6 +1534,8 @@ static size_t receive_header(char *data, size_t size, size_t count,
             context->has_response_location = false;
             context->redirect_response = false;
             context->redirect_callback_aborted = false;
+            context->redirect_drain = false;
+            context->redirect_drained_bytes = 0;
             context->interim_response = false;
             const char *space = memchr(data, ' ', length);
             if (space != NULL) {
@@ -1554,9 +1603,20 @@ static size_t receive_header(char *data, size_t size, size_t count,
             if (!enforce_response_cors_policy(context)) return 0;
             if (!enforce_response_credential_policy(context)) return 0;
             if (context->redirect_response) {
+                context->redirect_drain =
+                    fetch_redirect_abort_unsafe(context->easy);
+                if (context->redirect_drain) return length;
                 context->redirect_callback_aborted = true;
                 return 0;
             }
+            /* A streaming consumer sees the hop's timing as its headers
+               arrive (Navigation Timing's connection phases are final by
+               then); completion resamples it. */
+            if (!context->redirect_response && !context->interim_response
+                && context->stream != NULL
+                && context->stream->on_headers != NULL)
+                fetch_transport_timing_sample(
+                    context->easy, &context->result->transport_timing);
             if (!context->redirect_response && !context->interim_response
                 && context->stream != NULL
                 && context->stream->on_headers != NULL

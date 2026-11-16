@@ -1138,6 +1138,7 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
     /* Transport may make progress independently of the author-task budget,
        but promise settlement and dynamic-script execution remain gated. */
     phase_started = js_rt_monotonic_time_ns();
+    js_rt_preloaded_scripts_step(&runtime->bridge);
     size_t prepared_network_tasks = 0;
     ok = runtime_pump_network(runtime, 0, elapsed_ms,
                               &prepared_network_tasks);

@@ -1287,6 +1287,81 @@ static int test_nested_module_compile_time_is_exclusive(void)
     return 1;
 }
 
+/* Web IDL receiver checks mark what the browser's lazy modules define,
+   never a page's own code. A module of 8 KiB or more keeps no source text,
+   so its functions cannot be told from the browser's by their form: a
+   class it puts on the global (jQuery is one) stays an ordinary class
+   after the page loads a lazy module (Intl, DOM traversal), callable on
+   any receiver and with no interface class string, while the members the
+   lazy modules defined (traversal, streams, canvas) reject a plain object.
+   The same holds when the module is restored from the bytecode cache. */
+static int test_lazy_module_leaves_page_classes_alone(void)
+{
+    ModuleFixture fixture;
+    CHECK(fixture_open(&fixture));
+    BrowserSession session;
+    CHECK(browser_session_init(&session, &fixture.budget, 512u * 1024u));
+    browser_session_module_bytecode_set_limit(&session, 1024u * 1024u);
+    fixture.options.session = &session;
+    ModuleMap map = {0};
+    CHECK(module_map_add(&map, "https://mod.test/lib.js",
+              "https://mod.test/lib.js",
+              padded_source(
+                  "class Foo{m(){return 'm:'+this.tag}get g(){return this.tag}}"
+                  "function jQuery(){}jQuery.fn=jQuery.prototype;"
+                  "jQuery.extend=jQuery.fn.extend=function(){return 'extended'};"
+                  "jQuery.fn.each=function(){return this.tag};"
+                  "window.Foo=Foo;window.jQuery=jQuery;"
+                  "export const stripped=String(Foo.prototype.m)"
+                  ".includes('[native code]');",
+                  9u * 1024u)));
+    char *root = padded_source(
+        "import {stripped} from './lib.js';"
+        "void Intl.DateTimeFormat;document.createTreeWalker(document.body);"
+        "new WritableStream();document.createElement('canvas')"
+        ".getContext('2d');"
+        "const ok=(f)=>{try{return String(f())}catch(e){"
+        "return 'throw:'+e.message}};"
+        "globalThis.pocSummary=[stripped,"
+        "ok(()=>Foo.prototype.m.call({tag:'x'})),"
+        "ok(()=>Object.getOwnPropertyDescriptor(Foo.prototype,'g')"
+        ".get.call({tag:'y'})),"
+        "ok(()=>jQuery.extend.call({})),"
+        "ok(()=>jQuery.fn.each.call({tag:'z'})),"
+        "ok(()=>Object.assign({},{e:jQuery.extend}).e()),"
+        "Object.prototype.toString.call(new Foo()),"
+        "Object.prototype.toString.call(Foo.prototype),"
+        "ok(()=>new Intl.DateTimeFormat('en').resolvedOptions().locale),"
+        "ok(()=>TreeWalker.prototype.nextNode.call({})),"
+        "ok(()=>WritableStream.prototype.getWriter.call({})),"
+        "ok(()=>CanvasRenderingContext2D.prototype.fillRect.call({}))"
+        "].join('|');",
+        9u * 1024u);
+    CHECK(root != NULL);
+    static const char expected[] =
+        "true|m:x|y|extended|z|extended|[object Object]|[object Object]|en|"
+        "throw:Illegal invocation|throw:Illegal invocation|"
+        "throw:Illegal invocation";
+    for (unsigned load = 0; load < 2u; load++) {
+        ScriptRuntime *runtime = NULL;
+        ScriptResult result;
+        bool ran = run_root(&fixture, &map, root, &runtime, &result);
+        if (!ran || strcmp(result.summary, expected) != 0)
+            fprintf(stderr, "page classes (load %u): %s error=%s\n", load,
+                    result.summary, result.error);
+        CHECK(ran && strcmp(result.summary, expected) == 0);
+        /* The second load restores both modules from bytecode. */
+        CHECK(load == 0 || result.module_bytecode_cache_hits == 2);
+        script_runtime_destroy(runtime);
+    }
+    free(root);
+    browser_session_cache_clear(&session);
+    browser_session_destroy(&session);
+    module_map_free(&map);
+    CHECK(fixture_close(&fixture));
+    return 0;
+}
+
 int main(void)
 {
     /* The persistent-tier tests use fixed directory names relative to the
@@ -1315,6 +1390,8 @@ int main(void)
     CHECK(test_unrestorable_entry_falls_back_to_source() == 0);
     CHECK(test_restored_module_import_failure_matches_compile() == 0);
     puts("module bytecode cache: PASS");
+    CHECK(test_lazy_module_leaves_page_classes_alone() == 0);
+    puts("lazy modules leave page classes alone: PASS");
     /* The persistent tier, modules included: test_script_disk_cache.c. */
     CHECK(test_classic_script_dynamic_import() == 0);
     puts("classic script dynamic import: PASS");

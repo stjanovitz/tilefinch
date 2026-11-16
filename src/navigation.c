@@ -133,6 +133,8 @@ void navigation_destroy(NavigationSession *session)
         budget_free(session->budget, session->history);
         budget_free(session->budget, session->user_css);
         budget_free(session->budget, session->form_submission_body);
+        script_window_name_release(session->window_name);
+        budget_free(session->budget, session->window_name);
     }
     memset(session, 0, sizeof(*session));
 }

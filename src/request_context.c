@@ -243,3 +243,20 @@ const char *tilefinch_request_fetch_destination(
     }
     return "empty";
 }
+
+TilefinchCorsSettings tilefinch_cors_settings(const char *value,
+                                              size_t length)
+{
+    if (value == NULL) return TILEFINCH_CORS_SETTINGS_NONE;
+    return length == sizeof("use-credentials") - 1u
+        && strncasecmp(value, "use-credentials", length) == 0
+            ? TILEFINCH_CORS_SETTINGS_USE_CREDENTIALS
+            : TILEFINCH_CORS_SETTINGS_ANONYMOUS;
+}
+
+TilefinchCredentialsMode tilefinch_cors_settings_credentials(
+    TilefinchCorsSettings settings, bool cors)
+{
+    return !cors || settings == TILEFINCH_CORS_SETTINGS_USE_CREDENTIALS
+        ? TILEFINCH_CREDENTIALS_INCLUDE : TILEFINCH_CREDENTIALS_SAME_ORIGIN;
+}

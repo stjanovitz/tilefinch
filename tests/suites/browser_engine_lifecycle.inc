@@ -835,6 +835,65 @@ static bool activate_page_video(
         && action->type == CONTROLLER_ACTION_MEDIA;
 }
 
+/* The native player's request reads the element's crossorigin state: a
+   bare attribute (lexbor keeps no value for one), "" and an invalid value
+   are Anonymous, use-credentials in any case includes credentials, and no
+   attribute is a no-cors request. */
+static int test_page_video_cors_settings(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.session_cache_limit = 256u * 1024u;
+    config.maximum_document_bytes = 64u * 1024u;
+    config.tile_capacity = 2;
+    config.javascript.enabled = true;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+    static const struct {
+        const char *attribute;
+        TilefinchRequestMode mode;
+        TilefinchCredentialsMode credentials;
+    } cases[] = {
+        {"", TILEFINCH_REQUEST_MODE_NO_CORS, TILEFINCH_CREDENTIALS_INCLUDE},
+        {"crossorigin", TILEFINCH_REQUEST_MODE_CORS,
+         TILEFINCH_CREDENTIALS_SAME_ORIGIN},
+        {"crossorigin=''", TILEFINCH_REQUEST_MODE_CORS,
+         TILEFINCH_CREDENTIALS_SAME_ORIGIN},
+        {"crossorigin=anonymous", TILEFINCH_REQUEST_MODE_CORS,
+         TILEFINCH_CREDENTIALS_SAME_ORIGIN},
+        {"crossorigin=zz", TILEFINCH_REQUEST_MODE_CORS,
+         TILEFINCH_CREDENTIALS_SAME_ORIGIN},
+        {"crossorigin=use-credentials", TILEFINCH_REQUEST_MODE_CORS,
+         TILEFINCH_CREDENTIALS_INCLUDE},
+        {"crossorigin=USE-CREDENTIALS", TILEFINCH_REQUEST_MODE_CORS,
+         TILEFINCH_CREDENTIALS_INCLUDE},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char page[256];
+        snprintf(page, sizeof(page),
+                 "<!doctype html><body><video controls %s width=320 "
+                 "height=180 src=movie.mp4></video>", cases[i].attribute);
+        ControllerAction action;
+        bool activated = activate_page_video(
+            engine, "https://media.test/page.html", page, &action);
+        if (!activated || action.media_mode != cases[i].mode
+            || action.media_credentials != cases[i].credentials) {
+            fprintf(stderr, "video %s: activated=%d mode=%d credentials=%d\n",
+                    cases[i].attribute, activated, (int) action.media_mode,
+                    (int) action.media_credentials);
+            CHECK(false);
+        }
+    }
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
 /* A <video> offering several renditions plays the one the PSP policy ranks
    first (the lowest at or above 240p), and carries the rest, then the
    page's declared and discovered video, for the native route to fall back
@@ -6743,6 +6802,9 @@ static int test_same_document_and_script_free_defaults_on_clock(void)
        a pre-dispatch refusal and replay its native default. Run these before
        the deliberate watchdog failures below so each hostile boundary is
        independently attributed. */
+    /* The press enters the dispatcher four times: Enter's keydown and
+       keypress (one entry, controller_dispatch_enter_phase's phase 7), the
+       click, the submit, and Enter's keyup. */
     CHECK(browser_engine_focus_node(engine, getter_submit));
     size_t dispatches_before =
         navigation->page.script_result.event_dispatches_entered;
@@ -6752,7 +6814,7 @@ static int test_same_document_and_script_free_defaults_on_clock(void)
         || action.activation_outcome != CONTROLLER_ACTIVATION_RUNTIME_FAILED
         || action.url[0] != '\0'
         || navigation->page.script_result.event_dispatches_entered
-               != dispatches_before + 2u
+               != dispatches_before + 4u
         || !navigation->page.script_result.event_dispatch_entered
         || navigation->page.script_result.events_dispatched <= events_before
         || !actionable_has_attribute(getter_form, "data-check-ran")) {
@@ -6776,7 +6838,7 @@ static int test_same_document_and_script_free_defaults_on_clock(void)
                  == CONTROLLER_ACTIVATION_RUNTIME_FAILED
           && action.url[0] == '\0'
           && navigation->page.script_result.event_dispatches_entered
-                 == dispatches_before + 2u
+                 == dispatches_before + 4u
           && navigation->page.script_result.event_dispatch_entered
           && navigation->page.script_result.events_dispatched > events_before
           && actionable_has_attribute(getter_form, "data-check-ran"));

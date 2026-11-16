@@ -85,6 +85,8 @@ static void image_preloads_destroy(ScriptRuntime *runtime);
 #include "js_runtime/image_preloads.inc"
 #include "js_runtime/result_snapshot.inc"
 #include "js_runtime/legacy_surface.inc"
+#include "js_runtime/reflected_attributes.inc"
+#include "js_runtime/live_node_list.inc"
 #include "js_runtime/page_dialogs.inc"
 #include "js_runtime/runtime_creation.inc"
 #include "js_runtime/document_evaluation.inc"

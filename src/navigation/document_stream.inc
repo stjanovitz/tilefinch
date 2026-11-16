@@ -70,18 +70,6 @@ static bool navigation_stylesheet_mime_matches(const char *content_type)
         || isspace((unsigned char) after);
 }
 
-static TilefinchCredentialsMode navigation_module_credentials(
-    lxb_dom_node_t *node)
-{
-    size_t length = 0;
-    const char *value = document_attribute(node, "crossorigin", &length);
-    static const char use_credentials[] = "use-credentials";
-    return value != NULL && length == sizeof(use_credentials) - 1
-        && strncasecmp(value, use_credentials, length) == 0
-            ? TILEFINCH_CREDENTIALS_INCLUDE
-            : TILEFINCH_CREDENTIALS_SAME_ORIGIN;
-}
-
 static bool navigation_stream_preload_seen(
     const NavigationDocumentStream *stream, const lxb_dom_node_t *node)
 {
@@ -149,6 +137,26 @@ static void navigation_stream_add_preload_url(
     }
 }
 
+/* Puts a classic script request in the document's map of preloaded
+   resources, keyed with its element's integrity metadata (NULL or empty:
+   none). */
+static void navigation_stream_map_script_preload(
+    NavigationDocumentStream *stream, NavigationPreload *preload,
+    const char *integrity, size_t integrity_length)
+{
+    if (preload->url == NULL || preload->map_entry) return;
+    if (integrity != NULL && integrity_length != 0) {
+        preload->integrity = budget_malloc(stream->session->budget,
+                                           integrity_length + 1u);
+        /* Without its metadata the response could satisfy a consumer the
+           standard would refuse: keep it out of the map. */
+        if (preload->integrity == NULL) return;
+        memcpy(preload->integrity, integrity, integrity_length);
+        preload->integrity[integrity_length] = '\0';
+    }
+    preload->map_entry = true;
+}
+
 static void navigation_stream_discover_preload(
     NavigationDocumentStream *stream, lxb_dom_node_t *node)
 {
@@ -162,12 +170,10 @@ static void navigation_stream_discover_preload(
         return;
     }
     stream->session->preloads_discovered++;
-    size_t crossorigin_length = 0;
-    const char *crossorigin = document_attribute(
-        node, "crossorigin", &crossorigin_length);
-    bool cors = module || crossorigin != NULL;
-    TilefinchCredentialsMode credentials = cors
-        ? navigation_module_credentials(node) : TILEFINCH_CREDENTIALS_INCLUDE;
+    TilefinchCorsSettings cors_settings = document_cors_settings(node);
+    bool cors = module || cors_settings != TILEFINCH_CORS_SETTINGS_NONE;
+    TilefinchCredentialsMode credentials =
+        tilefinch_cors_settings_credentials(cors_settings, cors);
     size_t as_length = 0;
     const char *as = document_attribute(node, "as", &as_length);
     bool style = !module && navigation_span_equal(as, as_length, "style");
@@ -206,12 +212,208 @@ static void navigation_stream_discover_preload(
        "not-parser-inserted" (its nonce and integrity still count), which
        'strict-dynamic' admits; reddit's loader inserts one from a trusted
        script while the page parses. */
+    size_t before = stream->preload_count;
     navigation_stream_add_preload_url(
         stream, node, reference, script, module, cors, credentials, false,
         false, tilefinch_csp_element_grant(
                    &stream->parser->document.content_security_policy,
                    script ? TILEFINCH_DESTINATION_SCRIPT
                           : TILEFINCH_DESTINATION_STYLE, node, !module));
+    NavigationPreload *added = stream->preload_count > before
+        ? &stream->preloads[stream->preload_count - 1u] : NULL;
+    /* The scanner may have found the URL first in a later <script src>
+       of the same request mode: the link's preload is that request. */
+    char resolved[NAVIGATION_URL_LIMIT];
+    bool look = added == NULL && script && !module
+        && fetch_resolve_url(stream->resource_base_url, reference, resolved,
+                             sizeof(resolved));
+    for (size_t i = 0; look && added == NULL && i < stream->preload_count;
+         i++) {
+        NavigationPreload *seen = &stream->preloads[i];
+        if (seen->url != NULL && seen->script && !seen->module
+            && !seen->map_entry && seen->cors == cors
+            && seen->credentials == credentials
+            && strcmp(seen->url, resolved) == 0) added = seen;
+    }
+    if (added == NULL || !script || module) return;
+    size_t integrity_length = 0;
+    const char *integrity = document_attribute(node, "integrity",
+                                               &integrity_length);
+    navigation_stream_map_script_preload(stream, added, integrity,
+                                         integrity_length);
+}
+
+/* HTML's map of preloaded resources: a completed <link rel=preload
+   as=script> response is kept for the first classic script with the same
+   preload key (script_runtime_offer_preloaded_script). A CORS response is
+   otherwise discarded (the HTTP cache keeps no CORS-validated classic
+   script from here), so a page that inserts the same script fetched it a
+   second time; login.live.com does this for its 1 MB bundle. Before the
+   realm exists the authorized body is held for it. */
+static void navigation_stream_offer_preloaded_script(
+    NavigationDocumentStream *stream, NavigationPreload *preload,
+    FetchResult *result)
+{
+    if (!preload->map_entry || preload->module
+        || result->status_code == 304
+        || (result->length != 0 && !fetch_result_share_body(result))) return;
+    TilefinchRequestMode mode = preload->cors
+        ? TILEFINCH_REQUEST_MODE_CORS : TILEFINCH_REQUEST_MODE_NO_CORS;
+    TilefinchRequestContext context = {
+        .target_url = preload->url,
+        .initiator_url = stream->document_url,
+        .top_level_url = stream->document_url,
+        .method = "GET",
+        .mode = mode,
+        .credentials = preload->credentials,
+        .destination = TILEFINCH_DESTINATION_SCRIPT,
+        .csp_grant = preload->csp_grant
+    };
+    TilefinchResourceGrant grant = {0};
+    if (!fetch_resource_grant_create(
+            result, &context, preload->cors,
+            script_module_mime_type_allowed(result->content_type), false,
+            &grant, NULL)) return;
+    const char *response_url = result->effective_url[0] == '\0'
+        ? preload->url : result->effective_url;
+    if (stream->runtime != NULL) {
+        (void) script_runtime_offer_preloaded_script(
+            stream->runtime, preload->url, mode, preload->credentials,
+            preload->integrity, result->shared_body, result->length,
+            response_url, result->content_type);
+        return;
+    }
+    if (stream->optional_work_shed || preload->held_body != NULL
+        || result->length > SCRIPT_PRELOADED_SCRIPT_BYTE_LIMIT
+        || stream->held_preload_bytes
+               > SCRIPT_PRELOADED_SCRIPT_BYTE_LIMIT - result->length) return;
+    if (strcmp(response_url, preload->url) != 0) {
+        preload->held_response_url = budget_malloc(
+            stream->session->budget, strlen(response_url) + 1u);
+        if (preload->held_response_url == NULL) return;
+        memcpy(preload->held_response_url, response_url,
+               strlen(response_url) + 1u);
+    }
+    preload->held_body = browser_shared_body_retain(result->shared_body);
+    preload->held_length = result->length;
+    stream->held_preload_bytes += result->length;
+    snprintf(preload->held_content_type, sizeof(preload->held_content_type),
+             "%s", result->content_type);
+}
+
+/* Frees only: the reclaim hooks call it. Returns the bytes freed (none
+   when the HTTP cache still shares the body). */
+static size_t navigation_stream_release_held_preload(
+    NavigationDocumentStream *stream, NavigationPreload *preload)
+{
+    size_t freed = preload->held_body != NULL
+        && preload->held_body->references == 1u ? preload->held_length : 0;
+    stream->held_preload_bytes = stream->held_preload_bytes
+        > preload->held_length
+        ? stream->held_preload_bytes - preload->held_length : 0;
+    browser_shared_body_release(preload->held_body);
+    preload->held_body = NULL;
+    preload->held_length = 0;
+    budget_free(stream->session == NULL ? NULL : stream->session->budget,
+                preload->held_response_url);
+    preload->held_response_url = NULL;
+    return freed;
+}
+
+/* The realm now exists (runtime; NULL when none will): the responses held
+   for it go to its map. */
+static void navigation_stream_offer_held_preloads(
+    NavigationDocumentStream *stream, ScriptRuntime *runtime)
+{
+    for (size_t i = 0; i < stream->preload_count; i++) {
+        NavigationPreload *preload = &stream->preloads[i];
+        if (preload->held_body == NULL) continue;
+        /* Moved out first: the offer allocates, and an allocation can
+           reach the reclaim hooks, which release held responses. */
+        NavigationPreload held = *preload;
+        stream->held_preload_bytes = stream->held_preload_bytes
+            > held.held_length
+            ? stream->held_preload_bytes - held.held_length : 0;
+        preload->held_body = NULL;
+        preload->held_length = 0;
+        preload->held_response_url = NULL;
+        if (runtime != NULL)
+            (void) script_runtime_offer_preloaded_script(
+                runtime, preload->url,
+                preload->cors ? TILEFINCH_REQUEST_MODE_CORS
+                              : TILEFINCH_REQUEST_MODE_NO_CORS,
+                preload->credentials, preload->integrity,
+                held.held_body, held.held_length,
+                held.held_response_url == NULL
+                    ? preload->url : held.held_response_url,
+                held.held_content_type);
+        browser_shared_body_release(held.held_body);
+        budget_free(stream->session == NULL ? NULL : stream->session->budget,
+                    held.held_response_url);
+    }
+}
+
+/* A <link rel=preload as=script> still in flight when parsing ends goes
+   to the realm (script_runtime_adopt_preload_request) instead of being
+   cancelled: HTML keeps fetching a preload, and its consumer waits for the
+   response rather than fetching the URL again. Its request runs on the
+   page's scheduler, under the request's own timeout. */
+static bool navigation_stream_adopt_preload(NavigationDocumentStream *stream,
+                                            NavigationPreload *preload)
+{
+    if (stream->optional_work_shed || !preload->map_entry
+        || preload->module) return false;
+    /* No realm yet (no parser-blocking script ran): the page's realm takes
+       the request at commit (navigation_stream_hand_preloads_to_realm). */
+    if (stream->runtime == NULL) {
+        if (!stream->session->scripts_enabled
+            || !stream->session->document_scripts_enabled) return false;
+        preload->awaiting_realm = true;
+        preload->complete = true;
+        return true;
+    }
+    if (!script_runtime_adopt_preload_request(
+               stream->runtime, stream->scheduler, preload->request_id,
+               preload->url,
+               preload->cors ? TILEFINCH_REQUEST_MODE_CORS
+                             : TILEFINCH_REQUEST_MODE_NO_CORS,
+               preload->credentials, preload->csp_grant,
+               preload->integrity)) return false;
+    preload->request_id = 0;
+    preload->complete = true;
+    return true;
+}
+
+/* At commit, once the page's realm exists (runtime; NULL when it will
+   not): the preload responses and in-flight requests parsing kept for it
+   go to its map; scheduler is the page's resource scheduler. */
+static void navigation_stream_hand_preloads_to_realm(
+    NavigationSession *session, NavigationDocumentStream *stream,
+    ScriptRuntime *runtime, FetchScheduler *scheduler)
+{
+    if (stream == NULL) return;
+    navigation_stream_offer_held_preloads(stream, runtime);
+    for (size_t i = 0; i < stream->preload_count; i++) {
+        NavigationPreload *preload = &stream->preloads[i];
+        if (!preload->awaiting_realm) continue;
+        preload->awaiting_realm = false;
+        uint64_t request_id = preload->request_id;
+        preload->request_id = 0;
+        /* A scheduler other than the stream's lost the request with the
+           stream's scheduler. */
+        if (scheduler == NULL || scheduler != stream->scheduler) continue;
+        if (runtime != NULL && script_runtime_adopt_preload_request(
+                runtime, scheduler, request_id, preload->url,
+                preload->cors ? TILEFINCH_REQUEST_MODE_CORS
+                              : TILEFINCH_REQUEST_MODE_NO_CORS,
+                preload->credentials, preload->csp_grant,
+                preload->integrity)) continue;
+        (void) fetch_scheduler_cancel(
+            scheduler, request_id,
+            "speculative preload ended at navigation commit");
+        (void) fetch_scheduler_discard(scheduler, request_id);
+        session->preloads_deferred++;
+    }
 }
 
 static void navigation_stream_confirm_stylesheet_preload(
@@ -293,6 +495,20 @@ static bool navigation_preload_scan_attribute(
         }
     }
     return false;
+}
+
+/* The tag's crossorigin state, mapped as the element's will be
+   (document_cors_settings): a bare attribute is present with an empty
+   value, so Anonymous. */
+static TilefinchCorsSettings navigation_preload_scan_cors_settings(
+    const char *tag, size_t length)
+{
+    const char *value = NULL;
+    size_t value_length = 0;
+    if (!navigation_preload_scan_attribute(tag, length, "crossorigin",
+                                           &value, &value_length))
+        return TILEFINCH_CORS_SETTINGS_NONE;
+    return tilefinch_cors_settings(value, value_length);
 }
 
 static bool navigation_preload_decode_reference(
@@ -408,8 +624,8 @@ static void navigation_stream_preload_scan_tag(
     }
     if (closing) return;
     if (navigation_span_equal(name, name_length, "script")) {
-        const char *src = NULL, *type = NULL, *crossorigin = NULL;
-        size_t src_length = 0, type_length = 0, crossorigin_length = 0;
+        const char *src = NULL, *type = NULL;
+        size_t src_length = 0, type_length = 0;
         bool has_src = navigation_preload_scan_attribute(
             tag, length, "src", &src, &src_length);
         bool has_type = navigation_preload_scan_attribute(
@@ -426,20 +642,12 @@ static void navigation_stream_preload_scan_tag(
             char reference[2048];
             if (navigation_preload_decode_reference(
                     src, src_length, reference)) {
+                TilefinchCorsSettings cors_settings =
+                    navigation_preload_scan_cors_settings(tag, length);
+                bool cors = module
+                    || cors_settings != TILEFINCH_CORS_SETTINGS_NONE;
                 TilefinchCredentialsMode credentials =
-                    TILEFINCH_CREDENTIALS_INCLUDE;
-                bool has_crossorigin = navigation_preload_scan_attribute(
-                    tag, length, "crossorigin", &crossorigin,
-                    &crossorigin_length);
-                bool cors = module || has_crossorigin;
-                if (cors) {
-                    credentials = has_crossorigin
-                            && navigation_span_equal(
-                                crossorigin, crossorigin_length,
-                                "use-credentials")
-                        ? TILEFINCH_CREDENTIALS_INCLUDE
-                        : TILEFINCH_CREDENTIALS_SAME_ORIGIN;
-                }
+                    tilefinch_cors_settings_credentials(cors_settings, cors);
                 const char *nonce = NULL, *integrity = NULL;
                 size_t nonce_length = 0, integrity_length = 0;
                 /* The tag is the element the parser will build: one whose
@@ -450,12 +658,23 @@ static void navigation_stream_preload_scan_tag(
                         tag, length, "nonce", &nonce, &nonce_length);
                 (void) navigation_preload_scan_attribute(
                     tag, length, "integrity", &integrity, &integrity_length);
+                size_t before = stream->preload_count;
                 navigation_stream_add_preload_url(
                     stream, NULL, reference, true, module, cors, credentials,
                     true, false, tilefinch_csp_request_grant(
                         &stream->parser->document.content_security_policy,
                         TILEFINCH_DESTINATION_SCRIPT, nonce, nonce_length,
                         integrity, integrity_length, true));
+                /* The HTTP cache serves no classic CORS script, so the map
+                   of preloaded resources holds this request for the
+                   element's fetch, and a <link rel=preload> the parser
+                   reaches later finds it there whether or not it has
+                   completed (one entry per key, as Chromium's preload
+                   list keeps both). */
+                if (cors && !module && stream->preload_count > before)
+                    navigation_stream_map_script_preload(
+                        stream, &stream->preloads[before], integrity,
+                        integrity_length);
             }
         }
         stream->preload_scan_raw_text = 1;
@@ -486,9 +705,7 @@ static void navigation_stream_preload_scan_tag(
     }
     if (!navigation_span_equal(name, name_length, "link")) return;
     const char *disabled = NULL, *href = NULL, *rel = NULL;
-    const char *crossorigin = NULL;
     size_t disabled_length = 0, href_length = 0, rel_length = 0;
-    size_t crossorigin_length = 0;
     if (navigation_preload_scan_attribute(
             tag, length, "disabled", &disabled, &disabled_length)
         || !navigation_preload_scan_attribute(
@@ -501,14 +718,11 @@ static void navigation_stream_preload_scan_tag(
     char reference[2048];
     if (!navigation_preload_decode_reference(
             href, href_length, reference)) return;
-    bool cors = navigation_preload_scan_attribute(
-        tag, length, "crossorigin", &crossorigin, &crossorigin_length);
-    TilefinchCredentialsMode credentials = cors
-        && navigation_span_equal(crossorigin, crossorigin_length,
-                                 "use-credentials")
-            ? TILEFINCH_CREDENTIALS_INCLUDE
-            : cors ? TILEFINCH_CREDENTIALS_SAME_ORIGIN
-                   : TILEFINCH_CREDENTIALS_INCLUDE;
+    TilefinchCorsSettings cors_settings =
+        navigation_preload_scan_cors_settings(tag, length);
+    bool cors = cors_settings != TILEFINCH_CORS_SETTINGS_NONE;
+    TilefinchCredentialsMode credentials =
+        tilefinch_cors_settings_credentials(cors_settings, cors);
     const char *nonce = NULL;
     size_t nonce_length = 0;
     if (!tilefinch_csp_text_has_markup(tag + 1, length - 1u))
@@ -1015,6 +1229,8 @@ static void navigation_stream_finish_preload(
         success = navigation_stream_cache_preload(stream, preload, result);
         if (!success) failure_stage = 7;
     }
+    if (success) navigation_stream_offer_preloaded_script(stream, preload,
+                                                          result);
     if (!success) {
         if (preload->render_blocking_style) {
             session->performance.stylesheet_preload_failure_stage =
@@ -1323,6 +1539,7 @@ static void navigation_stream_settle_preloads(
             fetch_result_destroy(&result);
             continue;
         }
+        if (navigation_stream_adopt_preload(stream, preload)) continue;
         bool cancelled = fetch_scheduler_cancel(
             stream->scheduler, preload->request_id,
             "speculative preload ended at navigation commit");
@@ -1348,6 +1565,7 @@ static void navigation_stream_settle_preloads(
        fallback. Destroying the staging scheduler is safe here; candidate
        construction will create a fresh bounded scheduler when resources are
        enabled. */
+    script_runtime_cancel_preload_requests(stream->runtime);
     fetch_scheduler_destroy(stream->scheduler);
     stream->scheduler = NULL;
     for (size_t i = 0; i < stream->preload_count; i++) {

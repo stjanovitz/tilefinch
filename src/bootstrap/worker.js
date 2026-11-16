@@ -21,7 +21,8 @@ globalThis.__tilefinchInstallWorker = (
   /* Loaded after the page may have replaced these globals: build
      errors, promises and platform objects with the constructors
      hardening.js captured. */
-  const { Error, TypeError, RangeError, DOMException, Promise, Map, Set,
+  const { defineProperty, getOwnPropertyDescriptor, ownKeys,
+    Error, TypeError, RangeError, DOMException, Promise, Map, Set,
     Proxy, Array, URL, Headers, Response, Blob, TextEncoder, TextDecoder,
     URLSearchParams, AbortController, Request,
     /* The lifetime and fetch controllers below are the browser's own: they
@@ -1092,13 +1093,13 @@ globalThis.__tilefinchInstallWorker = (
     for (const observerState of deferredWorkerPerformanceObservers)
       observerState.schedule();
   };
-  Object.defineProperty(WorkerPerformance.prototype, Symbol.toStringTag, {
+  defineProperty(WorkerPerformance.prototype, Symbol.toStringTag, {
     configurable: true,
     value: "Performance",
   });
   markNative(WorkerPerformance);
-  for (const key of Reflect.ownKeys(WorkerPerformance.prototype)) {
-    const descriptor = Object.getOwnPropertyDescriptor(
+  for (const key of ownKeys(WorkerPerformance.prototype)) {
+    const descriptor = getOwnPropertyDescriptor(
       WorkerPerformance.prototype, key,
     );
     markNative(descriptor?.value);
@@ -1151,7 +1152,7 @@ globalThis.__tilefinchInstallWorker = (
       workerLastTaskMs: () => workerProgress.lastTaskMs,
     };
     for (const key of Object.keys(workerProgressProperties))
-      Object.defineProperty(globalThis.__tilefinchRootCensus, key, {
+      defineProperty(globalThis.__tilefinchRootCensus, key, {
         get: workerProgressProperties[key],
       });
   }
@@ -2828,13 +2829,13 @@ globalThis.__tilefinchInstallWorker = (
       slot.wrapper = null;
     }
   }
-  Object.defineProperty(globalThis.Worker.prototype, Symbol.toStringTag, {
+  defineProperty(globalThis.Worker.prototype, Symbol.toStringTag, {
     configurable: true,
     value: "Worker",
   });
   markNative(globalThis.Worker);
-  for (const key of Reflect.ownKeys(globalThis.Worker.prototype)) {
-    const descriptor = Object.getOwnPropertyDescriptor(
+  for (const key of ownKeys(globalThis.Worker.prototype)) {
+    const descriptor = getOwnPropertyDescriptor(
       globalThis.Worker.prototype,
       key,
     );

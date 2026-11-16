@@ -6,8 +6,8 @@
   /* Loaded after the page may have replaced these globals: build
      errors, promises and platform objects with the constructors
      hardening.js captured. */
-  const { Error, TypeError, DOMException, WeakMap, WeakRef } =
-    globalThis.__tilefinchEventInterfaces;
+  const { defineProperty, Error, TypeError, DOMException, WeakMap,
+    WeakRef } = globalThis.__tilefinchEventInterfaces;
   const wrap = globalThis.__tilefinchWrap,
     __tilefinchTraverse = globalThis.__tilefinchTraverse,
     nativeDescendants = globalThis.__tilefinchDescendants,
@@ -25,6 +25,7 @@
     FILTER_REJECT = 2,
     FILTER_SKIP = 3,
     nodeFilterConstants = {
+      __proto__: null,
       FILTER_ACCEPT,
       FILTER_REJECT,
       FILTER_SKIP,
@@ -45,8 +46,9 @@
   const NodeFilter = function NodeFilter() {
     throw new TypeError("Illegal constructor");
   };
-  for (const [name, value] of Object.entries(nodeFilterConstants))
-    Object.defineProperty(NodeFilter, name, { value, enumerable: true });
+  for (const name in nodeFilterConstants)
+    defineProperty(NodeFilter, name, { __proto__: null, enumerable: true,
+      value: nodeFilterConstants[name] });
   globalThis.NodeFilter = NodeFilter;
   {
     const nativeTraverse = __tilefinchTraverse,
@@ -536,7 +538,7 @@
       detach() {}
     }
     for (const constructor of [TreeWalker, NodeIterator])
-      Object.defineProperty(constructor.prototype, Symbol.toStringTag, {
+      defineProperty(constructor.prototype, Symbol.toStringTag, {
         configurable: true,
         value: constructor.name,
       });

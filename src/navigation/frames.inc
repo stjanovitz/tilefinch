@@ -57,13 +57,14 @@ static bool navigation_frame_document_needs_realm(const PocDocument *document)
 #endif
 
 /* Whether the frame has a document a snapshot can be drawn from: its realm,
-   or (lazy_realm) a document committed without one. */
+   a document whose realm was stopped at its memory limit, or (lazy_realm) a
+   document committed without one. */
 static bool navigation_frame_presentable(const NavigationFrame *frame)
 {
 #if defined(TILEFINCH_FRAME_LITE)
     if (frame->lite_realm_skipped) return true;
 #endif
-    return frame->runtime != NULL;
+    return frame->runtime != NULL || frame->realm_memory_stopped;
 }
 
 static bool navigation_frame_element_hidden(
@@ -898,6 +899,63 @@ static void navigation_retire_unloaded_frame(NavigationSession *session,
     frame->retired = true;
 }
 
+/* A child realm out of memory stops on its own, as a crashed renderer takes
+   down only its frame. Each frame has its own QuickJS runtime, allocator
+   pool and heap limit; what it shares with the page's realm is the page
+   Budget, so the harm an exhausted child does the page is the memory it
+   keeps holding (fpt.live.com's fingerprint frame on login.live.com held
+   5 MB after toDataURL ran it out, and the page's next layout was refused
+   and retired the page's realm). Stopping the child gives its heap back at
+   once, at an owner-turn boundary, never inside a call the parent made.
+   Its descendants, whose WindowProxies the child realm owned, go with it;
+   its document stays and is drawn without scripts, as a top-level page
+   whose realm was retired. The author already saw a catchable
+   InternalError in the task that ran out.
+
+   As for the page realm, only an allocation this realm's allocator actually
+   refused since the last check counts (an author can throw the text), with
+   the task reporting it, its heap at its end, or the task failing. */
+static bool navigation_stop_exhausted_frame_realm(NavigationSession *session,
+                                                  NavigationFrame *frame,
+                                                  bool task_failed)
+{
+    if (frame->retired || frame->runtime == NULL) return false;
+    size_t refusals = script_runtime_allocation_refusals(frame->runtime);
+    bool refused = refusals > frame->realm_refusals_seen;
+    frame->realm_refusals_seen = refusals;
+    if (!refused) return false;
+    const ScriptResult *result = &frame->script_result;
+    if (!task_failed
+        && !script_error_reports_out_of_memory(result->error)
+        && !script_error_reports_out_of_memory(
+               result->last_uncaught_callback_error)
+        && script_runtime_heap_available(frame->runtime) >= 256u * 1024u)
+        return false;
+    size_t slot = (size_t) (frame - session->page.frames);
+    navigation_retire_frame_descendants(
+        session, slot, "ancestor iframe stopped at its memory limit");
+    navigation_drop_frame_messages(session, frame);
+    script_runtime_set_layout(frame->runtime, NULL, 0);
+    script_runtime_destroy(frame->runtime);
+    frame->runtime = NULL;
+    frame->realm_memory_stopped = true;
+    frame->script_result.success = false;
+    snprintf(frame->script_result.summary,
+             sizeof(frame->script_result.summary),
+             "JavaScript stopped at its memory limit");
+    session->frames_memory_stopped++;
+    return true;
+}
+
+/* After work that can run child realms outside their own turn (message
+   delivery), stop each that ran out. */
+static void navigation_stop_exhausted_frame_realms(NavigationSession *session)
+{
+    for (size_t i = 0; i < session->page.frame_count; i++)
+        (void) navigation_stop_exhausted_frame_realm(
+            session, &session->page.frames[i], false);
+}
+
 /* A page realm that has run out of heap is retired the same way wherever
    that is noticed: its DOM, stylesheet and layout stay, scripts stop with
    "JavaScript stopped at its memory limit", and the static-content cascade
@@ -1343,18 +1401,13 @@ static bool navigation_frame_element_hidden(
 static bool navigation_refresh_frame_presentation(
     NavigationSession *session, NavigationFrame *frame)
 {
-#if defined(TILEFINCH_FRAME_LITE)
-    /* lazy_realm: a frame committed without a realm is drawn all the same
-       (nothing can mutate its document, so its snapshot never goes stale). */
+    /* A frame without a realm (lazy_realm, or one stopped at its memory
+       limit) is drawn all the same: nothing can mutate its document, so its
+       snapshot goes stale only when the parent resizes the iframe. */
     if (session == NULL || frame == NULL
-        || (frame->runtime == NULL && !frame->lite_realm_skipped)
+        || !navigation_frame_presentable(frame)
         || frame->document.html == NULL || frame->element == NULL
         || session->images != &session->page.images) return false;
-#else
-    if (session == NULL || frame == NULL || frame->runtime == NULL
-        || frame->document.html == NULL || frame->element == NULL
-        || session->images != &session->page.images) return false;
-#endif
 #if !defined(__PSP__)
     if (tilefinch_test_faults()->refuse_next_frame_presentation) {
         tilefinch_test_faults()->refuse_next_frame_presentation = false;
@@ -1768,6 +1821,7 @@ static bool navigation_complete_frame(NavigationSession *session,
                     &frame->document.content_security_policy));
         }
     }
+    frame->realm_memory_stopped = false;
 #if defined(TILEFINCH_FRAME_LITE)
     /* lazy_realm: a document nothing in which can run script or take a
        press commits as a frame without allow-scripts would. Its parent's
@@ -1814,9 +1868,20 @@ static bool navigation_complete_frame(NavigationSession *session,
                 navigation_now_us() - lite_create_started;
         }
 #endif
+        if (frame->runtime != NULL && frame->element != NULL) {
+            /* The child navigable's name is its container's name. */
+            size_t name_length = 0;
+            const char *name = document_attribute(frame->element, "name",
+                                                  &name_length);
+            if (name != NULL)
+                (void) script_runtime_set_window_name(
+                    frame->runtime, name, name_length);
+        }
         /* The bootstrap's freed blocks are not this frame's working set:
            hand them back to the page rather than keep them cached. */
         (void) script_runtime_trim_pool(frame->runtime);
+        frame->realm_refusals_seen =
+            script_runtime_allocation_refusals(frame->runtime);
         ok = frame->runtime != NULL
             && script_runtime_configure_messaging(
                 frame->runtime, true, exposed_same_origin,
@@ -1925,6 +1990,9 @@ static bool navigation_complete_frame(NavigationSession *session,
     }
     frame->loaded = true;
     session->frames_loaded++;
+    /* Its scripts or load listeners may have run it out of memory: give
+       that back before the presentation and the parent's layout need it. */
+    (void) navigation_stop_exhausted_frame_realm(session, frame, false);
     /* Likewise what the load's scripts freed. */
     (void) script_runtime_trim_pool(frame->runtime);
     if (!navigation_refresh_frame_presentation_or_defer(

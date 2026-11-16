@@ -983,6 +983,74 @@ static bool kept_run(ScriptRuntime *runtime, const char *source,
    ranks the page's own clip; a different declaration a script writes
    wins; moving to another URL forgets the kept one; a page that declares
    nothing keeps nothing. */
+/* HTMLMediaElement.play() requests the source in the element's
+   crossorigin state, which crossOrigin reflects: a bare attribute (lexbor
+   keeps no value for one), "" and an invalid value are Anonymous,
+   use-credentials in any case includes credentials, and no attribute is a
+   no-cors request. */
+static int test_media_play_cors_settings(Budget *budget)
+{
+    static const struct {
+        const char *attribute;
+        const char *reflected;
+        TilefinchRequestMode mode;
+        TilefinchCredentialsMode credentials;
+    } cases[] = {
+        {"", "null", TILEFINCH_REQUEST_MODE_NO_CORS,
+         TILEFINCH_CREDENTIALS_INCLUDE},
+        {"crossorigin", "anonymous", TILEFINCH_REQUEST_MODE_CORS,
+         TILEFINCH_CREDENTIALS_SAME_ORIGIN},
+        {"crossorigin=''", "anonymous", TILEFINCH_REQUEST_MODE_CORS,
+         TILEFINCH_CREDENTIALS_SAME_ORIGIN},
+        {"crossorigin=anonymous", "anonymous", TILEFINCH_REQUEST_MODE_CORS,
+         TILEFINCH_CREDENTIALS_SAME_ORIGIN},
+        {"crossorigin=zz", "anonymous", TILEFINCH_REQUEST_MODE_CORS,
+         TILEFINCH_CREDENTIALS_SAME_ORIGIN},
+        {"crossorigin=use-credentials", "use-credentials",
+         TILEFINCH_REQUEST_MODE_CORS, TILEFINCH_CREDENTIALS_INCLUDE},
+        {"crossorigin=USE-CREDENTIALS", "use-credentials",
+         TILEFINCH_REQUEST_MODE_CORS, TILEFINCH_CREDENTIALS_INCLUDE},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        for (int audio = 0; audio < 2; audio++) {
+            char html[256];
+            snprintf(html, sizeof(html),
+                     "<!doctype html><body><%s id=media %s "
+                     "src='https://media.example.test/clip.%s'></%s>",
+                     audio ? "audio" : "video", cases[i].attribute,
+                     audio ? "m4a" : "mp4", audio ? "audio" : "video");
+            PocDocument document;
+            CHECK(document_parse(&document, budget, html, strlen(html), 17));
+            ScriptResult result;
+            ScriptRuntime *runtime = script_runtime_create(
+                &document, budget, 12u * MIB, 4000,
+                "https://example.test/watch", &result);
+            CHECK(runtime != NULL && result.success);
+            CHECK(script_runtime_evaluate_diagnostic(
+                      runtime,
+                      "const m=document.querySelector('#media');m.play();"
+                      "globalThis.pocSummary=String(m.crossOrigin)",
+                      "<media-cors>", &result));
+            ScriptMediaRequest request;
+            bool requested = script_runtime_consume_media_request(
+                runtime, &request);
+            if (strcmp(result.summary, cases[i].reflected) != 0
+                || !requested || request.mode != cases[i].mode
+                || request.credentials != cases[i].credentials) {
+                fprintf(stderr, "%s %s: crossOrigin=%s requested=%d "
+                        "mode=%d credentials=%d\n",
+                        audio ? "audio" : "video", cases[i].attribute,
+                        result.summary, requested, (int) request.mode,
+                        (int) request.credentials);
+                CHECK(false);
+            }
+            script_runtime_destroy(runtime);
+            document_destroy(&document);
+        }
+    }
+    return 0;
+}
+
 static int test_kept_declarations(void)
 {
     Budget budget;
@@ -1321,6 +1389,7 @@ int main(void)
           && strcmp(result.summary, "AUDIO-PLAYING-OK") == 0);
     script_runtime_destroy(audio_runtime);
     document_destroy(&audio_document);
+    CHECK(test_media_play_cors_settings(&budget) == 0);
 
     /* Native control activation does not call HTMLMediaElement.play(). Its
        first state report must nevertheless attach to the same private media

@@ -4,6 +4,7 @@
 #include "tilefinch/script_lazy.h"
 #include "tilefinch/session.h"
 #include "tilefinch/viewport.h"
+#include "../src/js_runtime_internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -462,6 +463,254 @@ static void test_planner_synthetic_identity(void)
             &budget, rejected[i], strlen(rejected[i]), &plan));
     }
     CHECK(budget.current == 0);
+}
+
+/* Factory text outside the heap (js_lazy_webpack.c): a factory of 1 KiB or
+   more compiles without its text in the QuickJS heap and its functions read
+   it from the lazy tier. toString() stays exact (ASCII and not), a lazily
+   compiled inner function compiles from it on its first call even after
+   the plain copy was given up for room, and stacks are the ones the
+   factory has with its text in the heap. */
+#define EXT_PAD "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" \
+                "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" \
+                "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+#define EXT_EARLY "function early(a){var pad=\"" EXT_PAD "\";return a+pad.length}"
+#define EXT_LATE "function late(b){var pad=\"" EXT_PAD "\";\n" \
+    "  return \"late-\"+b+pad.length}"
+#define EXT_WORD "function word(){var pad=\"" EXT_PAD "\";" \
+    "return \"\xc3\xa9t\xc3\xa9\"+pad.length}"
+#define EXT_THROWER "function thrower(){var pad=\"" EXT_PAD "\";\n" \
+    "    throw new Error(\"boom\"+pad.length)}"
+#define EXT_PAD8 EXT_PAD EXT_PAD EXT_PAD EXT_PAD \
+    EXT_PAD EXT_PAD EXT_PAD EXT_PAD
+#define EXT_FACTORY "function(module,exports){/*" EXT_PAD8 EXT_PAD8 \
+    EXT_PAD8 EXT_PAD8 EXT_PAD8 EXT_PAD8 EXT_PAD8 EXT_PAD8 "*/\n" \
+    "exports.early=" EXT_EARLY ";\n" \
+    "exports.late=" EXT_LATE ";\n" \
+    "exports.word=" EXT_WORD ";\n" \
+    "exports.thrower=" EXT_THROWER ";\n" \
+    "exports.firstEarly=exports.early(1)}"
+
+static bool register_external_chunk_source(ScriptRuntime *runtime,
+                                    lxb_dom_node_t *script,
+                                    Budget *budget, const char *chunk,
+                                    const char *factory_text, ScriptResult *result)
+{
+    static char source[32768];
+    int written = snprintf(
+        source, sizeof(source),
+        "(self.%s=self.%s||[]).push([[6],{6:%s}]);",
+        chunk, chunk, factory_text);
+    if (written <= 0 || (size_t) written >= sizeof(source)) return false;
+    char capture[256];
+    snprintf(capture, sizeof(capture),
+             "globalThis.%s=[];globalThis.%s.push=function(v){"
+             "globalThis.__extModules=v[1]};",
+             chunk, chunk);
+    if (!script_runtime_evaluate_diagnostic(runtime, capture,
+                                            "<install-ext-capture>", result))
+        return false;
+    ScriptLazyWebpackPlan plan;
+    if (!plans(budget, source, &plan)) return false;
+    bool ok = plan.factory_count == 1;
+    BrowserSharedBody *body = shared_source(budget, source);
+    ok = ok && body != NULL;
+    if (ok) {
+        ok = script_runtime_evaluate_external_lazy_webpack(
+                 runtime, script, (const char *) body->data, body->length,
+                 "https://example.test/ext.js", &plan, body,
+                 release_shared_source, result)
+            == SCRIPT_LAZY_EVALUATION_SUCCEEDED;
+    } else if (body != NULL) {
+        browser_shared_body_release(body);
+    }
+    script_lazy_webpack_plan_destroy(&plan);
+    return ok;
+}
+
+static bool register_external_chunk(ScriptRuntime *runtime,
+    lxb_dom_node_t *script, Budget *budget, const char *chunk, ScriptResult *result)
+{
+    return register_external_chunk_source(runtime, script, budget, chunk,
+                                           EXT_FACTORY, result);
+}
+
+typedef struct {
+    ScriptRuntime *runtime;
+    const void *borrowed;
+    size_t limit;
+    unsigned calls;
+    bool remained_owned;
+    bool refuse;
+} FactoryTextGrowth;
+
+static size_t reclaim_factory_text(void *opaque, size_t live,
+                                    size_t growth, size_t limit)
+{
+    (void) live; (void) growth; (void) limit;
+    FactoryTextGrowth *probe = opaque;
+    probe->calls++;
+    (void) js_rt_source_store_relieve(probe->runtime, SIZE_MAX);
+    probe->remained_owned = budget_owns(probe->runtime->budget,
+                                        probe->borrowed);
+    /* Refuse on old code rather than letting its dangling input be read. */
+    return probe->remained_owned && !probe->refuse ? probe->limit : 0;
+}
+
+static void test_factory_text_allocation_case(ScriptRuntime *runtime,
+    lxb_dom_node_t *script, Budget *budget, ScriptResult *result, bool ascii)
+{
+    char expected[] = EXT_FACTORY;
+    if (ascii)
+        for (size_t i = 0; i < sizeof(expected) - 1; i++)
+            if ((unsigned char) expected[i] >= 0x80u) expected[i] = '?';
+    CHECK(register_external_chunk_source(runtime, script, budget,
+                                   "webpackChunk_reclaim", expected, result));
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "(()=>{const m={exports:{}};__extModules[6](m,m.exports);"
+        "globalThis.__reclaimExports=m.exports})()", "<retain-factory-text>", result));
+    JSContext *context = runtime->context;
+    JSValue global = JS_GetGlobalObject(context);
+    JSValue modules = JS_GetPropertyStr(context, global, "__extModules");
+    JSValue wrapper = JS_GetPropertyUint32(context, modules, 6);
+    JSValue to_string = JS_GetPropertyStr(context, wrapper, "toString");
+    ScriptLazyRuntimeFactory *factory = NULL;
+    for (ScriptLazyRuntimeBundle *b = runtime->lazy_webpack_bundles; b; b = b->next)
+        for (size_t i = 0; i < b->factory_count; i++)
+            if (JS_VALUE_GET_PTR(b->factories[i].wrapper) == JS_VALUE_GET_PTR(wrapper))
+                factory = &b->factories[i];
+    CHECK(factory != NULL && factory->plain != NULL && factory->external_owners != 0
+        && JS_IsUndefined(factory->compiled));
+    if (factory != NULL && factory->plain != NULL) {
+        JSMemoryUsage usage;
+        JS_ComputeMemoryUsage(runtime->runtime, &usage);
+        FactoryTextGrowth probe = {runtime, factory->plain,
+                                  (size_t)usage.malloc_limit, 0, false, false};
+        budget_quickjs_pool_set_limit_growth(runtime->quickjs_pool,
+                                              reclaim_factory_text, &probe);
+        JS_SetMemoryLimit(runtime->runtime, (size_t)usage.malloc_size);
+        JSValue text = JS_Call(context, to_string, wrapper, 0, NULL);
+        JS_SetMemoryLimit(runtime->runtime, (size_t)usage.malloc_limit);
+        budget_quickjs_pool_set_limit_growth(runtime->quickjs_pool,
+                                              js_rt_heap_growth_hook, runtime);
+        CHECK(probe.calls != 0 && probe.remained_owned && !JS_IsException(text));
+        if (JS_IsException(text)) JS_FreeValue(context, JS_GetException(context));
+        else {
+            const char *source = JS_ToCString(context, text);
+            CHECK(source != NULL && strcmp(source, expected) == 0);
+            if (source != NULL) JS_FreeCString(context, source);
+        }
+        JS_FreeValue(context, text);
+        /* A refused output allocation restores the borrowed cache too. */
+        JS_ComputeMemoryUsage(runtime->runtime, &usage);
+        probe.calls = 0; probe.remained_owned = false; probe.refuse = true;
+        budget_quickjs_pool_set_limit_growth(runtime->quickjs_pool,
+                                              reclaim_factory_text, &probe);
+        JS_SetMemoryLimit(runtime->runtime, (size_t)usage.malloc_size);
+        text = JS_Call(context, to_string, wrapper, 0, NULL);
+        JS_SetMemoryLimit(runtime->runtime, (size_t)usage.malloc_limit);
+        budget_quickjs_pool_set_limit_growth(runtime->quickjs_pool,
+                                              js_rt_heap_growth_hook, runtime);
+        CHECK(probe.calls != 0 && probe.remained_owned && JS_IsException(text)
+            && factory->plain == probe.borrowed);
+        if (JS_IsException(text)) JS_FreeValue(context, JS_GetException(context));
+        JS_FreeValue(context, text);
+    }
+    JS_FreeValue(context, to_string); JS_FreeValue(context, wrapper);
+    JS_FreeValue(context, modules); JS_FreeValue(context, global);
+}
+
+static void test_factory_text_allocation_reclaim(ScriptRuntime *runtime,
+    lxb_dom_node_t *script, Budget *budget, ScriptResult *result)
+{
+    test_factory_text_allocation_case(runtime, script, budget, result, false);
+    test_factory_text_allocation_case(runtime, script, budget, result, true);
+}
+
+static void test_factory_text_outside_heap(ScriptRuntime *runtime,
+                                           lxb_dom_node_t *script,
+                                           Budget *budget,
+                                           ScriptResult *result)
+{
+    /* The same factory with its text in the heap (lab knob) gives the
+       reference stack. */
+    setenv("TILEFINCH_LAZY_WEBPACK_FACTORY_TEXT", "heap", 1);
+    size_t external_before = result->lazy_webpack_external_text_compiles;
+    CHECK(register_external_chunk(runtime, script, budget,
+                                  "webpackChunk_extheap", result));
+    static const char run_heap[] =
+        "(()=>{const m={exports:{}};"
+        "globalThis.__extModules[6](m,m.exports);"
+        "globalThis.__extHeap=m.exports;"
+        "try{m.exports.thrower()}catch(e){globalThis.__extHeapStack=e.stack}"
+        "globalThis.pocSummary=m.exports.firstEarly===161"
+        "&&m.exports.late(2)==='late-2160'"
+        "?'EXT-HEAP-OK':'EXT-HEAP-FAILED'})()";
+    CHECK(script_runtime_evaluate_diagnostic(runtime, run_heap,
+                                             "<ext-heap>", result)
+          && strcmp(result->summary, "EXT-HEAP-OK") == 0
+          && result->lazy_webpack_external_text_compiles == external_before);
+    unsetenv("TILEFINCH_LAZY_WEBPACK_FACTORY_TEXT");
+
+    CHECK(register_external_chunk(runtime, script, budget,
+                                  "webpackChunk_ext", result));
+    static const char run_external[] =
+        "(()=>{const m={exports:{}};"
+        "globalThis.__extModules[6](m,m.exports);"
+        "const e=globalThis.__ext=m.exports,t=Function.prototype.toString;"
+        "globalThis.pocSummary=e.firstEarly===161"
+        "&&t.call(e.early)===String.raw`" EXT_EARLY "`"
+        "&&t.call(e.late)===String.raw`" EXT_LATE "`"
+        "&&t.call(e.thrower)===String.raw`" EXT_THROWER "`"
+        "?'EXT-TEXT-OK':'EXT-TEXT-FAILED'})()";
+    CHECK(script_runtime_evaluate_diagnostic(runtime, run_external,
+                                             "<ext-external>", result)
+          && strcmp(result->summary, "EXT-TEXT-OK") == 0
+          && result->lazy_webpack_external_text_compiles
+                 == external_before + 1
+          && result->lazy_webpack_external_text_read_failures == 0);
+
+    /* Pressure: with almost no room left, the safe point gives up the plain
+       copy. The functions not yet called then compile from text decoded
+       out of the compressed copy, and toString() reads it the same way. */
+    (void) script_runtime_collect_and_trim(runtime);
+    size_t drops = result->lazy_webpack_external_text_plain_drops;
+    size_t decodes = result->lazy_webpack_external_text_decodes;
+    size_t remaining = budget_remaining(budget);
+    /* room for a quarter of it to stay plain is less than the factory */
+    size_t keep = 24u * 1024u;
+    void *filler = remaining > keep
+        ? budget_malloc_category(budget, BUDGET_CATEGORY_RESOURCE,
+                                 remaining - keep)
+        : NULL;
+    CHECK(filler != NULL);
+    CHECK(script_runtime_advance(runtime, 0, 1, result)
+          && result->lazy_webpack_external_text_plain_drops > drops);
+    budget_free(budget, filler);
+    static const char run_after_pressure[] =
+        "(()=>{const e=globalThis.__ext,h=globalThis.__extHeap,"
+        "t=Function.prototype.toString;let stack='';"
+        "try{e.thrower()}catch(x){stack=x.stack}"
+        /* the frames above the caller's: the thrower's own */
+        "const top=x=>x.split('\\n').slice(0,2).join('\\n');"
+        "const failed=[e.late(3)==='late-3160',"
+        "e.word()==='\\u00e9t\\u00e9160',"
+        "t.call(e.word)===String.raw`" EXT_WORD "`,"
+        "t.call(e.word)===t.call(h.word),"
+        "t.call(e.early)===String.raw`" EXT_EARLY "`,"
+        "stack!==''&&top(stack)===top(globalThis.__extHeapStack),"
+        "/ext\\.js#factory-0:8:20\\)/.test(stack)]"
+        ".map((ok,i)=>ok?'':i).join('');"
+        "globalThis.pocSummary=failed===''?'EXT-PRESSURE-OK'"
+        ":'EXT-PRESSURE-FAILED:'+failed})()";
+    CHECK(script_runtime_evaluate_diagnostic(runtime, run_after_pressure,
+                                             "<ext-after-pressure>", result)
+          && strcmp(result->summary, "EXT-PRESSURE-OK") == 0);
+    if (strcmp(result->summary, "EXT-PRESSURE-OK") != 0)
+        fprintf(stderr, "summary: %s\n", result->summary);
+    CHECK(result->lazy_webpack_external_text_decodes > decodes
+          && result->lazy_webpack_external_text_decoded_bytes != 0
+          && result->lazy_webpack_external_text_read_failures == 0);
 }
 
 int main(int argc, char **argv)
@@ -1141,6 +1390,11 @@ int main(int argc, char **argv)
                   &result)
               && strcmp(result.summary, "LAZY-MEASURED-ADMITTED") == 0);
     }
+
+    test_factory_text_outside_heap(runtime, script, &runtime_budget,
+                                   &result);
+    test_factory_text_allocation_reclaim(runtime, script, &runtime_budget,
+                                         &result);
 
     /* A registration that throws (here in the page's chunk push) still
        ran: the window error event reports its exception, then the element

@@ -131,6 +131,13 @@ typedef struct {
     size_t discovery_node_count;
     bool opaque_origin;
     bool presentation_dirty;
+    /* The realm ran out of memory and was stopped on its own
+       (navigation_stop_exhausted_frame_realm): the document stays and is
+       drawn without scripts, as a top-level page whose realm was retired.
+       realm_refusals_seen is the realm's allocation-refusal count when it
+       was last checked. */
+    bool realm_memory_stopped;
+    size_t realm_refusals_seen;
 #if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
     /* frame_lite lazy_realm (include/tilefinch/frame_lite.h): committed
        with scripts allowed but no realm, because nothing in the document
@@ -1158,6 +1165,9 @@ struct NavigationSession {
        launched from the offline library); 0 when unarmed. Consumed by that
        realm, so any later document gets js_memory_limit again. */
     size_t next_top_level_js_heap;
+    /* The tab's browsing context name (window.name), kept across its
+       top-level documents; see ScriptWindowName. */
+    ScriptWindowName *window_name;
     /* Counted only in builds with tracing or the validation log. */
     size_t installed_app_heap_raises;
     size_t frame_messages_posted;
@@ -1171,6 +1181,9 @@ struct NavigationSession {
     size_t frame_messages_deferred;
     size_t frame_message_max_deferred_run;
     size_t frames_detached;
+    /* Child realms stopped at their memory limit with the page's own realm
+       left running. */
+    size_t frames_memory_stopped;
     uint64_t next_frame_message_sequence;
     uint64_t next_frame_lifecycle_generation;
     uint64_t last_frame_message_sequence;
@@ -1837,6 +1850,11 @@ size_t navigation_yield_layout_text_measures(NavigationSession *session,
    them off for those sheets' lives. Frees only. */
 size_t navigation_yield_style_memos(NavigationSession *session,
                                     NavigationLoad *load);
+/* Budget reclaim: drops the preloaded script responses `load` (may be
+   NULL) holds for its realm, and those its parser realm's map has not
+   used, until about needed bytes are free. Frees only. */
+size_t navigation_yield_preloaded_scripts(NavigationLoad *load,
+                                          size_t needed);
 bool navigation_dispatch_event(NavigationSession *session,
                                const char *selector,
                                const char *event_type);

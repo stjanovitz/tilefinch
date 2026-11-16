@@ -204,12 +204,14 @@ bool script_runtime_dispatch_node(ScriptRuntime *runtime,
     return ok;
 }
 
+/* X on a highlighted element: the Enter press around its keyboard-style
+   click (phase 6 of __tilefinchDispatchActivationHandle). */
 bool script_runtime_dispatch_activation_node(ScriptRuntime *runtime,
                                              lxb_dom_node_t *node,
                                              ScriptResult *result)
 {
     return script_runtime_dispatch_pointer_node(
-        runtime, node, 0, 0, 0, 0, 0, 0, result);
+        runtime, node, 6, 0, 0, 0, 0, 0, result);
 }
 
 /* Popunder guard input: a new gesture forgets the previous one's window
@@ -284,7 +286,10 @@ bool script_runtime_dispatch_pointer_node(
         JS_NewInt32(runtime->context, (int32_t) buttons)
     };
     JSValue returned = JS_UNDEFINED;
-    bool trusted_activation = phase == 0u || phase == 2u || phase == 5u;
+    /* Activation-triggering input (HTML): the press of a click, a pointer
+       or mouse down, an Enter keydown (6, 7). Not keyup (8). */
+    bool trusted_activation = phase == 0u || phase == 2u || phase == 5u
+        || phase == 6u || phase == 7u;
     if (trusted_activation) {
         js_rt_bridge_notify_user_activation(&runtime->bridge);
         runtime_note_activation_target(&runtime->bridge, node, phase != 5u);

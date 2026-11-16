@@ -357,7 +357,8 @@
         "checks=[p.localName==='p',"
         "document.getElementById('s').localName==='svg',"
         "document.getElementById('c').localName==='circle',"
-        "get.call({tagName:'BORROWED'})==='borrowed'];"
+        "(()=>{try{get.call({tagName:'BORROWED'});return false}"
+        "catch(e){return e instanceof TypeError}})()];"
         /* An element's own name does not follow a tagName the page
            redefines (as in Chromium). */
         "const q=document.createElement('div');"
@@ -369,7 +370,8 @@
         "const proxy=new Proxy(p,{getOwnPropertyDescriptor(){"
         "throw new Error('unexpected descriptor trap')}});"
         "checks.push(get.call(proxy)==='p');"
-        "checks.push(get.call({tagName:'\\u00c9'})==='\\u00e9');"
+        "try{get.call(Element.prototype);checks.push(false)}"
+        "catch(e){checks.push(e instanceof TypeError)}"
         "Object.defineProperty(q,'localName',{value:'author'});"
         "checks.push(q.localName==='author');"
         "globalThis.pocSummary=checks.every(Boolean)?'LOCAL-NAME-OK':"
@@ -2023,27 +2025,43 @@
     const char frame_binding_page[] =
         "<!doctype html><html><body><script>"
         "const bindingFrame=document.createElement('iframe');"
-        "const originalSetPrototype=Object.setPrototypeOf;let refusedFrames=0;"
-        "Object.setPrototypeOf=function(){throw Error('setup refusal');};"
-        "try{for(let i=0;i<20;i++){try{bindingFrame.contentWindow;}"
-        "catch(error){refusedFrames++;}}}finally{Object.setPrototypeOf=originalSetPrototype;}"
+        "const detachedNull=bindingFrame.contentWindow===null;"
+        "let refusedFrames=0;const refused=[];"
+        /* Host-only: the next 20 frame realm setups fail part way. */
+        "__tilefinchRefuseFrameSetups(20);"
+        "try{for(let i=0;i<20;i++){try{const frame=document.createElement("
+        "'iframe');refused.push(frame);document.body.appendChild(frame);"
+        "frame.contentWindow;}"
+        "catch(error){refusedFrames++;}}}finally{__tilefinchRefuseFrameSetups(0);}"
+        "for(const frame of refused)frame.remove();"
         "document.body.appendChild(bindingFrame);"
         "const frameEval=bindingFrame.contentWindow.eval;"
-        "const descriptorFrame=document.createElement('iframe').contentWindow;"
+        "const connected=()=>document.body.appendChild("
+        "document.createElement('iframe')).contentWindow;"
+        "const descriptorFrame=connected();"
         "const descriptor=Object.getOwnPropertyDescriptor(descriptorFrame,'Promise');"
         "const reflected=descriptor&&typeof descriptor.value==='function'"
         "&&descriptor.value!==Promise&&Reflect.ownKeys(descriptorFrame).includes('Date');"
-        "const assignedFrame=document.createElement('iframe').contentWindow;"
+        "const assignedFrame=connected();"
         "assignedFrame.Promise=17;assignedFrame.eval('var ready=1');"
         "const preserved=assignedFrame.Promise===17&&assignedFrame.ready===1;"
         "frameEval('var count=0, second=2; function increment(){return ++count;}');"
         "const closure=frameEval('increment()')===1&&frameEval('count')===1"
         "&&bindingFrame.contentWindow.count===1&&frameEval('second')===2;"
         "frameEval('let lexical=3; function changeLexical(){return ++lexical;}');"
-        "const lexical=frameEval('changeLexical()')===4&&frameEval('lexical')===4"
-        "&&bindingFrame.contentWindow.lexical===undefined;"
+        /* contentWindow.eval is the frame's own eval, so this is an
+           indirect eval: its let binding lives in that call's lexical
+           environment (closures keep it), not the frame's global scope.
+           Chromium answers the same. */
+        "const lexical=frameEval('changeLexical()')===4"
+        "&&frameEval('typeof lexical')==='undefined'"
+        "&&bindingFrame.contentWindow.lexical===undefined"
+        "&&bindingFrame.contentWindow.eval===frameEval"
+        "&&frameEval('eval===window.eval&&eval===globalThis.eval')"
+        "&&frameEval('window.eval===parent.frames[0].eval');"
         "frameEval('var longEval=7;'+'\\n'.repeat(70000));"
         "globalThis.pocSummary=refusedFrames===20&&reflected&&preserved"
+        "&&detachedNull"
         "&&frameEval('longEval')===7"
         "&&closure&&lexical&&frameEval('this===window')"
         "&&frameEval('(function(){return this===window;})()')"
@@ -2059,9 +2077,400 @@
     ScriptResult frame_binding_result;
     CHECK(scripts_run_document_at(&frame_binding_document, &budget, 8 * MIB,
         2000, "https://frame.test/", &frame_binding_result));
+    if (strcmp(frame_binding_result.summary, "FRAME-BINDINGS-OK") != 0)
+        printf("frame bindings: %s %s\n", frame_binding_result.summary,
+               frame_binding_result.error);
     CHECK(strcmp(frame_binding_result.summary, "FRAME-BINDINGS-OK") == 0);
     document_destroy(&frame_binding_document);
     CHECK(budget.current == frame_binding_baseline);
+
+    puts("test: frame code gets direct eval and unresolvable names throw");
+    /* An anti-abuse VM evaluated in a child frame builds its handlers with
+       eval(source) from inside its own closure; they must see the closure's
+       bindings. A name neither the frame nor the page defines is a
+       ReferenceError there, absent from `in`, and "undefined" to typeof. */
+    const size_t frame_direct_baseline = budget.current;
+    const char frame_direct_page[] =
+        "<!doctype html><html><body><script>"
+        "var pageOnly=7;"
+        "const frame=document.createElement('iframe');"
+        "document.body.appendChild(frame);const w=frame.contentWindow;"
+        "const direct=w.eval('(function(){var secret=41;"
+        "return function(e){return eval(e)}(\"secret+1\")})()');"
+        "const assigns=w.eval('(function(){var slot=1;eval(\"slot=5\");"
+        "eval(\"var made=9\");return slot+made})()');"
+        "const shadow=w.eval('(function(){return eval(\"var eval=3;eval\")})()');"
+        "const indirect=w.eval('(function(){var hidden=1;"
+        "return (0,eval)(\"typeof hidden\")})()');"
+        "let missing='none',call='none',store='none';"
+        "try{w.eval('(function(){return notDefinedAnywhere})')();}"
+        "catch(e){missing=e.name+(e instanceof w.ReferenceError);}"
+        "try{w.eval('(function(){notDefinedAnywhere(1)})')();}"
+        "catch(e){call=e.name;}"
+        "try{w.eval('(function(){notDefinedAnywhere.p=1})')();}"
+        "catch(e){store=e.name;}"
+        "const inherited=w.eval('pageOnly')===7&&w.eval('typeof navigator')==='object'"
+        "&&w.eval('typeof notDefinedAnywhere')==='undefined';"
+        "w.eval('pageOnly=8');"
+        "const own=pageOnly===7&&w.eval('pageOnly')===8;"
+        "globalThis.lateName=3;"
+        "const late=w.eval('lateName')===3;"
+        "const membership=!('notDefinedAnywhere' in w)&&('pageOnly' in w)"
+        "&&('document' in w)&&w.notDefinedAnywhere===undefined;"
+        "globalThis.pocSummary=[direct,assigns,shadow,indirect,missing,call,"
+        "store,inherited,own,late,membership,typeof w.eval,w.eval('3')].join(',');"
+        "</script></body></html>";
+    PocDocument frame_direct_document;
+    CHECK(document_parse(&frame_direct_document, &budget, frame_direct_page,
+                         strlen(frame_direct_page), 17));
+    ScriptResult frame_direct_result;
+    CHECK(scripts_run_document_at(&frame_direct_document, &budget, 8 * MIB,
+        2000, "https://frame.test/", &frame_direct_result));
+    CHECK(strcmp(frame_direct_result.summary,
+                 "42,14,3,undefined,ReferenceErrortrue,ReferenceError,"
+                 "ReferenceError,true,true,true,true,function,3") == 0);
+    document_destroy(&frame_direct_document);
+    CHECK(budget.current == frame_direct_baseline);
+
+    puts("test: interface members throw for a receiver that is not a platform object");
+    /* Web IDL: an operation or attribute called on an object that does not
+       implement the interface throws a TypeError. Sign-in security checks
+       call prototype members on {} to tell native functions from patched
+       ones. Promise-returning operations reject instead, the on* handlers
+       of Window and Document answer null without throwing, a
+       value iterator's keys/values are Array.prototype's, and nothing a
+       page defines is affected, also after a lazy module loads. */
+    const size_t receiver_baseline = budget.current;
+    const char receiver_page[] =
+        "<!doctype html><html><body><p id=p>x</p><script>"
+        "const d=(o,k)=>Object.getOwnPropertyDescriptor(o,k),"
+        "throwsType=(f)=>{try{f();return false}catch(e){"
+        "return e instanceof TypeError}},out=[];"
+        "out.push(throwsType(()=>HTMLMediaElement.prototype.canPlayType"
+        ".call({},'audio/x-m4a')));"
+        "out.push(throwsType(()=>d(Screen.prototype,'width').get.call({})));"
+        "out.push(throwsType(()=>Storage.prototype.getItem.call({},'a')));"
+        "out.push(throwsType(()=>d(Node.prototype,'parentNode').get"
+        ".call({}))&&throwsType(()=>Node.prototype.hasChildNodes.call({})));"
+        "out.push(throwsType(()=>Node.prototype.hasChildNodes.call("
+        "Node.prototype)));"
+        "out.push(throwsType(()=>EventTarget.prototype.addEventListener"
+        ".call({},'x',()=>{})));"
+        "out.push(throwsType(()=>d(Event.prototype,'cancelBubble').get"
+        ".call({})));"
+        "out.push(throwsType(()=>d(XMLHttpRequest.prototype,"
+        "'readyState').get.call({})));"
+        "out.push(throwsType(()=>d(Element.prototype,'tagName').get.call(7)));"
+        "out.push(d(Window.prototype,'onload').get.call({})===null);"
+        "out.push(d(Document.prototype,'onclick').get.call({})===null);"
+        "out.push(NodeList.prototype.values.call([4,5]).next().value===4);"
+        "const p=document.getElementById('p');"
+        "out.push(d(Node.prototype,'isConnected').get.call(p)===true"
+        "&&p.hasChildNodes()&&screen.width>0"
+        "&&document.createElement('audio').canPlayType('audio/x-m4a')!==undefined);"
+        "out.push(new Proxy(p,{}).tagName==='P');"
+        "const bare=addEventListener;bare('x',()=>{});out.push(true);"
+        "const promise=Permissions.prototype.query.call({},{name:'x'});"
+        "out.push(promise instanceof Promise);"
+        "const settled=promise.then(()=>'fulfilled',(e)=>"
+        "e instanceof TypeError?'TypeError':'other');"
+        "class PageThing{who(){return this.tag||'page'}}"
+        "globalThis.PageThing=PageThing;"
+        "Element.prototype.pageHelper=function(){return this.tag||'helper'};"
+        /* Loads the lazy CSSOM rule and IndexedDB modules. */
+        "const sheet=new CSSStyleSheet();sheet.insertRule('a{color:red}');"
+        "const rule=sheet.cssRules[0];void indexedDB;"
+        "out.push(rule.selectorText==='a'&&throwsType(()=>"
+        "d(Object.getPrototypeOf(rule),'selectorText').get.call({})));"
+        "out.push(PageThing.prototype.who.call({tag:'plain'})==='plain'"
+        "&&Element.prototype.pageHelper.call({tag:'plain'})==='plain');"
+        "globalThis.pocSummary=out.map(Number).join('')+':pending';"
+        "settled.then((how)=>{globalThis.pocSummary="
+        "out.map(Number).join('')+':'+how});"
+        "</script></body></html>";
+    PocDocument receiver_document;
+    CHECK(document_parse(&receiver_document, &budget, receiver_page,
+                         strlen(receiver_page), 17));
+    ScriptResult receiver_result;
+    CHECK(scripts_run_document_at(&receiver_document, &budget, 8 * MIB, 2000,
+                                  "https://receiver.test/", &receiver_result));
+    if (strcmp(receiver_result.summary, "111111111111111111:TypeError") != 0)
+        printf("receiver checks: %s %s\n", receiver_result.summary,
+               receiver_result.error);
+    CHECK(strcmp(receiver_result.summary,
+                 "111111111111111111:TypeError") == 0);
+    document_destroy(&receiver_document);
+    CHECK(budget.current == receiver_baseline);
+
+    puts("test: a lazy module leaves natives a page put on an interface unmarked");
+    /* A page may copy any function onto an interface prototype: an
+       ECMAScript builtin, a console method, a bound function. A lazy
+       module loading later marks only what it defined itself, so those
+       keep accepting every receiver everywhere. A page's patched
+       Object.defineProperty or Array.prototype.push is not what a module
+       defines and pushes with, so the classes the patches define stay
+       unmarked too. What the modules define is marked: their members
+       throw "Illegal invocation" for a plain object. */
+    const size_t borrowed_baseline = budget.current;
+    const char borrowed_page[] =
+        "<!doctype html><html><body><p id=p>x</p><script>"
+        "const bound=function(){return this.k}.bind({k:7});"
+        "NodeList.prototype.each=Array.prototype.map;"
+        "Element.prototype.has=Object.prototype.hasOwnProperty;"
+        "Element.prototype.say=console.warn;"
+        "Element.prototype.bound=bound;"
+        "HTMLElement.prototype.own=function(){return this.tag};"
+        "const dp=Object.defineProperty,pu=Array.prototype.push;let made=0;"
+        "const mk=()=>{globalThis['PageClass'+made++]=class{m(){return 1}}};"
+        "Object.defineProperty=function(o,k,d){mk();return dp(o,k,d)};"
+        "Array.prototype.push=function(...a){mk();"
+        "return Reflect.apply(pu,this,a)};"
+        /* Loads the lazy Intl, traversal, CSSOM rule, streams and canvas
+           modules. */
+        "void Intl.DateTimeFormat;"
+        "document.createTreeWalker(document.body);"
+        "const sheet=new CSSStyleSheet();sheet.insertRule('a{color:red}');"
+        "void sheet.cssRules[0];"
+        "new WritableStream();"
+        "document.createElement('canvas').getContext('2d');"
+        "Object.defineProperty=dp;Array.prototype.push=pu;"
+        "let marked=0;for(let i=0;i<made;i++){try{"
+        "globalThis['PageClass'+i].prototype.m.call({})}catch(e){marked++}}"
+        "const ill=(f)=>{try{f();return 'no throw'}catch(e){"
+        "return e.message==='Illegal invocation'?'ILL':e.message}};"
+        "const ok=(f)=>{try{return f()}catch(e){return 'throw:'+e.message}};"
+        "const out=[ok(()=>Array.prototype.map.call([1,2],x=>x*2).join()),"
+        "ok(()=>[3].map(x=>x+1).join()),"
+        "ok(()=>String(Object.prototype.hasOwnProperty.call({a:1},'a'))),"
+        "ok(()=>String(({b:1}).hasOwnProperty('b'))),"
+        "ok(()=>(console.warn('borrowed'),'warned')),"
+        "ok(()=>String(bound.call({}))),"
+        "ok(()=>String(HTMLElement.prototype.own.call({tag:'t'}))),"
+        "ok(()=>String(document.getElementById('p').has('id'))),"
+        "'marked '+marked,"
+        "ill(()=>TreeWalker.prototype.nextNode.call({})),"
+        "ill(()=>WritableStream.prototype.getWriter.call({})),"
+        "ill(()=>CanvasRenderingContext2D.prototype.fillRect.call({}))];"
+        "globalThis.pocSummary=out.join('|');"
+        "</script></body></html>";
+    PocDocument borrowed_document;
+    CHECK(document_parse(&borrowed_document, &budget, borrowed_page,
+                         strlen(borrowed_page), 17));
+    ScriptResult borrowed_result;
+    CHECK(scripts_run_document_at(&borrowed_document, &budget, 8 * MIB, 2000,
+                                  "https://borrowed.test/", &borrowed_result));
+    static const char borrowed_expected[] =
+        "2,4|4|true|true|warned|7|t|false|marked 0|ILL|ILL|ILL";
+    if (strcmp(borrowed_result.summary, borrowed_expected) != 0)
+        printf("borrowed natives: %s %s\n", borrowed_result.summary,
+               borrowed_result.error);
+    CHECK(strcmp(borrowed_result.summary, borrowed_expected) == 0);
+    document_destroy(&borrowed_document);
+    CHECK(budget.current == borrowed_baseline);
+
+    puts("test: a lazy module that loads inside a failed one is marked");
+    /* Page code that runs while canvas.js loads (its Object.freeze call)
+       loads the CSSOM rule module in the same window, then fails the
+       canvas load. The rule module loaded all the same, so its members
+       reject a plain object. */
+    const size_t nested_baseline = budget.current;
+    const char nested_page[] =
+        "<!doctype html><html><body><script>"
+        "const out=[],freeze=Object.freeze;let once=true;"
+        "Object.freeze=function(o){if(once){once=false;"
+        "const s=new CSSStyleSheet();s.insertRule('a{color:red}');"
+        "out.push(typeof s.cssRules[0]);throw new Error('refused')}"
+        "return freeze(o)};"
+        "try{document.createElement('canvas').getContext('2d');"
+        "out.push('canvas loaded')}catch(e){out.push('canvas failed')}"
+        "Object.freeze=freeze;"
+        "try{Object.getOwnPropertyDescriptor(CSSStyleRule.prototype,"
+        "'selectorText').get.call({});out.push('unmarked')}"
+        "catch(e){out.push(e.message)}"
+        "globalThis.pocSummary=out.join('|');"
+        "</script></body></html>";
+    PocDocument nested_document;
+    CHECK(document_parse(&nested_document, &budget, nested_page,
+                         strlen(nested_page), 17));
+    ScriptResult nested_result;
+    CHECK(scripts_run_document_at(&nested_document, &budget, 8 * MIB, 2000,
+                                  "https://nested.test/", &nested_result));
+    static const char nested_expected[] =
+        "object|canvas failed|Illegal invocation";
+    if (strcmp(nested_result.summary, nested_expected) != 0)
+        printf("nested lazy load: %s %s\n", nested_result.summary,
+               nested_result.error);
+    CHECK(strcmp(nested_result.summary, nested_expected) == 0);
+    document_destroy(&nested_document);
+    CHECK(budget.current == nested_baseline);
+
+    puts("test: element scroll operations reject for a wrong receiver");
+    /* scrollTo and scrollBy return promises here, rejecting a lone
+       non-dictionary argument; for a receiver that is not an element too,
+       as a promise-returning operation does (Web IDL), not by throwing. */
+    const size_t scroll_baseline = budget.current;
+    const char scroll_page[] =
+        "<!doctype html><html><body><script>"
+        "const how=(f)=>{let p;try{p=f()}catch(e){return Promise.resolve("
+        "'threw '+e.name)}return p instanceof Promise?p.then(()=>'fulfilled',"
+        "(e)=>'rejected '+e.name):Promise.resolve('no promise')};"
+        "globalThis.pocSummary='pending';"
+        "Promise.all([how(()=>Element.prototype.scrollTo.call({},5)),"
+        "how(()=>Element.prototype.scrollBy.call({},5))]).then((r)=>{"
+        "globalThis.pocSummary=r.join('|')});"
+        "</script></body></html>";
+    PocDocument scroll_document;
+    CHECK(document_parse(&scroll_document, &budget, scroll_page,
+                         strlen(scroll_page), 17));
+    ScriptResult scroll_result;
+    CHECK(scripts_run_document_at(&scroll_document, &budget, 8 * MIB, 2000,
+                                  "https://scroll.test/", &scroll_result));
+    static const char scroll_expected[] =
+        "rejected TypeError|rejected TypeError";
+    if (strcmp(scroll_result.summary, scroll_expected) != 0)
+        printf("scroll receivers: %s %s\n", scroll_result.summary,
+               scroll_result.error);
+    CHECK(strcmp(scroll_result.summary, scroll_expected) == 0);
+    document_destroy(&scroll_document);
+    CHECK(budget.current == scroll_baseline);
+
+    puts("test: a native interface member checks its receiver however called");
+    /* The interpreter enters a native function directly for o.m(); the
+       receiver check applies there as it does to m.call(o). */
+    const size_t direct_baseline = budget.current;
+    const char direct_page[] =
+        "<!doctype html><html><body><p id=p>x</p><script>"
+        "const how=(f)=>{try{return typeof f()}catch(e){"
+        "return e.name+':'+e.message}};"
+        "const get=Document.prototype.getElementById,"
+        "find=DocumentFragment.prototype.querySelector,"
+        "o={get,find},fragment=document.createDocumentFragment();"
+        "fragment.appendChild(document.createElement('b'));"
+        "globalThis.pocSummary=[how(()=>o.get('p')),how(()=>get.call(o,'p')),"
+        "how(()=>o.find('b')),how(()=>find.call(o,'b')),"
+        "how(()=>document.getElementById('p').id),"
+        "how(()=>fragment.querySelector('b').localName)].join('|');"
+        "</script></body></html>";
+    PocDocument direct_document;
+    CHECK(document_parse(&direct_document, &budget, direct_page,
+                         strlen(direct_page), 17));
+    ScriptResult direct_result;
+    CHECK(scripts_run_document_at(&direct_document, &budget, 8 * MIB, 2000,
+                                  "https://direct.test/", &direct_result));
+    static const char direct_expected[] =
+        "TypeError:Illegal invocation|TypeError:Illegal invocation|"
+        "TypeError:Illegal invocation|TypeError:Illegal invocation|"
+        "string|string";
+    if (strcmp(direct_result.summary, direct_expected) != 0)
+        printf("direct native calls: %s %s\n", direct_result.summary,
+               direct_result.error);
+    CHECK(strcmp(direct_result.summary, direct_expected) == 0);
+    document_destroy(&direct_document);
+    CHECK(budget.current == direct_baseline);
+
+    puts("test: interface class strings, option conversion and list types");
+    /* Web IDL class strings (every interface names itself to
+       Object.prototype.toString), IntersectionObserver's dictionary and
+       union conversion, and the list interfaces a few attributes return. */
+    const size_t idl_baseline = budget.current;
+    const char idl_page[] =
+        "<!doctype html><html><body><label for=i>l</label><input id=i>"
+        "<video id=v></video><table id=t><tfoot><tr id=f></tr></tfoot>"
+        "<tr id=d></tr><thead><tr id=h></tr></thead><tbody><tr id=b></tr>"
+        "</tbody></table><script>"
+        "const tag=(v)=>Object.prototype.toString.call(v).slice(8,-1),"
+        "throwsAs=(type,f)=>{try{f();return false}catch(e){"
+        "return e instanceof type}},bad=[],check=(name,ok)=>{"
+        "if(!ok)bad.push(name)};"
+        "const io=(o)=>new IntersectionObserver(()=>{},o);"
+        "check('threshold string',io({threshold:'1.00',trackVisibility:1,"
+        "delay:100}).thresholds.join()==='1');"
+        "check('threshold list',io({threshold:[0,'0.5']}).thresholds.join()"
+        "==='0,0.5');"
+        "check('null options',io(null).thresholds.join()==='0');"
+        "check('number options',throwsAs(TypeError,()=>io(5)));"
+        "check('threshold range',throwsAs(RangeError,()=>io({threshold:2})));"
+        "check('threshold nan',throwsAs(TypeError,()=>io({threshold:'x'})));"
+        "check('null margin',throwsAs(SyntaxError,()=>io({rootMargin:null})));"
+        "for(const [name,value] of ["
+        "['MouseEvent',new MouseEvent('click')],"
+        "['MouseEvent',document.createEvent('MouseEvents')],"
+        "['FocusEvent',new FocusEvent('focus')],"
+        "['InputEvent',new InputEvent('input')],"
+        "['KeyboardEvent',new KeyboardEvent('keydown')],"
+        "['PointerEvent',new PointerEvent('pointerdown')],"
+        "['CustomEvent',new CustomEvent('x')],['Event',new Event('x')],"
+        "['CSSStyleDeclaration',document.body.style],"
+        "['DOMRect',document.body.getBoundingClientRect()],"
+        "['DOMRectList',document.body.getClientRects()],"
+        "['MediaQueryList',matchMedia('(min-width:1px)')],"
+        "['History',history],['VisualViewport',visualViewport],"
+        "['Selection',getSelection()],['PerformanceTiming',performance.timing],"
+        "['Storage',localStorage],['Range',new Range()],"
+        "['DOMImplementation',document.implementation],"
+        "['IntersectionObserver',io()],"
+        "['AbortSignal',new AbortController().signal],"
+        "['CanvasRenderingContext2D',document.createElement('canvas')"
+        ".getContext('2d')],"
+        "['NodeList',document.getElementById('i').labels],"
+        "['HTMLCollection',document.scripts],"
+        "['TextTrackList',document.getElementById('v').textTracks],"
+        "['HTMLCollection',document.getElementById('t').rows],"
+        "['HTMLImageElement',new Image()],['Window',window],"
+        "['HTMLDocument',document]])check(name+'='+tag(value),tag(value)===name);"
+        "check('globals',[History,Selection,VisualViewport,DOMRectReadOnly,"
+        "DOMRectList,PerformanceTiming,TextTrackList].every((c)=>"
+        "typeof c==='function'));"
+        "check('instances',history instanceof History&&getSelection() "
+        "instanceof Selection&&visualViewport instanceof VisualViewport"
+        "&&visualViewport instanceof EventTarget"
+        "&&new DOMRect(1,2,3,4) instanceof DOMRectReadOnly"
+        "&&new DOMRect(1,2,3,4).toJSON().right===4);"
+        "check('unconstructible',throwsAs(TypeError,()=>new History())"
+        "&&throwsAs(TypeError,()=>new VisualViewport()));"
+        "check('labels',document.getElementById('i').labels.length===1"
+        "&&document.getElementById('i').labels.item(0).htmlFor==='i');"
+        "check('scripts live',(()=>{const list=document.scripts,"
+        "before=list.length;document.body.appendChild("
+        "document.createElement('script'));return list.length===before+1})());"
+        "const rows=document.getElementById('t').rows;"
+        "check('rows order',[...rows].map((r)=>r.id).join('')==='hdbf'"
+        "&&rows===document.getElementById('t').rows);"
+        "document.querySelector('tbody').appendChild("
+        "document.createElement('tr')).id='n';"
+        "check('rows live',[...rows].map((r)=>r.id).join('')==='hdnbf');"
+        "const video=document.getElementById('v');"
+        "check('textTracks',video.textTracks.length===0"
+        "&&video.textTracks===video.textTracks"
+        "&&video.textTracks.getTrackById('a')===null);"
+        "check('canPlayType',video.canPlayType('video/mp4')==='maybe'"
+        "&&video.canPlayType('video/mp4; codecs=\"avc1.42E01E\"')"
+        "==='probably');"
+        "check('rect list',(()=>{const list=document.getElementById('i')"
+        ".getClientRects();return list.length===[...list].length"
+        "&&list.item(9)===null})());"
+        "const hidden=(proto)=>!Object.getOwnPropertyNames(proto)"
+        ".some((k)=>k[0]==='_');"
+        "check('private members',hidden(URL.prototype)"
+        "&&hidden(MessagePort.prototype));"
+        "const url=new URL('a?x=1#f','https://h.test/b/');"
+        "url.searchParams.set('y','2');url.pathname='/c';"
+        "check('URL works',url.href==='https://h.test/c?x=1&y=2#f'"
+        "&&new URL('../z',url).href==='https://h.test/z');"
+        "globalThis.pocSummary=bad.length?'IDL-BAD:'+bad.join('|'):'IDL-OK';"
+        "</script></body></html>";
+    PocDocument idl_document;
+    CHECK(document_parse(&idl_document, &budget, idl_page,
+                         strlen(idl_page), 17));
+    ScriptResult idl_result;
+    CHECK(scripts_run_document_at(&idl_document, &budget, 8 * MIB, 2000,
+                                  "https://idl.test/", &idl_result));
+    if (strcmp(idl_result.summary, "IDL-OK") != 0)
+        printf("interface shapes: %s %s\n", idl_result.summary,
+               idl_result.error);
+    CHECK(strcmp(idl_result.summary, "IDL-OK") == 0);
+    document_destroy(&idl_document);
+    CHECK(budget.current == idl_baseline);
 
     puts("test: WebAssembly memory.buffer aliases linear memory without copies");
     size_t wasm_alias_baseline = budget.current;
@@ -3086,6 +3495,48 @@
           && document_provenance_result.success
           && strcmp(document_provenance_result.summary,
                     "NAVIGATION-HEADERS-OK") == 0);
+    /* A streamed document's realm exists once its headers arrive, before
+       its body: the hop's connection phases are already known then (its
+       first byte 70 ms after the hop started), and the completed response
+       below places them at the same times. */
+    ScriptNavigationTiming document_navigation_measured_headers_timing = {
+        .measured = true,
+        .response_start_us = 180000,
+        .name_lookup_us = 5000,
+        .connect_us = 12000,
+        .appconnect_us = 25000,
+        .first_byte_us = 70000,
+        .total_us = 72000,
+        .response_status = 200,
+        .next_hop_protocol = "h2",
+        .content_type = "text/html"
+    };
+    static const char document_navigation_measured_headers_source[] =
+        "(()=>{const entry=performance.getEntriesByType('navigation')[0],"
+        "t=performance.timing,o=performance.timeOrigin;"
+        "pocSummary=entry.fetchStart===0&&entry.domainLookupStart===110"
+        "&&entry.domainLookupEnd===115&&entry.connectStart===115"
+        "&&entry.secureConnectionStart===122&&entry.connectEnd===135"
+        "&&entry.requestStart===135&&entry.responseStart===180"
+        "&&entry.finalResponseHeadersStart===180&&entry.responseEnd===0"
+        "&&t.domainLookupStart===o+110&&t.domainLookupEnd===o+115"
+        "&&t.secureConnectionStart===o+122&&t.connectEnd===o+135"
+        "&&t.requestStart===o+135&&t.responseStart===o+180"
+        "&&t.responseEnd===0&&t.domLoading>=o+180"
+        "?'NAVIGATION-MEASURED-HEADERS-OK':"
+        "'NAVIGATION-MEASURED-HEADERS-FAILED:'+JSON.stringify(entry.toJSON())"
+        "+JSON.stringify(t)})()";
+    CHECK(script_runtime_record_navigation_timing(
+              document_provenance_runtime,
+              &document_navigation_measured_headers_timing)
+          && script_runtime_evaluate_diagnostic(
+              document_provenance_runtime,
+              document_navigation_measured_headers_source,
+              "<document-navigation-measured-headers>",
+              &document_provenance_result)
+          && document_provenance_result.success
+          && strcmp(document_provenance_result.summary,
+                    "NAVIGATION-MEASURED-HEADERS-OK") == 0);
     ScriptNavigationTiming document_navigation_timing = {
         .measured = true,
         .response_complete = true,
@@ -3121,6 +3572,8 @@
         "&&performance.timing.connectEnd===performance.timeOrigin+135"
         "&&performance.timing.responseStart===performance.timeOrigin+180"
         "&&performance.timing.responseEnd===performance.timeOrigin+220"
+        "&&performance.timing.secureConnectionStart"
+        "===performance.timeOrigin+122"
         "&&json.responseEnd===220&&Object.keys(entry).length===0"
         "?'NAVIGATION-TIMING-OK':'NAVIGATION-TIMING-FAILED:'"
         "+JSON.stringify(json)})()";
@@ -5623,6 +6076,90 @@
     lxb_dom_node_destroy_deep(parser_form);
     document_destroy(&parser_form_document);
     CHECK(budget.current == control_state_baseline);
+
+    puts("test: valueless attributes are present with an empty value");
+    size_t cors_baseline = budget.current;
+    PocDocument cors_document = {0};
+    static const char cors_page[] =
+        "<!doctype html><script id=bare crossorigin hidden></script>"
+        "<script id=empty crossorigin=''></script>"
+        "<script id=anonymous crossorigin=anonymous></script>"
+        "<script id=credentials crossorigin=use-credentials></script>"
+        "<script id=upper crossorigin=USE-CREDENTIALS></script>"
+        "<script id=invalid crossorigin=use-credential></script>"
+        "<script id=absent></script>";
+    CHECK(document_parse(&cors_document, &budget, cors_page,
+                         sizeof(cors_page) - 1u, 17));
+    lxb_dom_node_t *cors_root = lxb_dom_interface_node(cors_document.html);
+    static const struct {
+        const char *id;
+        TilefinchCorsSettings settings;
+    } cors_cases[] = {
+        {"bare", TILEFINCH_CORS_SETTINGS_ANONYMOUS},
+        {"empty", TILEFINCH_CORS_SETTINGS_ANONYMOUS},
+        {"anonymous", TILEFINCH_CORS_SETTINGS_ANONYMOUS},
+        {"credentials", TILEFINCH_CORS_SETTINGS_USE_CREDENTIALS},
+        {"upper", TILEFINCH_CORS_SETTINGS_USE_CREDENTIALS},
+        {"invalid", TILEFINCH_CORS_SETTINGS_ANONYMOUS},
+        {"absent", TILEFINCH_CORS_SETTINGS_NONE},
+    };
+    for (size_t i = 0; i < sizeof(cors_cases) / sizeof(cors_cases[0]); i++) {
+        lxb_dom_node_t *script = find_id(cors_root, cors_cases[i].id);
+        CHECK(script != NULL
+              && document_cors_settings(script) == cors_cases[i].settings);
+    }
+    lxb_dom_node_t *bare_script = find_id(cors_root, "bare");
+    size_t bare_length = 1;
+    /* lexbor keeps no value for a valueless attribute; it still reads as
+       present, with the empty value the DOM gives it. */
+    const lxb_dom_attr_t *bare_attr = lxb_dom_element_attr_by_name(
+        lxb_dom_interface_element(bare_script),
+        (const lxb_char_t *) "crossorigin", 11);
+    CHECK(bare_attr != NULL && bare_attr->value == NULL);
+    const char *bare_value = document_attribute(
+        bare_script, "crossorigin", &bare_length);
+    CHECK(bare_value != NULL && bare_length == 0);
+    CHECK(document_attribute(bare_script, "hidden", &bare_length) != NULL
+          && bare_length == 0);
+    CHECK(document_attribute(bare_script, "async", &bare_length) == NULL
+          && bare_length == 0);
+    /* setAttribute(name, "") and removal. */
+    lxb_dom_element_t *absent_element =
+        lxb_dom_interface_element(find_id(cors_root, "absent"));
+    CHECK(lxb_dom_element_set_attribute(
+              absent_element, (const lxb_char_t *) "crossorigin", 11,
+              (const lxb_char_t *) "", 0) != NULL
+          && document_cors_settings(lxb_dom_interface_node(absent_element))
+                 == TILEFINCH_CORS_SETTINGS_ANONYMOUS);
+    CHECK(lxb_dom_element_remove_attribute(
+              absent_element, (const lxb_char_t *) "crossorigin", 11)
+              == LXB_STATUS_OK
+          && document_cors_settings(lxb_dom_interface_node(absent_element))
+                 == TILEFINCH_CORS_SETTINGS_NONE);
+    /* The raw-text form the speculative scanner reads. */
+    CHECK(tilefinch_cors_settings(NULL, 0) == TILEFINCH_CORS_SETTINGS_NONE
+          && tilefinch_cors_settings("", 0)
+                 == TILEFINCH_CORS_SETTINGS_ANONYMOUS
+          && tilefinch_cors_settings("Use-Credentials>", 15)
+                 == TILEFINCH_CORS_SETTINGS_USE_CREDENTIALS
+          && tilefinch_cors_settings("use-credentials", 14)
+                 == TILEFINCH_CORS_SETTINGS_ANONYMOUS);
+    /* No CORS includes credentials (no-cors); a module script's CORS
+       request without the attribute is same-origin. */
+    CHECK(tilefinch_cors_settings_credentials(
+              TILEFINCH_CORS_SETTINGS_NONE, false)
+              == TILEFINCH_CREDENTIALS_INCLUDE
+          && tilefinch_cors_settings_credentials(
+                 TILEFINCH_CORS_SETTINGS_NONE, true)
+                 == TILEFINCH_CREDENTIALS_SAME_ORIGIN
+          && tilefinch_cors_settings_credentials(
+                 TILEFINCH_CORS_SETTINGS_ANONYMOUS, true)
+                 == TILEFINCH_CREDENTIALS_SAME_ORIGIN
+          && tilefinch_cors_settings_credentials(
+                 TILEFINCH_CORS_SETTINGS_USE_CREDENTIALS, true)
+                 == TILEFINCH_CREDENTIALS_INCLUDE);
+    document_destroy(&cors_document);
+    CHECK(budget.current == cors_baseline);
 
     puts("test: cache gone");
     layout_destroy(&layout);

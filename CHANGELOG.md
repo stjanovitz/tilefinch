@@ -8,6 +8,11 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.51 — 2026-11-16
+
+- Better compatibility with script-heavy pages, with faster loading and fewer pauses.
+- Reliability fixes for page controls, graphics, and low-memory handling.
+
 ## 0.1.50 — 2026-11-15
 
 - Improve graphics and compatibility for WebGL games and 3D pages. Larger supported draws are submitted in complete primitive groups, oversized canvas viewports are scaled to the drawing buffer, and additional blend equations and factors use the PSP graphics hardware.

@@ -181,7 +181,7 @@ JSValue js_dom_parse_color(JSContext *context,
 #define SCRIPT_REALM_MAXIMUM_SCRIPTS 256u
 #define SCRIPT_REALM_MAXIMUM_FILE_BYTES (8u * 1024u * 1024u)
 #define SCRIPT_REALM_MAXIMUM_TOTAL_BYTES (128u * 1024u * 1024u)
-#define SCRIPT_LAZY_BOOTSTRAP_FEATURE_COUNT 19u
+#define SCRIPT_LAZY_BOOTSTRAP_FEATURE_COUNT 20u
 /* A fully hydrated long article exceeds 4096 nodes several times
    over; a truncated walk silently drops querySelectorAll matches (the
    mobile section transform only saw the first few sections).
@@ -238,7 +238,7 @@ typedef struct {
 #define DOM_BRIDGE_NODE_LIMIT_MAX SCRIPT_DOM_HANDLE_SLOT_CAPACITY_MAX
 #define DOM_BRIDGE_NODE_BUDGET_CAPACITY SCRIPT_DOM_HANDLE_SLOT_BUDGET_CAPACITY
 #define DOM_BRIDGE_NODE_GROWTH_STEP SCRIPT_DOM_HANDLE_SLOT_GROWTH_STEP
-#define DOM_BRIDGE_WRAPPER_PLAIN_KEYS 6
+#define DOM_BRIDGE_WRAPPER_PLAIN_KEYS 7
 /* Live shadow roots per realm. Admission is memory-based, like script
    admission (js_dom_register_shadow_root): a root is admitted while the
    page Budget keeps SCRIPT_ADMISSION_PRESENTATION_RESERVE_BYTES free (for
@@ -467,6 +467,46 @@ typedef struct {
     bool heavy_counted;
     TilefinchResourceGrant stale_resource_grant;
 } ScriptDynamicTask;
+
+typedef enum {
+    SCRIPT_PRELOADED_SCRIPT_EMPTY = 0,
+    /* The preload's request is still in flight: a consumer waits for it
+       (HTML's onResponseAvailable) instead of fetching the URL itself. */
+    SCRIPT_PRELOADED_SCRIPT_PENDING,
+    SCRIPT_PRELOADED_SCRIPT_READY
+} ScriptPreloadedScriptState;
+
+/* One entry of the document's map of preloaded resources (HTML, <link
+   rel=preload>) for a classic script: the response of a preload whose key
+   is url, destination "script", mode and credentials, kept for the first
+   consumer (script_runtime_offer_preloaded_script). */
+typedef struct {
+    char *url;
+    /* The link's integrity metadata; NULL when it had none. */
+    char *integrity;
+    /* NULL when the response came from url itself. */
+    char *response_url;
+    BrowserSharedBody *body;
+    size_t length;
+    char content_type[128];
+    TilefinchRequestMode mode;
+    TilefinchCredentialsMode credentials;
+    ScriptPreloadedScriptState state;
+    /* READY with no body: the response failed the preload's own integrity
+       metadata, so Fetch made it a network error, which is what a
+       consumer gets. */
+    bool network_error;
+    /* PENDING: the navigation's request, which this entry now owns. The
+       scheduler (the page's resource scheduler) outlives the realm. */
+    FetchScheduler *scheduler;
+    uint64_t request_id;
+    uint8_t csp_grant;
+} ScriptPreloadedScript;
+/* How long after the load event an unconsumed entry is kept: Chromium's
+   kUnusedPreloadTimeout (resource_fetcher.cc), after which it reports the
+   preload as unused. Chromium's memory cache can still serve it later;
+   this engine has no such cache for CORS scripts, so the entry goes. */
+#define SCRIPT_PRELOADED_SCRIPT_UNUSED_MS 3000u
 
 typedef struct {
     lxb_dom_node_t *node;
@@ -916,9 +956,6 @@ typedef struct DomBridge {
     uint64_t clock_wall_elapsed_ms;
     uint64_t clock_monotonic_elapsed_ms;
     uint64_t clock_source_counts[SCRIPT_CLOCK_SOURCE_COUNT];
-#ifdef JS_RT_TEST_INSTRUMENTS
-    uint64_t frame_eval_count;
-#endif
     /* Mirrors the native QuickJS CSP gate for delayed frame-eval helpers.
        A trusted evaluator is compiled during bootstrap, before author policy
        is armed, so every later invocation must independently consult this
@@ -1014,6 +1051,13 @@ typedef struct DomBridge {
     ScriptMultiplayer multiplayer;
     unsigned char *multiplayer_event_scratch;
     ScriptDynamicTask dynamic_scripts[SCRIPT_DYNAMIC_TASK_LIMIT];
+    ScriptPreloadedScript preloaded_scripts[SCRIPT_PRELOADED_SCRIPT_LIMIT];
+    /* Sum of the READY entries' lengths, at most
+       SCRIPT_PRELOADED_SCRIPT_BYTE_LIMIT. */
+    size_t preloaded_script_bytes;
+    /* js_rt_bridge_elapsed_ms at the load event plus
+       SCRIPT_PRELOADED_SCRIPT_UNUSED_MS; 0 before the load event. */
+    uint64_t preloaded_scripts_unused_at_ms;
     ScriptElementState script_elements[SCRIPT_DYNAMIC_NODE_LIMIT];
     size_t script_element_count;
     uint32_t next_script_element_identity;
@@ -1391,10 +1435,20 @@ struct ScriptRuntime {
        it has taken its one hook claim (js_runtime_lazy_loading). */
     uint8_t lazy_loading_feature;
     bool lazy_hook_claimed;
+    /* Open while lazy modules load (and the step that builds their
+       objects runs): what the interfaces held when it opened, so that only
+       what those modules define is marked when it closes. NULL inside an
+       open window when the snapshot could not be taken. Loaded: some
+       module evaluated in the open window. */
+    bool platform_window_open;
+    bool platform_window_loaded;
+    JSPlatformSnapshot *platform_window;
 #ifdef JS_RT_TEST_INSTRUMENTS
     /* The bootstrap, eager and lazy, publishes its test-only probes. Off
        only when a host test asks for the shipping realm surface. */
     bool test_probes;
+    /* Frame realm setups still to refuse (__tilefinchRefuseFrameSetups). */
+    unsigned refused_frame_setups;
 #endif
     Watchdog watchdog;
     DomBridge bridge;
@@ -1493,6 +1547,20 @@ struct ScriptRuntime {
     /* The private WeakMap from each Document to its document.all
        collection (js_runtime/legacy_surface.inc). */
     JSValue document_all_cache;
+    /* window.name and window.status (js_runtime/legacy_surface.inc); the
+       name is mirrored to window_name_slot when the navigation keeps one. */
+    JSValue window_name;
+    JSValue window_status;
+    ScriptWindowName *window_name_slot;
+    /* The page window's own string names when author code starts, less the
+       private __tilefinch bridges: what a frame WindowProxy reports as its
+       own beyond its realm's (host_primitives.inc frame_scope_keys). */
+    /* Element getAttribute, setAttribute, removeAttribute, URL and
+       DOMException as the bootstrap left them, for the native reflected
+       attributes (js_runtime/reflected_attributes.inc). */
+    JSValue reflect_hooks[5];
+    JSPropertyEnum *frame_page_names;
+    uint32_t frame_page_name_count;
     /* Captured before author code can replace Window.navigator. The lazy
        OPFS module receives this identity through a temporary native-only
        handoff so StorageManager branding never consults a mutable global. */
@@ -1603,6 +1671,12 @@ struct ScriptRuntime {
     struct ScriptLazyRuntimeBundle *lazy_webpack_bundles;
     uint32_t next_lazy_webpack_bundle_id;
     bool lazy_factory_recovery_pending;
+    /* Program text of lazy-webpack factories whose functions refer to it by
+       external id (it would otherwise be in the heap), the plain copies of
+       it held, and the clock that orders those copies by last read. */
+    size_t lazy_webpack_external_text_bytes;
+    size_t lazy_webpack_plain_text_bytes;
+    uint64_t lazy_webpack_plain_clock;
     /* Text of classic scripts compiled without toString() text in the
        heap (js_source_store.h; created by the first such compile). */
     struct ScriptSourceStore *source_store;
@@ -1634,6 +1708,16 @@ typedef struct {
     uint32_t source_column;
     JSValue compiled;
     JSValue wrapper;
+    /* Factory text outside the heap (js_lazy_webpack.c): compiles whose
+       functions still name this factory's program text by its external id,
+       and a plain copy of that text (the compile's program buffer, or text
+       decoded from compressed_source), valid up to plain_length, or NULL. */
+    uint32_t external_owners;
+    uint8_t plain_ascii;
+    unsigned char *plain;
+    size_t plain_length;
+    size_t plain_input;
+    uint64_t plain_used;
 #ifndef TILEFINCH_NO_TRACE
     /* Factory-cache measurement (TILEFINCH_TRACE_FACTORY_CACHE, lab only):
        the compiled program held from compile to the end of its first call,
@@ -2056,6 +2140,16 @@ void js_rt_event_sources_destroy(DomBridge *bridge);
 /* Cancels in-flight CORS preflights and frees the realm's preflight keys;
    before the realm scheduler is destroyed. */
 void js_rt_cors_preflights_destroy(DomBridge *bridge);
+void js_rt_preloaded_scripts_destroy(DomBridge *bridge);
+/* Once per advance, before dynamic scripts start: completes pending
+   entries whose requests finished, and releases the unconsumed ones
+   SCRIPT_PRELOADED_SCRIPT_UNUSED_MS after the load event. */
+void js_rt_preloaded_scripts_step(DomBridge *bridge);
+/* The load event fired now. */
+void js_rt_preloaded_scripts_note_load(DomBridge *bridge);
+/* A queued dynamic script whose preload is still in flight: it waits. */
+bool js_rt_dynamic_task_awaits_preload(DomBridge *bridge,
+                                       const ScriptDynamicTask *task);
 /* Decides completed preflights, releasing their scheduler entries; once
    per host turn, so one whose request was aborted does not hold its entry
    until the realm's next request. */
@@ -2705,5 +2799,21 @@ JSValue js_style_set(JSContext *context, JSValueConst this_value,
 void js_lazy_webpack_recover_failure(ScriptRuntime *runtime);
 void js_lazy_webpack_bundles_destroy(ScriptRuntime *runtime);
 bool js_lazy_webpack_install(ScriptRuntime *runtime, JSValue global);
+/* Factory text outside the heap: the external-source hooks
+   (JS_SetExternalSourceHooks()) route ids at or above
+   SCRIPT_SOURCE_STORE_ID_LIMIT here; same contracts as the store's
+   (js_source_store.h). */
+int js_lazy_webpack_text_read(ScriptRuntime *runtime, uint32_t id,
+                              uint32_t offset, uint32_t length, char *dest);
+int js_lazy_webpack_text_query(ScriptRuntime *runtime, uint32_t id,
+                               uint32_t offset, uint32_t length);
+void js_lazy_webpack_text_release(ScriptRuntime *runtime, uint32_t id);
+/* Drops plain factory text, least recently read first, until at most
+   `allowance` bytes stay plain; returns the Budget bytes released. The
+   compressed copy stays, so nothing is lost. */
+size_t js_lazy_webpack_text_trim(ScriptRuntime *runtime, size_t allowance);
+/* True once the realm's external-source hooks are installed
+   (evaluation.inc). */
+bool js_rt_external_source_hooks(ScriptRuntime *runtime);
 
 #endif

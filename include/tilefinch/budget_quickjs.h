@@ -61,6 +61,9 @@ void budget_quickjs_pool_set_limit_growth(BudgetQuickJSPool *pool,
                                           void *opaque);
 /* Monotonic count of allocations refused by the realm's hard heap limit. */
 size_t budget_quickjs_pool_rejection_count(const BudgetQuickJSPool *pool);
+/* Monotonic count of allocations the limit admitted but the page Budget
+   refused (another realm, or the page itself, holds the memory). */
+size_t budget_quickjs_pool_budget_refusal_count(const BudgetQuickJSPool *pool);
 void budget_quickjs_pool_activity(const BudgetQuickJSPool *pool,
                                   BudgetQuickJSActivity *activity);
 

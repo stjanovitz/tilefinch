@@ -31,7 +31,7 @@
 static bool controller_set_scroll(BrowserController *controller, int scroll_y,
                                   int viewport_height);
 static ControllerActivationOutcome controller_dispatch_activation(
-    BrowserController *controller, lxb_dom_node_t *node);
+    BrowserController *controller, lxb_dom_node_t *node, bool enter_key);
 
 static int controller_add_coordinate(int value, int delta)
 {
@@ -554,19 +554,10 @@ static void media_credentials_policy(
     lxb_dom_node_t *media, TilefinchRequestMode *mode,
     TilefinchCredentialsMode *credentials)
 {
-    *mode = TILEFINCH_REQUEST_MODE_NO_CORS;
-    *credentials = TILEFINCH_CREDENTIALS_INCLUDE;
-    size_t length = 0;
-    const char *crossorigin = document_attribute(
-        media, "crossorigin", &length);
-    if (crossorigin == NULL) return;
-    *mode = TILEFINCH_REQUEST_MODE_CORS;
-    *credentials = length == sizeof("use-credentials") - 1u
-            && strncasecmp(
-                   crossorigin, "use-credentials",
-                   sizeof("use-credentials") - 1u) == 0
-        ? TILEFINCH_CREDENTIALS_INCLUDE
-        : TILEFINCH_CREDENTIALS_SAME_ORIGIN;
+    TilefinchCorsSettings settings = document_cors_settings(media);
+    bool cors = settings != TILEFINCH_CORS_SETTINGS_NONE;
+    *mode = cors ? TILEFINCH_REQUEST_MODE_CORS : TILEFINCH_REQUEST_MODE_NO_CORS;
+    *credentials = tilefinch_cors_settings_credentials(settings, cors);
 }
 
 /* ControllerAction already owns a bounded body scratch area; media
@@ -1186,7 +1177,7 @@ static bool controller_build_implicit_form_action(
         if (controller->navigation->page.runtime != NULL
             && (form_handle == 0 || submitter_handle == 0)) return false;
         ControllerActivationOutcome submitter_outcome =
-            controller_dispatch_activation(controller, submitter);
+            controller_dispatch_activation(controller, submitter, false);
         if (submitter_outcome == CONTROLLER_ACTIVATION_CANCELLED
             || submitter_outcome == CONTROLLER_ACTIVATION_RUNTIME_FAILED) {
             memset(action, 0, sizeof(*action));
@@ -2689,8 +2680,70 @@ void controller_pointer_discard_click(BrowserController *controller)
     if (controller != NULL) controller->pointer_click_pending = false;
 }
 
-static ControllerActivationOutcome controller_dispatch_activation(
+/* One phase of an Enter press (7: focus, keydown and keypress; 8: keyup),
+   as navigation reports it. */
+static ControllerActivationOutcome controller_dispatch_enter_phase(
+    BrowserController *controller, lxb_dom_node_t *node, unsigned phase)
+{
+    NavigationSession *navigation = controller->navigation;
+    if (navigation->page.runtime == NULL
+        || controller_node_in_native_basic_root(controller, node))
+        return CONTROLLER_ACTIVATION_RUNTIME_UNAVAILABLE;
+    if (!navigation_dispatch_node_pointer(navigation, node, phase,
+                                          0, 0, 0, 0, 0)) {
+        if (!navigation->page.loaded)
+            return CONTROLLER_ACTIVATION_RUNTIME_FAILED;
+        return !navigation->page.script_result.event_dispatch_entered
+            ? CONTROLLER_ACTIVATION_RUNTIME_REFUSED
+            : CONTROLLER_ACTIVATION_RUNTIME_FAILED;
+    }
+    return navigation->page.script_result.last_event_cancelled
+        ? CONTROLLER_ACTIVATION_CANCELLED
+        : CONTROLLER_ACTIVATION_DELIVERED;
+}
+
+/* X's keydown and keypress on NODE. Its keyup is owed until the press's
+   defaults have run (controller_enter_up). */
+static ControllerActivationOutcome controller_enter_down(
     BrowserController *controller, lxb_dom_node_t *node)
+{
+    long handle = controller_node_snapshot_handle(controller, node);
+    ControllerActivationOutcome key =
+        controller_dispatch_enter_phase(controller, node, 7u);
+    if (key == CONTROLLER_ACTIVATION_DELIVERED
+        || key == CONTROLLER_ACTIVATION_CANCELLED) {
+        controller->enter_release_pending = true;
+        controller->enter_release_handle = handle;
+        controller->enter_release_runtime = controller->navigation->page.runtime;
+    }
+    return key;
+}
+
+/* The owed keyup, in the realm that saw the keydown: at the pressed node,
+   or at the document when the page removed it. */
+static void controller_enter_up(BrowserController *controller)
+{
+    if (!controller->enter_release_pending) return;
+    controller->enter_release_pending = false;
+    NavigationSession *navigation = controller->navigation;
+    ScriptRuntime *runtime = navigation->page.runtime;
+    if (runtime == NULL || !navigation->page.loaded
+        || (const void *) runtime != controller->enter_release_runtime) return;
+    lxb_dom_node_t *node = controller->enter_release_handle == 0 ? NULL
+        : script_runtime_node_handle_resolve_connected(
+              runtime, controller->enter_release_handle);
+    if (node == NULL && navigation->page.document.html != NULL)
+        node = lxb_dom_interface_node(navigation->page.document.html);
+    if (node != NULL)
+        (void) controller_dispatch_enter_phase(controller, node, 8u);
+}
+
+/* ENTER_KEY: the user pressed X on NODE, so the page sees an Enter press
+   around the click. Otherwise the click alone (implicit submission's
+   default button), unless a completed cursor press is pending, which
+   delivers the pointer's click. */
+static ControllerActivationOutcome controller_dispatch_activation(
+    BrowserController *controller, lxb_dom_node_t *node, bool enter_key)
 {
     NavigationSession *navigation = controller->navigation;
     bool click_only = controller->pointer_click_pending;
@@ -2716,13 +2769,25 @@ static ControllerActivationOutcome controller_dispatch_activation(
         return CONTROLLER_ACTIVATION_RUNTIME_UNAVAILABLE;
     if (navigation->page.runtime == NULL)
         return CONTROLLER_ACTIVATION_RUNTIME_UNAVAILABLE;
+    if (enter_key && !click_only) {
+        /* Keydown and keypress, then the click unless either was
+           cancelled; a handler that removed the element leaves nothing to
+           click, as the press then activates nothing. */
+        long handle = controller_node_snapshot_handle(controller, node);
+        ControllerActivationOutcome key =
+            controller_enter_down(controller, node);
+        if (key != CONTROLLER_ACTIVATION_DELIVERED) return key;
+        node = controller_node_snapshot_resolve(controller, handle, node);
+        if (node == NULL) return CONTROLLER_ACTIVATION_CANCELLED;
+    }
     bool dispatched = click_only
         ? navigation_dispatch_node_pointer(
               navigation, node, 5, controller->pointer_click_x,
               controller->pointer_click_y,
               controller->pointer_click_offset_x,
               controller->pointer_click_offset_y, 0)
-        : navigation_dispatch_node_activation(navigation, node);
+        : navigation_dispatch_node_pointer(navigation, node, 0,
+                                           0, 0, 0, 0, 0);
     if (!dispatched) {
         if (!navigation->page.loaded)
             return CONTROLLER_ACTIVATION_RUNTIME_FAILED;
@@ -2745,7 +2810,7 @@ bool controller_commit_pointer_click(BrowserController *controller)
         return true;
     }
     ControllerActivationOutcome outcome =
-        controller_dispatch_activation(controller, node);
+        controller_dispatch_activation(controller, node, false);
     return outcome != CONTROLLER_ACTIVATION_NOT_DISPATCHED
         && outcome != CONTROLLER_ACTIVATION_RUNTIME_FAILED;
 }
@@ -3811,8 +3876,53 @@ static void controller_note_stopped_scripts(
         && !document_element_name_is(node, "label");
 }
 
+/* Enter in FIELD, in browser order: keydown and keypress on the field, the
+   implicit submission they default to (HTML; a field outside a form has
+   none), then keyup (controller_activate). A cancelled keydown or keypress
+   submits nothing. */
+static bool controller_enter_in_field(BrowserController *controller,
+                                      lxb_dom_node_t *field,
+                                      ControllerAction *action)
+{
+    long handle = controller_node_snapshot_handle(controller, field);
+    if (controller->navigation->page.runtime != NULL && handle == 0)
+        return false;
+    ControllerActivationOutcome key = controller_enter_down(controller, field);
+    lxb_dom_node_t *live = controller_node_snapshot_resolve(
+        controller, handle, field);
+    memset(action, 0, sizeof(*action));
+    action->activation_outcome = key;
+    if (key == CONTROLLER_ACTIVATION_CANCELLED
+        || key == CONTROLLER_ACTIVATION_RUNTIME_FAILED || live == NULL) {
+        action->type = CONTROLLER_ACTION_NONE;
+        return true;
+    }
+    if (form_ancestor(live) == NULL) {
+        action->type = CONTROLLER_ACTION_CONTROL;
+        return true;
+    }
+    return controller_build_implicit_form_action(
+        controller, live, CONTROLLER_ACTIVATION_NOT_DISPATCHED, action);
+}
+
+static bool controller_activate_press(BrowserController *controller,
+                                      ControllerAction *action);
+
+/* X (or Enter) on the focus. An Enter keydown it delivered gets its keyup
+   once the press's defaults have run. */
 bool controller_activate(BrowserController *controller,
                          ControllerAction *action)
+{
+    if (controller == NULL || controller->navigation == NULL
+        || action == NULL) return false;
+    controller->enter_release_pending = false;
+    bool activated = controller_activate_press(controller, action);
+    controller_enter_up(controller);
+    return activated;
+}
+
+static bool controller_activate_press(BrowserController *controller,
+                                      ControllerAction *action)
 {
     if (controller == NULL || controller->navigation == NULL
         || action == NULL) return false;
@@ -3860,7 +3970,7 @@ bool controller_activate(BrowserController *controller,
                     && tilefinch_url_same_origin(current->url, action->url)));
         controller->activations++;
         action->activation_outcome =
-            controller_dispatch_activation(controller, node);
+            controller_dispatch_activation(controller, node, true);
         if (action->activation_outcome == CONTROLLER_ACTIVATION_CANCELLED) {
             action->type = CONTROLLER_ACTION_NONE;
             action->url[0] = '\0';
@@ -3891,15 +4001,19 @@ bool controller_activate(BrowserController *controller,
             return controller_build_document_media_action(
                 controller, action);
         }
-        /* Completing native text entry is implicit submission, not another
-           click on the input. Pointer entry already dispatched its click;
-           only the form's default submitter receives a synthetic click. */
+        /* Enter in a text field (START, or the keyboard's Done on a form's
+           only field) is implicit submission, not another click on the
+           input. Pointer entry already dispatched its click; only the
+           form's default submitter receives a synthetic click. X reaches
+           here only on a readonly field, which the PSP cannot type into: in
+           a form it submits as Enter does, and outside one it stays a
+           press that clicks (a readonly field that opens a picker). */
         if (input_blocks_implicit_submission(node)
-            && form_ancestor(node) != NULL) {
+            && (form_ancestor(node) != NULL
+                || !has_attribute(node, "readonly"))) {
             controller->pointer_click_pending = false;
             controller->activations++;
-            return controller_build_implicit_form_action(
-                controller, node, CONTROLLER_ACTIVATION_NOT_DISPATCHED, action);
+            return controller_enter_in_field(controller, node, action);
         }
         ControllerChoiceSnapshot choice_snapshots[128];
         size_t choice_snapshot_count = 0;
@@ -3922,7 +4036,7 @@ bool controller_activate(BrowserController *controller,
         bool media_element = document_element_name_is(node, "video")
             || document_element_name_is(node, "audio");
         action->activation_outcome =
-            controller_dispatch_activation(controller, node);
+            controller_dispatch_activation(controller, node, true);
         if (action->activation_outcome == CONTROLLER_ACTIVATION_CANCELLED
             && !media_element) {
             action->type = CONTROLLER_ACTION_NONE;
@@ -3998,7 +4112,7 @@ bool controller_activate(BrowserController *controller,
         controller->activations++;
         bool native_nothing = false;
         action->activation_outcome =
-            controller_dispatch_activation(controller, node);
+            controller_dispatch_activation(controller, node, true);
         if (action->activation_outcome == CONTROLLER_ACTIVATION_CANCELLED) {
             action->type = CONTROLLER_ACTION_NONE;
         } else {
@@ -4050,6 +4164,18 @@ bool controller_activate(BrowserController *controller,
     return false;
 }
 
+/* An edit whose beforeinput ran but whose change did not happen: the page
+   still sees the keyboard's composition end and key release. */
+static void controller_abort_edit_events(BrowserController *controller)
+{
+    NavigationSession *navigation = controller->navigation;
+    if (navigation->page.runtime == NULL || !navigation->page.loaded
+        || navigation->page.document.html == NULL) return;
+    (void) navigation_dispatch_node_input_event(
+        navigation, lxb_dom_interface_node(navigation->page.document.html),
+        "inputabort", NULL, "", NULL);
+}
+
 static bool set_control_value(BrowserController *controller,
                               const char *value, size_t length,
                               const char *data, const char *input_type)
@@ -4090,7 +4216,10 @@ static bool set_control_value(BrowserController *controller,
         /* Author code may remove the edited control (or retire the realm)
            from beforeinput. The input was delivered, but there is no longer
            a connected native target on which to replay the default. */
-        if (control.node == NULL) return true;
+        if (control.node == NULL) {
+            controller_abort_edit_events(controller);
+            return true;
+        }
     }
     bool retained_value = control.type == CONTROL_INPUT
         || control.type == CONTROL_TEXTAREA;
@@ -4098,6 +4227,7 @@ static bool set_control_value(BrowserController *controller,
     if (retained_value
         && !document_control_value_snapshot(
                &navigation->page.document, control.node, &value_snapshot)) {
+        if (control_handle != 0) controller_abort_edit_events(controller);
         return false;
     }
     BudgetAllocationOwner previous_owner =
@@ -4128,6 +4258,7 @@ static bool set_control_value(BrowserController *controller,
                can remain safely published. */
             navigation_discard_current_page(navigation);
         }
+        if (control_handle != 0) controller_abort_edit_events(controller);
         return false;
     }
     if (retained_value) {
@@ -4138,7 +4269,10 @@ static bool set_control_value(BrowserController *controller,
     if (navigation->page.runtime != NULL && !native_basic) {
         control.node = controller_node_snapshot_resolve(
             controller, control_handle, control.node);
-        if (control.node == NULL) return true;
+        if (control.node == NULL) {
+            controller_abort_edit_events(controller);
+            return true;
+        }
         /* Re-find the corresponding control after relayout by stable node. */
         for (size_t i = 0; i < navigation->page.layout.control_count; i++) {
             if (navigation->page.layout.controls[i].node == control.node) {
@@ -4312,8 +4446,14 @@ bool controller_replace_text(BrowserController *controller,
     char value[CONTROLLER_EDIT_LIMIT + 1];
     if (length > 0) memcpy(value, utf8, length);
     value[length] = '\0';
+    /* Done with the text unchanged: nothing was typed. */
+    ControllerTextInputInfo info;
+    if (previous_length == length && memcmp(previous, value, length) == 0)
+        return controller_text_input_info(controller, &info) && info.editable;
+    /* The keyboard session's Done commits its text as one composition, as
+       a phone keyboard's does. */
     if (!set_control_value(controller, value, length, value,
-                           "insertReplacementText")) return false;
+                           "insertCompositionText")) return false;
     /* The native keyboard's Done commits the edit, which is what `change`
        reports: pages enable their Next button or validate on it. */
     lxb_dom_node_t *node = retained_focus_node(controller);

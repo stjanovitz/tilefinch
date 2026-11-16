@@ -2,7 +2,8 @@
   /* Loaded after the page may have replaced these globals: build
      errors, promises and platform objects with the constructors
      hardening.js captured. */
-  const { Error, TypeError, Promise } = globalThis.__tilefinchEventInterfaces;
+  const { defineProperty, Error, TypeError, Promise } =
+    globalThis.__tilefinchEventInterfaces;
   const createPrivateWeakMap = globalThis.__tilefinchCreatePrivateWeakMap;
   if (typeof createPrivateWeakMap !== "function")
     throw new Error("Private runtime storage is unavailable");
@@ -65,7 +66,7 @@
     }
   }
   for (const type of eventAttributes)
-    Object.defineProperty(SpeechSynthesisUtterance.prototype, "on" + type, {
+    defineProperty(SpeechSynthesisUtterance.prototype, "on" + type, {
       configurable: true,
       enumerable: true,
       get() {
@@ -124,7 +125,7 @@
     [SpeechSynthesisErrorEvent, "SpeechSynthesisErrorEvent"],
     [SpeechSynthesisUtterance, "SpeechSynthesisUtterance"],
   ])
-    Object.defineProperty(constructor.prototype, Symbol.toStringTag, {
+    defineProperty(constructor.prototype, Symbol.toStringTag, {
       configurable: true,
       value: tag,
     });
@@ -133,7 +134,7 @@
   globalThis.SpeechSynthesisEvent = SpeechSynthesisEvent;
   globalThis.SpeechSynthesisErrorEvent = SpeechSynthesisErrorEvent;
   globalThis.SpeechSynthesisUtterance = SpeechSynthesisUtterance;
-  Object.defineProperty(globalThis, "speechSynthesis", {
+  defineProperty(globalThis, "speechSynthesis", {
     configurable: true,
     enumerable: true,
     value: new SpeechSynthesis(speechToken),
@@ -215,7 +216,7 @@
       return false;
     }
   }
-  Object.defineProperty(MediaSource, "canConstructInDedicatedWorker", {
+  defineProperty(MediaSource, "canConstructInDedicatedWorker", {
     enumerable: true,
     value: false,
   });
@@ -224,7 +225,7 @@
     [SourceBuffer, "SourceBuffer"],
     [SourceBufferList, "SourceBufferList"],
   ])
-    Object.defineProperty(constructor.prototype, Symbol.toStringTag, {
+    defineProperty(constructor.prototype, Symbol.toStringTag, {
       configurable: true,
       value: tag,
     });
@@ -290,7 +291,7 @@
   FontFaceSet.prototype.entries = FontFaceSet.prototype.values;
   FontFaceSet.prototype[Symbol.iterator] = FontFaceSet.prototype.values;
   for (const type of ["loading", "loadingdone", "loadingerror"])
-    Object.defineProperty(FontFaceSet.prototype, "on" + type, {
+    defineProperty(FontFaceSet.prototype, "on" + type, {
       configurable: true,
       enumerable: true,
       get() { return requireFontSet(this)[type]; },
@@ -299,7 +300,7 @@
       },
     });
   if (typeof DocumentInterface === "function")
-    Object.defineProperty(DocumentInterface.prototype, "fonts", {
+    defineProperty(DocumentInterface.prototype, "fonts", {
       configurable: true,
       enumerable: true,
       get() {
@@ -326,7 +327,7 @@
     "processingStart", "processingEnd", "cancelable", "target",
     "interactionId",
   ])
-    Object.defineProperty(PerformanceEventTiming.prototype, name, {
+    defineProperty(PerformanceEventTiming.prototype, name, {
       configurable: true,
       enumerable: true,
       get: noEventTiming,
@@ -336,7 +337,7 @@
     [FontFaceSet, "FontFaceSet"],
     [PerformanceEventTiming, "PerformanceEventTiming"],
   ])
-    Object.defineProperty(constructor.prototype, Symbol.toStringTag, {
+    defineProperty(constructor.prototype, Symbol.toStringTag, {
       configurable: true,
       value: tag,
     });

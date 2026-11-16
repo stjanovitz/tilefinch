@@ -437,7 +437,8 @@ static bool runtime_evaluate_bootstrap_profiled(
 }
 
 /* hardening.js names the features that publish hooks by these values
-   (canvas 0, IndexedDB 1, motion 2, WebGL 5, WebAssembly 7). */
+   (canvas 0, IndexedDB 1, motion 2, WebGL 5, WebAssembly 7, WebGL
+   interfaces 19). */
 typedef enum {
     LAZY_BOOTSTRAP_CANVAS = 0,
     LAZY_BOOTSTRAP_INDEXED_DB,
@@ -458,11 +459,13 @@ typedef enum {
     LAZY_BOOTSTRAP_MEDIA_CAPTURE,
     LAZY_BOOTSTRAP_SERIALIZE,
     LAZY_BOOTSTRAP_FRAME_CLONE,
+    LAZY_BOOTSTRAP_WEBGL_INTERFACES,
     LAZY_BOOTSTRAP_COUNT
 } LazyBootstrapFeature;
 
 _Static_assert(LAZY_BOOTSTRAP_INDEXED_DB == 1 && LAZY_BOOTSTRAP_MOTION == 2
-               && LAZY_BOOTSTRAP_WEBGL == 5 && LAZY_BOOTSTRAP_WASM == 7,
+               && LAZY_BOOTSTRAP_WEBGL == 5 && LAZY_BOOTSTRAP_WASM == 7
+               && LAZY_BOOTSTRAP_WEBGL_INTERFACES == 19,
                "hardening.js names hook features by these values");
 _Static_assert(LAZY_BOOTSTRAP_COUNT == SCRIPT_LAZY_BOOTSTRAP_FEATURE_COUNT,
                "lazy bootstrap state must cover every feature");
@@ -594,6 +597,26 @@ static const LazyBootstrapProperty lazy_bootstrap_properties[] = {
     {"MediaDevices", LAZY_BOOTSTRAP_MEDIA_CAPTURE, LAZY_BOOTSTRAP_GLOBAL},
     {"mediaDevices", LAZY_BOOTSTRAP_MEDIA_CAPTURE,
      LAZY_BOOTSTRAP_NAVIGATOR_PROTOTYPE},
+    /* WebGL's interface objects, without webgl.js. */
+    {"WebGLObject", LAZY_BOOTSTRAP_WEBGL_INTERFACES, LAZY_BOOTSTRAP_GLOBAL},
+    {"WebGLBuffer", LAZY_BOOTSTRAP_WEBGL_INTERFACES, LAZY_BOOTSTRAP_GLOBAL},
+    {"WebGLFramebuffer", LAZY_BOOTSTRAP_WEBGL_INTERFACES,
+     LAZY_BOOTSTRAP_GLOBAL},
+    {"WebGLProgram", LAZY_BOOTSTRAP_WEBGL_INTERFACES, LAZY_BOOTSTRAP_GLOBAL},
+    {"WebGLRenderbuffer", LAZY_BOOTSTRAP_WEBGL_INTERFACES,
+     LAZY_BOOTSTRAP_GLOBAL},
+    {"WebGLShader", LAZY_BOOTSTRAP_WEBGL_INTERFACES, LAZY_BOOTSTRAP_GLOBAL},
+    {"WebGLTexture", LAZY_BOOTSTRAP_WEBGL_INTERFACES, LAZY_BOOTSTRAP_GLOBAL},
+    {"WebGLUniformLocation", LAZY_BOOTSTRAP_WEBGL_INTERFACES,
+     LAZY_BOOTSTRAP_GLOBAL},
+    {"WebGLActiveInfo", LAZY_BOOTSTRAP_WEBGL_INTERFACES,
+     LAZY_BOOTSTRAP_GLOBAL},
+    {"WebGLShaderPrecisionFormat", LAZY_BOOTSTRAP_WEBGL_INTERFACES,
+     LAZY_BOOTSTRAP_GLOBAL},
+    {"WebGLRenderingContext", LAZY_BOOTSTRAP_WEBGL_INTERFACES,
+     LAZY_BOOTSTRAP_GLOBAL},
+    {"WebGLContextEvent", LAZY_BOOTSTRAP_WEBGL_INTERFACES,
+     LAZY_BOOTSTRAP_GLOBAL},
     {"XMLSerializer", LAZY_BOOTSTRAP_SERIALIZE, LAZY_BOOTSTRAP_GLOBAL},
     {"getHTML", LAZY_BOOTSTRAP_SERIALIZE, LAZY_BOOTSTRAP_ELEMENT_PROTOTYPE},
     {"getHTML", LAZY_BOOTSTRAP_SERIALIZE,
@@ -624,6 +647,7 @@ static const char *runtime_lazy_bootstrap_name(LazyBootstrapFeature feature)
     case LAZY_BOOTSTRAP_MEDIA_CAPTURE: return "Media capture";
     case LAZY_BOOTSTRAP_SERIALIZE: return "Markup serialization";
     case LAZY_BOOTSTRAP_FRAME_CLONE: return "Window messaging";
+    case LAZY_BOOTSTRAP_WEBGL_INTERFACES: return "WebGL interfaces";
     default: return "Platform feature";
     }
 }
@@ -1062,6 +1086,12 @@ static const JsRtNative runtime_game_audio_reference_natives[] = {
 };
 #endif
 
+static void runtime_mark_lazy_platform_members(ScriptRuntime *runtime,
+                                               LazyBootstrapFeature feature);
+static bool runtime_platform_window_open(ScriptRuntime *runtime);
+static void runtime_platform_window_close(ScriptRuntime *runtime,
+                                          bool opened, bool mark);
+
 static bool runtime_load_lazy_bootstrap(
     ScriptRuntime *runtime, LazyBootstrapFeature feature)
 {
@@ -1070,10 +1100,18 @@ static bool runtime_load_lazy_bootstrap(
     if (*state == 2) return true;
     if (*state == 1 || *state == 3) return false;
     /* opfs.js extends streams.js's WritableStream: load Streams first, as
-       its own step, so that WritableStream is the captured one. */
-    bool prerequisites = feature != LAZY_BOOTSTRAP_OPFS
-        || runtime_load_lazy_bootstrap(runtime, LAZY_BOOTSTRAP_STREAMS);
+       its own step, so that WritableStream is the captured one. webgl.js
+       makes instances of webgl-interfaces.js's interface objects. */
+    bool prerequisites =
+        (feature != LAZY_BOOTSTRAP_OPFS
+         || runtime_load_lazy_bootstrap(runtime, LAZY_BOOTSTRAP_STREAMS))
+        && (feature != LAZY_BOOTSTRAP_WEBGL
+            || runtime_load_lazy_bootstrap(
+                   runtime, LAZY_BOOTSTRAP_WEBGL_INTERFACES));
     *state = 1;
+    /* Only what the module defines is marked
+       (runtime_platform_window_open). */
+    bool window = runtime_platform_window_open(runtime);
     uint8_t outer_loading = runtime->lazy_loading_feature;
     bool outer_claimed = runtime->lazy_hook_claimed;
     runtime->lazy_loading_feature = (uint8_t) (feature + 1);
@@ -1222,6 +1260,14 @@ static bool runtime_load_lazy_bootstrap(
             JS_FreeValue(runtime->context, global);
         }
 #endif
+    } else if (feature == LAZY_BOOTSTRAP_WEBGL_INTERFACES) {
+        evaluated = runtime_evaluate_bootstrap_profiled(
+            runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
+                         browser_bootstrap_webgl_interfaces,
+                         browser_bootstrap_webgl_interfaces_bytecode),
+            "<browser-webgl-interfaces-lazy>",
+            &browser_bootstrap_webgl_interfaces_bytecode,
+            false, trace, &total_us, &compile_us);
     } else if (feature == LAZY_BOOTSTRAP_WEBGL) {
         evaluated = runtime_evaluate_bootstrap_profiled(
             runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
@@ -1592,6 +1638,8 @@ static bool runtime_load_lazy_bootstrap(
     if (evaluated) {
         js_rt_saturating_add_size(
             &runtime->result.bootstrap_lazy_module_loads, 1);
+        runtime_mark_lazy_platform_members(runtime, feature);
+        runtime->platform_window_loaded = true;
     } else {
         js_rt_saturating_add_size(
             &runtime->result.bootstrap_lazy_module_failures, 1);
@@ -1600,6 +1648,7 @@ static bool runtime_load_lazy_bootstrap(
            engine-dependent half-installed surface. */
         (void) runtime_install_lazy_bootstrap_feature(runtime, feature);
     }
+    runtime_platform_window_close(runtime, window, evaluated);
     return evaluated;
 }
 
@@ -1744,128 +1793,54 @@ static JSValue js_runtime_lazy_loading(
         && host->lazy_bootstrap_state[feature] == 1);
 }
 
-static JSValue js_runtime_ensure_shadow_bootstrap(
-    JSContext *context, JSValueConst this_value, int argc,
-    JSValueConst *argv)
+/* The ensure natives: each loads its feature's module and answers true,
+   or throws. A function argument (the caller's step that builds the
+   module's objects, such as its factory call) runs after the module, in
+   the same marking window (runtime_platform_window_open), so interfaces
+   it creates are marked as the module's own; its result is returned. */
+static JSValue runtime_ensure_lazy_bootstrap(
+    JSContext *context, LazyBootstrapFeature feature, int argc,
+    JSValueConst *argv, const char *failure)
 {
-    (void) this_value;
-    (void) argc;
-    (void) argv;
     DomBridge *bridge = JS_GetContextOpaque(context);
-    if (bridge == NULL || !runtime_load_lazy_bootstrap(
-            bridge->host, LAZY_BOOTSTRAP_SHADOW))
-        return JS_ThrowInternalError(context,
-            "Shadow DOM ownership could not be initialized");
-    return JS_TRUE;
+    ScriptRuntime *runtime = bridge == NULL ? NULL : bridge->host;
+    if (runtime == NULL) return JS_ThrowInternalError(context, "%s", failure);
+    bool window = runtime_platform_window_open(runtime);
+    bool loaded = runtime_load_lazy_bootstrap(runtime, feature);
+    JSValue result = JS_TRUE;
+    if (loaded && argc > 0 && JS_IsFunction(context, argv[0]))
+        result = JS_Call(context, argv[0], JS_UNDEFINED, 0, NULL);
+    runtime_platform_window_close(runtime, window, loaded);
+    if (!loaded) return JS_ThrowInternalError(context, "%s", failure);
+    return result;
 }
 
-static JSValue js_runtime_ensure_documents_bootstrap(
-    JSContext *context, JSValueConst this_value, int argc,
-    JSValueConst *argv)
-{
-    (void) this_value;
-    (void) argc;
-    (void) argv;
-    DomBridge *bridge = JS_GetContextOpaque(context);
-    if (bridge == NULL || !runtime_load_lazy_bootstrap(
-            bridge->host, LAZY_BOOTSTRAP_DOCUMENTS))
-        return JS_ThrowInternalError(context,
-            "Secondary documents could not be initialized");
-    return JS_TRUE;
-}
-
-static JSValue js_runtime_ensure_forms_bootstrap(
-    JSContext *context, JSValueConst this_value, int argc,
-    JSValueConst *argv)
-{
-    (void) this_value;
-    (void) argc;
-    (void) argv;
-    DomBridge *bridge = JS_GetContextOpaque(context);
-    if (bridge == NULL || !runtime_load_lazy_bootstrap(
-            bridge->host, LAZY_BOOTSTRAP_FORMS))
-        return JS_ThrowInternalError(context,
-            "Form collections could not be initialized");
-    return JS_TRUE;
-}
-
-static JSValue js_runtime_ensure_rule_bootstrap(
-    JSContext *context, JSValueConst this_value, int argc,
-    JSValueConst *argv)
-{
-    (void) this_value;
-    (void) argc;
-    (void) argv;
-    DomBridge *bridge = JS_GetContextOpaque(context);
-    if (bridge == NULL || !runtime_load_lazy_bootstrap(
-            bridge->host, LAZY_BOOTSTRAP_CSSOM_RULES))
-        return JS_ThrowInternalError(context,
-            "CSSOM rules could not be initialized");
-    return JS_TRUE;
-}
-
-static JSValue js_runtime_ensure_frame_clone_bootstrap(
-    JSContext *context, JSValueConst this_value, int argc,
-    JSValueConst *argv)
-{
-    (void) this_value;
-    (void) argc;
-    (void) argv;
-    DomBridge *bridge = JS_GetContextOpaque(context);
-    if (bridge == NULL || !runtime_load_lazy_bootstrap(
-            bridge->host, LAZY_BOOTSTRAP_FRAME_CLONE))
-        return JS_ThrowInternalError(context,
-            "Window messaging could not be initialized");
-    return JS_TRUE;
-}
-
-static JSValue js_runtime_ensure_canvas_bootstrap(
-    JSContext *context, JSValueConst this_value, int argc,
-    JSValueConst *argv)
-{
-    (void) this_value;
-    (void) argc;
-    (void) argv;
-    DomBridge *bridge = JS_GetContextOpaque(context);
-    if (bridge == NULL || !runtime_load_lazy_bootstrap(
-            bridge->host, LAZY_BOOTSTRAP_CANVAS)) {
-        return JS_ThrowInternalError(
-            context, "Canvas support could not be initialized");
+#define RUNTIME_ENSURE_NATIVE(name, feature, failure)                      \
+    static JSValue js_runtime_ensure_##name##_bootstrap(                   \
+        JSContext *context, JSValueConst this_value, int argc,             \
+        JSValueConst *argv)                                                \
+    {                                                                      \
+        (void) this_value;                                                 \
+        return runtime_ensure_lazy_bootstrap(context, feature, argc, argv, \
+                                             failure);                     \
     }
-    return JS_TRUE;
-}
-
-static JSValue js_runtime_ensure_motion_bootstrap(
-    JSContext *context, JSValueConst this_value, int argc,
-    JSValueConst *argv)
-{
-    (void) this_value;
-    (void) argc;
-    (void) argv;
-    DomBridge *bridge = JS_GetContextOpaque(context);
-    if (bridge == NULL || !runtime_load_lazy_bootstrap(
-            bridge->host, LAZY_BOOTSTRAP_MOTION)) {
-        return JS_ThrowInternalError(
-            context, "Motion support could not be initialized");
-    }
-    return JS_TRUE;
-}
-
-static JSValue js_runtime_ensure_webgl_bootstrap(
-    JSContext *context, JSValueConst this_value, int argc,
-    JSValueConst *argv)
-{
-    (void) this_value;
-    (void) argc;
-    (void) argv;
-    DomBridge *bridge = JS_GetContextOpaque(context);
-    if (bridge == NULL || !runtime_load_lazy_bootstrap(
-            bridge->host, LAZY_BOOTSTRAP_WEBGL)) {
-        return JS_ThrowInternalError(
-            context, "WebGL support could not be initialized");
-    }
-    return JS_TRUE;
-}
+RUNTIME_ENSURE_NATIVE(shadow, LAZY_BOOTSTRAP_SHADOW,
+                      "Shadow DOM ownership could not be initialized")
+RUNTIME_ENSURE_NATIVE(documents, LAZY_BOOTSTRAP_DOCUMENTS,
+                      "Secondary documents could not be initialized")
+RUNTIME_ENSURE_NATIVE(forms, LAZY_BOOTSTRAP_FORMS,
+                      "Form collections could not be initialized")
+RUNTIME_ENSURE_NATIVE(rule, LAZY_BOOTSTRAP_CSSOM_RULES,
+                      "CSSOM rules could not be initialized")
+RUNTIME_ENSURE_NATIVE(frame_clone, LAZY_BOOTSTRAP_FRAME_CLONE,
+                      "Window messaging could not be initialized")
+RUNTIME_ENSURE_NATIVE(canvas, LAZY_BOOTSTRAP_CANVAS,
+                      "Canvas support could not be initialized")
+RUNTIME_ENSURE_NATIVE(motion, LAZY_BOOTSTRAP_MOTION,
+                      "Motion support could not be initialized")
+RUNTIME_ENSURE_NATIVE(webgl, LAZY_BOOTSTRAP_WEBGL,
+                      "WebGL support could not be initialized")
+#undef RUNTIME_ENSURE_NATIVE
 
 static JSContext *js_runtime_worker_realm_context(
     ScriptRuntime *host, JSValueConst global)
@@ -2377,6 +2352,7 @@ static const JsRtNative runtime_natives_first[] = {
     { "__tilefinchNodeOwner", js_dom_node_owner, 2, 0 },
     { "__tilefinchChildren", js_dom_children, 1, 0 },
     { "__tilefinchChildNodes", js_dom_child_nodes, 1, 0 },
+    { "__tilefinchLiveNodeList", js_dom_live_node_list, 4, 0 },
     { "__tilefinchDocumentChildNodes", js_dom_document_child_nodes, 0, 0 },
     { "__tilefinchTagName", js_dom_tag_name, 1, 0 },
     { "__tilefinchNodeIdentity", js_dom_node_identity, 3, 0 },
@@ -2527,7 +2503,7 @@ static const JsRtNative runtime_natives_third[] = {
     { "__tilefinchRequestScroll", js_request_scroll, 1, 0 },
     { "__tilefinchGeometry", js_element_geometry, 1, 0 },
     { "__tilefinchSetElementScroll", js_set_element_scroll, 3, 0 },
-    { "__tilefinchCreateFrameEval", js_create_frame_eval, 3, 0 },
+    { "__tilefinchBindFrameRealm", js_bind_frame_realm, 3, 0 },
     { "__tilefinchFrameScope", js_frame_scope, 1, 0 },
     { "__tilefinchParserWrite",
       js_dom_parser_write, 1, JS_RT_NATIVE_TRANSIENT },
@@ -2573,6 +2549,9 @@ static bool runtime_install_named_methods(JSContext *context, JSValue global)
 }
 
 #if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+static JSValue js_unresolved_promise_operations(JSContext *context,
+                                                JSValueConst this_value,
+                                                int argc, JSValueConst *argv);
 static const JsRtNative runtime_validation_natives[] = {
 #if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
     { "__tilefinchValidationThreadCpuUs", js_validation_thread_cpu_us, 0, 0 },
@@ -2582,6 +2561,9 @@ static const JsRtNative runtime_validation_natives[] = {
 #endif
     { "__tilefinchValidationHashBytes", js_validation_hash_bytes, 3, 0 },
     { "__tilefinchReleaseNodeWrapper", js_dom_release_node_wrapper, 2, 0 },
+    { "__tilefinchRefuseFrameSetups", js_refuse_frame_setups, 1, 0 },
+    { "__tilefinchUnresolvedPromiseOperations",
+      js_unresolved_promise_operations, 0, 0 },
 };
 #endif
 
@@ -2710,6 +2692,11 @@ static ScriptRuntime *runtime_create_host(
     host->motion_style_flushed = JS_UNDEFINED;
     host->media_update = JS_UNDEFINED;
     host->document_all_cache = JS_UNDEFINED;
+    host->window_name = JS_UNDEFINED;
+    host->window_status = JS_UNDEFINED;
+    for (size_t i = 0; i < sizeof(host->reflect_hooks)
+                               / sizeof(host->reflect_hooks[0]); i++)
+        host->reflect_hooks[i] = JS_UNDEFINED;
     host->opfs_storage_manager = JS_UNDEFINED;
     host->streams_writable_stream = JS_UNDEFINED;
     host->game_audio_host_suspend = JS_UNDEFINED;
@@ -2979,6 +2966,7 @@ static bool runtime_create_bind_bridge(
              sizeof(host->bridge.referrer_policy), "%s",
              options->referrer_policy == NULL
                ? "" : options->referrer_policy);
+    host->window_name_slot = options->window_name;
     host->bridge.fetch_timeout_ms = timeout_ms;
     host->bridge.viewport_width = options->viewport.css_width;
     host->bridge.viewport_height = options->viewport.css_height;
@@ -3322,6 +3310,8 @@ static const RuntimeBootstrapStep runtime_bootstrap_sequence[] = {
                                   LAZY_BOOTSTRAP_TRAVERSAL),
     RUNTIME_BOOTSTRAP_LAZY_MODULE(RUNTIME_BOOTSTRAP_ALWAYS,
                                   LAZY_BOOTSTRAP_SERIALIZE),
+    RUNTIME_BOOTSTRAP_LAZY_MODULE(RUNTIME_BOOTSTRAP_ALWAYS,
+                                  LAZY_BOOTSTRAP_WEBGL_INTERFACES),
     RUNTIME_BOOTSTRAP_LAZY_MODULE(RUNTIME_BOOTSTRAP_IF_SECURE_ORIGIN,
                                   LAZY_BOOTSTRAP_OPFS),
     RUNTIME_BOOTSTRAP_LAZY_MODULE(RUNTIME_BOOTSTRAP_IF_SECURE_ORIGIN,
@@ -3410,6 +3400,329 @@ static bool runtime_evaluate_bootstrap_sequence(
     return true;
 }
 
+/* Promise-returning operations reject for a wrong receiver themselves;
+   the engine check would make them throw, so they stay unmarked
+   ("Interface\0operation"). Reads own data properties only, so no lazy
+   trigger and no page getter runs. */
+static const char *const runtime_promise_operations[] = {
+    "BaseAudioContext\0decodeAudioData",
+    "CSSStyleSheet\0replace",
+    "Clipboard\0readText",
+    "Clipboard\0writeText",
+    "CustomElementRegistry\0whenDefined",
+    "Document\0exitFullscreen",
+    "Document\0webkitExitFullscreen",
+    "Element\0requestFullscreen",
+    "Element\0scrollBy",
+    "Element\0scrollTo",
+    "Element\0webkitRequestFullscreen",
+    "FileSystemDirectoryHandle\0getDirectoryHandle",
+    "FileSystemDirectoryHandle\0getFileHandle",
+    "FileSystemDirectoryHandle\0removeEntry",
+    "FileSystemDirectoryHandle\0resolve",
+    "FileSystemFileHandle\0createSyncAccessHandle",
+    "FileSystemFileHandle\0createWritable",
+    "FileSystemFileHandle\0getFile",
+    "FileSystemHandle\0isSameEntry",
+    "FileSystemHandle\0queryPermission",
+    "FileSystemHandle\0requestPermission",
+    "FileSystemWritableFileStream\0write",
+    "FontFaceSet\0load",
+    "GPU\0requestAdapter",
+    "HTMLImageElement\0decode",
+    "HTMLMediaElement\0play",
+    "IDBFactory\0databases",
+    "Keyboard\0getLayoutMap",
+    "Keyboard\0lock",
+    "MediaDevices\0enumerateDevices",
+    "MediaDevices\0getUserMedia",
+    "MediaStreamTrack\0applyConstraints",
+    "Navigator\0getBattery",
+    "NavigatorUAData\0getHighEntropyValues",
+    "Permissions\0query",
+    "ReadableStream\0pipeTo",
+    "ReadableStreamDefaultReader\0cancel",
+    "ReadableStreamDefaultReader\0read",
+    "Request\0arrayBuffer",
+    "Request\0blob",
+    "Request\0bytes",
+    "Request\0text",
+    "Response\0arrayBuffer",
+    "Response\0blob",
+    "Response\0text",
+    "ScreenOrientation\0lock",
+    "StorageManager\0estimate",
+    "StorageManager\0getDirectory",
+    "StorageManager\0persist",
+    "StorageManager\0persisted",
+    "SubtleCrypto\0digest",
+    "WritableStreamDefaultWriter\0abort",
+    "WritableStreamDefaultWriter\0close",
+    "WritableStreamDefaultWriter\0write",
+};
+
+/* The prototype own data property `operation` of the global's interface
+   `interface` names, or JS_UNDEFINED. No accessor runs: a lazy module's
+   trigger stays a trigger. */
+static JSValue runtime_promise_operation(JSContext *context,
+                                         JSValueConst global,
+                                         const char *interface)
+{
+    const char *operation = interface + strlen(interface) + 1u;
+    JSValue result = JS_UNDEFINED;
+    JSPropertyDescriptor descriptor;
+    JSAtom interface_atom = JS_NewAtom(context, interface);
+    JSAtom atom = JS_NewAtom(context, operation);
+    JSAtom prototype_atom = JS_NewAtom(context, "prototype");
+    if (interface_atom != JS_ATOM_NULL && atom != JS_ATOM_NULL
+        && prototype_atom != JS_ATOM_NULL
+        && JS_GetOwnProperty(context, &descriptor, global,
+                             interface_atom) > 0) {
+        JSValue prototype = JS_UNDEFINED;
+        JSPropertyDescriptor own;
+        if (JS_IsObject(descriptor.value)
+            && JS_GetOwnProperty(context, &own, descriptor.value,
+                                 prototype_atom) > 0) {
+            prototype = own.value;
+            JS_FreeValue(context, own.getter);
+            JS_FreeValue(context, own.setter);
+        }
+        JS_FreeValue(context, descriptor.value);
+        JS_FreeValue(context, descriptor.getter);
+        JS_FreeValue(context, descriptor.setter);
+        if (JS_IsObject(prototype)
+            && JS_GetOwnProperty(context, &descriptor, prototype, atom) > 0) {
+            result = descriptor.value;
+            JS_FreeValue(context, descriptor.getter);
+            JS_FreeValue(context, descriptor.setter);
+        }
+        JS_FreeValue(context, prototype);
+    }
+    if (prototype_atom != JS_ATOM_NULL) JS_FreeAtom(context, prototype_atom);
+    if (interface_atom != JS_ATOM_NULL) JS_FreeAtom(context, interface_atom);
+    if (atom != JS_ATOM_NULL) JS_FreeAtom(context, atom);
+    return result;
+}
+
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+/* __tilefinchUnresolvedPromiseOperations(), host and validation realms
+   only: the runtime_promise_operations entries that name no function, as
+   "Interface.operation" strings, so a test can catch a stale entry (one
+   that resolves to nothing is skipped silently). */
+static JSValue js_unresolved_promise_operations(JSContext *context,
+                                                JSValueConst this_value,
+                                                int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    (void) argc;
+    (void) argv;
+    JSValue global = JS_GetGlobalObject(context);
+    JSValue unresolved = JS_NewArray(context);
+    uint32_t count = 0;
+    for (size_t i = 0; !JS_IsException(unresolved)
+                       && i < sizeof(runtime_promise_operations)
+                              / sizeof(runtime_promise_operations[0]); i++) {
+        const char *interface = runtime_promise_operations[i];
+        JSValue operation = runtime_promise_operation(context, global,
+                                                      interface);
+        bool function = JS_IsFunction(context, operation);
+        JS_FreeValue(context, operation);
+        if (function) continue;
+        char name[96];
+        snprintf(name, sizeof(name), "%s.%s", interface,
+                 interface + strlen(interface) + 1u);
+        if (JS_DefinePropertyValueUint32(context, unresolved, count++,
+                                         JS_NewString(context, name),
+                                         JS_PROP_C_W_E) < 0) {
+            JS_FreeValue(context, unresolved);
+            unresolved = JS_EXCEPTION;
+        }
+    }
+    JS_FreeValue(context, global);
+    return unresolved;
+}
+#endif
+
+static void runtime_unmark_promise_operations(JSContext *context,
+                                              JSValueConst global)
+{
+    for (size_t i = 0; i < sizeof(runtime_promise_operations)
+                               / sizeof(runtime_promise_operations[0]); i++) {
+        JSValue operation = runtime_promise_operation(
+            context, global, runtime_promise_operations[i]);
+        JS_SetPlatformMember(context, operation, 0);
+        JS_FreeValue(context, operation);
+    }
+}
+
+/* Web IDL receiver checks, in one place. Every constructor among the
+   global's own properties is an interface: its prototype's operations and
+   attribute accessors throw "Illegal invocation" for a receiver that is not
+   a platform object (QuickJS JS_MarkPlatformInterfaces). Three cases stay
+   as the bootstrap wrote them: the [LegacyLenientThis] on* attributes of
+   Window and Document (and of the element interfaces, which share their
+   accessor functions); a value iterator's keys/values/entries; and
+   promise-returning operations, which must reject rather than throw and do
+   so themselves. Runs once, after the eager bootstrap and before any page
+   script; a lazy module's interfaces are marked when it loads
+   (runtime_mark_lazy_platform_members). */
+static void runtime_mark_platform_interfaces(ScriptRuntime *host)
+{
+    JSContext *context = host->context;
+    JSValue global = JS_GetGlobalObject(context);
+    JSValue lenient[3] = { JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED };
+    static const char *const lenient_names[3] = {
+        "Window", "Document", "HTMLDocument"
+    };
+    for (size_t i = 0; i < 3u; i++) {
+        JSValue constructor = JS_GetPropertyStr(context, global,
+                                                lenient_names[i]);
+        if (JS_IsObject(constructor))
+            lenient[i] = JS_GetPropertyStr(context, constructor, "prototype");
+        if (JS_IsException(lenient[i]) || JS_IsException(constructor)) {
+            JS_FreeValue(context, JS_GetException(context));
+            lenient[i] = JS_UNDEFINED;
+        }
+        JS_FreeValue(context, constructor);
+    }
+    (void) JS_MarkPlatformInterfaces(context, global, NULL);
+    for (size_t i = 0; i < 3u; i++) {
+        JS_MarkPlatformInterface(context, lenient[i], 1);
+        JS_FreeValue(context, lenient[i]);
+    }
+    runtime_unmark_promise_operations(context, global);
+    /* A lazy module's trigger stands in for a data property until the
+       module loads: reading it from any object, a prototype included,
+       must not throw. */
+    for (size_t i = 0; i < sizeof(lazy_bootstrap_properties)
+                               / sizeof(lazy_bootstrap_properties[0]); i++) {
+        const LazyBootstrapProperty *property = &lazy_bootstrap_properties[i];
+        if (property->target == LAZY_BOOTSTRAP_GLOBAL) continue;
+        JSValue target = runtime_lazy_bootstrap_target(context,
+                                                       property->target);
+        JSAtom atom = JS_NewAtom(context, property->name);
+        JSPropertyDescriptor descriptor;
+        if (JS_IsObject(target) && atom != JS_ATOM_NULL
+            && JS_GetOwnProperty(context, &descriptor, target, atom) > 0) {
+            JS_SetPlatformMember(context, descriptor.getter, 0);
+            JS_SetPlatformMember(context, descriptor.setter, 0);
+            JS_FreeValue(context, descriptor.value);
+            JS_FreeValue(context, descriptor.getter);
+            JS_FreeValue(context, descriptor.setter);
+        }
+        if (JS_IsException(target))
+            JS_FreeValue(context, JS_GetException(context));
+        if (atom != JS_ATOM_NULL) JS_FreeAtom(context, atom);
+        JS_FreeValue(context, target);
+    }
+    JS_FreeValue(context, global);
+}
+
+/* A lazy module has just loaded. Page script may have run before it, so
+   only what the module itself defined is marked, never a page's classes
+   or what a page put on an interface: here what this module's triggers
+   name, read as own data properties so that no page getter runs; the rest
+   when its window closes (runtime_platform_window_close). */
+static void runtime_mark_lazy_platform_members(ScriptRuntime *runtime,
+                                               LazyBootstrapFeature feature)
+{
+    JSContext *context = runtime->context;
+    for (size_t i = 0; i < sizeof(lazy_bootstrap_properties)
+                               / sizeof(lazy_bootstrap_properties[0]); i++) {
+        const LazyBootstrapProperty *property = &lazy_bootstrap_properties[i];
+        if (property->feature != feature) continue;
+        JSValue target = runtime_lazy_bootstrap_target(context,
+                                                       property->target);
+        JSAtom atom = JS_NewAtom(context, property->name);
+        JSPropertyDescriptor descriptor;
+        if (JS_IsObject(target) && atom != JS_ATOM_NULL
+            && JS_GetOwnProperty(context, &descriptor, target, atom) > 0) {
+            if (property->target != LAZY_BOOTSTRAP_GLOBAL) {
+                JS_SetPlatformMember(context, descriptor.value, 1);
+                JS_SetPlatformMember(context, descriptor.getter, 1);
+                JS_SetPlatformMember(context, descriptor.setter, 1);
+            } else if (JS_IsFunction(context, descriptor.value)) {
+                JSPropertyDescriptor prototype;
+                JSAtom prototype_atom = JS_NewAtom(context, "prototype");
+                if (prototype_atom != JS_ATOM_NULL
+                    && JS_GetOwnProperty(context, &prototype,
+                                         descriptor.value,
+                                         prototype_atom) > 0) {
+                    JS_MarkPlatformInterface(context, prototype.value, 0);
+                    JS_FreeValue(context, prototype.value);
+                    JS_FreeValue(context, prototype.getter);
+                    JS_FreeValue(context, prototype.setter);
+                }
+                if (prototype_atom != JS_ATOM_NULL)
+                    JS_FreeAtom(context, prototype_atom);
+            }
+            JS_FreeValue(context, descriptor.value);
+            JS_FreeValue(context, descriptor.getter);
+            JS_FreeValue(context, descriptor.setter);
+        }
+        if (JS_IsException(target))
+            JS_FreeValue(context, JS_GetException(context));
+        if (atom != JS_ATOM_NULL) JS_FreeAtom(context, atom);
+        JS_FreeValue(context, target);
+    }
+    JSValue global = JS_GetGlobalObject(context);
+    runtime_unmark_promise_operations(context, global);
+    JS_FreeValue(context, global);
+}
+
+/* A lazy module's marking window. Opening it snapshots what the
+   interfaces hold (JS_SnapshotPlatformInterfaces); closing it marks what
+   was added since: interfaces a module defined without a trigger property,
+   and members it added to interfaces that already existed (the CSSOM rule,
+   form and traversal members load this way). A page's class on the
+   global, or a native or method a page put on an interface, was there
+   before and stays unmarked however it was compiled (an ES module of
+   8 KiB or more keeps no source text; restored bytecode neither). The
+   window spans a module's evaluation, modules it loads in turn (they
+   share the outermost window, and it is marked if any of them loaded),
+   and the step an ensure native's caller passes it. The modules define
+   and push through the intrinsics hardening.js captured, so a page's
+   patched Object.defineProperty or Array.prototype.push does not run in
+   the window. Page code still can, through the other intrinsics a module
+   reaches on the global (array iteration, Set and WeakSet methods,
+   Object.assign, freeze and the like) and a page accessor it reads.
+   What such code defines is marked, so the receiver checks on it become
+   stricter; nothing else follows. Returns whether this call opened the
+   window; out of memory, it opens without a snapshot, and only the
+   triggers' interfaces are marked. */
+static bool runtime_platform_window_open(ScriptRuntime *runtime)
+{
+    if (runtime->platform_window_open) return false;
+    JSValue global = JS_GetGlobalObject(runtime->context);
+    runtime->platform_window = JS_SnapshotPlatformInterfaces(
+        runtime->context, global);
+    JS_FreeValue(runtime->context, global);
+    runtime->platform_window_open = true;
+    runtime->platform_window_loaded = false;
+    return true;
+}
+
+static void runtime_platform_window_close(ScriptRuntime *runtime,
+                                          bool opened, bool mark)
+{
+    if (!opened) return;
+    JSContext *context = runtime->context;
+    JSPlatformSnapshot *before = runtime->platform_window;
+    runtime->platform_window = NULL;
+    runtime->platform_window_open = false;
+    /* A module that loaded inside a failed outer load defined its
+       interfaces all the same. */
+    mark = mark || runtime->platform_window_loaded;
+    runtime->platform_window_loaded = false;
+    if (mark && before != NULL) {
+        JSValue global = JS_GetGlobalObject(context);
+        (void) JS_MarkPlatformInterfaces(context, global, before);
+        runtime_unmark_promise_operations(context, global);
+        JS_FreeValue(context, global);
+    }
+    JS_FreePlatformSnapshot(context, before);
+}
+
 /* Natives published only after the bootstrap: the legacy surface
    (document.all and friends) and CSS.registerProperty, whose lazy function
    entry then stays cold on pages that never register a property. */
@@ -3419,6 +3732,8 @@ static bool runtime_install_late_surface(ScriptRuntime *host,
     bool evaluated = true;
     if (evaluated)
         evaluated = runtime_install_legacy_surface(host, global);
+    if (evaluated)
+        evaluated = runtime_install_reflected_attributes(host, global);
     if (evaluated)
         evaluated = runtime_install_page_dialogs(host, global);
     if (evaluated) {
@@ -3715,6 +4030,7 @@ static ScriptRuntime *script_runtime_create_internal(
             host, trace_startup, &clock);
         if (evaluated)
             evaluated = runtime_install_late_surface(host, global);
+        if (evaluated) runtime_mark_platform_interfaces(host);
         if (evaluated)
             evaluated = runtime_capture_trusted_hooks(host, global);
 #if !defined(TILEFINCH_BOOTSTRAP_BYTECODE_ONLY)
@@ -3744,6 +4060,8 @@ static ScriptRuntime *script_runtime_create_internal(
             evaluated = runtime_take_host_handoffs(host, global);
         if (evaluated)
             evaluated = runtime_remove_transient_globals(host, global);
+        if (evaluated)
+            evaluated = js_rt_capture_frame_page_names(host, global);
         if (evaluated)
             evaluated = runtime_prepare_author_code(host, options);
 #if defined(TILEFINCH_MEMORY_DIAGNOSTICS)

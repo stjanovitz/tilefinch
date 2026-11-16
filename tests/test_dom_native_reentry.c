@@ -759,7 +759,8 @@ static const struct {
      "'BeginMotionObservation','MotionRecheck','MotionTreeChanged',"
      "'TransitionsDirty','WatchTransitions','CreateWebGLContext',"
      "'FlushWebGLSurfaces','WebGLConnected','WebGLReadback','WebGLResize',"
-     "'AbortIndexedDBForWorker','CloneWasmModule'];"
+     "'AbortIndexedDBForWorker','CloneWasmModule','WebGLInterfaces',"
+     "'WebGLMethods'];"
      "for(let i=0;i<names.length;i++){const n='__tilefinch'+names[i];"
      "try{Object.defineProperty(globalThis,n,{value:f,configurable:true})}"
      "catch(_){}try{globalThis[n]=f}catch(_){}"
@@ -784,7 +785,8 @@ static const struct {
      "'BeginMotionObservation','MotionRecheck','MotionTreeChanged',"
      "'TransitionsDirty','WatchTransitions','CreateWebGLContext',"
      "'FlushWebGLSurfaces','WebGLConnected','WebGLReadback','WebGLResize',"
-     "'AbortIndexedDBForWorker','CloneWasmModule'],"
+     "'AbortIndexedDBForWorker','CloneWasmModule','WebGLInterfaces',"
+     "'WebGLMethods'],"
      "I=Object.getPrototypeOf([][Symbol.iterator]()),next=I.next;"
      "let ran=0,claims=0,inside=false;"
      "I.next=function(){if(!inside){inside=true;ran++;try{"
@@ -944,6 +946,9 @@ static const struct {
     const char *name;
     const char *body;
 } define_property_families[] = {
+    {"webgl-interfaces",
+     "want(typeof WebGLRenderingContext==='function'"
+     "&&WebGLRenderingContext.COLOR_BUFFER_BIT===0x4000,'interfaces');"},
     {"frame-clone",
      "pending++;addEventListener('message',e=>{"
      "want(e.data&&e.data.a===1,'message '+e.data);settle()},{once:true});"
@@ -1658,7 +1663,8 @@ int main(int argc, char **argv)
         "const keys=Reflect.ownKeys(table),"
         "listen=['addListener','removeListener','dispatch','defineProperty',"
         "'apply','promiseThen','promiseReject','abortController',"
-        "'controllerSignal','signalReason','claimHooks'];"
+        "'controllerSignal','signalReason','claimHooks',"
+        "'getOwnPropertyDescriptor','ownKeys','construct','freeze','push'];"
         "for(const key of['Event','EventTarget','Navigator','Document',"
         "'XMLHttpRequest','console',...listen])"
         "check(keys.includes(key),'keys '+keys);"
@@ -1677,6 +1683,12 @@ int main(int argc, char **argv)
         "table.signalReason(ac.signal)===7,'abort trio');"
         /* The intrinsics beside it are the realm's own. */
         "check(table.defineProperty===Object.defineProperty&&"
+        "table.getOwnPropertyDescriptor===Object.getOwnPropertyDescriptor&&"
+        /* The native ownKeys, not the global's hook-hiding wrapper. */
+        "table.ownKeys({a:1}).join()==='a'&&"
+        "table.construct===Reflect.construct&&"
+        "table.freeze===Object.freeze&&"
+        "(a=>(table.push(a,1,2),a.join()==='1,2'))([])&&"
         "table.apply===Reflect.apply&&(r=>(r.catch(()=>{}),r instanceof Promise))"
         "(table.promiseReject(1))"
         "&&table.promiseThen(Promise.resolve(),()=>1) instanceof Promise,"
@@ -1705,7 +1717,8 @@ int main(int argc, char **argv)
             "'keydown:KeyboardEvent:true:true:true',"
             "'mousedown:MouseEvent:true:true:true',"
             "'input:InputEvent:true:false:true',"
-            "'compositionstart:CompositionEvent:true:false:false',"
+            /* UI Events: compositionstart is composed and cancelable. */
+            "'compositionstart:CompositionEvent:true:true:true',"
             "'submit:SubmitEvent:true:true:false',"
             "'change:Event:true:false:false'].join();"
             "pocSummary=made===0&&seen.join()===want?'OK':"

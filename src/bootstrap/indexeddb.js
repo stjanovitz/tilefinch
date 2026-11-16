@@ -101,7 +101,7 @@
   if (globalThis.__tilefinchTestProbes) {
     const statsView = {};
     for (const key of Object.keys(stats))
-      Object.defineProperty(statsView, key, {
+      defineProperty(statsView, key, {
         enumerable: true,
         get: () => stats[key],
       });
@@ -353,7 +353,7 @@
       let next = current[part];
       if (next === undefined) {
         next = {};
-        Object.defineProperty(current, part, {
+        defineProperty(current, part, {
           configurable: true,
           enumerable: true,
           writable: true,
@@ -364,7 +364,7 @@
         throw fail("The generated key could not be injected", "DataError");
       current = next;
     }
-    Object.defineProperty(current, parts[parts.length - 1], {
+    defineProperty(current, parts[parts.length - 1], {
       configurable: true,
       enumerable: true,
       writable: true,
@@ -501,7 +501,7 @@
     "abort", "blocked", "close", "complete", "error", "success",
     "upgradeneeded", "versionchange",
   ])
-    Object.defineProperty(TilefinchIDBEventTarget.prototype, `on${type}`, {
+    defineProperty(TilefinchIDBEventTarget.prototype, `on${type}`, {
       configurable: true,
       enumerable: true,
       get() {

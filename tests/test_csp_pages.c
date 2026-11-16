@@ -1,7 +1,9 @@
 /* Page-level CSP3 nonce, hash and 'strict-dynamic' behavior. Each case
    loads a replayed document whose response carries the policy, so the
    policy is known before the parser runs, exactly as on a real page; the
-   meta cases deliver it (or another) from <meta http-equiv> instead. */
+   meta cases deliver it (or another) from <meta http-equiv> instead. The
+   same replayed pages check the preload map's consumers (HTML "consume a
+   preloaded resource") and the request each crossorigin state makes. */
 #include "tilefinch/budget.h"
 #include "tilefinch/fetch.h"
 #include "tilefinch/js_runtime.h"
@@ -30,6 +32,8 @@ typedef struct {
     const char *header;
     /* A transport error recorded with the (partial) body, or NULL. */
     const char *error;
+    /* Scheduler pumps the replayed response takes to complete. */
+    unsigned delay_pumps;
 } PageRecord;
 
 static bool write_fixture(char directory[128], const PageRecord *records,
@@ -56,7 +60,7 @@ static bool write_fixture(char directory[128], const PageRecord *records,
             meta,
             "psp-http-trace=10\ncookie-values=redacted\n"
             "method=GET\nurl=%s\nlogical-request-url=%s\nsuccess=%d\n"
-            "async-delay-pumps=0\nexternal-cancel=0\n"
+            "async-delay-pumps=%u\nexternal-cancel=0\n"
             "transport-timeout=0\nredirect-origin-tainted=0\nerror=%s\n"
             "request-body-length=0\n"
             "request-body-hash=cbf29ce484222325\nrequest-content-type=\n"
@@ -85,7 +89,7 @@ static bool write_fixture(char directory[128], const PageRecord *records,
             "response-header-count=%d\nset-cookie-count=0\n"
             "response-header-0=content-type: %s\n",
             records[i].url, records[i].url,
-            records[i].error == NULL ? 1 : 0,
+            records[i].error == NULL ? 1 : 0, records[i].delay_pumps,
             records[i].error == NULL ? "" : records[i].error, length,
             (unsigned long long) hash, records[i].url,
             records[i].content_type, records[i].header == NULL ? 1 : 2,
@@ -131,6 +135,13 @@ typedef struct {
     const char *expected;
     /* Optional checks on the loaded session. */
     bool (*check)(NavigationSession *navigation);
+    /* External stylesheets the page may load; 0 is 4. */
+    size_t maximum_stylesheets;
+    /* Bytes of one script file; 0 is 64 KiB. Scripts may total four
+       files' worth. */
+    size_t maximum_script_file_bytes;
+    /* Bytes of the page; 0 is 64 KiB. */
+    size_t maximum_page_bytes;
 } PageCase;
 
 static bool run_page_case(const PageCase *page)
@@ -160,10 +171,14 @@ static bool run_page_case(const PageCase *page)
     if (navigation_ready) {
         navigation_attach_browser_session(&navigation, &browser);
         navigation_enable_scripts(&navigation, 8u * MIB, 2000);
+        size_t file_bytes = page->maximum_script_file_bytes == 0
+            ? 64u * 1024u : page->maximum_script_file_bytes;
         navigation_enable_document_scripts(
-            &navigation, 16, 256u * 1024u, 64u * 1024u, 2000);
+            &navigation, 16, file_bytes * 4u, file_bytes, 2000);
         navigation_enable_external_resources(
-            &navigation, 4, 64u * 1024u, 32u * 1024u,
+            &navigation,
+            page->maximum_stylesheets == 0 ? 4 : page->maximum_stylesheets,
+            64u * 1024u, 32u * 1024u,
             1, 16u * 1024u, 16u * 1024u, 64u * 1024u, 2000);
     }
     char error[256] = {0};
@@ -172,7 +187,9 @@ static bool run_page_case(const PageCase *page)
                directory, error, sizeof(error));
     uint64_t generation = replaying ? navigation_begin(&navigation) : 0;
     bool loaded = replaying && navigation_load_url(
-        &navigation, generation, PAGE_URL, 64u * 1024u, 2000, 480,
+        &navigation, generation, PAGE_URL,
+        page->maximum_page_bytes == 0 ? 64u * 1024u
+                                      : page->maximum_page_bytes, 2000, 480,
         NULL, NULL, true);
     ScriptResult result = {0};
     bool matched = false;
@@ -492,6 +509,511 @@ static const PageCase modulepreload_case = {
     .probe = "globalThis.pocSummary=String(globalThis.ran)",
     .expected = "ok",
     .check = preloads_admitted,
+};
+
+/* HTML's map of preloaded resources. Fetch consults it for every request,
+   so a parser-inserted <script src> consumes a <link rel=preload
+   as=script> with its key: a CORS script (which the HTTP cache cannot
+   serve) is fetched once, not twice. */
+static const PageRecord parser_preload_resources[] = {
+    SCRIPT("https://csp.test/parser.js", "globalThis.parser='yes';"),
+};
+
+static size_t replayed_requests(void)
+{
+    FetchTraceReplayStats stats = {0};
+    return fetch_trace_replay_stats(&stats) ? stats.request_count : 0;
+}
+
+static bool parser_consumed_preload(NavigationSession *navigation)
+{
+    const ScriptResult *result = &navigation->page.script_result;
+    size_t requests = replayed_requests();
+    bool ok = result->parser_scripts_preload_hits == 1u
+        && result->preloaded_scripts_released == 0u && requests == 2u;
+    if (!ok)
+        fprintf(stderr, "parser preload: hits=%zu released=%zu "
+                "requests=%zu\n", result->parser_scripts_preload_hits,
+                result->preloaded_scripts_released, requests);
+    return ok;
+}
+
+static const PageCase parser_preload_case = {
+    .name = "parser script consumes a preload",
+    .html =
+        "<!doctype html><head><link rel=preload as=script "
+        "crossorigin=anonymous href='https://csp.test/parser.js'></head>"
+        "<body><p>x</p><script crossorigin=anonymous "
+        "src='https://csp.test/parser.js'></script>"
+        "</body>",
+    .resources = parser_preload_resources,
+    .resource_count = 1,
+    .probe = "globalThis.pocSummary=String(globalThis.parser)",
+    .expected = "yes",
+    .check = parser_consumed_preload,
+};
+
+/* A preload whose response fails its own integrity metadata is a network
+   error (Fetch), and a script without integrity that consumes it gets
+   that network error: the script does not run, fires error, and is not
+   fetched again. */
+static const PageCase parser_preload_integrity_case = {
+    .name = "parser script consumes a preload that failed its integrity",
+    .html =
+        "<!doctype html><head><link rel=preload as=script "
+        "crossorigin=anonymous integrity='sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAA=' href='https://csp.test/parser.js'></head>"
+        "<body><p>x</p><script crossorigin=anonymous "
+        "onerror=\"globalThis.failed='yes'\" "
+        "src='https://csp.test/parser.js'></script>"
+        "</body>",
+    .resources = parser_preload_resources,
+    .resource_count = 1,
+    .probe = "globalThis.pocSummary=globalThis.parser+'|'+globalThis.failed",
+    .expected = "undefined|yes",
+    .check = parser_consumed_preload,
+};
+
+/* A preload still in flight when parsing ends is not cancelled: the realm
+   takes its request over, and a script the page inserts for the same key
+   waits for that response instead of fetching the URL again (HTML
+   onResponseAvailable). */
+static const PageRecord inflight_preload_resources[] = {
+    {.url = "https://csp.test/late.js", .content_type = "text/javascript",
+     .body = "globalThis.late='yes';", .delay_pumps = 40},
+};
+
+static bool inflight_preload_awaited(NavigationSession *navigation)
+{
+    const ScriptResult *result = &navigation->page.script_result;
+    size_t requests = replayed_requests();
+    bool ok = result->preloaded_scripts_adopted == 1u
+        && result->dynamic_scripts_preload_hits == 1u && requests == 2u;
+    if (!ok)
+        fprintf(stderr, "in-flight preload: adopted=%zu hits=%zu "
+                "requests=%zu\n", result->preloaded_scripts_adopted,
+                result->dynamic_scripts_preload_hits, requests);
+    return ok;
+}
+
+static const PageCase inflight_preload_case = {
+    .name = "inserted script waits for an in-flight preload",
+    .html =
+        "<!doctype html><head><link rel=preload as=script "
+        "crossorigin=anonymous href='https://csp.test/late.js'></head>"
+        "<body><p>x</p><script>"
+        "var s=document.createElement('script');s.crossOrigin='anonymous';"
+        "s.src='https://csp.test/late.js';document.head.append(s);"
+        "</script></body>",
+    .resources = inflight_preload_resources,
+    .resource_count = 1,
+    .probe = "globalThis.pocSummary=String(globalThis.late)",
+    .expected = "yes",
+    .check = inflight_preload_awaited,
+};
+
+/* The same for a deferred parser script, which runs after parsing ended:
+   it waits for the adopted request. */
+static const PageRecord deferred_preload_resources[] = {
+    {.url = "https://csp.test/deferred.js",
+     .content_type = "text/javascript",
+     .body = "globalThis.deferred='yes';", .delay_pumps = 40},
+};
+
+static bool deferred_preload_awaited(NavigationSession *navigation)
+{
+    const ScriptResult *result = &navigation->page.script_result;
+    size_t requests = replayed_requests();
+    bool ok = result->preloaded_scripts_adopted == 1u
+        && result->parser_scripts_preload_hits == 1u && requests == 2u;
+    if (!ok)
+        fprintf(stderr, "deferred preload: adopted=%zu hits=%zu "
+                "requests=%zu\n", result->preloaded_scripts_adopted,
+                result->parser_scripts_preload_hits, requests);
+    return ok;
+}
+
+static const PageCase deferred_preload_case = {
+    .name = "deferred script waits for an in-flight preload",
+    .html =
+        "<!doctype html><head><link rel=preload as=script "
+        "crossorigin=anonymous href='https://csp.test/deferred.js'>"
+        "<script defer crossorigin=anonymous "
+        "src='https://csp.test/deferred.js'></script></head><body><p>x</p>"
+        "</body>",
+    .resources = deferred_preload_resources,
+    .resource_count = 1,
+    .probe = "globalThis.pocSummary=String(globalThis.deferred)",
+    .expected = "yes",
+    .check = deferred_preload_awaited,
+};
+
+/* HTML's CORS settings attribute, as the request it makes. A bare
+   crossorigin (which lexbor stores without a value), "" and an invalid
+   value are Anonymous, "use-credentials" in any case is Use Credentials,
+   and no attribute is No CORS. Each state is read from what the network
+   layer let through: a cross-origin response without
+   Access-Control-Allow-Origin passes only a no-cors request, and one with
+   "*" passes no-cors and anonymous CORS but not credentialed CORS. */
+#define CORS_PAIR(name_, kind_, ext_, body_) \
+    {.url = "https://cors.test/" name_ "-plain." ext_, \
+     .content_type = (kind_), .body = body_("plain-" name_)}, \
+    {.url = "https://cors.test/" name_ "-star." ext_, \
+     .content_type = (kind_), .body = body_("star-" name_), \
+     .header = "access-control-allow-origin: *"}
+#define CORS_SCRIPT_BODY(marker_) "ran.push('" marker_ "')"
+#define CORS_SCRIPTS(name_) \
+    CORS_PAIR(name_, "text/javascript", "js", CORS_SCRIPT_BODY)
+static const PageRecord cors_script_resources[] = {
+    CORS_SCRIPTS("absent"), CORS_SCRIPTS("bare"), CORS_SCRIPTS("empty"),
+    CORS_SCRIPTS("anonymous"), CORS_SCRIPTS("invalid"),
+    CORS_SCRIPTS("credentials"), CORS_SCRIPTS("upper"),
+};
+
+#define CORS_SCRIPT_TAG(attribute_, kind_, name_) \
+    "<script " attribute_ " src='https://cors.test/" name_ "-" kind_ \
+    ".js'></script>"
+#define CORS_SCRIPT_TAGS(attribute_, name_) \
+    CORS_SCRIPT_TAG(attribute_, "plain", name_) \
+    CORS_SCRIPT_TAG(attribute_, "star", name_)
+
+/* What the matrix lets through: absent passes both responses, the
+   Anonymous states only "*", and Use Credentials neither. */
+#define CORS_MATRIX_PASSED \
+    "plain-absent,star-absent,star-bare,star-empty,star-anonymous," \
+    "star-invalid"
+
+static const PageCase cors_parser_script_case = {
+    .name = "parser script crossorigin states",
+    .html =
+        "<!doctype html><head><script>globalThis.ran=[]</script></head>"
+        "<body><p>x</p>"
+        CORS_SCRIPT_TAGS("", "absent")
+        CORS_SCRIPT_TAGS("crossorigin", "bare")
+        CORS_SCRIPT_TAGS("crossorigin=''", "empty")
+        CORS_SCRIPT_TAGS("crossorigin=anonymous", "anonymous")
+        CORS_SCRIPT_TAGS("crossorigin=zz", "invalid")
+        CORS_SCRIPT_TAGS("crossorigin=use-credentials", "credentials")
+        CORS_SCRIPT_TAGS("crossorigin=USE-CREDENTIALS", "upper")
+        "</body>",
+    .resources = cors_script_resources,
+    .resource_count = sizeof(cors_script_resources)
+        / sizeof(cors_script_resources[0]),
+    .probe = "globalThis.pocSummary=ran.join(',')",
+    .expected = CORS_MATRIX_PASSED,
+};
+
+/* Scripts the page inserts read the attribute as parsed ones do (a bare
+   attribute cannot be written through setAttribute). */
+static const PageCase cors_dynamic_script_case = {
+    .name = "inserted script crossorigin states",
+    .html =
+        "<!doctype html><head><script>globalThis.ran=[]</script></head>"
+        "<body><p>x</p><script>"
+        "for(const[name,value]of[['absent',null],['empty',''],"
+        "['anonymous','anonymous'],['invalid','zz'],"
+        "['credentials','use-credentials'],['upper','USE-CREDENTIALS']])"
+        "for(const kind of['plain','star']){"
+        "const s=document.createElement('script');s.async=false;"
+        "if(value!==null)s.setAttribute('crossorigin',value);"
+        "s.src='https://cors.test/'+name+'-'+kind+'.js';"
+        "document.body.append(s)}</script></body>",
+    .resources = cors_script_resources,
+    .resource_count = sizeof(cors_script_resources)
+        / sizeof(cors_script_resources[0]),
+    .probe = "globalThis.pocSummary=ran.join(',')",
+    .expected = "plain-absent,star-absent,star-empty,star-anonymous,"
+        "star-invalid",
+};
+
+/* A module script is always a CORS request; crossorigin picks its
+   credentials. */
+static const PageRecord cors_module_resources[] = {
+    {.url = "https://cors.test/absent.mjs", .content_type = "text/javascript",
+     .body = "ran.push('absent')", .header = "access-control-allow-origin: *"},
+    {.url = "https://cors.test/bare.mjs", .content_type = "text/javascript",
+     .body = "ran.push('bare')", .header = "access-control-allow-origin: *"},
+    {.url = "https://cors.test/invalid.mjs", .content_type = "text/javascript",
+     .body = "ran.push('invalid')",
+     .header = "access-control-allow-origin: *"},
+    {.url = "https://cors.test/credentials.mjs",
+     .content_type = "text/javascript", .body = "ran.push('credentials')",
+     .header = "access-control-allow-origin: *"},
+    {.url = "https://cors.test/upper.mjs", .content_type = "text/javascript",
+     .body = "ran.push('upper')", .header = "access-control-allow-origin: *"},
+    {.url = "https://cors.test/plain.mjs", .content_type = "text/javascript",
+     .body = "ran.push('plain')"},
+};
+
+static const PageCase cors_module_script_case = {
+    .name = "module script crossorigin states",
+    .html =
+        "<!doctype html><head><script>globalThis.ran=[]</script></head>"
+        "<body><p>x</p>"
+        "<script type=module src='https://cors.test/absent.mjs'></script>"
+        "<script type=module crossorigin "
+        "src='https://cors.test/bare.mjs'></script>"
+        "<script type=module crossorigin=zz "
+        "src='https://cors.test/invalid.mjs'></script>"
+        "<script type=module crossorigin=use-credentials "
+        "src='https://cors.test/credentials.mjs'></script>"
+        "<script type=module crossorigin=USE-CREDENTIALS "
+        "src='https://cors.test/upper.mjs'></script>"
+        "<script type=module src='https://cors.test/plain.mjs'></script>"
+        "</body>",
+    .resources = cors_module_resources,
+    .resource_count = sizeof(cors_module_resources)
+        / sizeof(cors_module_resources[0]),
+    .probe = "globalThis.pocSummary=ran.join(',')",
+    .expected = "absent,bare,invalid",
+};
+
+#define CORS_STYLE_BODY(marker_) "p{color:#123456}"
+#define CORS_STYLES(name_) CORS_PAIR(name_, "text/css", "css", CORS_STYLE_BODY)
+static const PageRecord cors_style_resources[] = {
+    CORS_STYLES("absent"), CORS_STYLES("bare"), CORS_STYLES("empty"),
+    CORS_STYLES("anonymous"), CORS_STYLES("invalid"),
+    CORS_STYLES("credentials"), CORS_STYLES("upper"),
+};
+
+#define CORS_LINK(attribute_, kind_, name_) \
+    "<link rel=stylesheet " attribute_ " href='https://cors.test/" name_ \
+    "-" kind_ ".css' onload=\"ran.push('" kind_ "-" name_ "')\">"
+#define CORS_LINK_TAGS(attribute_, name_) \
+    CORS_LINK(attribute_, "plain", name_) CORS_LINK(attribute_, "star", name_)
+
+static const PageCase cors_stylesheet_case = {
+    .name = "stylesheet crossorigin states",
+    .html =
+        "<!doctype html><head><script>globalThis.ran=[]</script>"
+        CORS_LINK_TAGS("", "absent")
+        CORS_LINK_TAGS("crossorigin", "bare")
+        CORS_LINK_TAGS("crossorigin=''", "empty")
+        CORS_LINK_TAGS("crossorigin=anonymous", "anonymous")
+        CORS_LINK_TAGS("crossorigin=zz", "invalid")
+        CORS_LINK_TAGS("crossorigin=use-credentials", "credentials")
+        CORS_LINK_TAGS("crossorigin=USE-CREDENTIALS", "upper")
+        "</head><body><p>x</p></body>",
+    .resources = cors_style_resources,
+    .resource_count = sizeof(cors_style_resources)
+        / sizeof(cors_style_resources[0]),
+    .probe = "globalThis.pocSummary=ran.join(',')",
+    .expected = CORS_MATRIX_PASSED,
+    .maximum_stylesheets = 14,
+};
+
+/* The speculative scanner, the <link rel=preload> element and the
+   <script> element agree on a bare crossorigin: all three key the request
+   (url, CORS, same-origin credentials), so the link takes over the
+   request the scanner started for the deferred script, and the script
+   consumes it: one fetch in all. */
+static const PageRecord bare_preload_resources[] = {
+    {.url = "https://csp.test/bare.js", .content_type = "text/javascript",
+     .body = "globalThis.bare='yes';", .delay_pumps = 40},
+};
+
+static const PageCase bare_preload_case = {
+    .name = "bare crossorigin preload and script agree",
+    .html =
+        "<!doctype html><head><link rel=preload as=script crossorigin "
+        "href='https://csp.test/bare.js'>"
+        "<script defer crossorigin src='https://csp.test/bare.js'></script>"
+        "</head><body><p>x</p></body>",
+    .resources = bare_preload_resources,
+    .resource_count = 1,
+    .probe = "globalThis.pocSummary=String(globalThis.bare)",
+    .expected = "yes",
+    .check = parser_consumed_preload,
+};
+
+/* A scanner request is the preload entry whether or not it has completed
+   when the parser reaches the link. Here the deferred script's request
+   completes first (no delay), so it was never a link's request and must
+   still be consumed: one fetch in all. */
+static const PageRecord early_preload_resources[] = {
+    SCRIPT("https://csp.test/early.js", "globalThis.early='yes';"),
+};
+
+static const PageCase early_preload_case = {
+    .name = "deferred script consumes a completed scanner request",
+    .html =
+        "<!doctype html><head><link rel=preload as=script "
+        "crossorigin=anonymous href='https://csp.test/early.js'>"
+        "<script defer crossorigin=anonymous "
+        "src='https://csp.test/early.js'></script></head><body><p>x</p>"
+        "</body>",
+    .resources = early_preload_resources,
+    .resource_count = 1,
+    .probe = "globalThis.pocSummary=String(globalThis.early)",
+    .expected = "yes",
+    .check = parser_consumed_preload,
+};
+
+/* The same for a parser-blocking head script preceded by its own
+   preload: the scanner's completed request serves it. */
+static const PageRecord blocking_preload_resources[] = {
+    SCRIPT("https://csp.test/blocking.js", "globalThis.blocking='yes';"),
+};
+
+static const PageCase blocking_preload_case = {
+    .name = "blocking script consumes its preload",
+    .html =
+        "<!doctype html><head><link rel=preload as=script "
+        "crossorigin=anonymous href='https://csp.test/blocking.js'>"
+        "<script crossorigin=anonymous "
+        "src='https://csp.test/blocking.js'></script></head><body><p>x</p>"
+        "</body>",
+    .resources = blocking_preload_resources,
+    .resource_count = 1,
+    .probe = "globalThis.pocSummary=String(globalThis.blocking)",
+    .expected = "yes",
+    .check = parser_consumed_preload,
+};
+
+/* Every CORS script the scanner requests fits in the map of preloaded
+   resources: six deferred crossorigin scripts are fetched once each. The
+   map had four entries, so the fifth and sixth were fetched again. */
+static const PageRecord six_preload_resources[] = {
+    SCRIPT("https://csp.test/s1.js", "globalThis.s=(globalThis.s||'')+1;"),
+    SCRIPT("https://csp.test/s2.js", "globalThis.s+=2;"),
+    SCRIPT("https://csp.test/s3.js", "globalThis.s+=3;"),
+    SCRIPT("https://csp.test/s4.js", "globalThis.s+=4;"),
+    SCRIPT("https://csp.test/s5.js", "globalThis.s+=5;"),
+    SCRIPT("https://csp.test/s6.js", "globalThis.s+=6;"),
+};
+
+static bool six_preloads_consumed(NavigationSession *navigation)
+{
+    const ScriptResult *result = &navigation->page.script_result;
+    size_t requests = replayed_requests();
+    bool ok = result->parser_scripts_preload_hits == 6u
+        && result->preloaded_scripts_released == 0u && requests == 7u;
+    if (!ok)
+        fprintf(stderr, "six preloads: hits=%zu released=%zu "
+                "requests=%zu\n", result->parser_scripts_preload_hits,
+                result->preloaded_scripts_released, requests);
+    return ok;
+}
+
+#define SIX_DEFERRED(n) \
+    "<script defer crossorigin=anonymous " \
+    "src='https://csp.test/s" #n ".js'></script>"
+
+static const PageCase six_preload_case = {
+    .name = "six CORS scripts are fetched once each",
+    .html =
+        "<!doctype html><head>" SIX_DEFERRED(1) SIX_DEFERRED(2)
+        SIX_DEFERRED(3) SIX_DEFERRED(4) SIX_DEFERRED(5) SIX_DEFERRED(6)
+        "</head><body><p>x</p></body>",
+    .resources = six_preload_resources,
+    .resource_count = 6,
+    .probe = "globalThis.pocSummary=String(globalThis.s)",
+    .expected = "123456",
+    .check = six_preloads_consumed,
+};
+
+#undef SIX_DEFERRED
+
+/* Responses held for the realm before it exists stay within the map's
+   byte bound: of two 1.2 MiB CORS scripts only the first is held, and the
+   second, which the map could not take, is fetched by its script. Held
+   without a bound, the second was offered to the map and dropped there. */
+#define BIG_PRELOAD_BYTES (1200u * 1024u)
+static char big_preload_a[BIG_PRELOAD_BYTES + 64u];
+static char big_preload_b[BIG_PRELOAD_BYTES + 64u];
+/* Long enough that both responses complete while it is parsed. */
+#define BIG_PRELOAD_PAGE_BYTES (6u * 1024u * 1024u)
+static char big_preload_html[BIG_PRELOAD_PAGE_BYTES + 512u];
+
+static void big_preload_fill(char *body, const char *name)
+{
+    int used = snprintf(body, 64u, "globalThis.%s='yes';/*", name);
+    memset(body + used, 'x', BIG_PRELOAD_BYTES - (size_t) used);
+    memcpy(body + BIG_PRELOAD_BYTES, "*/", 3u);
+}
+
+static void big_preload_page_fill(void)
+{
+    int used = snprintf(big_preload_html, 512u,
+        "<!doctype html><head>"
+        "<script defer crossorigin=anonymous "
+        "src='https://csp.test/big-a.js'></script>"
+        "<script defer crossorigin=anonymous "
+        "src='https://csp.test/big-b.js'></script></head><body><p>");
+    memset(big_preload_html + used, 'x',
+           BIG_PRELOAD_PAGE_BYTES - (size_t) used);
+    memcpy(big_preload_html + BIG_PRELOAD_PAGE_BYTES, "</p></body>", 12u);
+}
+
+static const PageRecord big_preload_resources[] = {
+    SCRIPT("https://csp.test/big-a.js", big_preload_a),
+    SCRIPT("https://csp.test/big-b.js", big_preload_b),
+};
+
+static bool big_preloads_bounded(NavigationSession *navigation)
+{
+    const ScriptResult *result = &navigation->page.script_result;
+    size_t requests = replayed_requests();
+    bool ok = result->parser_scripts_preload_hits == 1u
+        && result->preloaded_scripts_released == 0u && requests == 4u;
+    if (!ok)
+        fprintf(stderr, "big preloads: hits=%zu released=%zu "
+                "requests=%zu\n", result->parser_scripts_preload_hits,
+                result->preloaded_scripts_released, requests);
+    return ok;
+}
+
+static const PageCase big_preload_case = {
+    .name = "held preload responses stay within the byte bound",
+    .html = big_preload_html,
+    .resources = big_preload_resources,
+    .resource_count = 2,
+    .probe = "globalThis.pocSummary=globalThis.big_a+globalThis.big_b",
+    .expected = "yesyes",
+    .check = big_preloads_bounded,
+    .maximum_script_file_bytes = 2u * BIG_PRELOAD_BYTES,
+    .maximum_page_bytes = BIG_PRELOAD_PAGE_BYTES + 512u,
+};
+
+/* The same key from different spellings of one state: a bare preload is
+   consumed by an explicitly anonymous script, and an upper-case
+   use-credentials preload by a lower-case one. */
+static const PageRecord spelled_preload_resources[] = {
+    SCRIPT("https://csp.test/anonymous.js", "globalThis.anonymous='yes';"),
+    SCRIPT("https://csp.test/credentials.js",
+           "globalThis.credentials='yes';"),
+};
+
+static bool spelled_preloads_consumed(NavigationSession *navigation)
+{
+    const ScriptResult *result = &navigation->page.script_result;
+    size_t requests = replayed_requests();
+    bool ok = result->parser_scripts_preload_hits == 2u
+        && result->preloaded_scripts_released == 0u && requests == 3u;
+    if (!ok)
+        fprintf(stderr, "spelled preloads: hits=%zu released=%zu "
+                "requests=%zu\n", result->parser_scripts_preload_hits,
+                result->preloaded_scripts_released, requests);
+    return ok;
+}
+
+static const PageCase spelled_preload_case = {
+    .name = "crossorigin spellings share a preload key",
+    .html =
+        "<!doctype html><head><link rel=preload as=script crossorigin "
+        "href='https://csp.test/anonymous.js'>"
+        "<link rel=preload as=script crossorigin=USE-CREDENTIALS "
+        "href='https://csp.test/credentials.js'></head><body><p>x</p>"
+        "<script crossorigin=anonymous "
+        "src='https://csp.test/anonymous.js'></script>"
+        "<script crossorigin=use-credentials "
+        "src='https://csp.test/credentials.js'></script></body>",
+    .resources = spelled_preload_resources,
+    .resource_count = 2,
+    .probe = "globalThis.pocSummary=[globalThis.anonymous,"
+        "globalThis.credentials].join()",
+    .expected = "yes,yes",
+    .check = spelled_preloads_consumed,
 };
 
 /* A nonced data: module larger than any URL buffer (Reddit's loader is a
@@ -1012,6 +1534,126 @@ static bool disk_visit(const char *cache, const char *policy,
     return probed && clean;
 }
 
+/* navigation_yield_preloaded_scripts, the engine's reclaim step for a load
+   in progress: a preload response the load holds for a realm it has not
+   created yet (early_realm false), or has offered to the realm it is
+   building (early_realm true), is freed, and its consumer fetches the
+   script again instead of failing. Without the yield the consumer takes
+   the preload (two requests); with it, three. */
+static bool held_preload_yield_case(bool early_realm, bool yield)
+{
+    static char html[16384];
+    int used = snprintf(
+        html, sizeof(html),
+        "<!doctype html><head>%s<link rel=preload as=script "
+        "crossorigin=anonymous href='https://csp.test/held.js'></head><body>",
+        early_realm ? "<script>globalThis.early=1;</script>" : "");
+    while ((size_t) used < sizeof(html) - 256u)
+        used += snprintf(html + used, sizeof(html) - (size_t) used,
+                         "<p>filler paragraph</p>");
+    snprintf(html + used, sizeof(html) - (size_t) used,
+             "<script crossorigin=anonymous "
+             "src='https://csp.test/held.js'></script></body>");
+    const PageRecord records[] = {
+        {.url = PAGE_URL, .content_type = "text/html; charset=utf-8",
+         .body = html},
+        SCRIPT("https://csp.test/held.js",
+               "globalThis.held=(globalThis.held||0)+1;"),
+    };
+    size_t count = sizeof(records) / sizeof(records[0]);
+    char directory[128] = {0}, error[256] = {0};
+    bool written = write_fixture(directory, records, count);
+    Budget budget;
+    budget_init(&budget, 32u * MIB);
+    bool lexbor = budget_install_lexbor(&budget);
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool browser_ready = written && lexbor
+        && browser_session_init(&browser, &budget, 256u * 1024u);
+    bool ready = browser_ready && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_attach_browser_session(&navigation, &browser);
+        navigation_enable_scripts(&navigation, 8u * MIB, 2000);
+        navigation_enable_document_scripts(
+            &navigation, 16, 256u * 1024u, 64u * 1024u, 2000);
+        navigation_enable_external_resources(
+            &navigation, 4, 64u * 1024u, 32u * 1024u,
+            1, 16u * 1024u, 16u * 1024u, 64u * 1024u, 2000);
+        navigation_set_stream_delivery(&navigation, 512, 0, 0, 0, 0, 0);
+    }
+    bool replaying = ready && fetch_trace_replay_begin_response_keyed(
+        directory, error, sizeof(error));
+    uint64_t generation = replaying ? navigation_begin(&navigation) : 0;
+    NavigationLoad *load = replaying ? navigation_load_begin_url(
+        &navigation, generation, PAGE_URL, 64u * 1024u, 2000, 480,
+        NULL, NULL, true) : NULL;
+    NavigationLoadQuota quota = {
+        .fetch = {
+            .maximum_body_callbacks = 1,
+            .maximum_body_bytes = 512,
+            .maximum_time_us = 10000
+        },
+        .maximum_parser_body_bytes = 512,
+        .maximum_parser_time_us = 10000
+    };
+    size_t freed = 0;
+    for (size_t i = 0; load != NULL && i < 512; i++) {
+        if (navigation_load_status(load) != NAVIGATION_LOAD_PENDING) break;
+        (void) navigation_load_pump(load, &quota);
+        if (yield)
+            freed += navigation_yield_preloaded_scripts(load, (size_t) -1);
+    }
+    NavigationLoadStatus pumped = load == NULL ? NAVIGATION_LOAD_FAILED
+                                               : navigation_load_status(load);
+    bool finished = pumped == NAVIGATION_LOAD_READY_TO_FINISH
+        && navigation_load_finish(load, NULL)
+        && navigation_load_status(load) == NAVIGATION_LOAD_SUCCEEDED;
+    navigation_load_destroy(load);
+    ScriptResult result = {0};
+    bool ran = finished && navigation.page.runtime != NULL
+        && script_runtime_evaluate_diagnostic(
+               navigation.page.runtime,
+               "globalThis.pocSummary=String(globalThis.held)",
+               "<yield-probe>", &result)
+        && strcmp(result.summary, "1") == 0;
+    const ScriptResult *page = &navigation.page.script_result;
+    size_t requests = replayed_requests();
+    bool ok = ran
+        && (yield ? freed > 0 && page->parser_scripts_preload_hits == 0u
+                        && requests == 3u
+                  : page->parser_scripts_preload_hits == 1u
+                        && requests == 2u);
+    if (!ok)
+        fprintf(stderr,
+                "held preload yield (early=%d yield=%d): pumped=%d "
+                "finished=%d held=\"%s\" freed=%zu hits=%zu requests=%zu error=\"%s\" "
+                "replay=\"%s\"\n",
+                early_realm, yield, (int) pumped, finished, result.summary,
+                freed,
+                page->parser_scripts_preload_hits, requests,
+                navigation.last_error, error);
+    if (replaying) fetch_trace_end();
+    if (ready) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0;
+    if (lexbor) clean = budget_uninstall_lexbor(&budget) && clean;
+    if (written) remove_fixture(directory, count);
+    if (!clean)
+        fprintf(stderr, "held preload yield (early=%d yield=%d) leaked\n",
+                early_realm, yield);
+    return ok && clean;
+}
+
+static bool held_preloads_yield(void)
+{
+    bool ok = true;
+    for (unsigned early = 0; early < 2; early++)
+        for (unsigned yield = 0; yield < 2; yield++)
+            ok = held_preload_yield_case(early != 0, yield != 0) && ok;
+    return ok;
+}
+
 static bool module_disk_tier_behind_sri_and_csp(void)
 {
     int used = snprintf(disk_dep, sizeof(disk_dep),
@@ -1424,6 +2066,9 @@ static bool meta_prepared_long_data(void)
 int main(void)
 {
     if (!meta_prepared_long_data()) return 1;
+    big_preload_fill(big_preload_a, "big_a");
+    big_preload_fill(big_preload_b, "big_b");
+    big_preload_page_fill();
     int used = snprintf(
         long_data_html, sizeof(long_data_html),
         "<!doctype html><head><script type=module nonce='L0ng' src='"
@@ -1460,12 +2105,20 @@ int main(void)
         &meta_changed_source_case,
         &meta_changed_base_case, &meta_nomodule_activation_case,
         &meta_prepared_header_case, &meta_prepared_data_case,
+        &parser_preload_case, &parser_preload_integrity_case,
+        &inflight_preload_case,
+        &deferred_preload_case, &cors_parser_script_case,
+        &cors_dynamic_script_case, &cors_module_script_case,
+        &cors_stylesheet_case, &bare_preload_case, &spelled_preload_case,
+        &early_preload_case, &blocking_preload_case, &six_preload_case,
+        &big_preload_case,
     };
     size_t failures = 0;
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         if (!run_page_case(cases[i])) failures++;
     }
     if (!module_disk_tier_behind_sri_and_csp()) failures++;
+    if (!held_preloads_yield()) failures++;
     if (failures != 0) {
         fprintf(stderr, "tilefinch-csp-page-tests: %zu failure(s)\n",
                 failures);

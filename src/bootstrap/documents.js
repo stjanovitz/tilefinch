@@ -12,6 +12,7 @@ globalThis.__tilefinchEventInterfaces.defineProperty(globalThis,
     setNativeNodeOwner,
     adoptIntoDocument,
     liveCollection,
+    liveChildNodes,
     ancestorLimit,
     escapeSelector,
     makeDoctype,
@@ -209,14 +210,16 @@ globalThis.__tilefinchEventInterfaces.defineProperty(globalThis,
           isConnected: value("isConnected", () => true),
           contentType: value("contentType", (state) => state.contentType),
           compatMode: value("compatMode", (state) => state.compatMode),
-          URL: value("URL", () => "about:blank"),
-          documentURI: value("documentURI", () => "about:blank"),
+          /* A frame's document (bindFrameDocument) has its frame's URL,
+             Location and WindowProxy; other secondary documents none. */
+          URL: value("URL", (state) => state.url ?? "about:blank"),
+          documentURI: value("documentURI", (state) => state.url ?? "about:blank"),
           characterSet: value("characterSet", () => "UTF-8"),
           charset: value("charset", () => "UTF-8"),
           inputEncoding: value("inputEncoding", () => "UTF-8"),
           readyState: value("readyState", () => "complete"),
-          defaultView: value("defaultView", () => null),
-          location: value("location", () => null),
+          defaultView: value("defaultView", (state) => state.view ?? null),
+          location: value("location", (state) => state.location ?? null),
           activeElement: value("activeElement", (state, doc) =>
             doc.body || doc.documentElement),
           doctype: value("doctype", (state, doc) =>
@@ -275,13 +278,9 @@ globalThis.__tilefinchEventInterfaces.defineProperty(globalThis,
               item.textContent = String(text);
             } }.title,
           },
-          childNodes: value("childNodes", (state, doc) => {
-            const values = documentChildren(doc).slice();
-            defineProperty(values, "item", {
-              value: (index) => values[Number(index)] ?? null,
-            });
-            return values;
-          }),
+          childNodes: value("childNodes", (state, doc) =>
+            state.childNodes ||= liveChildNodes(
+              doc, () => documentChildren(doc))),
           children: value("children", (state, doc) =>
             state.childCollection ||= liveCollection(
               () => documentChildren(doc).filter(
@@ -459,6 +458,9 @@ globalThis.__tilefinchEventInterfaces.defineProperty(globalThis,
           compatMode,
           children: [],
           childCollection: null,
+          url: null,
+          location: null,
+          view: null,
         });
         return doc;
       },
@@ -478,6 +480,29 @@ globalThis.__tilefinchEventInterfaces.defineProperty(globalThis,
           head.appendChild(doc.createElement("title")).textContent = String(title);
         html.appendChild(doc.createElement("body"));
         return doc;
+      },
+      /* A frame's initial about:blank document (and the empty document of a
+         frame whose content lives in its own runtime): html, head and body,
+         no doctype. The initial about:blank document is in quirks mode. */
+      createNativeFrameDocument = (standards = false) => {
+        const doc = nativeDocument({
+            compatMode: standards ? "CSS1Compat" : "BackCompat",
+          }),
+          html = doc.appendChild(doc.createElement("html"));
+        html.appendChild(doc.createElement("head"));
+        html.appendChild(doc.createElement("body"));
+        return doc;
+      },
+      /* Gives a secondary document its frame: location is the frame's
+         Location (its href the document URL), view its WindowProxy. false
+         for a document this module did not make. */
+      bindFrameDocument = (doc, location, view) => {
+        const state = nativeDocumentState.get(doc);
+        if (!state) return false;
+        state.location = location ?? null;
+        state.url = location?.href == null ? null : String(location.href);
+        state.view = view ?? null;
+        return true;
       },
       htmlStartTag =
         /^(?:\s|<!--[\s\S]*?-->|<!doctype[^>]*>)*<html((?:\s+[^\s"'>\/=]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+))?)*)\s*\/?>/i,
@@ -544,6 +569,8 @@ globalThis.__tilefinchEventInterfaces.defineProperty(globalThis,
     };
     return {
       createNativeHTMLDocument,
+      createNativeFrameDocument,
+      bindFrameDocument,
       parseNativeHTMLDocument,
       parseNativeSVGDocument,
       parseErrorDocument,

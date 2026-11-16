@@ -417,8 +417,8 @@ void js_rt_jsmem_census_check(ScriptRuntime *runtime, const char *where,
     int mode = jsmem_mode();
     if (mode == 0 || runtime == NULL || runtime->quickjs_pool == NULL)
         return;
-    size_t rejections = budget_quickjs_pool_rejection_count(
-        runtime->quickjs_pool);
+    /* Refusals by the realm's limit and by the page Budget alike. */
+    size_t rejections = script_runtime_allocation_refusals(runtime);
     if (rejections > runtime->jsmem_rejections_seen) {
         runtime->jsmem_rejections_seen = rejections;
         if (runtime->jsmem_oom_censuses < 6) {
@@ -638,6 +638,13 @@ size_t js_rt_heap_growth_hook(void *opaque, size_t live, size_t growth,
         ? SIZE_MAX : runtime->heap_growth_reserve + granted + step;
     if (free_bytes < wanted) {
         script_runtime_release_script_bodies(runtime, wanted - free_bytes);
+        free_bytes = budget_remaining(runtime->budget);
+    }
+    /* Then preloaded script responses no script has consumed yet: their
+       consumer, if one comes, fetches the URL itself. */
+    if (free_bytes < wanted) {
+        (void) script_runtime_release_preloaded_scripts(
+            runtime, wanted - free_bytes);
         free_bytes = budget_remaining(runtime->budget);
     }
     /* Then the body of the script running now: compiled before it started,
@@ -872,7 +879,8 @@ static size_t js_rt_gc_pacing(void *opaque, size_t live, size_t limit,
        in the heap. Without it QuickJS re-arms (at half of live) sooner and
        collects the same object graph more often for the same allocation;
        space collections as if the text were still live, up to the limit. */
-    size_t text = script_source_store_text_bytes(runtime->source_store) / 2u;
+    size_t text = (script_source_store_text_bytes(runtime->source_store)
+                   + runtime->lazy_webpack_external_text_bytes) / 2u;
     if (text != 0 && proposed > live && proposed < limit) {
         proposed = text > limit - proposed ? limit : proposed + text;
     }
@@ -1028,9 +1036,12 @@ size_t script_runtime_heap_admission_available(const ScriptRuntime *runtime)
 {
     size_t available = script_runtime_heap_available(runtime);
     if (runtime == NULL || runtime->source_store == NULL) return available;
-    /* The text would be in the heap; what holds it now stays counted in
-       the Budget, so this is never above what the unstripped realm had. */
-    size_t text = script_source_store_text_bytes(runtime->source_store);
+    /* The text would be in the heap (the store's, and lazy-webpack factory
+       text named by external id); what holds it now is counted in the
+       Budget (the store), or already was (a factory's compressed copy), so
+       this is never above what the unstripped realm had. */
+    size_t text = script_source_store_text_bytes(runtime->source_store)
+        + runtime->lazy_webpack_external_text_bytes;
     return available > text ? available - text : 0;
 }
 
@@ -1118,6 +1129,15 @@ size_t script_runtime_heap_rejections(const ScriptRuntime *runtime)
     size_t count = budget_quickjs_pool_rejection_count(runtime->quickjs_pool);
     return count > runtime->compile_heap_rejections_absorbed
         ? count - runtime->compile_heap_rejections_absorbed : 0;
+}
+
+size_t script_runtime_allocation_refusals(const ScriptRuntime *runtime)
+{
+    if (runtime == NULL) return 0;
+    size_t limit = script_runtime_heap_rejections(runtime);
+    size_t budget = budget_quickjs_pool_budget_refusal_count(
+        runtime->quickjs_pool);
+    return limit > SIZE_MAX - budget ? SIZE_MAX : limit + budget;
 }
 
 void script_runtime_last_allocation_refusal(const ScriptRuntime *runtime,

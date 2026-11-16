@@ -128,6 +128,10 @@ typedef struct {
     unsigned post_target, post_landing, post_outcome;
     long post_http_status;
     bool post_pending;
+    /* Google refusing the browser on accounts.google.com
+       (SiteIdentityAccountsRefusal): how often, and the last one's class
+       and reason number. */
+    unsigned refusals, refusal_class, refusal_reason;
 } BrowserSigninTrail;
 
 /* YouTube provider state, owned by browser_engine/youtube.inc. The facade's
@@ -142,6 +146,9 @@ typedef struct {
     /* Last identity the provider rejected and reported signed out. */
     uint64_t login_rejected;
     unsigned login_events;
+    /* The navigation in flight may end on a /sorry/ page that counts as an
+       accounts.google.com refusal (site_identity_accounts_request). */
+    bool accounts_request;
     bool signin_diagnostics;
     BrowserSigninTrail signin_trail;
     unsigned signin_retries;
@@ -425,6 +432,8 @@ static void browser_engine_youtube_on_navigation_begin(
 static const char *browser_engine_youtube_commit_url(const char *url);
 static void browser_engine_youtube_on_commit(BrowserEngine *engine,
                                              bool committed);
+static void browser_engine_youtube_note_landing(
+    BrowserEngine *engine, BrowserNavigationJobStatus outcome);
 static void browser_engine_youtube_on_finish(
     BrowserEngine *engine, BrowserNavigationJobStatus outcome,
     const SiteAdapterLoadMetrics *adapter);
@@ -568,6 +577,14 @@ static size_t browser_engine_reclaim_accelerators(void *opaque,
     if (reclaimed < needed_bytes)
         reclaimed += media_json_responses_release(
             &engine->navigation.page.document);
+    /* And preloaded script responses no script has consumed yet, the
+       page's and those a load holds for its realm. */
+    if (reclaimed < needed_bytes)
+        reclaimed += script_runtime_release_preloaded_scripts(
+            engine->navigation.page.runtime, needed_bytes - reclaimed);
+    if (reclaimed < needed_bytes)
+        reclaimed += navigation_yield_preloaded_scripts(
+            engine->navigation_work.load, needed_bytes - reclaimed);
     return reclaimed;
 }
 
@@ -3108,10 +3125,8 @@ bool browser_engine_begin_navigation_history(
 /* A refused opted-in Google search (site_identity.h) fails without
    committing and clears the opt-in. Continue the same job on the local
    compatibility page for that query, which now carries its refusal note.
-   A refused accounts.google.com page continues on that page, reloaded once
-   with the shipping identity. The fallback replaces or adds a history entry
-   as the refused navigation would have; a refused history traversal only
-   restores its entry. */
+   The fallback replaces or adds a history entry as the refused navigation
+   would have; a refused history traversal only restores its entry. */
 static BrowserNavigationJobStatus browser_engine_google_fallback(
     BrowserEngine *engine, BrowserNavigationJobStatus finished)
 {
@@ -3119,8 +3134,7 @@ static BrowserNavigationJobStatus browser_engine_google_fallback(
     if (finished != BROWSER_NAVIGATION_JOB_FAILED
         || !site_identity_take_google_fallback(url, sizeof(url))
         || engine->navigation_work.history_move
-        || !(site_adapter_handles_navigation("GET", url)
-             || site_identity_accounts_host(url))) return finished;
+        || !site_adapter_handles_navigation("GET", url)) return finished;
     bool record_history = engine->navigation_work.record_history;
     engine->navigation.pending_navigation_referer[0] = '\0';
     engine->navigation.pending_navigation_user_activated = false;
@@ -3947,14 +3961,12 @@ bool browser_engine_load_url_with_limits(
         engine, browser_engine_do_load_url, &load, TILEFINCH_SUBSYSTEM_NETWORK,
         TILEFINCH_DIAGNOSTIC_NETWORK_FAILED);
     /* The synchronous form of browser_engine_google_fallback(). The opt-in
-       or the accounts identity is already cleared, so the retry is the
-       bounded local page or a page that cannot be refused again. */
+       is already cleared, so the retry is the bounded local page. */
     char google_fallback[NAVIGATION_URL_LIMIT];
     if (!loaded
         && site_identity_take_google_fallback(
                google_fallback, sizeof(google_fallback))
-        && (site_adapter_handles_navigation("GET", google_fallback)
-            || site_identity_accounts_host(google_fallback))) {
+        && site_adapter_handles_navigation("GET", google_fallback)) {
         engine->config.maximum_document_bytes = saved_maximum;
         engine->config.navigation_timeout_ms = saved_timeout;
         return browser_engine_load_url_with_limits(
@@ -4947,8 +4959,18 @@ bool browser_engine_execute_action(BrowserEngine *engine,
             engine, action->url, maximum_bytes, timeout_ms, true);
     }
     size_t loads_before = engine->navigation.loads_committed;
-    if (!controller_execute_action(
-            &engine->controller, action, maximum_bytes, timeout_ms)) {
+    /* The synchronous counterpart of a navigation job's begin and finish:
+       the sign-in trail and Google's refusal are noted the same way. */
+    browser_engine_youtube_note_request(
+        engine, action->url, method,
+        action->body_length == 0 ? NULL : controller_action_body(action),
+        action->body_length);
+    bool executed = controller_execute_action(
+        &engine->controller, action, maximum_bytes, timeout_ms);
+    browser_engine_youtube_note_landing(
+        engine, executed ? BROWSER_NAVIGATION_JOB_SUCCEEDED
+                         : BROWSER_NAVIGATION_JOB_FAILED);
+    if (!executed) {
         return set_error_code(
             engine, TILEFINCH_SUBSYSTEM_ENGINE,
             TILEFINCH_DIAGNOSTIC_INTERNAL_FAILED, "controller-action",

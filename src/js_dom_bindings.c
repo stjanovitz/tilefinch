@@ -4798,6 +4798,12 @@ JS_RT_GUARDED_NATIVE(, js_dom_remove_attribute)(JSContext *context,
     size_t name_length = 0;
     const char *name = JS_ToCStringLen(context, &name_length, argv[1]);
     if (name == NULL) return JS_EXCEPTION;
+    /* All attribute-removal forms meet here, including borrowed native
+       methods on the carrier. Its identity is not an author attribute. */
+    if (document_shadow_attribute_protected(node, name, name_length)) {
+        JS_FreeCString(context, name);
+        return JS_FALSE;
+    }
     if (!js_dom_latch_checked_default(
             bridge, node, name, name_length)) {
         JS_FreeCString(context, name);

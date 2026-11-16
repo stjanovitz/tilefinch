@@ -178,6 +178,11 @@
     { reflectString, secondaryDocumentPrototype, asciiLower, checkDoctypeName,
       contextFragment } = domShared;
   delete globalThis.__tilefinchDomShared;
+  /* Native code runs it only where the ARIA reflections are installed
+     (reflected_attributes.inc); elsewhere it goes with the channel. */
+  globalThis.__tilefinchHostChannel.ariaElementReferences =
+    domShared.ariaElementReferences;
+  delete domShared.ariaElementReferences;
   {
     /* Reflected <meta> attributes. Without the interface, meta.content fell
        through to a generic null getter; ChatGPT's mobile keyboard bootstrap
@@ -196,49 +201,6 @@
          expando left the media attribute, and the sheet, disabled. */
       media: reflectString("media"),
       referrerPolicy: reflectString("referrerPolicy"),
-      relList: {
-        configurable: true,
-        enumerable: true,
-        get() {
-          const owner = this,
-            tokens = () =>
-              String(owner.getAttribute("rel") || "")
-                .trim()
-                .split(/\s+/)
-                .filter(Boolean);
-          return {
-            get length() {
-              return tokens().length;
-            },
-            item(index) {
-              return tokens()[Math.floor(Number(index) || 0)] ?? null;
-            },
-            contains(token) {
-              return tokens().includes(String(token));
-            },
-            supports(token) {
-              return [
-                "stylesheet",
-                "preload",
-                "modulepreload",
-                "icon",
-                "alternate",
-                "canonical",
-                "manifest",
-                "dns-prefetch",
-                "preconnect",
-                "prefetch",
-              ].includes(String(token).toLowerCase());
-            },
-            toString() {
-              return tokens().join(" ");
-            },
-            [Symbol.iterator]() {
-              return tokens()[Symbol.iterator]();
-            },
-          };
-        },
-      },
     });
     Object.defineProperty(
       HTMLScriptElement.prototype,
@@ -584,6 +546,7 @@
     },
     returnValue: {
       configurable: true,
+      enumerable: true,
       get() {
         return !this.defaultPrevented;
       },
@@ -593,6 +556,7 @@
     },
     cancelBubble: {
       configurable: true,
+      enumerable: true,
       get() {
         return !!this.__stopped;
       },
@@ -602,6 +566,7 @@
     },
     srcElement: {
       configurable: true,
+      enumerable: true,
       get() {
         return this.target;
       },
@@ -617,8 +582,9 @@
     AT_TARGET: 2,
     BUBBLING_PHASE: 3,
   })) {
-    Object.defineProperty(Event, name, { value });
-    Object.defineProperty(Event.prototype, name, { value });
+    /* Web IDL constants are enumerable. */
+    Object.defineProperty(Event, name, { enumerable: true, value });
+    Object.defineProperty(Event.prototype, name, { enumerable: true, value });
   }
   const createEvent = (interfaceName) => {
     const name = String(interfaceName || ""),
@@ -668,7 +634,11 @@
         for (let index = 0; index < keys.length; index++)
           dictionary[keys[index]] = init[keys[index]];
       }
-      return new Interface(type, dictionary);
+      const event = new Interface(type, dictionary);
+      /* UIEventInit's view defaults to null for a page's own events; the
+         browser's UI events belong to this window. */
+      if (event.view === null) event.view = globalThis;
+      return event;
     };
   /* Boot-time only: the host captures it once the bootstrap has run and
      deletes it before any author code (runtime_creation.inc). */
@@ -694,7 +664,7 @@
     constructor(type, options = {}) {
       options ??= {};
       super(type, options);
-      this.view = options.view ?? globalThis;
+      this.view = options.view ?? null;
       this.detail = Number(options.detail) || 0;
       this.which = Number(options.which) || 0;
     }
@@ -757,6 +727,8 @@
       this.y = this.clientY;
       this.button = Number(options.button) || 0;
       this.buttons = Number(options.buttons) || 0;
+      /* UI Events: a mouse event's legacy which is its button plus one. */
+      this.which = this.button + 1;
       this.relatedTarget = options.relatedTarget ?? null;
       modifierFields(this, options);
     }
@@ -776,9 +748,30 @@
       this.pageY = this.clientY + (Number(globalThis.scrollY) || 0);
       initModifiers(this, ctrlKey, altKey, shiftKey, metaKey);
       this.button = Number(button) || 0;
+      this.which = this.button + 1;
       this.relatedTarget = relatedTarget;
     }
   };
+  {
+    /* No standard defines fromElement and toElement yet (w3c/pointerevents
+       issue 605); Chromium and WebKit answer them alike. A mouseout or
+       mouseleave goes from its target to its related target; every other
+       type, a created event's included, from the related target to the
+       target. Only a node is answered. */
+    const NodeInterface = Node,
+      node = (value) => value instanceof NodeInterface ? value : null,
+      leaving = (event) =>
+        event.type === "mouseout" || event.type === "mouseleave";
+    Object.defineProperties(MouseEvent.prototype,
+      Object.getOwnPropertyDescriptors({
+        get fromElement() {
+          return node(leaving(this) ? this.target : this.relatedTarget);
+        },
+        get toElement() {
+          return node(leaving(this) ? this.relatedTarget : this.target);
+        },
+      }));
+  }
   globalThis.PointerEvent = class PointerEvent extends MouseEvent {
     constructor(type, options = {}) {
       options ??= {};
@@ -831,8 +824,10 @@
     DOM_KEY_LOCATION_RIGHT: 2,
     DOM_KEY_LOCATION_NUMPAD: 3,
   })) {
-    Object.defineProperty(KeyboardEvent, name, { value });
-    Object.defineProperty(KeyboardEvent.prototype, name, { value });
+    Object.defineProperty(KeyboardEvent, name, { enumerable: true, value });
+    Object.defineProperty(KeyboardEvent.prototype, name, {
+      enumerable: true, value,
+    });
   }
   globalThis.InputEvent = class InputEvent extends UIEvent {
     constructor(type, options = {}) {
@@ -2742,23 +2737,6 @@
         });
         return doc;
       };
-    /* An empty frame's document keeps its own tree code; its elements get
-       the innerHTML getter only. */
-    const originalFrameDocument = globalThis.__tilefinchCreateFrameDocument;
-    if (typeof originalFrameDocument === "function")
-      globalThis.__tilefinchCreateFrameDocument = (standards) => {
-        const doc = originalFrameDocument(standards),
-          { createElement, createElementNS } = doc,
-          walk = (node) => {
-            markupAccessor(node);
-            for (const child of node.__detachedChildren || []) walk(child);
-          };
-        walk(doc);
-        doc.createElement = (tag) => markupAccessor(createElement(tag));
-        doc.createElementNS = (namespace, tag) =>
-          markupAccessor(createElementNS(namespace, tag));
-        return doc;
-      };
     const originalNewDocument = globalThis.__tilefinchNewDocument;
     if (typeof originalNewDocument === "function")
       globalThis.__tilefinchNewDocument = (xml) =>
@@ -2791,6 +2769,7 @@
         setNativeNodeOwner: globalThis.__tilefinchSetNodeOwner,
         adoptIntoDocument: globalThis.__tilefinchAdoptNodeOwner,
         liveCollection: globalThis.__tilefinchLiveHTMLCollection,
+        liveChildNodes: domShared.liveChildNodes,
         ancestorLimit: globalThis.__tilefinchAncestorLimit,
         escapeSelector: CSS.escape,
         makeDoctype,
@@ -2850,6 +2829,13 @@
     };
     domShared.createHTMLDocument = (title) =>
       nativeDocuments().createNativeHTMLDocument(title);
+    /* A frame's documents are native secondary documents, so its elements
+       are the typed native elements a page's are (HTMLImageElement and the
+       rest), not script stand-ins. */
+    globalThis.__tilefinchCreateFrameDocument = (standards) =>
+      nativeDocuments().createNativeFrameDocument(standards);
+    globalThis.__tilefinchBindFrameDocument = (doc, location, view) =>
+      nativeDocuments().bindFrameDocument(doc, location, view);
     Object.defineProperty(Element.prototype, "outerHTML", Object.getOwnPropertyDescriptor({
       get outerHTML() {
         if (this.__handle === undefined && this.__detachedChildren)

@@ -882,8 +882,15 @@ static inline bool document_element_name_is_ignoring_case(
     return name != NULL && strlen(wanted) == length
         && strncasecmp(name, wanted, length) == 0;
 }
+/* An attribute's value, or NULL when the element has no such attribute.
+   A valueless attribute (<script crossorigin>) has the empty value "", as
+   the DOM defines it: lexbor stores no value for one, and treating that as
+   absent would make every boolean and enumerated attribute written without
+   a value read as missing. */
 const char *document_attribute(lxb_dom_node_t *node, const char *name,
                                size_t *length);
+/* The element's crossorigin CORS settings attribute state. */
+TilefinchCorsSettings document_cors_settings(lxb_dom_node_t *node);
 /* An HTML <meta http-equiv=refresh> (ASCII case-insensitive). */
 bool document_is_refresh_meta(lxb_dom_node_t *node);
 /* The one rule for a page's preview image: a <meta> whose property (or,
@@ -907,10 +914,17 @@ bool document_mark_shadow_carrier(lxb_dom_node_t *node);
 #if !defined(__PSP__)
 /* Children visited looking for carriers since the process started. */
 size_t document_test_shadow_scan_visits(void);
+/* Attributes examined while identifying native carriers. */
+size_t document_test_shadow_attribute_visits(void);
 /* Attribute lookups that went through lexbor's name table. */
 size_t document_test_attribute_table_lookups(void);
 #endif
 bool document_node_is_shadow_carrier(const lxb_dom_node_t *node);
+/* Scripts cannot remove a carrier's native identity attribute. An author
+   attribute with the same name is ordinary; native teardown stays free to
+   destroy the carrier and its attributes directly. */
+bool document_shadow_attribute_protected(const lxb_dom_node_t *node,
+                                          const char *name, size_t length);
 lxb_dom_node_t *document_shadow_carrier_of_host(const lxb_dom_node_t *host);
 /* The nearest carrier at or above `node` (bounded walk), or NULL. */
 lxb_dom_node_t *document_shadow_carrier_containing(

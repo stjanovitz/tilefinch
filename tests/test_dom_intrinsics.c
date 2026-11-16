@@ -255,7 +255,7 @@ static bool test_test_probe_surface(void)
         "'__tilefinchCanvasDiagnostics','__tilefinchTransitionStats',"
         "'__tilefinchDiagnosticLookup','__tilefinchLastUncaughtTask',"
         "'__tilefinchXHRSendCalls','__tilefinchXHRLastStates',"
-        "'__tilefinchXHRDiagnostics','__tilefinchFrameEvalTelemetry',"
+        "'__tilefinchXHRDiagnostics',"
         "'__tilefinchDiagnosticMobileSafari','__tilefinchClearNodeCache']"
         ".filter(name=>name in globalThis);"
         "if(present.length)throw Error('test probes: '+present.join());"
@@ -415,6 +415,168 @@ static bool test_element_id_memo(void)
     return ok && zero;
 }
 
+/* A live childNodes list steps to an index from the nearest of its first
+   child, its cursor and its last child, so walking 3,000 children
+   backwards steps over about as many nodes as walking them forwards (it
+   was quadratic: about 4.5 million steps). Counted, not timed. */
+static bool test_child_nodes_reverse_walk(void)
+{
+    const char *name = "child-nodes-reverse-walk";
+    if (selected_case != NULL && strcmp(name, selected_case) != 0) return true;
+    selected_case_ran = true;
+    ScriptPageFixture fixture;
+    if (!script_page_fixture_open(&fixture,
+            "<body><div id=host></div><script></script></body>", 0))
+        return false;
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &fixture.document, &fixture.budget, 12u * 1024u * 1024u, 4000,
+        "https://dom-intrinsics.test/", &fixture.options, &result);
+    bool ok = runtime != NULL && script_runtime_evaluate_diagnostic(runtime,
+        "(()=>{const h=document.getElementById('host');"
+        "for(let i=0;i<3000;i++)h.appendChild(document.createElement('i'))"
+        ".id='c'+i;globalThis.pocSummary='OK'})()", name, &result)
+        && strcmp(result.summary, "OK") == 0;
+    static const char forward[] =
+        "(()=>{const l=document.getElementById('host').childNodes;let n=0;"
+        "for(let i=0;i<l.length;i++)if(l[i].id==='c'+i)n++;"
+        "globalThis.pocSummary=String(n)})()";
+    static const char reverse[] =
+        "(()=>{const l=document.getElementById('host').childNodes;let n=0;"
+        "for(let i=l.length-1;i>=0;i--)if(l[i].id==='c'+i)n++;"
+        "globalThis.pocSummary=String(n)})()";
+    /* Jumps among the three starting points land on the right child. */
+    static const char jumps[] =
+        "(()=>{const l=document.getElementById('host').childNodes,"
+        "at=[0,2999,1,2998,1500,1499,1501,10,2990,3000,-1];"
+        "globalThis.pocSummary=at.map(i=>l[i]?l[i].id:'none').join()})()";
+    size_t before = result.node_list_index_steps, forward_steps = 0,
+        reverse_steps = 0;
+    ok = ok && script_runtime_evaluate_diagnostic(runtime, forward, name,
+                                                  &result)
+        && strcmp(result.summary, "3000") == 0;
+    forward_steps = result.node_list_index_steps - before;
+    before = result.node_list_index_steps;
+    ok = ok && script_runtime_evaluate_diagnostic(runtime, reverse, name,
+                                                  &result)
+        && strcmp(result.summary, "3000") == 0;
+    reverse_steps = result.node_list_index_steps - before;
+    ok = ok && script_runtime_evaluate_diagnostic(runtime, jumps, name,
+                                                  &result)
+        && strcmp(result.summary, "c0,c2999,c1,c2998,c1500,c1499,c1501,"
+                                  "c10,c2990,none,none") == 0;
+    if (ok && (forward_steps > 3000u || reverse_steps > 3000u))
+        ok = false;
+    if (!ok)
+        fprintf(stderr, "%s: forward=%zu reverse=%zu summary=%s %s\n", name,
+                forward_steps, reverse_steps, result.summary, result.error);
+    script_runtime_destroy(runtime);
+    bool zero = script_page_fixture_close(&fixture);
+    printf("%s: %s (steps forward %zu, reverse %zu)\n", name,
+           ok && zero ? "PASS" : "FAIL", forward_steps, reverse_steps);
+    return ok && zero;
+}
+
+/* Count real attribute visits, not elapsed time: selecting the cached
+   cursor must not first inspect an attribute-heavy first child again. */
+static bool test_child_nodes_attribute_work(bool shadow)
+{
+    const char *name = shadow ? "shadow-child-nodes-attribute-work"
+        : "child-nodes-attribute-work";
+    if (selected_case != NULL && strcmp(name, selected_case) != 0) return true;
+    selected_case_ran = true;
+    ScriptPageFixture fixture;
+    if (!script_page_fixture_open(&fixture, "<script></script>", 0)) return false;
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &fixture.document, &fixture.budget, 12u * 1024u * 1024u, 1000,
+        "https://dom-intrinsics.test/", &fixture.options, &result);
+    bool ok = runtime != NULL && script_runtime_evaluate_diagnostic(runtime,
+        "globalThis.walkHeld=[];globalThis.walkHost=document.createElement('div');"
+        "for(let i=0;i<512;i++){const c=document.createElement('i');c.id='c'+i;"
+        "walkHeld.push(c);walkHost.appendChild(c)}"
+        "for(let a=0;a<256;a++)walkHeld[0].setAttribute('data-test-'+a,''+a);",
+        name, &result);
+    if (ok && shadow) ok = script_runtime_evaluate_diagnostic(runtime,
+        "walkHost.attachShadow({mode:'open'}).innerHTML='<slot></slot>'",
+        name, &result);
+    ok = ok && script_runtime_evaluate_diagnostic(runtime,
+        "globalThis.walkList=walkHost.childNodes;"
+        "if(walkList.length!==512)throw Error('length');"
+        "for(let i=0;i<512;i++)if(walkList[i]!==walkHeld[i])throw Error('warm order');",
+        name, &result);
+    size_t visits = document_test_shadow_attribute_visits();
+    size_t steps = result.node_list_index_steps;
+    ok = ok && script_runtime_evaluate_diagnostic(runtime,
+        "for(let i=0;i<walkList.length;i++)"
+        "if(walkList[i]!==walkHeld[i])throw Error('forward order');",
+        name, &result);
+    size_t forward_visits = document_test_shadow_attribute_visits() - visits;
+    size_t forward_steps = result.node_list_index_steps - steps;
+    visits = document_test_shadow_attribute_visits();
+    steps = result.node_list_index_steps;
+    ok = ok && script_runtime_evaluate_diagnostic(runtime,
+        "for(let i=walkList.length-1;i>=0;i--)"
+        "if(walkList[i]!==walkHeld[i])throw Error('reverse order');",
+        name, &result);
+    size_t reverse_visits = document_test_shadow_attribute_visits() - visits;
+    size_t reverse_steps = result.node_list_index_steps - steps;
+    ok = ok && forward_visits <= 4u * (512u + 256u)
+        && reverse_visits <= 4u * (512u + 256u)
+        && forward_steps <= 512u && reverse_steps <= 512u;
+    if (!ok) fprintf(stderr, "%s: visits=%zu/%zu steps=%zu/%zu %s\n",
+        name, forward_visits, reverse_visits, forward_steps, reverse_steps,
+        result.error);
+    script_runtime_destroy(runtime);
+    bool zero = script_page_fixture_close(&fixture);
+    printf("%s: %s (attribute visits forward %zu, reverse %zu)\n", name,
+        ok && zero ? "PASS" : "FAIL", forward_visits, reverse_visits);
+    return ok && zero;
+}
+
+/* Counting includes a bounded prefix, but a hidden carrier must not make
+   a truncated count look exact and enable the last-child shortcut. */
+static bool test_shadow_child_nodes_counting_boundary(void)
+{
+    const char *name = "shadow-child-nodes-counting-boundary";
+    if (selected_case != NULL && strcmp(name, selected_case) != 0) return true;
+    selected_case_ran = true;
+    ScriptPageFixture fixture;
+    if (!script_page_fixture_open(&fixture,
+            "<body><div></div><script></script></body>", 0)) return false;
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &fixture.document, &fixture.budget, 12u * 1024u * 1024u, 4000,
+        "https://dom-intrinsics.test/", &fixture.options, &result);
+    bool ok = runtime != NULL && script_runtime_evaluate_diagnostic(runtime,
+        "globalThis.__largeHost=document.body.firstChild;"
+        "__largeHost.attachShadow({mode:'open'})", name, &result);
+    lxb_dom_node_t *host = lxb_dom_interface_node(
+        lxb_html_document_body_element(fixture.document.html))->first_child;
+    for (unsigned i = 0; ok && i <= SCRIPT_DOM_HANDLE_SLOT_CAPACITY_MAX; i++) {
+        const char *tag = i == SCRIPT_DOM_HANDLE_SLOT_CAPACITY_MAX - 2u ? "b"
+            : i == SCRIPT_DOM_HANDLE_SLOT_CAPACITY_MAX - 1u ? "em"
+            : i == SCRIPT_DOM_HANDLE_SLOT_CAPACITY_MAX ? "u" : "i";
+        lxb_dom_element_t *element = lxb_dom_document_create_element(
+            &fixture.document.html->dom_document,
+            (const lxb_char_t *)tag, strlen(tag), NULL);
+        ok = element != NULL;
+        if (ok) lxb_dom_node_insert_child(host, lxb_dom_interface_node(element));
+    }
+    ok = ok && script_runtime_evaluate_diagnostic(runtime,
+        "(()=>{const l=__largeHost.childNodes;"
+        "if(l.length!==65505||l[65502].localName!=='b'"
+        "||l[65503].localName!=='em'||l[65504].localName!=='u'"
+        "||l[65505]!==undefined)throw Error('truncated list '+l.length);"
+        "globalThis.pocSummary='OK'})()", name, &result)
+        && strcmp(result.summary, "OK") == 0;
+    if (!ok) fprintf(stderr, "%s: %s\n", name, result.error);
+    script_runtime_destroy(runtime);
+    bool zero = script_page_fixture_close(&fixture);
+    printf("%s: %s\n", name, ok && zero ? "PASS" : "FAIL");
+    return ok && zero;
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 2) return 2;
@@ -425,6 +587,62 @@ int main(int argc, char **argv)
     ok &= test_author_sheet_owner_lifetime();
     ok &= test_test_probe_surface();
     ok &= test_element_id_memo();
+    ok &= test_child_nodes_reverse_walk();
+    ok &= test_child_nodes_attribute_work(false);
+    ok &= test_child_nodes_attribute_work(true);
+    ok &= test_shadow_child_nodes_counting_boundary();
+    ok &= run_case("shadow-carrier-marker-survives-attribute-removal",
+        "(()=>{const marker='data-tilefinch-shadow-root',"
+        "plain=document.createElement('div');"
+        "const remove=plain.removeAttribute,removeNS=plain.removeAttributeNS;"
+        "const routes=[r=>remove.call(r,marker),"
+        "r=>remove.call(r,marker.toUpperCase()),"
+        "r=>removeNS.call(r,null,marker),"
+        "r=>r.attributes.removeNamedItem(marker),"
+        "r=>r.attributes.removeNamedItemNS(null,marker)];"
+        "for(const mode of ['open','closed'])for(const erase of routes){"
+        "const h=document.createElement('div'),light=h.appendChild(document.createElement('i'));"
+        "document.body.append(h);const r=h.attachShadow({mode});"
+        "r.innerHTML='<b class=hidden-shadow-child>shadow</b>';const l=h.childNodes;"
+        "if(l.length!==1||l[0]!==light)throw Error('initial light tree');"
+        "erase(r);"
+        "if(l.length!==1||l[0]!==light||l[1]!==undefined)throw Error('carrier exposed');"
+        "if(document.querySelector('.hidden-shadow-child'))throw Error('shadow query exposed');"
+        "r.setAttribute('data-author','x');remove.call(r,'data-author');"
+        "if(r.hasAttribute('data-author'))throw Error('ordinary root attribute kept');"
+        "plain.setAttribute(marker,'author');erase(plain);"
+        "if(plain.hasAttribute(marker))throw Error('ordinary attribute protected');"
+        "h.remove()}globalThis.pocSummary='OK'})()");
+    ok &= run_case("collection-enumeration-refuses-unbounded-counts",
+        "(()=>{const h=document.createElement('div');"
+        "h.appendChild(document.createElement('i'));h.attachShadow({mode:'open'});"
+        "const l=h.childNodes,filter=Array.prototype.filter;"
+        "for(const length of [0x20000000,0x20000001,0xffffffff]){"
+        "let error=null;Array.prototype.filter=function(){return {length}};"
+        "try{Object.getOwnPropertyNames(l)}catch(e){error=e}"
+        "finally{Array.prototype.filter=filter}"
+        "if(error&&error.name!=='RangeError')throw Error('unsafe list refusal '+error);"
+        "if(l.length!==1||l[0].localName!=='i')throw Error('list damaged');"
+        "const d=Object.create(Document.prototype);"
+        "d.querySelectorAll=()=>({length});error=null;"
+        "try{Object.getOwnPropertyNames(d.all)}catch(e){error=e}"
+        "if(error?.name!=='RangeError')throw Error('unsafe all refusal '+error);"
+        "}globalThis.pocSummary='OK'})()");
+    ok &= run_case("shadow-child-nodes-linear-and-live",
+        "(()=>{const h=document.createElement('div');"
+        "for(let i=0;i<128;i++)h.appendChild(document.createElement('i')).id='c'+i;"
+        "h.attachShadow({mode:'open'}).innerHTML='<slot></slot>';"
+        "const l=h.childNodes,filter=Array.prototype.filter;let visits=0,n=0;"
+        "Array.prototype.filter=function(...args){visits+=this.length;"
+        "return Reflect.apply(filter,this,args)};"
+        "try{for(const child of l){if(child.id!=='c'+n++)throw Error('order')}"
+        "for(let i=l.length-1;i>=0;i--)if(l[i].id!=='c'+i)throw Error('reverse')}"
+        "finally{Array.prototype.filter=filter}"
+        "if(n!==128||visits>512)throw Error('repeated full scans '+visits);"
+        "h.removeChild(h.firstChild);h.appendChild(document.createElement('b'));"
+        "if(l!==h.childNodes||l.length!==128||l[0].id!=='c1'"
+        "||l[127].localName!=='b')throw Error('stale light tree');"
+        "globalThis.pocSummary='OK'})()");
     ok &= run_case("insertion-of-a-document-or-attr-changes-nothing",
         "(()=>{const host=document.createElement('div');document.body.append(host);"
         "const ref=host.appendChild(document.createElement('i')),"
@@ -1272,7 +1490,8 @@ int main(int argc, char **argv)
         "for(let i=0;i<list.childNodes.length;i++)if(list.childNodes[i])seen++;"
         "if(seen!==150)throw Error('seen '+seen);"
         "const reads=stats.liveCollectionReads-before;"
-        "if(reads!==3)throw Error('index loops read '+reads+' times');"
+        /* childNodes is a native live list and reads no copy at all. */
+        "if(reads!==2)throw Error('index loops read '+reads+' times');"
         "if(list.childNodes!==list.childNodes)throw Error('childNodes identity');"
         "const check=(label,want)=>{"
         "if(kids.length!==want||items.length!==want)"

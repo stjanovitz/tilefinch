@@ -286,7 +286,7 @@ static SourceStoreEntry *store_new_entry(ScriptSourceStore *store,
     store->stats.text_bytes += length;
     store->stats.entries++;
     entry->id = store->next_id++;
-    if (store->next_id == 0) store->next_id = 1;
+    if (store->next_id >= SCRIPT_SOURCE_STORE_ID_LIMIT) store->next_id = 1;
     entry->last_read = ++store->clock;
     if (store->last == NULL) store->entries = entry;
     else store->last->next = entry;

@@ -3307,7 +3307,8 @@ int main(int argc, char **argv)
            navigation.page.script_result.async_network_peak_inflight);
     printf("javascript-dynamic-scripts queued=%zu started=%zu completed=%zu "
            "failed=%zu cancelled=%zu cache-hits=%zu quota=%zu "
-           "ordered-waits=%zu peak-pending=%zu nomodule=%zu bytes=%zu\n",
+           "ordered-waits=%zu peak-pending=%zu nomodule=%zu bytes=%zu "
+           "preload-hits=%zu\n",
            navigation.page.script_result.dynamic_scripts_queued,
            navigation.page.script_result.dynamic_scripts_started,
            navigation.page.script_result.dynamic_scripts_completed,
@@ -3318,7 +3319,14 @@ int main(int argc, char **argv)
            navigation.page.script_result.dynamic_scripts_ordered_waits,
            navigation.page.script_result.dynamic_scripts_peak_pending,
            navigation.page.script_result.dynamic_scripts_nomodule_skipped,
-           navigation.page.script_result.dynamic_script_bytes);
+           navigation.page.script_result.dynamic_script_bytes,
+           navigation.page.script_result.dynamic_scripts_preload_hits);
+    printf("javascript-script-preloads parser-hits=%zu adopted=%zu "
+           "released=%zu released-bytes=%zu\n",
+           navigation.page.script_result.parser_scripts_preload_hits,
+           navigation.page.script_result.preloaded_scripts_adopted,
+           navigation.page.script_result.preloaded_scripts_released,
+           navigation.page.script_result.preloaded_scripts_released_bytes);
     printf("javascript-script-clone started=%zu unstarted=%zu "
            "suppressed=%zu refused=%zu\n",
            navigation.page.script_result.script_clones_started,
@@ -3481,6 +3489,22 @@ int main(int argc, char **argv)
              .lazy_webpack_compiled_factory_evictions,
            navigation.page.script_result
              .lazy_webpack_factory_compile_failures);
+    printf("javascript-lazy-factory-text compiles=%zu reads=%zu "
+           "read-bytes=%zu decodes=%zu decoded-bytes=%zu decode-us=%llu "
+           "plain-drops=%zu read-failures=%zu\n",
+           navigation.page.script_result.lazy_webpack_external_text_compiles,
+           navigation.page.script_result.lazy_webpack_external_text_reads,
+           navigation.page.script_result
+             .lazy_webpack_external_text_read_bytes,
+           navigation.page.script_result.lazy_webpack_external_text_decodes,
+           navigation.page.script_result
+             .lazy_webpack_external_text_decoded_bytes,
+           (unsigned long long) navigation.page.script_result
+             .lazy_webpack_external_text_decode_us,
+           navigation.page.script_result
+             .lazy_webpack_external_text_plain_drops,
+           navigation.page.script_result
+             .lazy_webpack_external_text_read_failures);
     printf("javascript-lazy-records lookups=%zu hits=%zu "
            "queued=%zu plan-us=%llu "
            "preflight-attempts=%zu preflight-us=%llu record-bytes=%zu "
@@ -3664,7 +3688,8 @@ int main(int argc, char **argv)
     printf("frames discovered=%zu loaded=%zu failed=%zu detached=%zu "
            "messages-posted=%zu messages-delivered=%zu dropped=%zu "
            "deferred=%zu max-deferred-run=%zu "
-           "to-parent=%zu to-child=%zu last-event=\"%s\"\n",
+           "to-parent=%zu to-child=%zu last-event=\"%s\" "
+           "memory-stopped=%zu\n",
            navigation.frames_discovered, navigation.frames_loaded,
            navigation.frames_failed, navigation.frames_detached,
            navigation.frame_messages_posted,
@@ -3674,7 +3699,8 @@ int main(int argc, char **argv)
            navigation.frame_message_max_deferred_run,
            navigation.frame_messages_to_parent,
            navigation.frame_messages_to_child,
-           navigation.last_frame_message_event);
+           navigation.last_frame_message_event,
+           navigation.frames_memory_stopped);
     printf("frame-message-events=\"%s\"\n",
            navigation.frame_message_event_log);
     printf("frame-message-last sequence=%llu source=%ld target=%ld\n",
@@ -3946,10 +3972,6 @@ cleanup:
         if (navigation.page.script_result.summary[0] != '\0') {
             fprintf(stderr, "page failure-summary=\"%s\"\n",
                     navigation.page.script_result.summary);
-        }
-        if (navigation.page.script_result.frame_eval_telemetry[0] != '\0') {
-            fprintf(stderr, "page frame-eval=\"%s\"\n",
-                    navigation.page.script_result.frame_eval_telemetry);
         }
         fprintf(stderr, "page performance-now calls=%zu last-ms=%.0f\n",
                 navigation.page.script_result.performance_now_calls,

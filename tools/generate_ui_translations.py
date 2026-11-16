@@ -51,11 +51,10 @@ CATALOGS.append((14, list(latest_languages.values())))
 CATALOGS.append((15, list(latest_languages.values())))
 CATALOGS.append((16, list(latest_languages.values())))
 CATALOGS.append((17, list(latest_languages.values())))
-# Hebrew joined in v18. v18 was not yet published when its next rows came,
-# so it holds every language, Hebrew last, rather than Hebrew alone with a
-# v19 for the rest: one catalog to publish at the next release.
+# Hebrew joined in v18. Published version paths remain immutable.
 latest_languages["he"] = ("he", "Hebrew", "HEBREW")
 CATALOGS.append((18, list(latest_languages.values())))
+CATALOGS.append((19, list(latest_languages.values())))
 ACTIVE_VERSION = CATALOGS[-1][0]
 # Languages read right to left: their catalog rows are stored in display
 # order at load and the browser's list panels are mirrored

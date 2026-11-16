@@ -408,13 +408,8 @@ TilefinchCredentialsMode credentials)
 TilefinchCredentialsMode js_rt_module_credentials_for_node(
 lxb_dom_node_t *node)
 {
-    size_t length = 0;
-    const char *value = document_attribute(node, "crossorigin", &length);
-    static const char use_credentials[] = "use-credentials";
-    return value != NULL && length == sizeof(use_credentials) - 1
-        && strncasecmp(value, use_credentials, length) == 0
-            ? TILEFINCH_CREDENTIALS_INCLUDE
-            : TILEFINCH_CREDENTIALS_SAME_ORIGIN;
+    return tilefinch_cors_settings_credentials(
+        document_cors_settings(node), true);
 }
 
 void js_rt_module_referrer_policy_for_node(

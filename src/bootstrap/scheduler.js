@@ -362,7 +362,7 @@
         const item = endpoint.queue.shift();
         if (!item) return;
         endpoint.deliveryInProgress = true;
-        current._deliver(item.data, item.ports, () => {
+        portSteps.deliver.call(current, item.data, item.ports, () => {
           endpoint.deliveryInProgress = false;
           if (endpoint.queue.length) scheduleEndpointDrain(endpoint);
         });
@@ -383,6 +383,7 @@
         if (!blocked && !scheduleEndpointDrain(endpoint)) blocked = true;
       });
     };
+    const portSteps = { __proto__: null };
     class MessagePort extends EventTarget {
       constructor(key, owner, endpoint = null) {
         super();
@@ -483,7 +484,7 @@
             value, __tilefinchRealmGlobal.__tilefinchWorkerCloneIntrinsics.owner,
             transfer, ports),
           target = this._peer;
-        if (target && !target._closed) target._enqueue(copied, ports);
+        if (target && !target._closed) portSteps.enqueue.call(target, copied, ports);
       }
     }
     class MessageChannel {
@@ -497,6 +498,11 @@
         this.port1._peer = this.port2;
         this.port2._peer = this.port1;
       }
+    }
+    /* Delivery steps are not members of the interface. */
+    for (const name of ["enqueue", "deliver"]) {
+      portSteps[name] = MessagePort.prototype["_" + name];
+      delete MessagePort.prototype["_" + name];
     }
     __tilefinchRealmGlobal.MessagePort = MessagePort;
     __tilefinchRealmGlobal.MessageChannel = MessageChannel;
@@ -727,7 +733,14 @@
         return deliverViewportEvent(viewport, event);
       },
     };
-    Object.setPrototypeOf(viewport, EventTarget.prototype);
+    /* CSSOM View: the viewport object is a VisualViewport. */
+    class VisualViewport extends EventTarget {
+      constructor() {
+        throw new TypeError("Illegal constructor");
+      }
+    }
+    Object.setPrototypeOf(viewport, VisualViewport.prototype);
+    __tilefinchRealmGlobal.VisualViewport = VisualViewport;
     __tilefinchRealmGlobal.visualViewport = viewport;
   }
   {
@@ -935,12 +948,12 @@
     composedEventTypes = new Set([
       "beforeinput", "click", "input", "keydown", "keypress", "keyup",
       "pointerdown", "pointermove", "pointerup", "mousedown", "mousemove",
-      "mouseup",
+      "mouseup", "compositionstart", "compositionupdate", "compositionend",
     ]),
     cancelableEventTypes = new Set([
       "beforeinput", "click", "keydown", "keypress", "keyup",
       "pointerdown", "pointermove", "pointerup", "mousedown", "mousemove",
-      "mouseup", "submit",
+      "mouseup", "submit", "compositionstart",
     ]);
   const tilefinchEvent = (name, overrides = null) => {
     name = String(name);
@@ -997,6 +1010,68 @@
     else event = newEvent(name, options);
     return trusted(event);
   };
+  /* The keys a PSP user really presses. X on a highlighted element is
+     Enter, as on a TV or console browser. The on-screen keyboards report
+     as a phone keyboard does, key "Unidentified" with keyCode 229; their
+     delete is Backspace. */
+  const ENTER_KEY = { key: "Enter", code: "Enter", keyCode: 13 },
+    VIRTUAL_KEY = { key: "Unidentified", code: "", keyCode: 229 },
+    BACKSPACE_KEY = { key: "Backspace", code: "Backspace", keyCode: 8 },
+    { HTMLInputElement, HTMLTextAreaElement } = globalThis,
+    selectionOf = document.getSelection,
+    selectionChanged = __tilefinchRealmGlobal.__tilefinchSelectionChanged,
+    fireKey = (target, type, key) => browserDispatch(target,
+      tilefinchEvent(type, {
+        key: key.key,
+        code: key.code,
+        keyCode: key.keyCode,
+        which: key.keyCode,
+        charCode: type === "keypress" ? key.keyCode : 0,
+      })),
+    fireComposition = (target, type, data) => browserDispatch(target,
+      tilefinchEvent(type, { data })),
+    fireInput = (target, type, data, inputType, isComposing) =>
+      browserDispatch(target, trusted(newEvent(type, {
+        bubbles: true,
+        composed: true,
+        cancelable: type === "beforeinput" && !isComposing,
+        data,
+        inputType,
+        isComposing,
+      }, "InputEvent"))),
+    activeElement = () => __tilefinchRealmGlobal.__tilefinchActiveElement,
+    /* Keys go to the focused element. A highlighted element that cannot
+       take focus leaves an unrelated earlier focus behind (a search field
+       the user moved away from); its keys go to the body instead, so that
+       field's Enter handler does not run. */
+    bodyTarget = () => document.body || document.documentElement || document,
+    keyTarget = (target) => {
+      const active = activeElement();
+      return active?.isConnected && (active === target ||
+        (isNode(active) && active.contains(target))) ? active : bodyTarget();
+    };
+  /* One Enter press: keydown, then keypress unless keydown was cancelled.
+     Cancelling either cancels what Enter does. keyup goes where focus is
+     at the release, or back to the keydown target. */
+  let enterTarget = null, enterFocus = null;
+  const enterDown = (target) => {
+      enterTarget = keyTarget(target);
+      enterFocus = activeElement();
+      if (!fireKey(enterTarget, "keydown", ENTER_KEY)) return false;
+      /* A keydown handler that removed the focused element leaves the
+         body focused. */
+      if (!enterTarget.isConnected) enterTarget = bodyTarget();
+      return fireKey(enterTarget, "keypress", ENTER_KEY);
+    },
+    enterUp = (target) => {
+      const active = activeElement();
+      let at = enterTarget || keyTarget(target);
+      if (active && active !== enterFocus && active !== document.body)
+        at = active;
+      else if (!at.isConnected) at = bodyTarget();
+      enterTarget = enterFocus = null;
+      return fireKey(at, "keyup", ENTER_KEY);
+    };
   __tilefinchRealmGlobal.__tilefinchDispatchAt = (selector, type) => {
     const target = selector
         ? document.querySelector(String(selector))
@@ -1137,7 +1212,7 @@
       }
     }
     let point = null;
-    if (phase) {
+    if (phase && phase < 6) {
       clientX = Number(clientX) || 0;
       clientY = Number(clientY) || 0;
       if (pointerCaptureTarget && typeof target.getBoundingClientRect === "function") {
@@ -1240,14 +1315,27 @@
       }
     };
     if (phase === 5) return clickDefault();
-    /* Controller activation is keyboard-like, not a fabricated pointer
-       gesture.  Pointer Events requires its click to use pointerId -1 and an
-       empty pointerType; low-level pointer/mouse events are reserved for the
-       actual pointer path above. */
-    if (phase === 0) {
+    /* X on a highlighted element is an Enter press (6): keydown and
+       keypress, the keyboard-style click (Pointer Events: pointerId -1, an
+       empty pointerType, detail 0), keyup. 7 and 8 are the press and the
+       release around a default C performs itself (a field's implicit
+       submission). 0 is the click alone, for the default button that
+       implicit submission clicks; it takes no focus. Pointer and mouse
+       events belong to the cursor path above. */
+    if (phase === 0) return clickDefault();
+    if (phase === 6 || phase === 7) {
       focusElement(target);
-      return clickDefault();
+      const accepted = enterDown(target);
+      if (phase === 7) return accepted;
+      let clicked = false;
+      try {
+        clicked = accepted && clickDefault();
+      } finally {
+        enterUp(target);
+      }
+      return clicked;
     }
+    if (phase === 8) return enterUp(target);
     const pointerAccepted = fire("pointerdown"),
       mouseAccepted = fire("mousedown");
     if (pointerAccepted && mouseAccepted) focusElement(target);
@@ -1255,6 +1343,36 @@
     fire("mouseup");
     return clickDefault();
   };
+  /* One keyboard edit, in Chrome's order. C calls "beforeinput" before
+     the native change and "input" after it, or "inputabort" when the
+     change does not happen after all; the key stays down in between.
+     Typed text (insertText) is a phone keyboard's plain commit: keydown
+     229, textInput, beforeinput, input, keyup. The keyboard session's Done
+     (insertCompositionText) commits one composition: keydown 229,
+     compositionstart, beforeinput (not cancelable), compositionupdate, the
+     change, compositionend, input, keyup. Backspace's keydown and
+     beforeinput can cancel its deletion; keyup follows either way. */
+  let edit = null;
+  const finishEdit = () => {
+      const pending = edit;
+      edit = null;
+      return !pending || fireKey(pending.target.isConnected
+        ? pending.target : bodyTarget(), "keyup", pending.key);
+    },
+    editSelectionChanged = (target, value) => {
+      /* The edit leaves the caret after the text, as typing does. */
+      if (target instanceof HTMLInputElement ||
+          target instanceof HTMLTextAreaElement) {
+        const end = value === null ? 0 : String(value).length;
+        if (target.__selectionStart === end && target.__selectionEnd === end)
+          return;
+        target.__selectionStart = target.__selectionEnd = end;
+        target.__selectionDirection = "none";
+        selectionChanged?.(target);
+      } else if (target.isConnected)
+        timerApply(selectionOf, document, [])
+          ?.collapse(target, target.childNodes.length);
+    };
   __tilefinchRealmGlobal.__tilefinchDispatchInputHandle = (
     handle,
     type,
@@ -1262,30 +1380,55 @@
     inputType,
     currentValue,
   ) => {
+    const name = String(type);
+    if (name === "inputabort") {
+      if (edit?.composing && edit.target.isConnected)
+        fireComposition(edit.target, "compositionend", "");
+      return finishEdit();
+    }
     const target = trustedWrap(Number(handle));
     if (!target) return false;
-    const name = String(type);
-    if (name === "input" && currentValue !== null) {
+    data = data === null ? null : String(data);
+    inputType = String(inputType || "");
+    const composing = inputType === "insertCompositionText";
+    if (name === "beforeinput") {
+      finishEdit();
+      const key = inputType === "deleteContentBackward"
+        ? BACKSPACE_KEY : VIRTUAL_KEY;
+      edit = { target, key, composing };
+      /* A phone keyboard's keydown cannot stop its text. */
+      if (!fireKey(target, "keydown", key) && key === BACKSPACE_KEY) {
+        finishEdit();
+        return false;
+      }
+      if (composing) {
+        fireComposition(target, "compositionstart", "");
+        fireInput(target, name, data, inputType, true);
+        fireComposition(target, "compositionupdate", data ?? "");
+        return true;
+      }
+      /* Typed text first fires a cancelable textInput TextEvent, as in
+         Chrome; cancelling it cancels the insertion like beforeinput. */
+      if (inputType === "insertText" && data !== null && data !== "") {
+        const text = createBootstrapEvent.call(document, "TextEvent");
+        text.initTextEvent("textInput", true, true, __tilefinchRealmGlobal, data);
+        if (!browserDispatch(target, trusted(text))) {
+          finishEdit();
+          return false;
+        }
+      }
+      if (fireInput(target, name, data, inputType, false)) return true;
+      finishEdit();
+      return false;
+    }
+    if (name !== "input") return fireInput(target, name, data, inputType, false);
+    if (currentValue !== null)
       __tilefinchRealmGlobal.__tilefinchSyncNativeControlValue?.(target, currentValue);
-    }
-    /* Typed text first fires a cancelable textInput TextEvent, as in
-       Chrome; cancelling it cancels the insertion like beforeinput. */
-    if (name === "beforeinput" && String(inputType) === "insertText" &&
-        data !== null && String(data) !== "") {
-      const text = createBootstrapEvent.call(document, "TextEvent");
-      text.initTextEvent("textInput", true, true, __tilefinchRealmGlobal, String(data));
-      if (!browserDispatch(target, trusted(text))) return false;
-    }
-    return browserDispatch(target,
-      trusted(
-        newEvent(name, {
-          bubbles: true,
-          cancelable: name === "beforeinput",
-          data: data === null ? null : String(data),
-          inputType: String(inputType || ""),
-        }, "InputEvent"),
-      ),
-    );
+    if (edit?.composing) fireComposition(target, "compositionend", data ?? "");
+    const accepted = fireInput(target, name, data, inputType, false);
+    editSelectionChanged(target, currentValue);
+    finishEdit();
+    return accepted;
   };
   __tilefinchRealmGlobal.__tilefinchDispatchSubmitHandle = (formHandle, submitterHandle) => {
     const form = trustedWrap(Number(formHandle)),

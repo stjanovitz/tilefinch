@@ -895,6 +895,8 @@ static ScriptRuntime *navigation_create_runtime(
         }
         session->next_top_level_js_heap = 0;
     }
+    if (document_scope == SCRIPT_DOCUMENT_SCOPE_TOP_LEVEL)
+        script_window_name_enter(session->window_name, url);
     ScriptRuntimeOptions options = {
         .session = session->browser_session,
         .fonts = fonts,
@@ -917,7 +919,9 @@ static ScriptRuntime *navigation_create_runtime(
         .document_scope = document_scope,
         .document_referrer = document_referrer,
         .navigation_started_us = navigation_started_us,
-        .referrer_policy = referrer_policy
+        .referrer_policy = referrer_policy,
+        .window_name = document_scope == SCRIPT_DOCUMENT_SCOPE_TOP_LEVEL
+            ? session->window_name : NULL
     };
     ScriptRuntime *runtime = script_runtime_create_configured(
         document, session->budget, js_memory_limit,
@@ -2120,6 +2124,9 @@ void navigation_retire_current_page_scripts(NavigationSession *session)
     /* postMessage payloads retain raw realm identities. Once every realm is
        retired they can neither be delivered nor safely remain queued. */
     navigation_clear_frame_messages(session, &session->page, true);
+    /* The page's scheduler outlives the realm here: give back the preload
+       requests the realm took over. */
+    script_runtime_cancel_preload_requests(session->page.runtime);
     if (session->page.runtime != NULL)
         script_runtime_destroy(session->page.runtime);
     session->page.runtime = NULL;

@@ -143,6 +143,9 @@ typedef struct {
        require it unchanged (nothing else, such as a second fallback copy,
        runs later). */
     size_t settle;
+    /* Refuse this (1-based) heap allocation of the page's first inline
+       event handler compile (0: none). */
+    unsigned refuse_handler_allocation;
 } PageCase;
 
 static const char probe[] =
@@ -195,6 +198,8 @@ static bool run_page_case(const PageCase *page)
     /* Script deadlines count work, not wall time, so a loaded machine
        cannot turn an out-of-memory stop into a timeout. */
     tilefinch_test_faults()->watchdog_poll_ms = 1u;
+    tilefinch_test_faults()->inline_handler_refuse_allocation =
+        page->refuse_handler_allocation;
     bool loaded = replaying && navigation_load_url(
         &navigation, generation, PAGE_URL, 64u * 1024u, 2000, 480,
         NULL, NULL, true);
@@ -262,6 +267,7 @@ static bool run_page_case(const PageCase *page)
     if (replaying) fetch_trace_end();
     if (navigation_ready) navigation_destroy(&navigation);
     tilefinch_test_faults()->watchdog_poll_ms = 0;
+    tilefinch_test_faults()->inline_handler_refuse_allocation = 0;
     if (browser_ready) browser_session_destroy(&browser);
     bool clean = budget.current == 0
         && budget_active_allocations(&budget, NULL) == 0;
@@ -796,13 +802,17 @@ static const PageCase fallback_late_throw_case = {
 
 /* The browser's own refusals fire `error` without a window error: a
    script over the per-file limit, and one that runs out of memory (the
-   realm then runs no more scripts). */
+   realm then runs no more scripts). The arrays are block-scoped, as in the
+   null case below, so the refused script's memory is released before the
+   element's error handler is compiled: kept in a global, whether that
+   handler still fit depended on how many bytes the bootstrap left in the
+   realm, and an out-of-memory handler reported to window.onerror instead. */
 static char oversized_body[80u * 1024u];
 
 static const PageRecord refusal_resources[] = {
     SCRIPT("https://errors.test/big.js", oversized_body),
     SCRIPT("https://errors.test/oom.js",
-           "rec('oom');const a=[];for(;;)a.push(new Array(65536).fill(1))"),
+           "rec('oom');{const a=[];for(;;)a.push(new Array(65536).fill(1))}"),
 };
 
 static const PageCase refusal_events_case = {
@@ -816,6 +826,25 @@ static const PageCase refusal_events_case = {
     .resources = refusal_resources,
     .resource_count = 2,
     .expected = "E:big,i,oom,E:oom >> ",
+};
+
+/* The out-of-memory refusal again, when the heap also refuses the
+   element's error handler as it compiles (here the first allocation of the
+   first compile; with the arrays in a global, whether it fit depended on
+   the bytes the bootstrap left). That refusal is the browser's too: it is
+   not reported to window.onerror, and the handler is compiled again when
+   it is next needed, here in the same dispatch. */
+static const PageCase refusal_handler_case = {
+    .name = "an error handler the heap refuses to compile",
+    .html =
+        PRELUDE QUIET_ONERROR "</script>"
+        "<script src='https://errors.test/oom.js'"
+        " onerror=\"rec('E:oom')\"></script>"
+        "</body>",
+    .resources = &refusal_resources[1],
+    .resource_count = 1,
+    .expected = "oom,E:oom >> ",
+    .refuse_handler_allocation = 1,
 };
 
 /* A script the watchdog interrupts did not finish: `error`, and no
@@ -875,7 +904,8 @@ int main(void)
         &deferred_events_case, &csp_events_case, &module_events_case,
         &dynamic_events_case, &written_events_case, &fallback_throw_case,
         &fallback_missing_case, &fallback_late_throw_case,
-        &refusal_events_case, &interrupt_events_case, &null_events_case,
+        &refusal_events_case, &refusal_handler_case, &interrupt_events_case,
+        &null_events_case,
     };
     size_t failures = 0;
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {

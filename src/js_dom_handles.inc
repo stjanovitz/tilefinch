@@ -1046,7 +1046,7 @@ JSValue js_dom_retain_node_wrapper(JSContext *context,
 /* What a wrapper holds that a new wrapper would have again: the three keys
    every wrapper is built with, then bootstrap's caches of what its node can
    answer (the owner document and namespace, from native state, and the live
-   children collection). Bootstrap's private slots (attribute objects, a
+   children collection and childNodes list). Bootstrap's private slots (attribute objects, a
    sheet) count as caches too, and are not listed: they were reclaimed with
    the wrapper before and a page's sheets can be large. Anything else on a
    wrapper is the page's, and keeps it through a collection. */
@@ -1056,7 +1056,7 @@ static void bridge_note_plain_wrapper_keys(JSContext *context,
 {
     static const char *const caches[] = {
         "__tilefinchAdoptedOwner", "__tilefinchChildrenCollection",
-        "__namespaceURI"
+        "__tilefinchChildNodeList", "__namespaceURI"
     };
     _Static_assert(3u + sizeof(caches) / sizeof(caches[0])
                        <= DOM_BRIDGE_WRAPPER_PLAIN_KEYS,

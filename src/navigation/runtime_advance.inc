@@ -472,6 +472,11 @@ bool navigation_advance_runtime(NavigationSession *session,
         }
         if (navigation_retire_failed_document_refresh(
                 session, frame->runtime)) return false;
+        /* A child realm that ran out of memory stops on its own; the page
+           and its other frames go on. */
+        if (navigation_stop_exhausted_frame_realm(session, frame,
+                                                  !frame_advanced))
+            continue;
         if (!frame_advanced) {
 #if NAVIGATION_CAPABILITY_TRACES_COMPILED
             /* reject_source_context is read only by the host lab. */
@@ -519,6 +524,7 @@ bool navigation_advance_runtime(NavigationSession *session,
         session->performance.advance_frames_us +=
             messages_started - frames_started;
     bool messages_delivered = navigation_deliver_frame_messages(session);
+    if (messages_delivered) navigation_stop_exhausted_frame_realms(session);
     uint64_t messages_finished = navigation_now_us();
     if (messages_finished > messages_started)
         session->performance.advance_messages_us +=

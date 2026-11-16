@@ -1831,6 +1831,10 @@ static TILEFINCH_OUT_OF_LINE bool commit_scripts(NavigationSession *session,
                 session->page.resource_scheduler = NULL;
             }
         }
+        /* Before the deferred scripts below can consume them. */
+        navigation_stream_hand_preloads_to_realm(
+            session, txn->streaming, session->page.runtime,
+            session->page.resource_scheduler);
         if (session->page.runtime != NULL) {
             script_runtime_set_stylesheet(session->page.runtime,
                                           &session->page.stylesheet);
@@ -1914,6 +1918,22 @@ static TILEFINCH_OUT_OF_LINE bool commit_scripts(NavigationSession *session,
                     return false;
                 }
             }
+            /* A script that filled the realm without failing the pipeline
+               (an inline script's error is the page's) leaves it as unable
+               to run as one that did; whether a later step also fails
+               depends on how much the error object took. A refused
+               allocation with room left is the page's to recover from, and
+               so is "out of memory" (or null) the page threw itself: the
+               heap must have refused an allocation since the last check. */
+            if (scripts_ok && session->page.runtime != NULL
+                && script_error_reports_out_of_memory(
+                       session->page.script_result.error)
+                && script_runtime_heap_rejections(session->page.runtime)
+                       > session->page.script_heap_rejections_seen
+                && script_runtime_heap_available(session->page.runtime)
+                       < 256u * 1024u)
+                (void) navigation_retire_exhausted_script_realms(
+                    session, false);
             bool hydration_degraded = !scripts_ok || metrics.failed != 0
                 || metrics.skipped_quota != 0
                 || metrics.skipped_pressure != 0
@@ -1978,6 +1998,9 @@ static TILEFINCH_OUT_OF_LINE bool commit_scripts(NavigationSession *session,
             }
         }
     }
+    /* No realm took them: cancel what parsing kept. */
+    navigation_stream_hand_preloads_to_realm(
+        session, txn->streaming, NULL, session->page.resource_scheduler);
     if (txn->streaming != NULL && txn->streaming->script_disabled_after_failure
         && txn->streaming->server_body_snapshot.markup != NULL) {
         (void) navigation_restore_server_body_if_degraded(

@@ -1304,6 +1304,8 @@ struct JSObject {
     
     uint8_t extensible : 1;
     uint8_t free_mark : 1; /* only used when freeing objects with cycles */
+    uint8_t platform_prototype : 1; /* a Web IDL interface prototype object */
+    uint8_t platform_member : 1; /* a function that needs a platform object as its receiver */
     uint8_t is_exotic : 1; /* TRUE if object has exotic property handlers */
     uint8_t fast_array : 1; /* TRUE if u.array is used for get/put (for JS_CLASS_ARRAY, JS_CLASS_ARGUMENTS, JS_CLASS_MAPPED_ARGUMENTS and typed arrays) */
     uint8_t is_constructor : 1; /* TRUE if object is a constructor function */
@@ -6730,6 +6732,8 @@ static JSValue JS_NewObjectFromShape2(JSContext *ctx, JSShape *sh, JSClassID cla
     p->is_std_array_prototype = 0;
     p->extensible = TRUE;
     p->free_mark = 0;
+    p->platform_prototype = 0;
+    p->platform_member = 0;
     p->is_exotic = 0;
     p->fast_array = 0;
     p->is_constructor = 0;
@@ -13279,6 +13283,400 @@ exception:
 static JSValue JS_ToPrimitive(JSContext *ctx, JSValueConst val, int hint)
 {
     return JS_ToPrimitiveFree(ctx, JS_DupValue(ctx, val), hint);
+}
+
+/* Web IDL receiver check. An interface member (operation, attribute getter
+   or setter) throws a TypeError unless its receiver implements an interface:
+   here, unless an interface prototype object is on the receiver's prototype
+   chain and the receiver is not one itself. undefined and null pass (the
+   function decides what its global object is) and so does a Proxy, whose
+   chain cannot be read without running its traps. */
+static BOOL js_platform_receiver(JSValueConst this_obj)
+{
+    JSObject *p;
+    int tag = JS_VALUE_GET_TAG(this_obj);
+    if (tag != JS_TAG_OBJECT)
+        return tag == JS_TAG_UNDEFINED || tag == JS_TAG_NULL;
+    p = JS_VALUE_GET_OBJ(this_obj);
+    if (p->platform_prototype)
+        return FALSE;
+    for (;;) {
+        if (p->class_id == JS_CLASS_PROXY)
+            return TRUE;
+        p = p->shape->proto;
+        if (!p)
+            return FALSE;
+        if (p->platform_prototype)
+            return TRUE;
+    }
+}
+
+void JS_SetPlatformMember(JSContext *ctx, JSValueConst func, JS_BOOL enabled)
+{
+    if (JS_VALUE_GET_TAG(func) == JS_TAG_OBJECT && JS_IsFunction(ctx, func))
+        JS_VALUE_GET_OBJ(func)->platform_member = enabled != 0;
+}
+
+/* A function an ECMAScript prototype also holds under the same name (a
+   value iterator's keys/values/entries are Array.prototype's) keeps
+   accepting any receiver. */
+static BOOL js_platform_shared_intrinsic(JSContext *ctx, JSAtom atom,
+                                         JSObject *func)
+{
+    JSValueConst holders[4];
+    int i;
+    holders[0] = ctx->class_proto[JS_CLASS_ARRAY];
+    holders[1] = ctx->class_proto[JS_CLASS_OBJECT];
+    holders[2] = ctx->function_proto;
+    holders[3] = ctx->class_proto[JS_CLASS_MAP];
+    for (i = 0; i < 4; i++) {
+        JSObject *holder;
+        JSShapeProperty *prs;
+        JSProperty *pr;
+        if (JS_VALUE_GET_TAG(holders[i]) != JS_TAG_OBJECT)
+            continue;
+        holder = JS_VALUE_GET_OBJ(holders[i]);
+        prs = find_own_property(&pr, holder, atom);
+        if (prs && (prs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL
+            && JS_VALUE_GET_TAG(pr->u.value) == JS_TAG_OBJECT
+            && JS_VALUE_GET_OBJ(pr->u.value) == func)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+/* The objects JS_SnapshotPlatformInterfaces found: an open-addressing set
+   of object pointers, each held by a reference so that no address is
+   reused while the snapshot lives. */
+struct JSPlatformSnapshot {
+    uint32_t bits; /* log2 of the slot count */
+    uint32_t count;
+    JSObject *slots[];
+};
+
+static uint32_t js_platform_snapshot_index(const JSPlatformSnapshot *s,
+                                           const JSObject *p)
+{
+    uint32_t h = (uint32_t)((uintptr_t)p >> 3) * 0x9E3779B1u;
+    return h >> (32 - s->bits);
+}
+
+static BOOL js_platform_snapshot_has(const JSPlatformSnapshot *s,
+                                     const JSObject *p)
+{
+    uint32_t mask = ((uint32_t)1 << s->bits) - 1, i;
+    for (i = js_platform_snapshot_index(s, p); s->slots[i]; i = (i + 1) & mask) {
+        if (s->slots[i] == p)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+/* Adds p to s, once; with s NULL, only counts it. */
+static void js_platform_snapshot_add(JSContext *ctx, JSPlatformSnapshot *s,
+                                     JSObject *p, uint32_t *visited)
+{
+    uint32_t mask, i;
+    (*visited)++;
+    if (!s || !p)
+        return;
+    mask = ((uint32_t)1 << s->bits) - 1;
+    for (i = js_platform_snapshot_index(s, p); s->slots[i]; i = (i + 1) & mask) {
+        if (s->slots[i] == p)
+            return;
+    }
+    s->slots[i] = p;
+    s->count++;
+    JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, p));
+}
+
+/* Visits each object a snapshot records: the global's own constructors
+   (data properties and global variables) and every function among the own
+   properties (values, getters, setters) of their marked prototypes. With
+   s NULL, only counts them. Returns the count. */
+static uint32_t js_platform_snapshot_fill(JSContext *ctx, JSObject *g,
+                                          JSPlatformSnapshot *s)
+{
+    JSShapeProperty *prs;
+    uint32_t i, count = g->shape->prop_count, visited = 0;
+    for (i = 0, prs = get_shape_prop(g->shape); i < count; i++, prs++) {
+        JSProperty *pr = &g->prop[i], *ppr;
+        JSShapeProperty *pprs, *mprs;
+        JSObject *ctor, *proto;
+        JSValueConst value;
+        uint32_t j;
+        if (prs->atom == JS_ATOM_NULL)
+            continue;
+        if ((prs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL)
+            value = pr->u.value;
+        else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF)
+            value = *pr->u.var_ref->pvalue;
+        else
+            continue;
+        if (JS_VALUE_GET_TAG(value) != JS_TAG_OBJECT)
+            continue;
+        ctor = JS_VALUE_GET_OBJ(value);
+        if (!ctor->is_constructor)
+            continue;
+        js_platform_snapshot_add(ctx, s, ctor, &visited);
+        pprs = find_own_property(&ppr, ctor, JS_ATOM_prototype);
+        if (!pprs || (pprs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL
+            || JS_VALUE_GET_TAG(ppr->u.value) != JS_TAG_OBJECT)
+            continue;
+        proto = JS_VALUE_GET_OBJ(ppr->u.value);
+        if (!proto->platform_prototype)
+            continue;
+        mprs = get_shape_prop(proto->shape);
+        for (j = 0; j < proto->shape->prop_count; j++) {
+            JSProperty *mpr = &proto->prop[j];
+            if (mprs[j].atom == JS_ATOM_NULL)
+                continue;
+            switch (mprs[j].flags & JS_PROP_TMASK) {
+            case JS_PROP_NORMAL:
+                if (JS_VALUE_GET_TAG(mpr->u.value) == JS_TAG_OBJECT)
+                    js_platform_snapshot_add(ctx, s,
+                                             JS_VALUE_GET_OBJ(mpr->u.value),
+                                             &visited);
+                break;
+            case JS_PROP_GETSET:
+                js_platform_snapshot_add(ctx, s, mpr->u.getset.getter,
+                                         &visited);
+                js_platform_snapshot_add(ctx, s, mpr->u.getset.setter,
+                                         &visited);
+                break;
+            default:
+                break;
+            }
+        }
+    }
+    return visited;
+}
+
+/* Records what the interfaces on global hold now (see
+   js_platform_snapshot_fill), for JS_MarkPlatformInterfaces to tell what
+   an embedder's script adds after it. NULL when out of memory. */
+JSPlatformSnapshot *JS_SnapshotPlatformInterfaces(JSContext *ctx,
+                                                  JSValueConst global)
+{
+    JSPlatformSnapshot *s;
+    uint32_t visited, bits = 4;
+    if (JS_VALUE_GET_TAG(global) != JS_TAG_OBJECT)
+        return NULL;
+    visited = js_platform_snapshot_fill(ctx, JS_VALUE_GET_OBJ(global), NULL);
+    /* at most half full */
+    while (bits < 30 && ((uint32_t)1 << bits) < 2 * visited)
+        bits++;
+    s = js_mallocz_rt(ctx->rt, sizeof(*s) + sizeof(s->slots[0]) * ((size_t)1 << bits));
+    if (!s)
+        return NULL;
+    s->bits = bits;
+    js_platform_snapshot_fill(ctx, JS_VALUE_GET_OBJ(global), s);
+    return s;
+}
+
+void JS_FreePlatformSnapshot(JSContext *ctx, JSPlatformSnapshot *s)
+{
+    uint32_t i;
+    if (!s)
+        return;
+    for (i = 0; i < ((uint32_t)1 << s->bits); i++) {
+        if (s->slots[i])
+            JS_FreeValue(ctx, JS_MKPTR(JS_TAG_OBJECT, s->slots[i]));
+    }
+    js_free_rt(ctx->rt, s);
+}
+
+static void js_platform_mark_function(JSContext *ctx, JSAtom atom,
+                                      JSObject *func,
+                                      const JSPlatformSnapshot *since)
+{
+    if (!func || !JS_IsFunction(ctx, JS_MKPTR(JS_TAG_OBJECT, func)))
+        return;
+    /* An async function rejects for a wrong receiver; it must not throw. */
+    if (func->class_id == JS_CLASS_ASYNC_FUNCTION)
+        return;
+    /* A function the interfaces already held is left as it is: marked
+       already, deliberately unmarked, or a page's own (a method a page
+       defined, or a native it copied there). */
+    if (since && js_platform_snapshot_has(since, func))
+        return;
+    if (!js_platform_shared_intrinsic(ctx, atom, func))
+        func->platform_member = 1;
+}
+
+/* Marks proto as an interface prototype object and each function among its
+   own properties (values, getters and setters; not `constructor`) as an
+   interface member. With lenient_handlers, the accessors of attributes
+   named on* are unmarked instead ([LegacyLenientThis] event handlers of
+   Window and Document), which also unmarks them for an interface that
+   shares the same accessor functions. Reads no property and runs no
+   script. */
+static void js_mark_platform_interface(JSContext *ctx, JSValueConst proto,
+                                       BOOL lenient_handlers,
+                                       const JSPlatformSnapshot *since)
+{
+    JSObject *p;
+    JSShapeProperty *prs;
+    uint32_t i, count;
+    if (JS_VALUE_GET_TAG(proto) != JS_TAG_OBJECT)
+        return;
+    p = JS_VALUE_GET_OBJ(proto);
+    if (p->class_id == JS_CLASS_PROXY || p->fast_array)
+        return;
+    p->platform_prototype = 1;
+    count = p->shape->prop_count;
+    for (i = 0, prs = get_shape_prop(p->shape); i < count; i++, prs++) {
+        JSProperty *pr = &p->prop[i];
+        JSAtom atom = prs->atom;
+        if (atom == JS_ATOM_NULL || atom == JS_ATOM_constructor)
+            continue;
+        /* A value iterator's keys, values, entries and @@iterator are
+           Array.prototype's own in Web IDL, generic over any receiver; an
+           embedder that defines its own keeps them generic. */
+        if (atom == JS_ATOM_keys || atom == JS_ATOM_values
+            || atom == JS_ATOM_Symbol_iterator)
+            continue;
+        if (!__JS_AtomIsTaggedInt(atom)) {
+            char buf[ATOM_GET_STR_BUF_SIZE];
+            JSAtomStruct *name = ctx->rt->atom_array[atom];
+            if (name->atom_type == JS_ATOM_TYPE_STRING && name->len == 7
+                && !strcmp(JS_AtomGetStr(ctx, buf, sizeof(buf), atom),
+                           "entries"))
+                continue;
+        }
+        if ((lenient_handlers || since)
+            && !__JS_AtomIsTaggedInt(atom)) {
+            JSAtomStruct *name = ctx->rt->atom_array[atom];
+            if (name->atom_type == JS_ATOM_TYPE_STRING && name->len > 2
+                && string_get(name, 0) == 'o' && string_get(name, 1) == 'n') {
+                /* Lenient: clear the mark, also when another interface
+                   shares the accessor. A later pass leaves it as it is. */
+                if (lenient_handlers
+                    && (prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
+                    if (pr->u.getset.getter)
+                        pr->u.getset.getter->platform_member = 0;
+                    if (pr->u.getset.setter)
+                        pr->u.getset.setter->platform_member = 0;
+                }
+                continue;
+            }
+        }
+        switch (prs->flags & JS_PROP_TMASK) {
+        case JS_PROP_NORMAL:
+            if (JS_VALUE_GET_TAG(pr->u.value) == JS_TAG_OBJECT)
+                js_platform_mark_function(ctx, atom,
+                                          JS_VALUE_GET_OBJ(pr->u.value),
+                                          since);
+            break;
+        case JS_PROP_GETSET:
+            js_platform_mark_function(ctx, atom, pr->u.getset.getter,
+                                      since);
+            js_platform_mark_function(ctx, atom, pr->u.getset.setter,
+                                      since);
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+void JS_MarkPlatformInterface(JSContext *ctx, JSValueConst proto,
+                              JS_BOOL lenient_handlers)
+{
+    js_mark_platform_interface(ctx, proto, lenient_handlers != 0, NULL);
+}
+
+/* Marks the prototype of every constructor among global's own data
+   properties as an interface (JS_MarkPlatformInterface), except the
+   ECMAScript constructors, whose prototypes are the realm's class
+   prototypes.
+   Accessor and lazily initialized globals are left alone. With since,
+   for use once author script may have run: what the embedder's own script
+   added after JS_SnapshotPlatformInterfaces took since. Constructors the
+   snapshot holds are visited only when their prototype is marked, and
+   functions it holds are never marked, so a page's classes and the
+   methods and natives a page put on an interface stay as they were,
+   however they were compiled. The on* attributes of what is visited stay
+   unmarked.
+   Returns the number of interfaces visited. */
+int JS_MarkPlatformInterfaces(JSContext *ctx, JSValueConst global,
+                              const JSPlatformSnapshot *since)
+{
+    JSObject *g;
+    JSShapeProperty *prs;
+    uint32_t i, count;
+    int marked = 0;
+    if (JS_VALUE_GET_TAG(global) != JS_TAG_OBJECT)
+        return 0;
+    g = JS_VALUE_GET_OBJ(global);
+    count = g->shape->prop_count;
+    for (i = 0, prs = get_shape_prop(g->shape); i < count; i++, prs++) {
+        JSProperty *pr = &g->prop[i], *ppr;
+        JSShapeProperty *pprs;
+        JSObject *ctor, *proto;
+        JSValueConst value;
+        BOOL builtin = FALSE, known = FALSE;
+        int k;
+        if (prs->atom == JS_ATOM_NULL)
+            continue;
+        /* global bindings are variable references */
+        if ((prs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL)
+            value = pr->u.value;
+        else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF)
+            value = *pr->u.var_ref->pvalue;
+        else
+            continue;
+        if (JS_VALUE_GET_TAG(value) != JS_TAG_OBJECT)
+            continue;
+        ctor = JS_VALUE_GET_OBJ(value);
+        if (!ctor->is_constructor)
+            continue;
+        pprs = find_own_property(&ppr, ctor, JS_ATOM_prototype);
+        if (!pprs || (pprs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL
+            || JS_VALUE_GET_TAG(ppr->u.value) != JS_TAG_OBJECT)
+            continue;
+        proto = JS_VALUE_GET_OBJ(ppr->u.value);
+        if (since) {
+            known = js_platform_snapshot_has(since, ctor);
+            if (known && !proto->platform_prototype)
+                continue;
+        }
+        for (k = 0; k < ctx->rt->class_count && !builtin; k++)
+            builtin = JS_VALUE_GET_TAG(ctx->class_proto[k]) == JS_TAG_OBJECT
+                && JS_VALUE_GET_OBJ(ctx->class_proto[k]) == proto
+                && k < JS_CLASS_INIT_COUNT;
+        for (k = 0; k < JS_NATIVE_ERROR_COUNT && !builtin; k++)
+            builtin = JS_VALUE_GET_TAG(ctx->native_error_proto[k]) == JS_TAG_OBJECT
+                && JS_VALUE_GET_OBJ(ctx->native_error_proto[k]) == proto;
+        if (builtin || (JS_VALUE_GET_TAG(ctx->function_proto) == JS_TAG_OBJECT
+                        && JS_VALUE_GET_OBJ(ctx->function_proto) == proto))
+            continue;
+        js_mark_platform_interface(ctx, ppr->u.value, FALSE, since);
+        /* Web IDL class string: the interface prototype object's own
+           @@toStringTag is the interface's name. Only where the prototype
+           names this constructor back, so an alias (Image, Audio) does not
+           rename another interface's prototype. */
+        if (!known && !find_own_property1(proto, JS_ATOM_Symbol_toStringTag)) {
+            JSProperty *cpr;
+            JSShapeProperty *cprs = find_own_property(&cpr, proto,
+                                                      JS_ATOM_constructor);
+            if (cprs && (cprs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL
+                && JS_VALUE_GET_TAG(cpr->u.value) == JS_TAG_OBJECT
+                && JS_VALUE_GET_OBJ(cpr->u.value) == ctor) {
+                JSValue name = JS_AtomToString(ctx, prs->atom);
+                JSValue target = JS_DupValue(ctx, ppr->u.value);
+                if (JS_IsException(name)
+                    || JS_DefinePropertyValue(ctx, target,
+                                              JS_ATOM_Symbol_toStringTag,
+                                              name, JS_PROP_CONFIGURABLE) < 0)
+                    JS_FreeValue(ctx, JS_GetException(ctx));
+                JS_FreeValue(ctx, target);
+                /* defining a property cannot move the global's own */
+            }
+        }
+        marked++;
+    }
+    return marked;
 }
 
 void JS_SetIsHTMLDDA(JSContext *ctx, JSValueConst obj)
@@ -19990,17 +20388,21 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
 
 /* A call from the interpreter loop (OP_call*, OP_call_method): a native
    function is entered as JS_CallInternal() would enter it, after the same
-   interrupt poll, without JS_CallInternal()'s frame setup, which is sized
-   for bytecode and costs about fifty instructions per call on the PSP. */
+   interrupt poll and Web IDL receiver check, without JS_CallInternal()'s
+   frame setup, which is sized for bytecode and costs about fifty
+   instructions per call on the PSP. */
 static inline JSValue js_call_from_bytecode(JSContext *ctx,
                                             JSValueConst func_obj,
                                             JSValueConst this_obj,
                                             int argc, JSValue *argv)
 {
+    JSObject *p;
     if (JS_VALUE_GET_TAG(func_obj) == JS_TAG_OBJECT &&
-        JS_VALUE_GET_OBJ(func_obj)->class_id == JS_CLASS_C_FUNCTION) {
+        (p = JS_VALUE_GET_OBJ(func_obj))->class_id == JS_CLASS_C_FUNCTION) {
         if (unlikely(js_poll_interrupts(ctx)))
             return JS_EXCEPTION;
+        if (unlikely(p->platform_member) && !js_platform_receiver(this_obj))
+            return JS_ThrowTypeError(ctx, "Illegal invocation");
         return js_call_c_function(ctx, func_obj, this_obj, argc,
                                   (JSValueConst *)argv, 0);
     }
@@ -20196,6 +20598,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         }
     }
     p = JS_VALUE_GET_OBJ(func_obj);
+    if (unlikely(p->platform_member) && !js_platform_receiver(this_obj))
+        return JS_ThrowTypeError(caller_ctx, "Illegal invocation");
     if (unlikely(p->class_id != JS_CLASS_BYTECODE_FUNCTION)) {
         JSClassCall *call_func;
         if (p->class_id != JS_CLASS_C_FUNCTION && p->class_id != JS_CLASS_C_FUNCTION_DATA)

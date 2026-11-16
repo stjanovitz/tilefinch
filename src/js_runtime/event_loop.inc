@@ -1658,8 +1658,10 @@ static bool runtime_pump_network(ScriptRuntime *runtime,
         ScriptDynamicTask *next = NULL;
         for (size_t i = 0; i < SCRIPT_DYNAMIC_TASK_LIMIT; i++) {
             ScriptDynamicTask *task = &bridge->dynamic_scripts[i];
+            /* One whose preload is still in flight waits for it. */
             if (task->active && task->state == SCRIPT_DYNAMIC_QUEUED
-                && (next == NULL || task->sequence < next->sequence)) {
+                && (next == NULL || task->sequence < next->sequence)
+                && !js_rt_dynamic_task_awaits_preload(bridge, task)) {
                 next = task;
             }
         }

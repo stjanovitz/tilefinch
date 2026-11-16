@@ -9,6 +9,7 @@
 #include "tilefinch/script_lazy.h"
 #include "tilefinch/sha256.h"
 #include "tilefinch/url.h"
+#include "js_source_store.h"
 #include "script_text_lz.h"
 
 #include <stdio.h>
@@ -192,6 +193,7 @@ static void lazy_bundle_destroy(JSContext *context, Budget *budget,
     lazy_bundle_release_source(bundle);
     for (size_t i = 0; i < bundle->factory_count; i++) {
         budget_free(budget, bundle->factories[i].compressed_source);
+        budget_free(budget, bundle->factories[i].plain);
     }
     budget_free(budget, bundle->factories);
     budget_free(budget, bundle->source_url);
@@ -203,6 +205,9 @@ void js_lazy_webpack_bundles_destroy(ScriptRuntime *runtime)
     if (runtime == NULL) return;
     ScriptLazyRuntimeBundle *bundle = runtime->lazy_webpack_bundles;
     runtime->lazy_webpack_bundles = NULL;
+    /* functions freed later find no factory (js_lazy_webpack_text_*) */
+    runtime->lazy_webpack_external_text_bytes = 0;
+    runtime->lazy_webpack_plain_text_bytes = 0;
     while (bundle != NULL) {
         ScriptLazyRuntimeBundle *next = bundle->next;
         lazy_bundle_destroy(runtime->context, runtime->budget, bundle);
@@ -267,16 +272,28 @@ static bool lazy_factory_store_source(
             &factory->compressed_source_capacity);
 }
 
+/* A factory compiles as a program of its own: this prefix, the factory's
+   text, and ")". */
+static const char lazy_strict_prefix[] = "\"use strict\";(\n";
+static const char lazy_loose_prefix[] = "(\n";
+
+static size_t lazy_program_prefix(const ScriptLazyRuntimeBundle *bundle,
+                                  const char **prefix)
+{
+    if (prefix != NULL)
+        *prefix = bundle->strict_mode ? lazy_strict_prefix
+                                      : lazy_loose_prefix;
+    return bundle->strict_mode ? sizeof(lazy_strict_prefix) - 1
+                               : sizeof(lazy_loose_prefix) - 1;
+}
+
 static bool lazy_factory_program(Budget *budget,
                                  const ScriptLazyRuntimeBundle *bundle,
                                  const ScriptLazyRuntimeFactory *factory,
                                  char **program, size_t *program_length)
 {
-    static const char strict_prefix[] = "\"use strict\";(\n";
-    static const char loose_prefix[] = "(\n";
-    const char *prefix = bundle->strict_mode ? strict_prefix : loose_prefix;
-    size_t prefix_length = bundle->strict_mode
-        ? sizeof(strict_prefix) - 1 : sizeof(loose_prefix) - 1;
+    const char *prefix = NULL;
+    size_t prefix_length = lazy_program_prefix(bundle, &prefix);
     bool raw_available = bundle->source != NULL
         && factory->source_offset <= bundle->source_length
         && factory->source_length
@@ -288,7 +305,8 @@ static bool lazy_factory_program(Budget *budget,
         return false;
     }
     size_t length = prefix_length + factory->source_length + 1;
-    char *copy = budget_malloc(budget, length + 1);
+    char *copy = budget_malloc_category(budget, BUDGET_CATEGORY_JAVASCRIPT,
+                                        length + 1);
     if (copy == NULL) return false;
     memcpy(copy, prefix, prefix_length);
     bool restored = raw_available;
@@ -314,13 +332,358 @@ static bool lazy_factory_program(Budget *budget,
     return true;
 }
 
+/* ---- Factory text outside the heap ----
+
+   QuickJS keeps the text of each function it compiles for
+   Function.prototype.toString(), and a lazily compiled inner function
+   compiles its body from that text on its first call. For a factory that
+   is a plain copy, in the realm heap and for as long as any of its
+   functions lives, of text compressed_source already holds (on
+   login.live.com, 1.7 MiB for 403 factories). A factory whose program
+   (lazy_factory_program()) is at least LAZY_EXTERNAL_TEXT_MINIMUM bytes
+   therefore compiles with JS_STRIP_SOURCE and names its program by an
+   external id (JS_SetExternalSourceHooks(); evaluation.inc routes ids at or
+   above SCRIPT_SOURCE_STORE_ID_LIMIT here), so its functions record only
+   where their text is. A read is served from the factory's plain copy,
+   or decodes compressed_source from its start up to the end of the read
+   into a new one. The compile's program buffer becomes the first plain
+   copy.
+
+   Plain copies follow the function-source store's rule, plain first and
+   given up under pressure: at each safe point they are trimmed, least
+   recently read first, to what the page's room allows plain (a quarter
+   of it, less the store's own plain text: js_rt_source_store_safe_point()),
+   all of them once the realm was refused growth, and when the
+   realm's growth would be refused they go before the store's text
+   (js_rt_source_store_relieve()). Dropping one loses nothing:
+   compressed_source lives as long as the bundle, so a read never fails
+   while it does, and the text is never "required" the way the store's
+   is. A copy is also dropped when no function refers to its text any
+   more. TILEFINCH_LAZY_WEBPACK_FACTORY_TEXT=heap (lab builds) keeps the
+   text in the heap, for A/B measurement. */
+#define LAZY_EXTERNAL_TEXT_MINIMUM 1024u
+#define LAZY_EXTERNAL_INDEX_BITS 13u
+#define LAZY_EXTERNAL_BUNDLE_LIMIT \
+    ((uint32_t) (SCRIPT_SOURCE_STORE_ID_LIMIT >> LAZY_EXTERNAL_INDEX_BITS))
+_Static_assert(SCRIPT_LAZY_RESIDENT_FACTORY_LIMIT
+                   <= (1u << LAZY_EXTERNAL_INDEX_BITS),
+               "a factory index fits in an external text id");
+
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+#define LAZY_TEXT_TIMING 1
+#else
+#define LAZY_TEXT_TIMING 0
+#endif
+
+enum { LAZY_TEXT_ASCII_UNKNOWN = 0, LAZY_TEXT_ASCII_YES, LAZY_TEXT_ASCII_NO };
+
+static bool lazy_external_text_enabled(void)
+{
+    const char *mode =
+        tilefinch_lab_getenv("TILEFINCH_LAZY_WEBPACK_FACTORY_TEXT");
+    return mode == NULL || strcmp(mode, "heap") != 0;
+}
+
+static size_t lazy_program_length(const ScriptLazyRuntimeBundle *bundle,
+                                  const ScriptLazyRuntimeFactory *factory)
+{
+    return lazy_program_prefix(bundle, NULL) + factory->source_length + 1u;
+}
+
+/* The external id of factory `index`'s program text, or 0 if the bundle's
+   identifier does not fit in one. */
+static uint32_t lazy_external_id(const ScriptLazyRuntimeBundle *bundle,
+                                 size_t index)
+{
+    if (bundle->identifier == 0
+        || bundle->identifier >= LAZY_EXTERNAL_BUNDLE_LIMIT
+        || index >= SCRIPT_LAZY_RESIDENT_FACTORY_LIMIT) return 0;
+    return SCRIPT_SOURCE_STORE_ID_LIMIT
+        | (bundle->identifier << LAZY_EXTERNAL_INDEX_BITS)
+        | (uint32_t) index;
+}
+
+/* The factory external id `id` names, or NULL once its bundle is gone
+   (the realm is being destroyed). */
+static ScriptLazyRuntimeFactory *lazy_external_factory(
+    ScriptRuntime *runtime, uint32_t id,
+    const ScriptLazyRuntimeBundle **bundle_out)
+{
+    if (runtime == NULL || id < SCRIPT_SOURCE_STORE_ID_LIMIT) return NULL;
+    uint32_t local = id - SCRIPT_SOURCE_STORE_ID_LIMIT;
+    ScriptLazyRuntimeBundle *bundle = lazy_bundle_find(
+        runtime, local >> LAZY_EXTERNAL_INDEX_BITS);
+    size_t index = local & ((1u << LAZY_EXTERNAL_INDEX_BITS) - 1u);
+    if (bundle == NULL || index >= bundle->factory_count) return NULL;
+    if (bundle_out != NULL) *bundle_out = bundle;
+    return &bundle->factories[index];
+}
+
+static void lazy_plain_drop(ScriptRuntime *runtime,
+                            const ScriptLazyRuntimeBundle *bundle,
+                            ScriptLazyRuntimeFactory *factory)
+{
+    if (factory->plain == NULL) return;
+    size_t held = lazy_program_length(bundle, factory) + 1u;
+    budget_free(runtime->budget, factory->plain);
+    factory->plain = NULL;
+    factory->plain_length = 0;
+    factory->plain_input = 0;
+    runtime->lazy_webpack_plain_text_bytes -=
+        held < runtime->lazy_webpack_plain_text_bytes
+            ? held : runtime->lazy_webpack_plain_text_bytes;
+}
+
+size_t js_lazy_webpack_text_trim(ScriptRuntime *runtime, size_t allowance)
+{
+    if (runtime == NULL) return 0;
+    size_t before = runtime->lazy_webpack_plain_text_bytes;
+    while (runtime->lazy_webpack_plain_text_bytes > allowance) {
+        ScriptLazyRuntimeBundle *victim_bundle = NULL;
+        ScriptLazyRuntimeFactory *victim = NULL;
+        for (ScriptLazyRuntimeBundle *bundle = runtime->lazy_webpack_bundles;
+             bundle != NULL; bundle = bundle->next) {
+            for (size_t i = 0; i < bundle->factory_count; i++) {
+                ScriptLazyRuntimeFactory *factory = &bundle->factories[i];
+                if (factory->plain == NULL) continue;
+                if (allowance == 0) {
+                    /* everything goes: no need to order */
+                    lazy_plain_drop(runtime, bundle, factory);
+                    js_rt_saturating_add_size(
+                        &runtime->result
+                             .lazy_webpack_external_text_plain_drops, 1);
+                    continue;
+                }
+                if (victim == NULL
+                    || factory->plain_used < victim->plain_used) {
+                    victim = factory;
+                    victim_bundle = bundle;
+                }
+            }
+        }
+        if (victim == NULL) break;
+        lazy_plain_drop(runtime, victim_bundle, victim);
+        js_rt_saturating_add_size(
+            &runtime->result.lazy_webpack_external_text_plain_drops, 1);
+    }
+    size_t after = runtime->lazy_webpack_plain_text_bytes;
+    return before > after ? before - after : 0;
+}
+
+/* Makes `factory`'s plain copy hold at least `end` bytes of its program;
+   false if the Budget refused the copy or the text does not decode. */
+static bool lazy_plain_ensure(ScriptRuntime *runtime,
+                              const ScriptLazyRuntimeBundle *bundle,
+                              ScriptLazyRuntimeFactory *factory, size_t end)
+{
+    const char *prefix = NULL;
+    size_t prefix_length = lazy_program_prefix(bundle, &prefix);
+    size_t program_length = prefix_length + factory->source_length + 1u;
+    if (factory->plain != NULL && factory->plain_length >= end) return true;
+    if (factory->plain == NULL) {
+        unsigned char *plain = budget_malloc_category(
+            runtime->budget, BUDGET_CATEGORY_JAVASCRIPT, program_length + 1u);
+        if (plain == NULL) {
+            /* other factories' copies give way to this one */
+            (void) js_lazy_webpack_text_trim(runtime, 0);
+            plain = budget_malloc_category(
+                runtime->budget, BUDGET_CATEGORY_JAVASCRIPT,
+                program_length + 1u);
+            if (plain == NULL) return false;
+        }
+        memcpy(plain, prefix, prefix_length);
+        factory->plain = plain;
+        factory->plain_length = prefix_length;
+        factory->plain_input = 0;
+        runtime->lazy_webpack_plain_text_bytes += program_length + 1u;
+    }
+    size_t text_at = factory->plain_length - prefix_length;
+    if (text_at > factory->source_length) text_at = factory->source_length;
+    size_t text_end = end > prefix_length ? end - prefix_length : 0;
+    if (text_end > factory->source_length) text_end = factory->source_length;
+    if (text_at < text_end) {
+        size_t decoded_from = text_at;
+        unsigned char *text = factory->plain + prefix_length;
+        bool raw = bundle->source != NULL
+            && factory->source_offset <= bundle->source_length
+            && factory->source_length
+                   <= bundle->source_length - factory->source_offset;
+        if (raw) {
+            /* still registering: the bundle's own bytes are at hand */
+            memcpy(text, bundle->source + factory->source_offset,
+                   factory->source_length);
+            factory->plain_input = factory->compressed_source_length;
+            text_at = factory->source_length;
+        } else {
+#if LAZY_TEXT_TIMING
+            uint64_t started_ns = js_rt_monotonic_time_ns();
+#endif
+            if (factory->compressed_source == NULL
+                || !script_text_lz_decompress_until(
+                       factory->compressed_source,
+                       factory->compressed_source_length, text,
+                       factory->source_length, &factory->plain_input,
+                       &text_at, text_end)
+                || text_at < text_end) {
+                lazy_plain_drop(runtime, bundle, factory);
+                return false;
+            }
+#if LAZY_TEXT_TIMING
+            runtime->result.lazy_webpack_external_text_decode_us +=
+                (js_rt_monotonic_time_ns() - started_ns) / 1000u;
+#endif
+            js_rt_saturating_add_size(
+                &runtime->result.lazy_webpack_external_text_decodes, 1);
+            js_rt_saturating_add_size(
+                &runtime->result.lazy_webpack_external_text_decoded_bytes,
+                text_at - decoded_from);
+        }
+        factory->plain_length = prefix_length + text_at;
+    }
+    if (end == program_length && text_at == factory->source_length
+        && factory->plain_length < program_length) {
+        factory->plain[program_length - 1u] = ')';
+        factory->plain[program_length] = '\0';
+        factory->plain_length = program_length;
+    }
+    return factory->plain_length >= end;
+}
+
+int js_lazy_webpack_text_read(ScriptRuntime *runtime, uint32_t id,
+                              uint32_t offset, uint32_t length, char *dest)
+{
+    const ScriptLazyRuntimeBundle *bundle = NULL;
+    ScriptLazyRuntimeFactory *factory =
+        lazy_external_factory(runtime, id, &bundle);
+    if (runtime != NULL)
+        js_rt_saturating_add_size(
+            &runtime->result.lazy_webpack_external_text_reads, 1);
+    size_t program_length = factory == NULL
+        ? 0 : lazy_program_length(bundle, factory);
+    if (factory == NULL || offset > program_length
+        || length > program_length - offset
+        || (length != 0 && dest == NULL)
+        || !lazy_plain_ensure(runtime, bundle, factory,
+                              (size_t) offset + length)) {
+        if (runtime != NULL)
+            js_rt_saturating_add_size(
+                &runtime->result.lazy_webpack_external_text_read_failures, 1);
+        return -1;
+    }
+    if (length != 0) memcpy(dest, factory->plain + offset, length);
+    factory->plain_used = ++runtime->lazy_webpack_plain_clock;
+    js_rt_saturating_add_size(
+        &runtime->result.lazy_webpack_external_text_read_bytes, length);
+    return 0;
+}
+
+int js_lazy_webpack_text_query(ScriptRuntime *runtime, uint32_t id,
+                               uint32_t offset, uint32_t length)
+{
+    const ScriptLazyRuntimeBundle *bundle = NULL;
+    ScriptLazyRuntimeFactory *factory =
+        lazy_external_factory(runtime, id, &bundle);
+    if (factory == NULL || offset > lazy_program_length(bundle, factory)
+        || length > lazy_program_length(bundle, factory) - offset) {
+        if (runtime != NULL)
+            js_rt_saturating_add_size(
+                &runtime->result.lazy_webpack_external_text_read_failures, 1);
+        return -1;
+    }
+    if (factory->plain_ascii == LAZY_TEXT_ASCII_UNKNOWN
+        && factory->plain != NULL
+        && factory->plain_length == lazy_program_length(bundle, factory)) {
+        unsigned char bits = 0;
+        for (size_t i = 0; i < factory->plain_length; i++)
+            bits |= factory->plain[i];
+        factory->plain_ascii = (bits & 0x80u) == 0
+            ? LAZY_TEXT_ASCII_YES : LAZY_TEXT_ASCII_NO;
+    }
+    /* 0: possibly not ASCII; the engine then reads a window at a time */
+    return factory->plain_ascii == LAZY_TEXT_ASCII_YES ? 1 : 0;
+}
+
+void js_lazy_webpack_text_release(ScriptRuntime *runtime, uint32_t id)
+{
+    const ScriptLazyRuntimeBundle *bundle = NULL;
+    ScriptLazyRuntimeFactory *factory =
+        lazy_external_factory(runtime, id, &bundle);
+    if (factory == NULL || factory->external_owners == 0) return;
+    if (--factory->external_owners != 0) return;
+    size_t program_length = lazy_program_length(bundle, factory);
+    runtime->lazy_webpack_external_text_bytes -=
+        program_length < runtime->lazy_webpack_external_text_bytes
+            ? program_length : runtime->lazy_webpack_external_text_bytes;
+    lazy_plain_drop(runtime, bundle, factory);
+}
+
+/* Compile setup for factory `index`: strips the program's text from the
+   heap and names it by external id. Returns the id (0: the text stays in
+   the heap) and the strip flags to restore. The owner count goes up before
+   the compile, since a compile that fails releases the id inside it. */
+static uint32_t lazy_external_compile_begin(
+    ScriptRuntime *runtime, ScriptLazyRuntimeBundle *bundle, size_t index,
+    size_t program_length, int *previous_strip)
+{
+    ScriptLazyRuntimeFactory *factory = &bundle->factories[index];
+    uint32_t id = program_length >= LAZY_EXTERNAL_TEXT_MINIMUM
+            && program_length <= UINT32_MAX / 2u
+            && factory->external_owners < UINT32_MAX
+            && lazy_external_text_enabled()
+        ? lazy_external_id(bundle, index) : 0;
+    if (id == 0 || !js_rt_external_source_hooks(runtime)) return 0;
+    if (factory->external_owners++ == 0)
+        runtime->lazy_webpack_external_text_bytes += program_length;
+    *previous_strip = JS_GetStripInfo(runtime->runtime);
+    JS_SetStripInfo(runtime->runtime, *previous_strip | JS_STRIP_SOURCE);
+    (void) JS_SetExternalSourceId(runtime->runtime, id,
+                                  (uint32_t) program_length);
+    return id;
+}
+
+/* Undoes lazy_external_compile_begin(); true if the compile took the id
+   (its functions, if it made any, now refer to the text). */
+static bool lazy_external_compile_end(ScriptRuntime *runtime, uint32_t id,
+                                      int previous_strip)
+{
+    if (id == 0) return false;
+    JS_SetStripInfo(runtime->runtime, previous_strip);
+    uint32_t pending = JS_SetExternalSourceId(runtime->runtime, 0, 0);
+    if (pending == 0) {
+        js_rt_saturating_add_size(
+            &runtime->result.lazy_webpack_external_text_compiles, 1);
+        return true;
+    }
+    /* never reached JS_Eval (admission refused it) */
+    js_lazy_webpack_text_release(runtime, pending);
+    return false;
+}
+
 /* Every factory retains exact compressed source, so a cold toString query
    need not instantiate compiler state just to recover author text. */
 static JSValue lazy_factory_source_string(
     JSContext *context, ScriptRuntime *runtime,
     const ScriptLazyRuntimeBundle *bundle,
-    const ScriptLazyRuntimeFactory *factory)
+    ScriptLazyRuntimeFactory *factory)
 {
+    size_t prefix_length = lazy_program_prefix(bundle, NULL);
+    if (factory->plain != NULL
+        && factory->plain_length == lazy_program_length(bundle, factory)) {
+        /* The output allocation can reclaim plain copies through the heap
+           growth hook. Keep this buffer owned but unavailable to trimming
+           until the copy is complete, without allocating another copy. */
+        unsigned char *plain = factory->plain;
+        factory->plain = NULL;
+        JSValue text = JS_NewStringLen(
+            context, (const char *) plain + prefix_length,
+            factory->source_length);
+        factory->plain = plain;
+        /* A collection during the allocation may have freed the last
+           external source owner while the buffer was borrowed. */
+        if (factory->external_owners == 0)
+            lazy_plain_drop(runtime, bundle, factory);
+        return text;
+    }
     if (bundle->source != NULL
         && factory->source_offset <= bundle->source_length
         && factory->source_length
@@ -588,15 +951,29 @@ static JSValue lazy_factory_compile(JSContext *context,
                                    &census_unused, &census_lazy_before);
     uint64_t census_started_ns = js_rt_monotonic_time_ns();
 #endif
+    int previous_strip = 0;
+    uint32_t external_id = lazy_external_compile_begin(
+        runtime, bundle, factory_index, program_length, &previous_strip);
     JSValue compiled = js_rt_compile_source_type(
         context, program, program_length, name, JS_EVAL_TYPE_GLOBAL,
         SCRIPT_COMPILE_SOURCE_LAZY_FACTORY, &runtime->result, &admitted);
+    bool external = lazy_external_compile_end(runtime, external_id,
+                                              previous_strip);
 #ifndef TILEFINCH_NO_TRACE
     uint64_t census_compile_us = census_elapsed_us(census_started_ns);
     if (census)
         census_lazy_function_stats(runtime->runtime, &census_unused,
                                    &census_unused, &census_lazy_after);
 #endif
+    if (external && factory->external_owners != 0 && factory->plain == NULL) {
+        /* the program buffer is the text's first plain copy */
+        factory->plain = (unsigned char *) program;
+        factory->plain_length = program_length;
+        factory->plain_input = factory->compressed_source_length;
+        factory->plain_used = ++runtime->lazy_webpack_plain_clock;
+        runtime->lazy_webpack_plain_text_bytes += program_length + 1u;
+        program = NULL;
+    }
     budget_free(runtime->budget, program);
     if (!admitted || JS_IsException(compiled)) {
         if (tilefinch_trace_lazy_scripts()) {

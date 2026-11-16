@@ -370,6 +370,10 @@ typedef struct {
     bool response_cookies_truncated;
     bool client_hint_header_rejected;
     bool redirect_callback_aborted;
+    /* This redirect's body is read and discarded rather than aborted
+       (fetch_redirect_abort_unsafe), and how much of it has been read. */
+    bool redirect_drain;
+    size_t redirect_drained_bytes;
     size_t response_cookie_start;
     bool has_response_location;
     bool redirect_response;

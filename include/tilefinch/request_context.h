@@ -2,6 +2,7 @@
 #define TILEFINCH_REQUEST_CONTEXT_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 typedef enum {
@@ -135,5 +136,23 @@ const char *tilefinch_request_facts_fetch_site(
 const char *tilefinch_request_fetch_mode(const TilefinchRequestContext *context);
 const char *tilefinch_request_fetch_destination(
     const TilefinchRequestContext *context);
+
+/* An HTML CORS settings attribute (crossorigin). Absent (a NULL value) is
+   No CORS; "use-credentials", ASCII case-insensitive, is Use Credentials;
+   any other value, empty or invalid, is Anonymous. */
+typedef enum {
+    TILEFINCH_CORS_SETTINGS_NONE = 0,
+    TILEFINCH_CORS_SETTINGS_ANONYMOUS,
+    TILEFINCH_CORS_SETTINGS_USE_CREDENTIALS
+} TilefinchCorsSettings;
+
+TilefinchCorsSettings tilefinch_cors_settings(const char *value,
+                                              size_t length);
+/* The credentials mode of a request whose element is in `settings`: a
+   no-cors request (cors false) and Use Credentials include them, and a CORS
+   request in Anonymous or No CORS (a module script) sends them same-origin
+   only. */
+TilefinchCredentialsMode tilefinch_cors_settings_credentials(
+    TilefinchCorsSettings settings, bool cors);
 
 #endif

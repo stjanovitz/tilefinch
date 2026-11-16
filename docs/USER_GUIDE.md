@@ -54,6 +54,10 @@ a password, accepting only fills in the field: press Start on the focused
 field to send the form (in Danzeff, R+Start accepts and sends at once). A
 multi-line text box is never sent this way.
 
+Web pages see this typing as they see a phone's keyboard: the text you
+accept arrives as one finished entry, and pressing Cross on a link or button
+reaches the page as the Enter key, as on a TV browser.
+
 Address completion stays on the PSP. URL history contributes only when you
 have turned history on.
 
@@ -329,9 +333,15 @@ appear automatically. When your most recent YouTube history entry is not
 already suggested, a **Recently watched** card shows it, with a resume link
 when YouTube supplies the position.
 
-If signing in ends on a Google page instead of returning to YouTube, choose
-**Menu → Page tools → Continue to YouTube**. It finishes the sign-in without
-sending your password again, and YouTube's homepage then checks the login.
+Google decides which browsers may sign in. If it answers your email with
+its **Couldn't sign you in** page, Tilefinch shows that page and adds
+**Google refused sign-in from this browser**. Tilefinch does not try again
+or pretend to be another browser; YouTube keeps working without an account.
+
+If signing in ends on another Google page instead of returning to YouTube,
+choose **Menu → Page tools → Continue to YouTube**. It finishes the sign-in
+without sending your password again, and YouTube's homepage then checks the
+login.
 If sign-in still seems to do nothing, see
 [YouTube sign-in does nothing](../TROUBLESHOOTING.md#youtube-sign-in-does-nothing).
 

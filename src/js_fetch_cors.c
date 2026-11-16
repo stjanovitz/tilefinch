@@ -3384,6 +3384,584 @@ size_t js_rt_dynamic_response_bound(DomBridge *bridge, bool reclaim_responses)
     return bound;
 }
 
+static void preloaded_script_clear(DomBridge *bridge,
+                                   ScriptPreloadedScript *entry)
+{
+    if (entry->state == SCRIPT_PRELOADED_SCRIPT_READY)
+        bridge->preloaded_script_bytes =
+            bridge->preloaded_script_bytes > entry->length
+            ? bridge->preloaded_script_bytes - entry->length : 0;
+    budget_free(bridge->budget, entry->url);
+    budget_free(bridge->budget, entry->integrity);
+    budget_free(bridge->budget, entry->response_url);
+    browser_shared_body_release(entry->body);
+    memset(entry, 0, sizeof(*entry));
+}
+
+/* An unconsumed entry dropped (pressure, the unused window). */
+static size_t preloaded_script_release(DomBridge *bridge,
+                                       ScriptPreloadedScript *entry)
+{
+    size_t freed = entry->body != NULL && entry->body->references == 1u
+        ? entry->length : 0;
+    if (bridge->result != NULL) {
+        js_rt_saturating_add_size(
+            &bridge->result->preloaded_scripts_released, 1);
+        js_rt_saturating_add_size(
+            &bridge->result->preloaded_scripts_released_bytes, entry->length);
+    }
+    preloaded_script_clear(bridge, entry);
+    return freed;
+}
+
+/* A pending entry's request, cancelled and released without allocating. */
+static void preloaded_script_cancel_request(DomBridge *bridge,
+                                            ScriptPreloadedScript *entry,
+                                            const char *reason)
+{
+    if (entry->state == SCRIPT_PRELOADED_SCRIPT_PENDING
+        && entry->scheduler != NULL && entry->request_id != 0) {
+        (void) fetch_scheduler_cancel(entry->scheduler, entry->request_id,
+                                      reason);
+        (void) fetch_scheduler_discard(entry->scheduler, entry->request_id);
+    }
+    preloaded_script_clear(bridge, entry);
+}
+
+void js_rt_preloaded_scripts_destroy(DomBridge *bridge)
+{
+    /* A pending request stays with its scheduler, which the page destroys
+       after the realm (script_runtime_cancel_preload_requests covers a
+       realm retired while the page lives on). */
+    for (size_t i = 0; i < SCRIPT_PRELOADED_SCRIPT_LIMIT; i++)
+        preloaded_script_clear(bridge, &bridge->preloaded_scripts[i]);
+}
+
+void script_runtime_cancel_preload_requests(ScriptRuntime *runtime)
+{
+    if (runtime == NULL) return;
+    DomBridge *bridge = &runtime->bridge;
+    for (size_t i = 0; i < SCRIPT_PRELOADED_SCRIPT_LIMIT; i++) {
+        ScriptPreloadedScript *entry = &bridge->preloaded_scripts[i];
+        if (entry->state == SCRIPT_PRELOADED_SCRIPT_PENDING)
+            preloaded_script_cancel_request(bridge, entry,
+                                            "page scripts retired");
+    }
+}
+
+/* The entry with this preload key, in any state. */
+static ScriptPreloadedScript *preloaded_script_find(
+    DomBridge *bridge, const char *url, TilefinchRequestMode mode,
+    TilefinchCredentialsMode credentials)
+{
+    if (url == NULL) return NULL;
+    for (size_t i = 0; i < SCRIPT_PRELOADED_SCRIPT_LIMIT; i++) {
+        ScriptPreloadedScript *entry = &bridge->preloaded_scripts[i];
+        if (entry->state != SCRIPT_PRELOADED_SCRIPT_EMPTY
+            && entry->mode == mode && entry->credentials == credentials
+            && strcmp(entry->url, url) == 0) return entry;
+    }
+    return NULL;
+}
+
+/* HTML's "consume a preloaded resource": the entry whose preload key (URL,
+   destination "script", mode, credentials mode) matches the request's,
+   provided the request has no integrity metadata or the same metadata as
+   the preload (compared as written, which is never looser than the
+   standard's comparison of the parsed metadata). An entry whose integrity
+   differs stays for another consumer. */
+static ScriptPreloadedScript *preloaded_script_match(
+    DomBridge *bridge, const char *url, TilefinchRequestMode mode,
+    TilefinchCredentialsMode credentials, const char *integrity,
+    size_t integrity_length)
+{
+    ScriptPreloadedScript *entry =
+        preloaded_script_find(bridge, url, mode, credentials);
+    if (entry == NULL || integrity == NULL || integrity_length == 0)
+        return entry;
+    if (entry->integrity == NULL
+        || strlen(entry->integrity) != integrity_length
+        || memcmp(entry->integrity, integrity, integrity_length) != 0)
+        return NULL;
+    return entry;
+}
+
+/* A free slot for a new key, or NULL (full, or the key is present: HTML
+   keeps one entry per key). */
+static ScriptPreloadedScript *preloaded_script_slot(
+    DomBridge *bridge, const char *url, TilefinchRequestMode mode,
+    TilefinchCredentialsMode credentials)
+{
+    if (preloaded_script_find(bridge, url, mode, credentials) != NULL)
+        return NULL;
+    for (size_t i = 0; i < SCRIPT_PRELOADED_SCRIPT_LIMIT; i++) {
+        if (bridge->preloaded_scripts[i].state
+            == SCRIPT_PRELOADED_SCRIPT_EMPTY)
+            return &bridge->preloaded_scripts[i];
+    }
+    return NULL;
+}
+
+/* Copies the key into *entry, which is not in the map yet. */
+static bool preloaded_script_copy_key(DomBridge *bridge,
+                                      ScriptPreloadedScript *entry,
+                                      const char *url,
+                                      const char *integrity)
+{
+    entry->url = js_rt_dynamic_copy_text(bridge->budget, url);
+    entry->integrity = integrity == NULL || integrity[0] == '\0'
+        ? NULL : js_rt_dynamic_copy_text(bridge->budget, integrity);
+    return entry->url != NULL
+        && (integrity == NULL || integrity[0] == '\0'
+            || entry->integrity != NULL);
+}
+
+/* Fetch's integrity check of the preload's own request: a response that
+   fails the link's integrity metadata is a network error. As for a
+   script (dynamic_task_integrity_allows), a no-cors response passes only
+   when it is same-origin all the way. */
+static bool preloaded_script_integrity_passes(
+    const DomBridge *bridge, const ScriptPreloadedScript *entry,
+    const BrowserSharedBody *body, size_t length, const char *response_url)
+{
+    if (entry->integrity == NULL) return true;
+    if (entry->mode != TILEFINCH_REQUEST_MODE_CORS
+        && (bridge->opaque_origin || bridge->document_url == NULL
+            || !tilefinch_url_same_origin(bridge->document_url, entry->url)
+            || !tilefinch_url_same_origin(
+                   entry->url,
+                   response_url == NULL ? entry->url : response_url)))
+        return false;
+    if (length != 0 && (body == NULL || body->data == NULL)) return false;
+    TilefinchIntegrityResult result = tilefinch_resource_integrity_verify(
+        entry->integrity, strlen(entry->integrity),
+        length == 0 ? (const uint8_t *) "" : body->data, length);
+    return result != TILEFINCH_INTEGRITY_MISMATCH
+        && result != TILEFINCH_INTEGRITY_INVALID;
+}
+
+/* Makes entry READY with the response, within the byte bound. The copy
+   comes first: an allocation can reach the reclaim hooks, which release
+   READY entries. A response that fails the preload's integrity becomes a
+   READY network error that holds nothing. */
+static bool preloaded_script_fill(DomBridge *bridge,
+                                  ScriptPreloadedScript *entry,
+                                  BrowserSharedBody *body, size_t length,
+                                  const char *response_url,
+                                  const char *content_type)
+{
+    if (!preloaded_script_integrity_passes(bridge, entry, body, length,
+                                           response_url)) {
+        budget_free(bridge->budget, entry->response_url);
+        entry->response_url = NULL;
+        entry->body = NULL;
+        entry->length = 0;
+        entry->content_type[0] = '\0';
+        entry->scheduler = NULL;
+        entry->request_id = 0;
+        entry->network_error = true;
+        entry->state = SCRIPT_PRELOADED_SCRIPT_READY;
+        return true;
+    }
+    bool own_url = response_url == NULL
+        || strcmp(response_url, entry->url) == 0;
+    char *response_copy = own_url
+        ? NULL : js_rt_dynamic_copy_text(bridge->budget, response_url);
+    if (!own_url && response_copy == NULL) return false;
+    if (length > SCRIPT_PRELOADED_SCRIPT_BYTE_LIMIT
+        || bridge->preloaded_script_bytes
+               > SCRIPT_PRELOADED_SCRIPT_BYTE_LIMIT - length) {
+        budget_free(bridge->budget, response_copy);
+        if (bridge->result != NULL) {
+            js_rt_saturating_add_size(
+                &bridge->result->preloaded_scripts_released, 1);
+            js_rt_saturating_add_size(
+                &bridge->result->preloaded_scripts_released_bytes, length);
+        }
+        return false;
+    }
+    budget_free(bridge->budget, entry->response_url);
+    entry->response_url = response_copy;
+    entry->body = browser_shared_body_retain(body);
+    entry->length = length;
+    snprintf(entry->content_type, sizeof(entry->content_type), "%s",
+             content_type == NULL ? "" : content_type);
+    entry->scheduler = NULL;
+    entry->request_id = 0;
+    entry->state = SCRIPT_PRELOADED_SCRIPT_READY;
+    bridge->preloaded_script_bytes += length;
+    return true;
+}
+
+bool script_runtime_offer_preloaded_script(
+    ScriptRuntime *runtime, const char *url, TilefinchRequestMode mode,
+    TilefinchCredentialsMode credentials, const char *integrity,
+    BrowserSharedBody *body, size_t length, const char *response_url,
+    const char *content_type)
+{
+    /* Only a body the consumer can compile in place (NUL-terminated)
+       becomes an entry; anything else is left to the consumer's fetch. */
+    if (runtime == NULL || url == NULL
+        || (length != 0 && !dynamic_source_body_usable(body, length)))
+        return false;
+    DomBridge *bridge = &runtime->bridge;
+    ScriptPreloadedScript entry = {
+        .mode = mode, .credentials = credentials
+    };
+    if (preloaded_script_slot(bridge, url, mode, credentials) == NULL
+        || !preloaded_script_copy_key(bridge, &entry, url, integrity)
+        || !preloaded_script_fill(bridge, &entry, body, length,
+                                  response_url, content_type)) {
+        entry.state = SCRIPT_PRELOADED_SCRIPT_EMPTY;
+        preloaded_script_clear(bridge, &entry);
+        return false;
+    }
+    /* The copies may have run the reclaim hooks; look again. */
+    ScriptPreloadedScript *slot =
+        preloaded_script_slot(bridge, url, mode, credentials);
+    if (slot == NULL) {
+        preloaded_script_clear(bridge, &entry);
+        return false;
+    }
+    *slot = entry;
+    return true;
+}
+
+/* A completed preload's response, authorized for a classic script. */
+static bool preloaded_response_accept(
+    DomBridge *bridge, const char *url, TilefinchRequestMode mode,
+    TilefinchCredentialsMode credentials, uint8_t csp_grant,
+    FetchResult *result)
+{
+    if (result->status_code < 200 || result->status_code >= 300
+        || (result->length != 0 && !fetch_result_share_body(result)))
+        return false;
+    TilefinchRequestContext context = {
+        .target_url = url,
+        .initiator_url = bridge->document_url,
+        .top_level_url = bridge->top_level_url,
+        .method = "GET",
+        .mode = mode,
+        .credentials = credentials,
+        .destination = TILEFINCH_DESTINATION_SCRIPT,
+        .csp_grant = csp_grant,
+        .initiator_opaque = bridge->opaque_origin
+    };
+    TilefinchResourceGrant grant = {0};
+    return fetch_resource_grant_create(
+        result, &context, mode == TILEFINCH_REQUEST_MODE_CORS,
+        script_module_mime_type_allowed(result->content_type), false,
+        &grant, NULL);
+}
+
+bool script_runtime_adopt_preload_request(
+    ScriptRuntime *runtime, FetchScheduler *scheduler, uint64_t request_id,
+    const char *url, TilefinchRequestMode mode,
+    TilefinchCredentialsMode credentials, uint8_t csp_grant,
+    const char *integrity)
+{
+    if (runtime == NULL || scheduler == NULL || request_id == 0
+        || url == NULL) return false;
+    DomBridge *bridge = &runtime->bridge;
+    ScriptPreloadedScript entry = {
+        .mode = mode, .credentials = credentials
+    };
+    if (preloaded_script_slot(bridge, url, mode, credentials) == NULL
+        || !preloaded_script_copy_key(bridge, &entry, url, integrity)) {
+        preloaded_script_clear(bridge, &entry);
+        return false;
+    }
+    ScriptPreloadedScript *slot =
+        preloaded_script_slot(bridge, url, mode, credentials);
+    if (slot == NULL) {
+        preloaded_script_clear(bridge, &entry);
+        return false;
+    }
+    entry.state = SCRIPT_PRELOADED_SCRIPT_PENDING;
+    entry.scheduler = scheduler;
+    entry.request_id = request_id;
+    entry.csp_grant = csp_grant;
+    *slot = entry;
+    if (bridge->result != NULL)
+        js_rt_saturating_add_size(
+            &bridge->result->preloaded_scripts_adopted, 1);
+    return true;
+}
+
+/* A pending entry whose request completed becomes READY, or goes when its
+   response is unusable. False while the request is still in flight. */
+static bool preloaded_script_settle(DomBridge *bridge,
+                                    ScriptPreloadedScript *entry)
+{
+    if (entry->state != SCRIPT_PRELOADED_SCRIPT_PENDING) return true;
+    FetchRequestProgress progress = {0};
+    if (!fetch_scheduler_request_progress(entry->scheduler,
+                                          entry->request_id, &progress)) {
+        /* Its scheduler no longer knows it (cancelled and discarded). */
+        preloaded_script_clear(bridge, entry);
+        return true;
+    }
+    if (!fetch_scheduler_request_complete(entry->scheduler,
+                                          entry->request_id)) return false;
+    /* The allocations below may release other entries, never this one
+       (only READY entries are released). */
+    FetchResult *result = fetch_result_create(bridge->budget);
+    /* Out of memory: try again on a later turn. */
+    if (result == NULL) return false;
+    bool success = false;
+    if (!fetch_scheduler_take(entry->scheduler, entry->request_id,
+                              &success, result)) {
+        fetch_result_free(result);
+        preloaded_script_clear(bridge, entry);
+        return true;
+    }
+    entry->scheduler = NULL;
+    entry->request_id = 0;
+    if (bridge->result != NULL && success)
+        js_rt_record_network_response(bridge->result, result);
+    bool kept = success
+        && preloaded_response_accept(bridge, entry->url, entry->mode,
+                                     entry->credentials, entry->csp_grant,
+                                     result)
+        && (result->length == 0
+            || dynamic_source_body_usable(result->shared_body,
+                                          result->length));
+    if (kept)
+        js_rt_script_store_response_cookies(
+            bridge, result, entry->url, entry->mode, entry->credentials,
+            TILEFINCH_DESTINATION_SCRIPT);
+    kept = kept && preloaded_script_fill(
+        bridge, entry, result->shared_body, result->length,
+        result->effective_url[0] == '\0' ? entry->url
+                                         : result->effective_url,
+        result->content_type);
+    fetch_result_free(result);
+    if (!kept) preloaded_script_clear(bridge, entry);
+    return true;
+}
+
+void js_rt_preloaded_scripts_note_load(DomBridge *bridge)
+{
+    if (bridge == NULL || bridge->preloaded_scripts_unused_at_ms != 0)
+        return;
+    uint64_t now = js_rt_bridge_elapsed_ms(bridge);
+    bridge->preloaded_scripts_unused_at_ms =
+        now >= UINT64_MAX - SCRIPT_PRELOADED_SCRIPT_UNUSED_MS
+        ? UINT64_MAX : now + SCRIPT_PRELOADED_SCRIPT_UNUSED_MS;
+}
+
+void js_rt_preloaded_scripts_step(DomBridge *bridge)
+{
+    bool unused = bridge->preloaded_scripts_unused_at_ms != 0
+        && js_rt_bridge_elapsed_ms(bridge)
+               >= bridge->preloaded_scripts_unused_at_ms;
+    /* Release first: a response completing now stays for this turn's
+       consumers, and goes on the next turn if none took it. */
+    for (size_t i = 0; unused && i < SCRIPT_PRELOADED_SCRIPT_LIMIT; i++) {
+        ScriptPreloadedScript *entry = &bridge->preloaded_scripts[i];
+        if (entry->state == SCRIPT_PRELOADED_SCRIPT_READY)
+            (void) preloaded_script_release(bridge, entry);
+    }
+    FetchScheduler *scheduler = NULL;
+    for (size_t i = 0; i < SCRIPT_PRELOADED_SCRIPT_LIMIT; i++) {
+        ScriptPreloadedScript *entry = &bridge->preloaded_scripts[i];
+        if (entry->state != SCRIPT_PRELOADED_SCRIPT_PENDING) continue;
+        FetchScheduler *owner = entry->scheduler;
+        if (!preloaded_script_settle(bridge, entry)) scheduler = owner;
+    }
+    /* The page's scheduler, which nothing else may be pumping now that
+       parsing is over. */
+    if (scheduler != NULL) {
+        FetchPumpQuota quota = {
+            .maximum_body_callbacks = 2,
+            .maximum_body_bytes = 32u * 1024u,
+            .maximum_time_us = 2000
+        };
+        (void) fetch_scheduler_pump_bounded(scheduler, 2, 0, &quota, NULL);
+    }
+}
+
+bool js_rt_dynamic_task_awaits_preload(DomBridge *bridge,
+                                       const ScriptDynamicTask *task)
+{
+    if (task->module || task->request_url == NULL) return false;
+    const ScriptPreloadedScript *entry = preloaded_script_match(
+        bridge, task->request_url, task->mode, task->credentials,
+        task->integrity,
+        task->integrity == NULL ? 0 : strlen(task->integrity));
+    return entry != NULL && entry->state == SCRIPT_PRELOADED_SCRIPT_PENDING;
+}
+
+bool script_runtime_consume_preloaded_script(
+    ScriptRuntime *runtime, const char *url, TilefinchRequestMode mode,
+    TilefinchCredentialsMode credentials, const char *integrity,
+    size_t integrity_length, long timeout_ms, ScriptPreloadedResponse *out)
+{
+    if (out != NULL) memset(out, 0, sizeof(*out));
+    if (runtime == NULL || url == NULL || out == NULL) return false;
+    DomBridge *bridge = &runtime->bridge;
+    ScriptPreloadedScript *entry = preloaded_script_match(
+        bridge, url, mode, credentials, integrity, integrity_length);
+    if (entry == NULL) return false;
+    uint64_t started = js_rt_monotonic_time_ns();
+    uint64_t limit_ns = timeout_ms <= 0 ? 0
+        : (uint64_t) timeout_ms * UINT64_C(1000000);
+    size_t waits = 0;
+    /* HTML: the fetch waits for a preload whose response is not yet
+       available (onResponseAvailable). */
+    while (entry->state == SCRIPT_PRELOADED_SCRIPT_PENDING) {
+        if (preloaded_script_settle(bridge, entry)) break;
+        if (js_rt_monotonic_time_ns() - started >= limit_ns
+            || !tilefinch_platform_cooperate("script-preload-wait",
+                                             ++waits)) {
+            preloaded_script_cancel_request(
+                bridge, entry, "parser script preload wait exceeded");
+            return false;
+        }
+        FetchPumpQuota quota = {
+            .maximum_body_callbacks = 2,
+            .maximum_body_bytes = 32u * 1024u,
+            .maximum_time_us = 2000
+        };
+        (void) fetch_scheduler_pump_bounded(entry->scheduler, 2, 10,
+                                            &quota, NULL);
+    }
+    if (entry->state != SCRIPT_PRELOADED_SCRIPT_READY) return false;
+    /* Consumed: the map no longer holds it, whatever the script does. */
+    out->network_error = entry->network_error;
+    out->body = entry->body;
+    out->length = entry->length;
+    out->response_url = entry->response_url;
+    entry->body = NULL;
+    entry->response_url = NULL;
+    preloaded_script_clear(bridge, entry);
+    if (bridge->result != NULL)
+        js_rt_saturating_add_size(
+            &bridge->result->parser_scripts_preload_hits, 1);
+    return true;
+}
+
+void script_runtime_preloaded_response_release(
+    ScriptRuntime *runtime, ScriptPreloadedResponse *response)
+{
+    if (response == NULL) return;
+    browser_shared_body_release(response->body);
+    budget_free(runtime == NULL ? NULL : runtime->bridge.budget,
+                response->response_url);
+    memset(response, 0, sizeof(*response));
+}
+
+size_t script_runtime_release_preloaded_scripts(ScriptRuntime *runtime,
+                                                size_t needed)
+{
+    if (runtime == NULL) return 0;
+    DomBridge *bridge = &runtime->bridge;
+    size_t freed = 0;
+    for (size_t i = 0; i < SCRIPT_PRELOADED_SCRIPT_LIMIT && freed < needed;
+         i++) {
+        ScriptPreloadedScript *entry = &bridge->preloaded_scripts[i];
+        if (entry->state == SCRIPT_PRELOADED_SCRIPT_READY)
+            freed += preloaded_script_release(bridge, entry);
+    }
+    return freed;
+}
+
+/* A matching preload's response, taken in place of a fetch. Returns false
+   to leave the task to the ordinary paths (its quota could not be held
+   yet: *deferred). */
+static bool dynamic_task_consume_preload(DomBridge *bridge,
+                                         ScriptDynamicTask *task,
+                                         ScriptPreloadedScript *entry,
+                                         bool *deferred)
+{
+    /* Moved out first: the quota reservation can allocate, and an
+       allocation can reach the reclaim hooks, which release READY
+       entries. */
+    ScriptPreloadedScript taken = *entry;
+    bridge->preloaded_script_bytes =
+        bridge->preloaded_script_bytes > taken.length
+        ? bridge->preloaded_script_bytes - taken.length : 0;
+    memset(entry, 0, sizeof(*entry));
+    taken.state = SCRIPT_PRELOADED_SCRIPT_EMPTY;
+    if (taken.network_error) {
+        /* The preload's response failed its own integrity: the script's
+           fetch is that network error. */
+        preloaded_script_clear(bridge, &taken);
+        if (bridge->result != NULL)
+            js_rt_saturating_add_size(
+                &bridge->result->dynamic_scripts_integrity_rejected, 1);
+        task->state = SCRIPT_DYNAMIC_READY;
+        task->success = false;
+        return true;
+    }
+    ScriptQuotaReserveResult quota_status =
+        js_rt_bridge_script_quota_reserve_known(
+            bridge, SCRIPT_QUOTA_PRECOUNTED_EXECUTABLE, taken.length,
+            &task->quota_reservation);
+    if (quota_status == SCRIPT_QUOTA_RESERVE_DEFERRED) {
+        /* Back in the map for the next attempt, unless its key was
+           offered again meanwhile. */
+        ScriptPreloadedScript *slot = preloaded_script_slot(
+            bridge, taken.url, taken.mode, taken.credentials);
+        if (slot != NULL) {
+            taken.state = SCRIPT_PRELOADED_SCRIPT_READY;
+            *slot = taken;
+            bridge->preloaded_script_bytes += taken.length;
+        } else {
+            preloaded_script_clear(bridge, &taken);
+        }
+        if (deferred != NULL) *deferred = true;
+        return true;
+    }
+    task->state = SCRIPT_DYNAMIC_READY;
+    if (quota_status == SCRIPT_QUOTA_RESERVE_REJECTED
+        || taken.length > task->quota_reservation.reserved_bytes) {
+        if (quota_status != SCRIPT_QUOTA_RESERVE_REJECTED)
+            js_rt_bridge_script_quota_abort(bridge, &task->quota_reservation);
+        if (bridge->result != NULL)
+            js_rt_saturating_add_size(
+                &bridge->result->dynamic_scripts_quota_rejected, 1);
+        preloaded_script_clear(bridge, &taken);
+        task->success = false;
+        return true;
+    }
+    if (bridge->result != NULL)
+        js_rt_saturating_add_size(&bridge->result->dynamic_scripts_started, 1);
+    /* Consumed: the map no longer holds it, whatever the script does. */
+    BrowserSharedBody *body = taken.body;
+    size_t length = taken.length;
+    taken.body = NULL;
+    budget_free(bridge->budget, task->response_url);
+    task->response_url = taken.response_url;
+    taken.response_url = NULL;
+    char content_type[sizeof(taken.content_type)];
+    memcpy(content_type, taken.content_type, sizeof(content_type));
+    preloaded_script_clear(bridge, &taken);
+    bool accepted = dynamic_task_take_source(bridge, task, body, length);
+    task->success = accepted;
+    if (!accepted) return true;
+    const char *response_url = task->response_url == NULL
+        ? task->request_url : task->response_url;
+    task->resource_timing.cache_hit = true;
+    task->resource_timing.timing_allowed = !bridge->opaque_origin
+        && bridge->document_url != NULL
+        && tilefinch_url_same_origin(bridge->document_url, task->request_url);
+    task->resource_timing.encoded_body_bytes =
+        length > UINT32_MAX ? UINT32_MAX : (uint32_t) length;
+    task->resource_timing.decoded_body_bytes =
+        task->resource_timing.encoded_body_bytes;
+    if (dynamic_resource_timing_body_info_visible(
+            bridge, task, response_url, false))
+        dynamic_resource_timing_set_content_type(bridge, task, content_type);
+    if (bridge->result != NULL) {
+        js_rt_saturating_add_size(
+            &bridge->result->dynamic_scripts_cache_hits, 1);
+        js_rt_saturating_add_size(
+            &bridge->result->dynamic_scripts_preload_hits, 1);
+    }
+    return true;
+}
+
 bool js_rt_dynamic_start_task(ScriptRuntime *runtime,
                         ScriptDynamicTask *task, bool *deferred)
 {
@@ -3433,6 +4011,15 @@ bool js_rt_dynamic_start_task(ScriptRuntime *runtime,
                    ? "cors" : "no-cors");
     TilefinchRequestContext resource_context =
         dynamic_script_request_context(bridge, task);
+    ScriptPreloadedScript *preloaded = cache_blocked || task->module
+        ? NULL : preloaded_script_match(
+              bridge, task->request_url, task->mode, task->credentials,
+              task->integrity,
+              task->integrity == NULL ? 0 : strlen(task->integrity));
+    if (preloaded != NULL
+        && preloaded->state == SCRIPT_PRELOADED_SCRIPT_READY)
+        return dynamic_task_consume_preload(bridge, task, preloaded,
+                                            deferred);
     if (!cache_blocked && bridge->session != NULL
         && has_initiator_origin && task->module && !bridge->opaque_origin) {
         cache_status = browser_session_cache_match_module(

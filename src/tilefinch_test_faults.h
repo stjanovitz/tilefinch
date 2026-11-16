@@ -107,6 +107,11 @@ typedef struct {
     unsigned event_hold_refuse_allocation;
     unsigned event_release_refuse_allocation;
     bool event_hook_refused;
+    /* Refuse the Nth (1-based) JavaScript heap allocation made while the
+       next inline event handler compiles
+       (__tilefinchCompileInlineEventHandler), once, as a full page heap
+       would. */
+    unsigned inline_handler_refuse_allocation;
     /* Refuse the next render-shell initialization once. */
     bool refuse_next_render_shell_init;
     /* Make the next layout cooperate checkpoint decline to continue once,

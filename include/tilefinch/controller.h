@@ -180,6 +180,12 @@ typedef struct {
     bool pointer_down_active;
     bool pointer_click_pending;
     bool pointer_resize_active;
+    /* An Enter press whose keyup is still owed: X's keydown went to the
+       page and its keyup follows the press's defaults (a form's submit).
+       The realm is kept so a keyup is never sent to another page. */
+    bool enter_release_pending;
+    long enter_release_handle;
+    const void *enter_release_runtime;
     uint8_t pointer_resize_mode;
     int pointer_resize_start_x;
     int pointer_resize_start_y;

@@ -1471,13 +1471,15 @@ class PrivateConsoleTests(unittest.TestCase):
                 keeper.close()
 
     @unittest.skipUnless(LAB, "requires the host lab executable")
-    def test_cancelled_beforeinput_is_reported_without_value_disclosure(self):
+    def test_refused_value_is_reported_without_value_disclosure(self):
+        # The keyboard's commit is a composition, which beforeinput cannot
+        # cancel; the page refuses the text by clearing it on input.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             fixture = root / "mock.html"
             fixture.write_text("""<input id=user autocomplete=username><script>
-                document.getElementById('user').addEventListener('beforeinput',
-                  function (event) { event.preventDefault(); });</script>""")
+                document.getElementById('user').addEventListener('input',
+                  function () { this.value = ''; });</script>""")
             session = PRIVATE.PrivateLab(LAB, root, fixture=fixture)
             try:
                 session.status(timeout=30)

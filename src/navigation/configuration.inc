@@ -12,6 +12,14 @@ bool navigation_init(NavigationSession *session, Budget *budget,
         return false;
     }
     session->history_capacity = history_capacity;
+    session->window_name = budget_calloc(budget, 1,
+                                         sizeof(*session->window_name));
+    if (session->window_name == NULL) {
+        budget_free(budget, session->history);
+        memset(session, 0, sizeof(*session));
+        return false;
+    }
+    session->window_name->budget = budget;
     session->stream_delivery.chunk_bytes = 16384;
     session->progressive_preview_lookahead_percent = 50;
     /* A relayout that cost a visible fraction of a second shows its first
@@ -531,9 +539,28 @@ typedef struct {
     uint8_t csp_grant;
     bool launched;
     bool complete;
+    /* A classic script request in the document's map of preloaded
+       resources: a <link rel=preload as=script>, or the scanner's CORS
+       <script src> (which the HTTP cache cannot serve). Its completed
+       response goes to the map (script_runtime_offer_preloaded_script)
+       with the element's integrity metadata (NULL: none). */
+    bool map_entry;
+    char *integrity;
+    /* Its authorized response when it completed before the realm existed,
+       offered to the map once the realm is created
+       (navigation_stream_offer_held_preloads). */
+    BrowserSharedBody *held_body;
+    size_t held_length;
+    char *held_response_url;
+    char held_content_type[64];
+    /* In flight at the end of parsing with no realm yet: request_id waits
+       for the page's realm (navigation_stream_hand_preloads_to_realm). */
+    bool awaiting_realm;
 } NavigationPreload;
 
 #define NAVIGATION_PRELOAD_LIMIT 8
+_Static_assert(NAVIGATION_PRELOAD_LIMIT <= SCRIPT_PRELOADED_SCRIPT_LIMIT,
+               "the map of preloaded scripts has room for every preload");
 #define NAVIGATION_PRELOAD_CONCURRENCY 2
 #define NAVIGATION_PRELOAD_SCAN_TAG_LIMIT 4096
 #define NAVIGATION_STYLESHEET_INPUT_LIMIT 64
@@ -644,6 +671,8 @@ typedef struct {
     DocumentParser *parser;
     uint64_t started_us;
     uint64_t response_headers_elapsed_us;
+    /* The response hop's transport timing when its headers arrived. */
+    FetchTransportTiming response_header_timing;
     uint16_t response_status;
     char next_hop_protocol[16];
     char response_content_type[256];
@@ -685,6 +714,9 @@ typedef struct {
     int viewport_width;
     NavigationPreload preloads[NAVIGATION_PRELOAD_LIMIT];
     size_t preload_count;
+    /* Bytes of the preloads' held_body responses, within
+       SCRIPT_PRELOADED_SCRIPT_BYTE_LIMIT. */
+    size_t held_preload_bytes;
     char preload_scan_tag[NAVIGATION_PRELOAD_SCAN_TAG_LIMIT];
     size_t preload_scan_tag_length;
     char preload_scan_quote;

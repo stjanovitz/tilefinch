@@ -1,5 +1,7 @@
 /* Legacy Window and Document surface installed natively after the bootstrap:
-   document.all (HTMLAllCollection) and window.print(). Native so no
+   document.all (HTMLAllCollection), window.print(), the Window members a
+   PSP window answers with constants (screenX, closed, moveTo...), window.name
+   and status, and document.characterSet. Native so no
    bootstrap JavaScript stays resident for them; the collection's class and
    prototype are created on the first document.all read.
 
@@ -10,6 +12,13 @@
    code that takes it to the 32 MiB ceiling. */
 
 static JSClassID legacy_all_class_id;
+
+static bool collection_length_valid(JSContext *context, uint64_t count)
+{
+    if (count <= SCRIPT_DOM_HANDLE_SLOT_CAPACITY_MAX + 1u) return true;
+    JS_ThrowRangeError(context, "Collection exceeds bounded size");
+    return false;
+}
 
 typedef struct {
     JSValue document;
@@ -81,7 +90,8 @@ static bool legacy_all_open(JSContext *context,
     JSValue length = JS_IsException(cursor->list) ? JS_EXCEPTION
         : JS_GetPropertyStr(context, cursor->list, "length");
     bool ok = !JS_IsException(length)
-        && JS_ToUint32(context, &cursor->length, length) == 0;
+        && JS_ToUint32(context, &cursor->length, length) == 0
+        && collection_length_valid(context, cursor->length);
     JS_FreeValue(context, length);
     return ok;
 }
@@ -380,6 +390,22 @@ static int legacy_all_get_own_property(JSContext *context,
     return 1;
 }
 
+/* Both exotic collection enumerators use this boundary. Script-side trees
+   may report arbitrary lengths; a Budget refusal is not an overflow guard
+   on the PSP. Reject those counts before size arithmetic or native loops. */
+static JSPropertyEnum *collection_key_table(JSContext *context,
+                                            int64_t count, size_t extra)
+{
+    size_t maximum = SIZE_MAX / sizeof(JSPropertyEnum);
+    if (count < 0 || !collection_length_valid(context, (uint64_t) count))
+        return NULL;
+    if (extra > maximum || (uint64_t) count > maximum - extra) {
+        JS_ThrowRangeError(context, "Collection enumeration exceeds bounded size");
+        return NULL;
+    }
+    return js_malloc(context, sizeof(JSPropertyEnum) * ((size_t) count + extra));
+}
+
 static int legacy_all_get_own_property_names(JSContext *context,
                                              JSPropertyEnum **table,
                                              uint32_t *length,
@@ -391,10 +417,9 @@ static int legacy_all_get_own_property_names(JSContext *context,
         JS_GetOpaque(object, legacy_all_class_id);
     if (collection == NULL) return 0;
     int64_t count = legacy_all_length(context, collection);
-    if (count < 0 || count > (int64_t) (UINT32_MAX / 2u)) return -1;
+    if (count < 0) return -1;
     if (count == 0) return 0;
-    JSPropertyEnum *entries = js_malloc(
-        context, sizeof(*entries) * (size_t) count);
+    JSPropertyEnum *entries = collection_key_table(context, count, 0);
     if (entries == NULL) return -1;
     for (int64_t i = 0; i < count; i++) {
         entries[i].is_enumerable = 1;
@@ -595,6 +620,276 @@ static JSValue js_window_print(JSContext *context, JSValueConst this_value,
     return JS_UNDEFINED;
 }
 
+/* Window operations a PSP window answers by doing nothing: it is never
+   moved, resized, focused away from or blurred, and event capture is a
+   no-op in HTML. stop() has no loading of its own to abort here either: the
+   navigation layer owns the document's fetch. */
+static JSValue js_window_noop(JSContext *context, JSValueConst this_value,
+                              int argc, JSValueConst *argv)
+{
+    (void) context;
+    (void) this_value;
+    (void) argc;
+    (void) argv;
+    return JS_UNDEFINED;
+}
+
+/* The browsing context's name (magic 0) and the legacy status text
+   (magic 1). A top-level realm's name lives in its navigation's slot, so it
+   survives the document; a frame's starts as its container's name. */
+static JSValue js_window_text_get(JSContext *context, JSValueConst this_value,
+                                  int magic)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    ScriptRuntime *runtime = bridge == NULL ? NULL : bridge->host;
+    if (runtime == NULL) return JS_NewString(context, "");
+    JSValue value = magic == 0 ? runtime->window_name : runtime->window_status;
+    return JS_IsString(value) ? JS_DupValue(context, value)
+                              : JS_NewString(context, "");
+}
+
+static JSValue js_window_text_set(JSContext *context, JSValueConst this_value,
+                                  JSValueConst value, int magic)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    ScriptRuntime *runtime = bridge == NULL ? NULL : bridge->host;
+    if (runtime == NULL) return JS_UNDEFINED;
+    JSValue text = JS_ToString(context, value);
+    if (JS_IsException(text)) return text;
+    if (magic == 0 && runtime->window_name_slot != NULL) {
+        size_t length = 0;
+        const char *bytes = JS_ToCStringLen(context, &length, text);
+        if (bytes == NULL) {
+            JS_FreeValue(context, text);
+            return JS_EXCEPTION;
+        }
+        /* A refusal (too long, or no memory) keeps the name with this
+           document only: the next one starts without it. */
+        if (!script_window_name_store(runtime->window_name_slot, bytes,
+                                      length))
+            script_window_name_store(runtime->window_name_slot, "", 0);
+        JS_FreeCString(context, bytes);
+    }
+    JSValue *slot = magic == 0 ? &runtime->window_name
+                               : &runtime->window_status;
+    JS_FreeValue(context, *slot);
+    *slot = text;
+    return JS_UNDEFINED;
+}
+
+/* A Window whose browsing context exists is never closed: the realm ends
+   with its document. */
+static JSValue js_window_closed(JSContext *context, JSValueConst this_value)
+{
+    (void) context;
+    (void) this_value;
+    return JS_FALSE;
+}
+
+static const JSCFunctionListEntry window_legacy_functions[] = {
+#define WINDOW_NOOP(name, length) \
+    { name, JS_PROP_C_W_E, JS_DEF_CFUNC, 0, \
+      .u = { .func = { length, JS_CFUNC_generic, \
+                       { .generic = js_window_noop } } } }
+    /* close() too: no Tilefinch window was opened by a script, so none is
+       script-closable, and the call does nothing. */
+    WINDOW_NOOP("stop", 0), WINDOW_NOOP("focus", 0), WINDOW_NOOP("blur", 0),
+    WINDOW_NOOP("close", 0),
+    WINDOW_NOOP("moveTo", 2), WINDOW_NOOP("moveBy", 2),
+    WINDOW_NOOP("resizeTo", 2), WINDOW_NOOP("resizeBy", 2),
+    WINDOW_NOOP("captureEvents", 0), WINDOW_NOOP("releaseEvents", 0),
+#undef WINDOW_NOOP
+    /* The window fills the screen at its origin. [Replaceable] attributes,
+       so data properties a page may overwrite, as innerWidth is. */
+    JS_PROP_INT32_DEF("screenX", 0, JS_PROP_C_W_E),
+    JS_PROP_INT32_DEF("screenY", 0, JS_PROP_C_W_E),
+    JS_PROP_INT32_DEF("screenLeft", 0, JS_PROP_C_W_E),
+    JS_PROP_INT32_DEF("screenTop", 0, JS_PROP_C_W_E),
+    /* The entries above are also each frame realm's own; frames.js defines
+       a frame's name, and its WindowProxy answers closed. */
+    { "name", JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE,
+      JS_DEF_CGETSET_MAGIC, 0,
+      .u = { .getset = { .get = { .getter_magic = js_window_text_get },
+                         .set = { .setter_magic = js_window_text_set } } } },
+    { "status", JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE,
+      JS_DEF_CGETSET_MAGIC, 1,
+      .u = { .getset = { .get = { .getter_magic = js_window_text_get },
+                         .set = { .setter_magic = js_window_text_set } } } },
+    { "closed", JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE, JS_DEF_CGETSET, 0,
+      .u = { .getset = { .get = { .getter = js_window_closed } } } },
+};
+
+#define WINDOW_FRAME_MEMBER_COUNT 14
+
+/* The entries the global does not already own: a function list aborts on
+   a name that exists, and a session page's bootstrap defines some of these
+   itself (that definition is kept). */
+static bool legacy_define_missing_members(JSContext *context,
+                                          JSValueConst global, size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        JSAtom atom = JS_NewAtom(context, window_legacy_functions[i].name);
+        int present = atom == JS_ATOM_NULL ? -1
+            : JS_GetOwnProperty(context, NULL, global, atom);
+        if (atom != JS_ATOM_NULL) JS_FreeAtom(context, atom);
+        if (present < 0
+            || (present == 0
+                && JS_SetPropertyFunctionList(
+                       context, global, &window_legacy_functions[i], 1) < 0))
+            return false;
+    }
+    return true;
+}
+
+static bool legacy_define_frame_window_members(JSContext *realm,
+                                               JSValueConst global)
+{
+    return legacy_define_missing_members(realm, global,
+                                         WINDOW_FRAME_MEMBER_COUNT);
+}
+
+/* Document.characterSet and its legacy aliases charset and inputEncoding
+   (magic picks the name). data[0] is the realm's document, whose encoding
+   the parser decided; data[1] is Document.prototype. Every other document
+   here (createHTMLDocument, DOMParser, new Document(), frames) was built
+   from a string, so it is UTF-8. */
+static JSValue js_document_character_set(JSContext *context,
+                                         JSValueConst this_value, int argc,
+                                         JSValueConst *argv, int magic,
+                                         JSValue *data)
+{
+    (void) argc;
+    (void) argv;
+    (void) magic;
+    if (!JS_IsObject(this_value))
+        return JS_ThrowTypeError(context, "Illegal invocation");
+    if (JS_VALUE_GET_PTR(this_value) != JS_VALUE_GET_PTR(data[0])) {
+        int is_document = legacy_all_inherits(context, this_value, data[1]);
+        if (is_document < 0) return JS_EXCEPTION;
+        if (!is_document)
+            return JS_ThrowTypeError(context, "Illegal invocation");
+        return JS_NewString(context, "UTF-8");
+    }
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    const char *name = bridge == NULL || bridge->document == NULL ? NULL
+        : tilefinch_encoding_name(
+              (TilefinchEncoding) bridge->document->encoding);
+    return JS_NewString(context, name == NULL ? "UTF-8" : name);
+}
+
+static bool legacy_define_character_set(JSContext *context,
+                                        JSValueConst global,
+                                        JSValueConst prototype)
+{
+    JSValue data[2] = {
+        JS_GetPropertyStr(context, global, "document"),
+        JS_DupValue(context, prototype)
+    };
+    static const char *const names[] = {
+        "characterSet", "charset", "inputEncoding"
+    };
+    bool ok = JS_IsObject(data[0]);
+    for (int i = 0; ok && i < 3; i++) {
+        char label[32];
+        snprintf(label, sizeof(label), "get %s", names[i]);
+        JSValue getter = JS_NewCFunctionData(
+            context, js_document_character_set, 0, i, 2, data);
+        ok = !JS_IsException(getter)
+            && JS_DefinePropertyValueStr(context, getter, "name",
+                                         JS_NewString(context, label),
+                                         JS_PROP_CONFIGURABLE) >= 0;
+        JSAtom atom = ok ? JS_NewAtom(context, names[i]) : JS_ATOM_NULL;
+        if (ok && atom != JS_ATOM_NULL) {
+            ok = JS_DefinePropertyGetSet(
+                     context, prototype, atom, getter, JS_UNDEFINED,
+                     JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE) >= 0;
+            getter = JS_UNDEFINED;
+        } else {
+            ok = false;
+        }
+        JS_FreeValue(context, getter);
+        if (atom != JS_ATOM_NULL) JS_FreeAtom(context, atom);
+    }
+    JS_FreeValue(context, data[0]);
+    JS_FreeValue(context, data[1]);
+    return ok;
+}
+
+void script_window_name_release(ScriptWindowName *name)
+{
+    if (name == NULL) return;
+    if (name->budget != NULL) budget_free(name->budget, name->value);
+    name->value = NULL;
+    name->length = 0;
+}
+
+bool script_window_name_store(ScriptWindowName *name, const char *value,
+                              size_t length)
+{
+    if (name == NULL || (value == NULL && length != 0)) return false;
+    if (length > SCRIPT_WINDOW_NAME_LIMIT || name->budget == NULL) {
+        script_window_name_release(name);
+        return length == 0;
+    }
+    if (length == 0) {
+        script_window_name_release(name);
+        return true;
+    }
+    char *copy = budget_realloc(name->budget, name->value, length);
+    if (copy == NULL) {
+        script_window_name_release(name);
+        return false;
+    }
+    memcpy(copy, value, length);
+    name->value = copy;
+    name->length = length;
+    return true;
+}
+
+/* HTML clears a top-level navigable's name when it navigates to another
+   site, so a name a page set does not follow the user to an unrelated one
+   (the "window.name" cross-site channel). Same-site documents keep it. */
+void script_window_name_enter(ScriptWindowName *name, const char *url)
+{
+    if (name == NULL) return;
+    char site[sizeof(name->site)];
+    if (url == NULL || !tilefinch_url_site_key(url, site, sizeof(site)))
+        site[0] = '\0';
+    if (site[0] == '\0' || strcmp(site, name->site) != 0)
+        script_window_name_release(name);
+    memcpy(name->site, site, sizeof(site));
+}
+
+bool script_runtime_set_window_name(ScriptRuntime *runtime, const char *name,
+                                    size_t length)
+{
+    if (runtime == NULL || runtime->context == NULL
+        || (name == NULL && length != 0)) return false;
+    JSValue value = JS_NewStringLen(runtime->context, name == NULL ? "" : name,
+                                    length);
+    if (JS_IsException(value)) {
+        JS_FreeValue(runtime->context, JS_GetException(runtime->context));
+        return false;
+    }
+    JS_FreeValue(runtime->context, runtime->window_name);
+    runtime->window_name = value;
+    return true;
+}
+
+static bool legacy_define_window_members(ScriptRuntime *host,
+                                         JSValueConst global)
+{
+    const ScriptWindowName *slot = host->window_name_slot;
+    if (slot != NULL && slot->length != 0
+        && !script_runtime_set_window_name(host, slot->value, slot->length))
+        return false;
+    return legacy_define_missing_members(
+        host->context, global,
+        sizeof(window_legacy_functions) / sizeof(window_legacy_functions[0]));
+}
+
 /* Installed after hardening.js, which publishes the private WeakMap
    factory document.all's first read uses. */
 static bool runtime_install_legacy_surface(ScriptRuntime *host,
@@ -624,6 +919,8 @@ static bool runtime_install_legacy_surface(ScriptRuntime *host,
         JS_FreeValue(context, getter);
     }
     if (all_atom != JS_ATOM_NULL) JS_FreeAtom(context, all_atom);
+    ok = ok && legacy_define_character_set(context, global, prototype)
+        && legacy_define_window_members(host, global);
     JS_FreeValue(context, prototype);
     JSValue print = ok ? JS_NewCFunction(context, js_window_print, "print", 0)
                        : JS_EXCEPTION;

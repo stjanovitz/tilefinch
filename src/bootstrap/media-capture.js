@@ -35,7 +35,7 @@
   let mediaDevices = null;
   const newId = () => crypto.randomUUID();
   const handlerAttribute = (prototype, type) =>
-    Object.defineProperty(prototype, "on" + type, {
+    defineProperty(prototype, "on" + type, {
       configurable: true,
       enumerable: true,
       get() {
@@ -312,14 +312,14 @@
       const track = init.track;
       trackState(track);
       super(type, init);
-      Object.defineProperty(this, "track", { enumerable: true, value: track });
+      defineProperty(this, "track", { enumerable: true, value: track });
     }
   }
 
   class OverconstrainedError extends DOMException {
     constructor(constraint, message = "") {
       super(String(message), "OverconstrainedError");
-      Object.defineProperty(this, "constraint", {
+      defineProperty(this, "constraint", {
         enumerable: true, value: String(constraint),
       });
     }
@@ -420,7 +420,7 @@
     [InputDeviceInfo, "InputDeviceInfo"],
     [MediaDevices, "MediaDevices"],
   ])
-    Object.defineProperty(constructor.prototype, Symbol.toStringTag, {
+    defineProperty(constructor.prototype, Symbol.toStringTag, {
       configurable: true,
       value: tag,
     });
@@ -429,7 +429,7 @@
     MediaDeviceInfo, InputDeviceInfo, MediaDevices,
   });
   if (typeof NavigatorInterface === "function")
-    Object.defineProperty(NavigatorInterface.prototype, "mediaDevices", {
+    defineProperty(NavigatorInterface.prototype, "mediaDevices", {
       configurable: true,
       enumerable: true,
       get() {

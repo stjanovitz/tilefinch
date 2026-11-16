@@ -1214,6 +1214,19 @@ int JS_ProfileForEachBytecode(JSRuntime *rt, JSProfileBytecodeFunc *cb,
 /* set the [IsHTMLDDA] internal slot */
 void JS_SetIsHTMLDDA(JSContext *ctx, JSValueConst obj);
 
+/* Web IDL receiver checks: a marked interface member throws a TypeError
+   ("Illegal invocation") unless its receiver has a marked interface
+   prototype object on its prototype chain. See quickjs.c. */
+void JS_MarkPlatformInterface(JSContext *ctx, JSValueConst proto,
+                              JS_BOOL lenient_handlers);
+typedef struct JSPlatformSnapshot JSPlatformSnapshot;
+JSPlatformSnapshot *JS_SnapshotPlatformInterfaces(JSContext *ctx,
+                                                  JSValueConst global);
+void JS_FreePlatformSnapshot(JSContext *ctx, JSPlatformSnapshot *snapshot);
+int JS_MarkPlatformInterfaces(JSContext *ctx, JSValueConst global,
+                              const JSPlatformSnapshot *since);
+void JS_SetPlatformMember(JSContext *ctx, JSValueConst func, JS_BOOL enabled);
+
 typedef struct JSModuleDef JSModuleDef;
 
 /* return the module specifier (allocated with js_malloc()) or NULL if
