@@ -2,6 +2,7 @@
 #include "tilefinch/request_context.h"
 #include "tilefinch/public_suffix.h"
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -395,6 +396,105 @@ int main(void)
                                     sizeof(other_site))
           && strcmp(output, "http://192.168.1.1") == 0
           && strcmp(other_site, "http://10.9.1.1") == 0);
+
+    /* An address is at most TILEFINCH_URL_SERIALIZED_LIMIT - 1 bytes to
+       the parser and to every writer, whatever buffer a writer is given.
+       A redirect hop's may be TILEFINCH_URL_LONG_LIMIT - 1: the _long
+       parser and writers take it, and so do the checks that answer with an
+       origin or a yes/no. */
+    static char long_url[TILEFINCH_URL_LONG_LIMIT + 2];
+    static char long_output[TILEFINCH_URL_LONG_LIMIT + 2];
+    static char long_base[TILEFINCH_URL_LONG_LIMIT];
+    static const char long_prefix[] = "HTTP://Hop.Example.TEST/a/./b?sidt=";
+    static const char long_normal[] = "http://hop.example.test/a/b?sidt=";
+    const size_t shrink = sizeof(long_prefix) - sizeof(long_normal);
+    static const size_t long_lengths[] = {
+        TILEFINCH_URL_SERIALIZED_LIMIT - 1u, TILEFINCH_URL_SERIALIZED_LIMIT,
+        3000u, 7000u, TILEFINCH_URL_LONG_LIMIT - 1u
+    };
+    for (size_t i = 0; i < sizeof(long_lengths) / sizeof(long_lengths[0]);
+         i++) {
+        size_t length = long_lengths[i];
+        bool fits_plain = length < TILEFINCH_URL_SERIALIZED_LIMIT;
+        memcpy(long_url, long_prefix, sizeof(long_prefix) - 1u);
+        memset(long_url + sizeof(long_prefix) - 1u, 't',
+               length - (sizeof(long_prefix) - 1u));
+        long_url[length] = '\0';
+        CHECK(tilefinch_url_parse(long_url, &url) == fits_plain);
+        CHECK(tilefinch_url_parse_long(long_url, &url) && url.length == length
+              && url.query_length == length - (sizeof(long_prefix) - 1u) + 5u);
+        CHECK(tilefinch_url_origin(long_url, output, sizeof(output))
+              && strcmp(output, "http://hop.example.test") == 0);
+        CHECK(tilefinch_url_same_origin(long_url, "http://hop.example.test/")
+              && !tilefinch_url_same_origin(long_url, "http://example.test/")
+              && tilefinch_url_is_downgrade("https://hop.example.test/",
+                                            long_url));
+        /* The plain writers: a large buffer does not make them long. */
+        CHECK(tilefinch_url_normalize(long_url, long_output,
+                                      sizeof(long_output)) == fits_plain);
+        CHECK(tilefinch_url_request_key(long_url, long_output,
+                                        sizeof(long_output)) == fits_plain);
+        CHECK(tilefinch_url_resolve("http://example.test/", long_url,
+                                    long_output, sizeof(long_output))
+                  == fits_plain);
+        CHECK(tilefinch_url_resolve(long_url, "/short", long_output,
+                                    sizeof(long_output)) == fits_plain);
+        /* The upgrade is one byte longer before it is normalized. */
+        CHECK(tilefinch_url_upgrade_to_https(long_url, long_output,
+                                             sizeof(long_output))
+                  == (length + 1u < TILEFINCH_URL_SERIALIZED_LIMIT));
+        /* The long writers. */
+        CHECK(tilefinch_url_normalize_long(long_url, long_output,
+                                           sizeof(long_output))
+              && strlen(long_output) == length - shrink
+              && strncmp(long_output, long_normal,
+                         sizeof(long_normal) - 1u) == 0
+              && long_output[length - shrink - 1u] == 't');
+        CHECK(tilefinch_url_request_key_long(long_url, long_output,
+                                             sizeof(long_output))
+              && strlen(long_output) == length - shrink);
+        if (length + 1u < TILEFINCH_URL_LONG_LIMIT) {
+            CHECK(tilefinch_url_upgrade_to_https_long(long_url, long_output,
+                                                      sizeof(long_output))
+                  && strlen(long_output) == length - shrink + 1u
+                  && strncmp(long_output,
+                             "https://hop.example.test/a/b?sidt=", 34) == 0);
+        } else {
+            CHECK(!tilefinch_url_upgrade_to_https_long(
+                long_url, long_output, sizeof(long_output)));
+        }
+        /* Absolute against any base, and relative against a long base. */
+        CHECK(tilefinch_url_resolve_long("https://example.test/x", long_url,
+                                         long_output, sizeof(long_output))
+              && strlen(long_output) == length - shrink);
+        memcpy(long_base, long_output, strlen(long_output) + 1u);
+        CHECK(tilefinch_url_resolve_long(long_base, "next?x=1", long_output,
+                                         sizeof(long_output))
+              && strcmp(long_output, "http://hop.example.test/a/next?x=1")
+                     == 0);
+        CHECK(tilefinch_url_resolve_long(long_base, "#frag", long_output,
+                                         sizeof(long_output))
+                  == (strlen(long_base) + 5u < TILEFINCH_URL_LONG_LIMIT)
+              && (strlen(long_base) + 5u >= TILEFINCH_URL_LONG_LIMIT
+                  || strlen(long_output) == strlen(long_base) + 5u));
+        /* A result that does not fit its buffer is refused, never cut. */
+        CHECK(!tilefinch_url_normalize_long(long_url, long_output,
+                                            length - shrink));
+        CHECK(tilefinch_url_normalize_long(long_url, long_output,
+                                           length - shrink + 1u));
+    }
+    /* One byte more is no address at all. */
+    memset(long_url + sizeof(long_prefix) - 1u, 't',
+           TILEFINCH_URL_LONG_LIMIT - (sizeof(long_prefix) - 1u));
+    long_url[TILEFINCH_URL_LONG_LIMIT] = '\0';
+    CHECK(!tilefinch_url_parse(long_url, &url)
+          && !tilefinch_url_parse_long(long_url, &url)
+          && !tilefinch_url_origin(long_url, output, sizeof(output))
+          && !tilefinch_url_same_origin(long_url, "http://hop.example.test/")
+          && !tilefinch_url_normalize_long(long_url, long_output,
+                                           sizeof(long_output))
+          && !tilefinch_url_resolve_long("http://example.test/", long_url,
+                                         long_output, sizeof(long_output)));
 
     puts("url-tests status=PASS");
     return 0;

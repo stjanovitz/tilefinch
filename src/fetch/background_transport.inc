@@ -67,8 +67,12 @@ bool fetch_background_transport_stream_shape_supported(
         && request->content_blocker == NULL
         && request->cookie_session == NULL
         && request->cookie_context == NULL
+        /* A scheduler hop may be a redirect chain's long intermediate
+           address (TILEFINCH_URL_LONG_LIMIT): the slot keeps it in a
+           budget block (large_url). */
         && FETCH_BACKGROUND_FIELD_FITS(
-               url, FETCH_BACKGROUND_URL_CAPACITY)
+               url, single_hop ? TILEFINCH_URL_LONG_LIMIT
+                               : FETCH_BACKGROUND_URL_CAPACITY)
         && FETCH_BACKGROUND_FIELD_FITS(
                request->content_type,
                FETCH_BACKGROUND_CONTENT_TYPE_CAPACITY)
@@ -217,6 +221,11 @@ typedef struct {
     size_t total_length;
     size_t response_cookie_bytes;
     size_t response_cookie_count;
+    /* Browser thread only, reset when the slot is claimed: the fields
+       already handed over (the header take hands them first) and whether
+       the chain's capacity cut them short. */
+    size_t cookies_handed;
+    bool cookies_truncated;
     long header_status;
     char initial_url[FETCH_BACKGROUND_URL_CAPACITY];
     char url[FETCH_BACKGROUND_URL_CAPACITY];
@@ -234,6 +243,22 @@ typedef struct {
        its copy until the next claim. */
     char *large_body;
     char *large_extra_headers;
+    /* The same for a scheduler hop's address of FETCH_BACKGROUND_URL_CAPACITY
+       bytes or more (a redirect chain's long intermediate hop); `url` is
+       then empty and nothing follows a redirect from it here. Read through
+       fetch_background_slot_url(). */
+    char *large_url;
+    /* A navigation's scheduler hop keeps its response's Location here, room
+       for TILEFINCH_URL_LONG_LIMIT bytes, instead of in `location`: the
+       browser thread follows it and it may be several kilobytes. The
+       browser thread allocates and frees it as the two above; the worker
+       only writes into it while the transfer runs. */
+    char *large_location;
+    /* The current response has a Location field. Only its first is kept,
+       as the header snapshot and the browser-thread path keep it, and an
+       empty one still makes the response a redirect (the browser thread
+       resolves it against the hop's address). */
+    bool location_present;
     char cookie[FETCH_BACKGROUND_COOKIE_CAPACITY];
     char origin[FETCH_BACKGROUND_ORIGIN_CAPACITY];
     char accept[FETCH_BACKGROUND_ACCEPT_CAPACITY];
@@ -256,6 +281,31 @@ typedef struct {
     char curl_error[CURL_ERROR_SIZE];
     FetchBackgroundResult result;
 } FetchBackgroundSlot;
+
+/* The current response's Location and the buffer it is kept in: a
+   navigation's scheduler hop has room for a long one (large_location). */
+static const char *fetch_background_slot_location(
+    const FetchBackgroundSlot *slot)
+{
+    return slot->large_location != NULL ? slot->large_location
+                                        : slot->location;
+}
+
+static char *fetch_background_slot_location_buffer(
+    FetchBackgroundSlot *slot, size_t *capacity)
+{
+    *capacity = slot->large_location != NULL
+        ? TILEFINCH_URL_LONG_LIMIT : sizeof(slot->location);
+    return slot->large_location != NULL ? slot->large_location
+                                        : slot->location;
+}
+
+static void fetch_background_slot_clear_location(FetchBackgroundSlot *slot)
+{
+    slot->location_present = false;
+    slot->location[0] = '\0';
+    if (slot->large_location != NULL) slot->large_location[0] = '\0';
+}
 
 typedef struct {
     atomic_int state;
@@ -427,13 +477,27 @@ static FetchBackgroundCookieCapture fetch_background_capture_cookie(
     return FETCH_BACKGROUND_COOKIE_CAPTURED;
 }
 
+/* A response's address only when a document may have it, never one cut
+   to fit: a hop longer than that has none (a chain may not end on one, and
+   the scheduler refuses it), and the browser thread's copy holds only
+   TILEFINCH_URL_SERIALIZED_LIMIT - 1 bytes. */
+static void fetch_background_set_effective_url(FetchBackgroundResult *result,
+                                               const char *url)
+{
+    if (strlen(url) < TILEFINCH_URL_SERIALIZED_LIMIT)
+        snprintf(result->effective_url, sizeof(result->effective_url), "%s",
+                 url);
+    else
+        result->effective_url[0] = '\0';
+}
+
 static void fetch_background_reset_response_headers(
     FetchBackgroundSlot *slot)
 {
     if (slot == NULL) return;
     slot->header_status = 0;
     slot->response_headers_complete = false;
-    slot->location[0] = '\0';
+    fetch_background_slot_clear_location(slot);
     slot->content_range[0] = '\0';
     slot->content_type_response[0] = '\0';
     slot->response_cookie_bytes = 0;
@@ -524,14 +588,29 @@ static bool fetch_background_store_header(
             value, value_length);
     } else if (name_length == 8u
                && strncasecmp(data, "location", 8u) == 0) {
-        copy_header_value(slot->location, sizeof(slot->location),
-                          value, value_length);
+        if (slot->location_present) return true;
+        slot->location_present = true;
+        size_t location_capacity = 0;
+        char *location = fetch_background_slot_location_buffer(
+            slot, &location_capacity);
+        copy_header_value(location, location_capacity, value, value_length);
+        /* One cut to fit its buffer would be followed to another address.
+           The header snapshot need not hold it: the browser thread reads a
+           single hop's Location from this buffer too. */
+        if (fetch_background_redirect_location_lost(
+                slot->header_status, value_length, location_capacity)) {
+            slot->result.chain_limit = FETCH_CHAIN_LIMIT_TARGET_LENGTH;
+            snprintf(slot->result.error, sizeof(slot->result.error), "%s",
+                     "redirect response headers exceeded transport bounds");
+            return false;
+        }
     } else if (set_cookie) {
         FetchBackgroundCookieCapture capture =
             fetch_background_capture_cookie(slot, value, value_length);
         if (capture == FETCH_BACKGROUND_COOKIE_TRUNCATED) {
             slot->result.set_cookies_truncated = true;
         } else if (capture == FETCH_BACKGROUND_COOKIE_REJECTED) {
+            slot->result.chain_limit = FETCH_CHAIN_LIMIT_COOKIES;
             snprintf(slot->result.error, sizeof(slot->result.error), "%s",
                      "background response cookies exceeded bound");
             return false;
@@ -622,15 +701,15 @@ static size_t fetch_background_receive_header(
             if (slot->result.set_cookies_truncated
                 && fetch_background_redirect_cookie_overflow_fatal(
                        slot->single_hop, slot->header_status,
-                       slot->location[0] != '\0')) {
+                       fetch_background_slot_location(slot)[0] != '\0')) {
+                slot->result.chain_limit = FETCH_CHAIN_LIMIT_COOKIES;
                 snprintf(
                     slot->result.error, sizeof(slot->result.error),
                     "%s", "redirect response cookies exceeded transport bounds");
                 return 0;
             }
             slot->result.status_code = slot->header_status;
-            snprintf(slot->result.effective_url,
-                     sizeof(slot->result.effective_url), "%s", slot->url);
+            fetch_background_set_effective_url(&slot->result, slot->url);
             snprintf(slot->result.content_range,
                      sizeof(slot->result.content_range), "%s",
                      slot->content_range);
@@ -643,7 +722,7 @@ static size_t fetch_background_receive_header(
                line resets them; only terminal snapshots get published. */
             if (fetch_background_header_block_publishable(
                     slot->single_hop, slot->header_status,
-                    slot->location[0] != '\0')) {
+                    fetch_background_slot_location(slot)[0] != '\0')) {
                 fetch_transport_timing_sample(
                     slot->easy, &slot->header_timing);
                 atomic_store_explicit(
@@ -811,14 +890,24 @@ static const char *fetch_background_slot_extra_headers(
         ? slot->large_extra_headers : slot->extra_headers;
 }
 
+/* The address this slot requests. */
+static const char *fetch_background_slot_url(const FetchBackgroundSlot *slot)
+{
+    return slot->large_url != NULL ? slot->large_url : slot->url;
+}
+
 /* Browser thread only, on a slot the worker no longer reads. */
 static void fetch_background_slot_drop_large_fields(
     FetchBackgroundSlot *slot)
 {
     budget_free(fetch_background.budget, slot->large_body);
     budget_free(fetch_background.budget, slot->large_extra_headers);
+    budget_free(fetch_background.budget, slot->large_url);
+    budget_free(fetch_background.budget, slot->large_location);
     slot->large_body = NULL;
     slot->large_extra_headers = NULL;
+    slot->large_url = NULL;
+    slot->large_location = NULL;
 }
 
 /* Copies `length` bytes plus a terminator into the inline field when they
@@ -839,11 +928,38 @@ static bool fetch_background_slot_store_payload(
     return true;
 }
 
-/* Browser thread, slot PREPARING. The shape check bounds both lengths. */
+/* Browser thread, slot PREPARING. The shape check bounds the lengths.
+   `single_hop`: a scheduler hop, whose redirects the browser thread
+   follows. */
 static bool fetch_background_slot_store_request_payload(
-    FetchBackgroundSlot *slot, const FetchRequest *request)
+    FetchBackgroundSlot *slot, const FetchRequest *request, const char *url,
+    bool single_hop)
 {
     fetch_background_slot_drop_large_fields(slot);
+    size_t url_length = strlen(url);
+    slot->url[0] = '\0';
+    /* Only a redirect this worker follows itself compares against the
+       first address, and it never starts from a long one. */
+    slot->initial_url[0] = '\0';
+    if (url_length < sizeof(slot->initial_url))
+        memcpy(slot->initial_url, url, url_length + 1u);
+    if (!fetch_background_slot_store_payload(
+            slot->url, sizeof(slot->url), &slot->large_url, url,
+            url_length)) return false;
+    /* A navigation's redirect may name an address of several kilobytes
+       (fetch_hop_advance follows it); any other hop's Location is refused
+       past TILEFINCH_URL_SERIALIZED_LIMIT, which the inline field holds. */
+    if (single_hop && request->sec_fetch_mode != NULL
+        && strcasecmp(request->sec_fetch_mode, "navigate") == 0) {
+        slot->large_location = budget_malloc_category(
+            fetch_background.budget, BUDGET_CATEGORY_RESOURCE,
+            TILEFINCH_URL_LONG_LIMIT);
+        if (slot->large_location == NULL) {
+            fetch_background_slot_drop_large_fields(slot);
+            return false;
+        }
+        slot->large_location[0] = '\0';
+    }
     const char *headers = request->extra_headers == NULL
         ? "" : request->extra_headers;
     size_t headers_length = strlen(headers);
@@ -872,8 +988,9 @@ static bool fetch_background_configure_request_shape(
         .content_type = slot->content_type
     };
     bool hints_ready = true;
+    const char *slot_url = fetch_background_slot_url(slot);
     if (slot->send_low_client_hints
-        && tilefinch_url_potentially_trustworthy(slot->url)) {
+        && tilefinch_url_potentially_trustworthy(slot_url)) {
         for (size_t i = 0;
              hints_ready
              && i < sizeof(fetch_low_client_hint_headers)
@@ -885,8 +1002,8 @@ static bool fetch_background_configure_request_shape(
     bool high_entropy_allowed = slot->send_client_hints
         && !slot->suppress_high_client_hints
         && slot->client_hint_origin[0] != '\0'
-        && tilefinch_url_same_origin(slot->client_hint_origin, slot->url)
-        && tilefinch_url_potentially_trustworthy(slot->url);
+        && tilefinch_url_same_origin(slot->client_hint_origin, slot_url)
+        && tilefinch_url_potentially_trustworthy(slot_url);
     if (high_entropy_allowed) {
         for (size_t i = 0;
              hints_ready
@@ -952,7 +1069,8 @@ static long fetch_background_remaining_ms(const FetchBackgroundSlot *slot)
 
 static bool fetch_background_configure_easy(FetchBackgroundSlot *slot)
 {
-    if (slot == NULL || slot->url[0] == '\0') return false;
+    if (slot == NULL || fetch_background_slot_url(slot)[0] == '\0')
+        return false;
     fetch_background_slot_release_curl(slot);
     slot->easy = curl_easy_init();
     if (slot->easy == NULL) return false;
@@ -985,7 +1103,8 @@ static bool fetch_background_configure_easy(FetchBackgroundSlot *slot)
         || !fetch_configure_http_version(slot->easy)
         || !fetch_configure_private_network(
                slot->easy, &slot->private_network)
-        || curl_easy_setopt(slot->easy, CURLOPT_URL, slot->url) != CURLE_OK
+        || curl_easy_setopt(slot->easy, CURLOPT_URL,
+                            fetch_background_slot_url(slot)) != CURLE_OK
         || curl_easy_setopt(slot->easy, CURLOPT_FOLLOWLOCATION, 0L) != CURLE_OK
         || curl_easy_setopt(
                slot->easy, CURLOPT_SUPPRESS_CONNECT_HEADERS, 1L) != CURLE_OK
@@ -1315,7 +1434,11 @@ static void fetch_background_finish_stream_if_drained(
 
 static bool fetch_background_follow_redirect(FetchBackgroundSlot *slot)
 {
+    /* Only a request this worker follows itself gets here: its address
+       and its Location are in the inline fields (a long hop is the
+       scheduler's, which follows its own redirects). */
     if (slot->header_status < 300 || slot->header_status >= 400
+        || slot->large_url != NULL || slot->large_location != NULL
         || slot->location[0] == '\0'
         || slot->redirects >= FETCH_REDIRECT_LIMIT) return false;
     char resolved[FETCH_BACKGROUND_URL_CAPACITY];
@@ -1360,7 +1483,7 @@ static bool fetch_background_follow_redirect(FetchBackgroundSlot *slot)
     atomic_store_explicit(
         &slot->received_body_bytes, 0u, memory_order_release);
     slot->header_status = 0;
-    slot->location[0] = '\0';
+    fetch_background_slot_clear_location(slot);
     slot->content_range[0] = '\0';
     slot->curl_error[0] = '\0';
     return fetch_background_configure_easy(slot);
@@ -1400,8 +1523,8 @@ static void fetch_background_finish_easy(
            healthy stream (media, a large download) is not a stall. */
         if (code != CURLE_OK || first_us >= 5000000
             || (first_us == 0 && total_us >= 5000000)) {
-            const char *host = effective_url == NULL ? slot->url
-                                                     : effective_url;
+            const char *host = effective_url == NULL
+                ? fetch_background_slot_url(slot) : effective_url;
             const char *scheme_end = host == NULL ? NULL
                                                   : strstr(host, "://");
             if (scheme_end != NULL) host = scheme_end + 3;
@@ -1458,10 +1581,8 @@ static void fetch_background_finish_easy(
         snprintf(slot->result.error, sizeof(slot->result.error), "%s",
                  "blocked private network target");
     }
-    if (!header_snapshot_published && effective_url != NULL) {
-        snprintf(slot->result.effective_url,
-                 sizeof(slot->result.effective_url), "%s", effective_url);
-    }
+    if (!header_snapshot_published && effective_url != NULL)
+        fetch_background_set_effective_url(&slot->result, effective_url);
     if (!header_snapshot_published) {
         snprintf(slot->result.content_range,
                  sizeof(slot->result.content_range), "%s",
@@ -1495,7 +1616,8 @@ static void fetch_background_finish_easy(
     /* One line per connection a media request opened: which request paid
        for it, and what the handshake cost. */
     if (slot->result.new_connections > 0
-        && strstr(slot->url, ".googlevideo.com/") != NULL) {
+        && strstr(fetch_background_slot_url(slot),
+                  ".googlevideo.com/") != NULL) {
         psp_log_printf(
             "tilefinch-media-connection: conn=%lld handshake=%lluus "
             "measured=%u fresh=%u tls12=%u status=%ld code=%d at=%lluus\n",
@@ -1868,6 +1990,8 @@ static void fetch_background_expire_active_deadlines(void)
                  slot->transfer_done);
 #endif
         fetch_background_slot_release_curl(slot);
+        if (!deadline_expired)
+            slot->result.chain_limit = FETCH_CHAIN_LIMIT_STALL;
         slot->result.success = false;
         slot->result.timed_out = true;
         slot->transfer_done = true;
@@ -2546,7 +2670,8 @@ static uint64_t fetch_background_transport_enqueue_stream_internal(
     }
     const char *method = request->method == NULL ? "GET" : request->method;
     size_t url_length = strlen(url);
-    if (url_length >= FETCH_BACKGROUND_URL_CAPACITY) {
+    if (url_length >= (single_hop ? TILEFINCH_URL_LONG_LIMIT
+                                  : FETCH_BACKGROUND_URL_CAPACITY)) {
         if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNSUPPORTED;
         return 0;
     }
@@ -2563,10 +2688,6 @@ static uint64_t fetch_background_transport_enqueue_stream_internal(
                 memory_order_acq_rel, memory_order_acquire)) continue;
         bool copied =
             fetch_background_copy_field(
-                slot->initial_url, sizeof(slot->initial_url), url)
-            && fetch_background_copy_field(
-                slot->url, sizeof(slot->url), url)
-            && fetch_background_copy_field(
                 slot->method, sizeof(slot->method), method)
             && fetch_background_copy_field(
                 slot->content_type, sizeof(slot->content_type),
@@ -2606,7 +2727,8 @@ static uint64_t fetch_background_transport_enqueue_stream_internal(
                 slot->sec_fetch_site, sizeof(slot->sec_fetch_site),
                 request->sec_fetch_site);
         bool payload_stored = copied
-            && fetch_background_slot_store_request_payload(slot, request);
+            && fetch_background_slot_store_request_payload(
+                   slot, request, url, single_hop);
         if (!payload_stored) {
             fetch_background_slot_drop_large_fields(slot);
             atomic_store_explicit(
@@ -2625,6 +2747,8 @@ static uint64_t fetch_background_transport_enqueue_stream_internal(
         slot->buffer_index = -1;
         slot->streaming = true;
         slot->single_hop = single_hop;
+        slot->cookies_handed = 0;
+        slot->cookies_truncated = false;
         slot->transfer_done = false;
         slot->curl_paused = false;
         slot->pause_started_us = 0;
@@ -2668,7 +2792,7 @@ static uint64_t fetch_background_transport_enqueue_stream_internal(
         slot->length = 0;
         slot->chunk_offset = 0;
         slot->total_length = 0;
-        slot->location[0] = '\0';
+        fetch_background_slot_clear_location(slot);
         slot->content_range[0] = '\0';
         slot->content_type_response[0] = '\0';
         slot->curl_error[0] = '\0';
@@ -2742,21 +2866,24 @@ uint64_t fetch_background_transport_enqueue_media_stream_sized_diagnosed(
 
 uint64_t fetch_background_transport_enqueue_hop_stream(
     const char *url, const FetchRequest *request,
-    size_t maximum_bytes, long timeout_ms)
+    size_t maximum_bytes, long timeout_ms,
+    FetchBackgroundEnqueueStatus *status)
 {
     return fetch_background_transport_enqueue_stream_internal(
         url, request, maximum_bytes, timeout_ms, true,
-        FETCH_BACKGROUND_STREAM_CHUNK_TARGET, FETCH_BACKGROUND_LANE_ORDINARY, NULL);
+        FETCH_BACKGROUND_STREAM_CHUNK_TARGET, FETCH_BACKGROUND_LANE_ORDINARY,
+        status);
 }
 
 uint64_t fetch_background_transport_enqueue_blocking_hop_stream(
     const char *url, const FetchRequest *request,
-    size_t maximum_bytes, long timeout_ms)
+    size_t maximum_bytes, long timeout_ms,
+    FetchBackgroundEnqueueStatus *status)
 {
     return fetch_background_transport_enqueue_stream_internal(
         url, request, maximum_bytes, timeout_ms, true,
         FETCH_BACKGROUND_STREAM_CHUNK_TARGET, FETCH_BACKGROUND_LANE_BLOCKING,
-        NULL);
+        status);
 }
 
 uint64_t fetch_background_transport_enqueue_media_hop_stream_sized_diagnosed(
@@ -2850,6 +2977,8 @@ static uint64_t fetch_background_transport_enqueue_fixed_internal(
             &slot->generation, generation, memory_order_release);
         slot->buffer_index = -1;
         slot->single_hop = false;
+        slot->cookies_handed = 0;
+        slot->cookies_truncated = false;
         slot->transfer_done = false;
         slot->curl_paused = false;
         slot->pause_started_us = 0;
@@ -3230,11 +3359,61 @@ static void fetch_background_copy_media_response(
              source->error);
 }
 
-bool fetch_background_transport_take_headers(
-    uint64_t request_id, FetchResult *metadata)
+/* Appends the slot's Set-Cookie fields not yet handed over to `result`,
+   each with the hop's URL. At the chain's capacity a redirect the worker
+   follows itself overflows (its next request would go out without them);
+   any other response keeps what fits and is marked truncated. Browser
+   thread only. The fields are stable once the headers are published: the
+   worker ignores every header line after the published block. */
+static FetchBackgroundCookieHandoff fetch_background_hand_over_cookies(
+    FetchBackgroundSlot *slot, Budget *budget, FetchResult *result)
+{
+    bool redirect_response =
+        fetch_background_redirect_cookie_overflow_fatal(
+            slot->single_hop, slot->result.status_code,
+            fetch_background_slot_location(slot)[0] != '\0');
+    const char *slot_url = fetch_background_slot_url(slot);
+    size_t url_length = strlen(slot_url);
+    while (slot->cookies_handed < slot->response_cookie_count) {
+        if (result->set_cookie_count >= FETCH_RESPONSE_COOKIE_CAPACITY) {
+            if (redirect_response) return FETCH_BACKGROUND_COOKIES_OVERFLOW;
+            slot->cookies_truncated = true;
+            slot->cookies_handed = slot->response_cookie_count;
+            break;
+        }
+        const FetchBackgroundCookie *cookie =
+            &slot->response_cookies[slot->cookies_handed];
+        char *value = budget_malloc_category(
+            budget, BUDGET_CATEGORY_RESOURCE,
+            (size_t) cookie->value_length + 1u);
+        char *url = budget_malloc_category(
+            budget, BUDGET_CATEGORY_RESOURCE, url_length + 1u);
+        if (value == NULL || url == NULL) {
+            budget_free(budget, value);
+            budget_free(budget, url);
+            return FETCH_BACKGROUND_COOKIES_MEMORY;
+        }
+        memcpy(value,
+               slot->response_cookie_storage + cookie->value_offset,
+               (size_t) cookie->value_length + 1u);
+        memcpy(url, slot_url, url_length + 1u);
+        result->set_cookies[result->set_cookie_count] = value;
+        result->set_cookie_urls[result->set_cookie_count] = url;
+        result->set_cookie_count++;
+        slot->cookies_handed++;
+    }
+    if (slot->cookies_truncated) result->set_cookies_truncated = true;
+    return FETCH_BACKGROUND_COOKIES_HANDED;
+}
+
+bool fetch_background_transport_take_headers_with_cookies(
+    uint64_t request_id, Budget *budget, FetchResult *metadata,
+    FetchBackgroundCookieHandoff *cookies)
 {
     FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_owns(request_id),
-        fetch_replay_lane_take_headers(request_id, metadata));
+        fetch_replay_lane_take_headers_with_cookies(
+            request_id, budget, metadata, cookies));
+    if (cookies != NULL) *cookies = FETCH_BACKGROUND_COOKIES_HANDED;
     unsigned index = fetch_background_id_slot(request_id);
     if (!fetch_background.initialized || metadata == NULL
         || index >= FETCH_BACKGROUND_REQUEST_LIMIT) return false;
@@ -3248,6 +3427,36 @@ bool fetch_background_transport_take_headers(
             memory_order_acq_rel, memory_order_acquire)) return false;
     fetch_background_copy_header_snapshot(metadata, &slot->result);
     metadata->transport_timing = slot->header_timing;
+    if (budget != NULL) {
+        FetchBackgroundCookieHandoff handoff =
+            fetch_background_hand_over_cookies(slot, budget, metadata);
+        if (cookies != NULL) *cookies = handoff;
+    }
+    return true;
+}
+
+bool fetch_background_transport_take_headers(
+    uint64_t request_id, FetchResult *metadata)
+{
+    return fetch_background_transport_take_headers_with_cookies(
+        request_id, NULL, metadata, NULL);
+}
+bool fetch_background_transport_response_location(
+    uint64_t request_id, const char **location)
+{
+    if (location != NULL) *location = NULL;
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_owns(request_id),
+        fetch_replay_lane_response_location(request_id, location));
+    unsigned index = fetch_background_id_slot(request_id);
+    if (!fetch_background.initialized || location == NULL
+        || index >= FETCH_BACKGROUND_REQUEST_LIMIT) return false;
+    FetchBackgroundSlot *slot = &fetch_background.slots[index];
+    if (!slot->streaming || !slot->single_hop
+        || !fetch_background_slot_matches(slot, request_id)
+        || atomic_load_explicit(&slot->headers_state, memory_order_acquire)
+               != FETCH_BACKGROUND_HEADERS_TAKEN) return false;
+    if (!slot->location_present) return false;
+    *location = fetch_background_slot_location(slot);
     return true;
 }
 
@@ -3370,45 +3579,15 @@ bool fetch_background_transport_take_fetch_result_consumed(
     snprintf(result->error, sizeof(result->error), "%s",
              assembled ? slot->result.error
                        : "background streamed response was incomplete");
-    bool cookies_ok = true;
-    bool cookie_capacity_rejected = false;
-    bool redirect_response =
-        fetch_background_redirect_cookie_overflow_fatal(
-            slot->single_hop, slot->result.status_code,
-            slot->location[0] != '\0');
-    for (size_t i = 0; i < slot->response_cookie_count; i++) {
-        if (result->set_cookie_count >= FETCH_RESPONSE_COOKIE_CAPACITY) {
-            if (redirect_response) {
-                cookies_ok = false;
-                cookie_capacity_rejected = true;
-            } else {
-                result->set_cookies_truncated = true;
-            }
-            break;
-        }
-        const FetchBackgroundCookie *cookie = &slot->response_cookies[i];
-        size_t url_length = strlen(slot->url);
-        char *value = budget_malloc_category(
-            budget, BUDGET_CATEGORY_RESOURCE,
-            (size_t) cookie->value_length + 1u);
-        char *url = budget_malloc_category(
-            budget, BUDGET_CATEGORY_RESOURCE,
-            url_length + 1u);
-        if (value == NULL || url == NULL) {
-            budget_free(budget, value);
-            budget_free(budget, url);
-            cookies_ok = false;
-            break;
-        }
-        memcpy(value,
-               slot->response_cookie_storage + cookie->value_offset,
-               (size_t) cookie->value_length + 1u);
-        memcpy(url, slot->url, url_length + 1u);
-        result->set_cookies[result->set_cookie_count] = value;
-        result->set_cookie_urls[result->set_cookie_count] = url;
-        result->set_cookie_count++;
-    }
+    if (slot->result.chain_limit != FETCH_CHAIN_LIMIT_NONE)
+        result->chain.limit = slot->result.chain_limit;
+    FetchBackgroundCookieHandoff handoff =
+        fetch_background_hand_over_cookies(slot, budget, result);
+    bool cookies_ok = handoff == FETCH_BACKGROUND_COOKIES_HANDED;
+    bool cookie_capacity_rejected =
+        handoff == FETCH_BACKGROUND_COOKIES_OVERFLOW;
     if (!cookies_ok) {
+        result->chain.limit = FETCH_CHAIN_LIMIT_COOKIES;
         while (result->set_cookie_count != 0) {
             size_t at = --result->set_cookie_count;
             budget_free(budget, result->set_cookies[at]);
@@ -3947,23 +4126,27 @@ uint64_t fetch_background_transport_enqueue_media_diagnosed(
 }
 uint64_t fetch_background_transport_enqueue_hop_stream(
     const char *url, const FetchRequest *request,
-    size_t maximum_bytes, long timeout_ms)
+    size_t maximum_bytes, long timeout_ms,
+    FetchBackgroundEnqueueStatus *status)
 {
     FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
         fetch_replay_lane_enqueue(url, request, maximum_bytes, timeout_ms,
-                                  true, true, 0, FETCH_BACKGROUND_LANE_ORDINARY, NULL));
+                                  true, true, 0, FETCH_BACKGROUND_LANE_ORDINARY, status));
     (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
+    if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE;
     return 0;
 }
 uint64_t fetch_background_transport_enqueue_blocking_hop_stream(
     const char *url, const FetchRequest *request,
-    size_t maximum_bytes, long timeout_ms)
+    size_t maximum_bytes, long timeout_ms,
+    FetchBackgroundEnqueueStatus *status)
 {
     FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
         fetch_replay_lane_enqueue(url, request, maximum_bytes, timeout_ms,
                                   true, true, 0,
-                                  FETCH_BACKGROUND_LANE_BLOCKING, NULL));
+                                  FETCH_BACKGROUND_LANE_BLOCKING, status));
     (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
+    if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE;
     return 0;
 }
 uint64_t fetch_background_transport_enqueue_media_hop_stream_sized_diagnosed(
@@ -4001,12 +4184,29 @@ bool fetch_background_transport_metrics(
     (void) metrics;
     return false;
 }
+bool fetch_background_transport_take_headers_with_cookies(
+    uint64_t request_id, Budget *budget, FetchResult *metadata,
+    FetchBackgroundCookieHandoff *cookies)
+{
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_owns(request_id),
+        fetch_replay_lane_take_headers_with_cookies(
+            request_id, budget, metadata, cookies));
+    (void) request_id; (void) budget; (void) metadata;
+    if (cookies != NULL) *cookies = FETCH_BACKGROUND_COOKIES_HANDED;
+    return false;
+}
 bool fetch_background_transport_take_headers(
     uint64_t request_id, FetchResult *metadata)
 {
+    return fetch_background_transport_take_headers_with_cookies(
+        request_id, NULL, metadata, NULL);
+}
+bool fetch_background_transport_response_location(
+    uint64_t request_id, const char **location)
+{
+    if (location != NULL) *location = NULL;
     FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_owns(request_id),
-        fetch_replay_lane_take_headers(request_id, metadata));
-    (void) request_id; (void) metadata;
+        fetch_replay_lane_response_location(request_id, location));
     return false;
 }
 bool fetch_background_transport_take_media_headers(

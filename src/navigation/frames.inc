@@ -553,6 +553,7 @@ static bool navigation_deliver_frame_messages(NavigationSession *session)
             }
             navigation_frame_presentation_destroy(
                 session, target_owner_frame);
+            navigation_frame_drop_heavy_hold(target_owner_frame);
             script_runtime_destroy(target_owner_frame->runtime);
             target_owner_frame->runtime = NULL;
             images_destroy(&target_owner_frame->images);
@@ -695,6 +696,7 @@ static bool navigation_retire_detached_frames(NavigationSession *session)
                                         frame->parent_handle);
         }
         navigation_frame_presentation_destroy(session, frame);
+        navigation_frame_drop_heavy_hold(frame);
         script_runtime_destroy(frame->runtime);
         frame->runtime = NULL;
         images_destroy(&frame->images);
@@ -866,6 +868,7 @@ static void navigation_retire_frame_descendants(
         }
         navigation_drop_frame_messages(session, candidate);
         navigation_frame_presentation_destroy(session, candidate);
+        navigation_frame_drop_heavy_hold(candidate);
         script_runtime_destroy(candidate->runtime);
         candidate->runtime = NULL;
         images_destroy(&candidate->images);
@@ -890,6 +893,7 @@ static void navigation_retire_unloaded_frame(NavigationSession *session,
     }
     navigation_drop_frame_messages(session, frame);
     navigation_frame_presentation_destroy(session, frame);
+    navigation_frame_drop_heavy_hold(frame);
     script_runtime_destroy(frame->runtime);
     frame->runtime = NULL;
     images_destroy(&frame->images);
@@ -1176,6 +1180,7 @@ static bool navigation_load_frames_for_context(
             }
             navigation_drop_frame_messages(session, frame);
             navigation_frame_presentation_destroy(session, frame);
+            navigation_frame_drop_heavy_hold(frame);
             script_runtime_destroy(frame->runtime);
             images_destroy(&frame->images);
             document_destroy(&frame->document);
@@ -1616,9 +1621,117 @@ bool navigation_test_install_frame_capability_trace(
 }
 #endif
 
-static bool navigation_complete_frame(NavigationSession *session,
-                                      NavigationFrame *frame,
-                                      bool fetched_ok, FetchResult *fetch)
+/* A frame with no completed scripts may be rebuilt from its kept response.
+   Once a script has completed, its realm and document must be kept so its
+   external effects are not repeated when the answer arrives. */
+static bool navigation_frame_hold_heavy(NavigationSession *session,
+                                        NavigationFrame *frame,
+                                        size_t held_bytes)
+{
+    if (!script_runtime_heavy_frame_replay_safe(frame->runtime)) {
+        frame->fetch_pending = false;
+        frame->loaded = false;
+        frame->heavy_held = true;
+        frame->heavy_held_bytes = held_bytes;
+        return true;
+    }
+    navigation_drop_frame_messages(session, frame);
+    navigation_frame_presentation_destroy(session, frame);
+    script_runtime_destroy(frame->runtime);
+    frame->runtime = NULL;
+    images_destroy(&frame->images);
+    document_destroy(&frame->document);
+    frame->fetch_pending = false;
+    frame->loaded = false;
+    frame->heavy_held = true;
+    frame->heavy_held_bytes = held_bytes;
+    /* As at discovery: the container's browsing context has no document
+       yet. */
+    char parent_origin[NAVIGATION_URL_LIMIT] = {0};
+    char child_origin[NAVIGATION_URL_LIMIT] = {0};
+    bool same_origin = url_origin(frame->parent_url, parent_origin,
+                                  sizeof(parent_origin))
+        && url_origin(frame->url, child_origin, sizeof(child_origin))
+        && strcmp(parent_origin, child_origin) == 0
+        && !frame->opaque_origin;
+    (void) script_runtime_set_frame_window_state(
+        frame->parent_runtime, frame->parent_handle, true, same_origin,
+        frame->opaque_origin, frame->url, false,
+        navigation_frame_parent_result(session, frame));
+    return true;
+}
+
+/* A frame's response kept for the page's frame answer is at most this
+   large (navigation_complete_frame): a bot check's or sign-in frame's
+   document is a few KiB (DataDome's captcha frame on etsy and nytimes:
+   under 10 KiB). A larger frame loads as before, its big parser scripts
+   running unasked, rather than holding its whole document through its
+   scripts' run. */
+#define NAVIGATION_HEAVY_FRAME_KEEP_BYTES (64u * 1024u)
+
+static bool navigation_finish_frame(NavigationSession *session,
+                                    NavigationFrame *frame, bool ok,
+                                    bool parent_state_oom)
+{
+    if (!ok && navigation_retire_failed_document_refresh(
+            session, frame->runtime)) return false;
+    if (!ok) {
+        session->frames_failed++;
+        navigation_drop_frame_messages(session, frame);
+        frame->fetch_pending = false;
+        frame->loaded = false;
+        frame->retired = true;
+        ScriptRuntime *parent_runtime = frame->parent_runtime;
+        size_t parent_slot_plus_one = frame->parent_frame_slot_plus_one;
+        lxb_dom_node_t *element = frame->element;
+        size_t before = script_runtime_heap_rejections(parent_runtime);
+        bool state_ok = script_runtime_set_frame_window_state(
+            parent_runtime, frame->parent_handle, false, false, false,
+            NULL, false, navigation_frame_parent_result(session, frame));
+        parent_state_oom |= !state_ok
+            && script_runtime_heap_rejections(parent_runtime) > before;
+        navigation_frame_presentation_destroy(session, frame);
+        script_runtime_destroy(frame->runtime);
+        frame->runtime = NULL;
+        images_destroy(&frame->images);
+        document_destroy(&frame->document);
+        if (!state_ok || parent_state_oom) {
+            if (navigation_retire_failed_document_refresh(
+                    session, parent_runtime)) return false;
+            if (parent_slot_plus_one == 0
+                && navigation_retire_exhausted_page_realm(
+                    session, parent_state_oom))
+                return true;
+        }
+        bool realm_retired = false;
+        return navigation_dispatch_frame_setup_error(
+            session, parent_runtime, parent_slot_plus_one, element,
+            &realm_retired);
+    }
+    frame->loaded = true;
+    session->frames_loaded++;
+    (void) navigation_stop_exhausted_frame_realm(session, frame, false);
+    (void) script_runtime_trim_pool(frame->runtime);
+    if (!navigation_refresh_frame_presentation_or_defer(
+            session, frame)) return false;
+    if (tilefinch_trace_js_roots()) {
+        script_runtime_report_roots(frame->runtime, stderr, "frame-loaded",
+                                    "child", frame->parent_handle);
+    }
+    bool realm_retired = false;
+    return navigation_dispatch_frame_event_contained(
+        session, frame->parent_runtime,
+        frame->parent_frame_slot_plus_one,
+        frame->element, "load", &realm_retired);
+}
+
+/* RESUMED: a frame with no prior scripts loads from its kept response;
+   a frame with completed scripts resumes its live realm in place. */
+static bool navigation_complete_frame_response(NavigationSession *session,
+                                               NavigationFrame *frame,
+                                               bool fetched_ok,
+                                               FetchResult *fetch,
+                                               bool resumed)
 {
     uint64_t response_completed_us = navigation_now_us();
     ScriptNavigationTiming navigation_timing = navigation_timing_from_fetch(
@@ -1649,7 +1762,7 @@ static bool navigation_complete_frame(NavigationSession *session,
     }
     TilefinchRequestContext request_context =
         navigation_frame_request_context(session, frame);
-    if (fetched_ok) {
+    if (fetched_ok && !resumed) {
         navigation_accept_response_cookies(
             session->browser_session, &request_context, fetch,
             fetch->effective_url[0] == '\0'
@@ -1796,6 +1909,22 @@ static bool navigation_complete_frame(NavigationSession *session,
             &frame->document.content_security_policy, final_url);
         (void) document_apply_meta_csp(&frame->document, true);
     }
+    /* While the page's frame question is open, a small frame document with
+       an external classic script keeps its response in case that script
+       is big and has to wait for the answer (navigation_frame_hold_heavy):
+       only such a script can stop a frame's load. */
+    if (ok && scripts_allowed && frame->heavy_response == NULL
+        && fetch->length <= NAVIGATION_HEAVY_FRAME_KEEP_BYTES
+        && script_runtime_heavy_frames_ask(session->page.runtime)
+        && script_document_has_external_classic(&frame->document)) {
+        Budget *response_budget = fetch->budget;
+        frame->heavy_response = fetch_result_create(response_budget);
+        if (frame->heavy_response != NULL) {
+            *frame->heavy_response = *fetch;
+            memset(fetch, 0, sizeof(*fetch));
+            fetch->budget = response_budget;
+        }
+    }
     fetch_result_destroy(fetch);
     /* Cleanup may free enough heap to succeed or replace the exception text.
        Preserve allocator evidence at the original failed publication. */
@@ -1924,6 +2053,13 @@ static bool navigation_complete_frame(NavigationSession *session,
         ok = navigation_install_frame_capability_trace(frame);
     }
     if (ok && frame->runtime != NULL) {
+        /* The page's frame answer covers its frames. Without a kept
+           response a frame cannot wait for it, so its parser scripts run
+           as before. */
+        if (session->page.runtime != NULL)
+            script_runtime_heavy_frame_begin(
+                frame->runtime, session->page.runtime,
+                frame->heavy_response != NULL);
         (void) script_runtime_record_navigation_timing(
             frame->runtime, &navigation_timing);
         ExternalScriptMetrics metrics = {0};
@@ -1944,68 +2080,22 @@ static bool navigation_complete_frame(NavigationSession *session,
                                                  &frame->script_result);
         }
     }
-    if (!ok && navigation_retire_failed_document_refresh(
-            session, frame->runtime)) return false;
-    if (!ok) {
-        session->frames_failed++;
-        navigation_drop_frame_messages(session, frame);
-        frame->fetch_pending = false;
-        frame->loaded = false;
-        frame->retired = true;
-        /* The child is released before its error listener runs and before a
-           parent out of heap is retired below (which destroys every frame
-           realm), so neither can reach its half-torn-down state. */
-        ScriptRuntime *parent_runtime = frame->parent_runtime;
-        size_t parent_slot_plus_one = frame->parent_frame_slot_plus_one;
-        lxb_dom_node_t *element = frame->element;
-        size_t before = script_runtime_heap_rejections(parent_runtime);
-        bool state_ok = script_runtime_set_frame_window_state(
-            parent_runtime, frame->parent_handle, false, false, false,
-            NULL, false, navigation_frame_parent_result(session, frame));
-        parent_state_oom |= !state_ok
-            && script_runtime_heap_rejections(parent_runtime) > before;
-        navigation_frame_presentation_destroy(session, frame);
-        script_runtime_destroy(frame->runtime);
-        frame->runtime = NULL;
-        images_destroy(&frame->images);
-        document_destroy(&frame->document);
-        /* The parent realm could not record the frame (or, for a frame that
-           loaded, its committed document): on a page at its JS heap limit,
-           the WindowProxy update runs out of memory. That costs the frame,
-           as at discovery: a top realm out of heap is retired and the page
-           continues without JavaScript. Only a DOM refresh that destroyed
-           the page fails the turn. */
-        if (!state_ok || parent_state_oom) {
-            if (navigation_retire_failed_document_refresh(
-                    session, parent_runtime)) return false;
-            if (parent_slot_plus_one == 0
-                && navigation_retire_exhausted_page_realm(
-                    session, parent_state_oom))
-                return true;
-        }
-        bool realm_retired = false;
-        return navigation_dispatch_frame_setup_error(
-            session, parent_runtime, parent_slot_plus_one, element,
-            &realm_retired);
-    }
-    frame->loaded = true;
-    session->frames_loaded++;
-    /* Its scripts or load listeners may have run it out of memory: give
-       that back before the presentation and the parent's layout need it. */
-    (void) navigation_stop_exhausted_frame_realm(session, frame, false);
-    /* Likewise what the load's scripts freed. */
-    (void) script_runtime_trim_pool(frame->runtime);
-    if (!navigation_refresh_frame_presentation_or_defer(
-            session, frame)) return false;
-    if (tilefinch_trace_js_roots()) {
-        script_runtime_report_roots(frame->runtime, stderr, "frame-loaded",
-                                    "child", frame->parent_handle);
-    }
-    bool realm_retired = false;
-    return navigation_dispatch_frame_event_contained(
-        session, frame->parent_runtime,
-        frame->parent_frame_slot_plus_one,
-        frame->element, "load", &realm_retired);
+    size_t held_bytes = 0;
+    if (!ok && frame->runtime != NULL && frame->heavy_response != NULL
+        && script_runtime_heavy_frame_held(frame->runtime, &held_bytes))
+        return navigation_frame_hold_heavy(session, frame, held_bytes);
+    FetchResult *kept_response = frame->heavy_response;
+    frame->heavy_response = NULL;
+    fetch_result_free(kept_response);
+    return navigation_finish_frame(session, frame, ok, parent_state_oom);
+}
+
+static bool navigation_complete_frame(NavigationSession *session,
+                                      NavigationFrame *frame,
+                                      bool fetched_ok, FetchResult *fetch)
+{
+    return navigation_complete_frame_response(session, frame, fetched_ok,
+                                              fetch, false);
 }
 
 #if !defined(__PSP__)
@@ -2051,10 +2141,143 @@ bool navigation_test_complete_frame(NavigationSession *session,
 }
 #endif
 
+/* Resume the already-parsed child after its earlier scripts have run. The
+   script loader's bounded completed-handle set skips those scripts, while
+   the pending one and its successors run with the page's answer. */
+static bool navigation_resume_live_heavy_frame(NavigationSession *session,
+                                               NavigationFrame *frame)
+{
+    char base_url[NAVIGATION_URL_LIMIT];
+    bool ok = navigation_document_resource_base(
+        &frame->document, frame->url, base_url);
+    if (ok) {
+        ExternalScriptMetrics metrics = {0};
+        ok = document_scripts_execute(
+            &frame->document, frame->runtime, session->budget,
+            session->browser_session, base_url, frame->url,
+            frame->referrer_policy, 16,
+            session->maximum_script_bytes > 1024u * 1024u
+                ? session->maximum_script_bytes : 1024u * 1024u,
+            navigation_frame_script_file_bytes(session), 15000,
+            session->page.resource_scheduler,
+            &metrics, &frame->script_result)
+            && script_runtime_finish_loading(frame->runtime,
+                                             &frame->script_result);
+    }
+    FetchResult *kept_response = frame->heavy_response;
+    frame->heavy_response = NULL;
+    fetch_result_free(kept_response);
+    return navigation_finish_frame(session, frame, ok, false);
+}
+
+/* Once the page has its frame answer (or no longer asks), a frame with no
+   earlier scripts reloads from its response. A live child resumes in place. */
+static bool navigation_resume_heavy_frames(NavigationSession *session)
+{
+    if (session->page.runtime == NULL
+        || script_runtime_heavy_frames_ask(session->page.runtime))
+        return true;
+    for (size_t i = 0; i < session->page.frame_count; i++) {
+        NavigationFrame *frame = &session->page.frames[i];
+        if (!frame->heavy_held || frame->retired) continue;
+        FetchResult *response = frame->heavy_response;
+        frame->heavy_response = NULL;
+        frame->heavy_held = false;
+        frame->heavy_held_bytes = 0;
+        if (frame->runtime != NULL) {
+            /* The response is still owned by the frame until the resumed
+               pass finishes; its cookies are never taken again. */
+            frame->heavy_response = response;
+            if (!navigation_resume_live_heavy_frame(session, frame))
+                return false;
+            if (session->page.runtime == NULL) return true;
+            continue;
+        }
+        if (response == NULL) continue;
+        frame->fetch_pending = true;
+        bool completed = navigation_complete_frame_response(
+            session, frame, true, response, true);
+        fetch_result_free(response);
+        if (!completed) return false;
+        if (session->page.runtime == NULL) return true;
+    }
+    return true;
+}
+
+bool navigation_heavy_state(NavigationSession *session,
+                            ScriptHeavyState *state)
+{
+    if (state != NULL) memset(state, 0, sizeof(*state));
+    return session != NULL && state != NULL && session->page.loaded
+        && session->page.runtime != NULL
+        && script_runtime_heavy_state(session->page.runtime, state);
+}
+
+bool navigation_heavy_frames(NavigationSession *session,
+                             NavigationHeavyFrames *frames)
+{
+    if (frames != NULL) memset(frames, 0, sizeof(*frames));
+    if (session == NULL || frames == NULL || !session->page.loaded)
+        return false;
+    const ScriptRuntime *top = session->page.runtime;
+    frames->asks = script_runtime_heavy_frames_ask(top);
+    for (size_t i = 0; i < session->page.frame_count; i++) {
+        NavigationFrame *frame = &session->page.frames[i];
+        if (frame->heavy_response != NULL) {
+            frames->kept_responses++;
+            frames->kept_bytes += frame->heavy_response->length;
+        }
+        if (frame->retired || top == NULL) continue;
+        size_t scripts = 0, bytes = 0, refused = 0;
+        if (frame->heavy_held) {
+            scripts = 1;
+            bytes = frame->heavy_held_bytes;
+        } else {
+            script_runtime_heavy_frame_counts(frame->runtime, &scripts,
+                                              &bytes, &refused);
+        }
+        if (scripts != 0 && frames->waiting_scripts == 0)
+            snprintf(frames->url, sizeof(frames->url), "%s", frame->url);
+        frames->waiting_scripts = scripts > SIZE_MAX - frames->waiting_scripts
+            ? SIZE_MAX : frames->waiting_scripts + scripts;
+        frames->waiting_bytes = bytes > SIZE_MAX - frames->waiting_bytes
+            ? SIZE_MAX : frames->waiting_bytes + bytes;
+        frames->refused_scripts =
+            refused > SIZE_MAX - frames->refused_scripts
+            ? SIZE_MAX : frames->refused_scripts + refused;
+    }
+    return true;
+}
+
+bool navigation_answer_heavy(NavigationSession *session, bool run)
+{
+    return session != NULL && session->page.runtime != NULL
+        && script_runtime_answer_heavy(session->page.runtime, run);
+}
+
+bool navigation_answer_heavy_frames(NavigationSession *session, bool run)
+{
+    if (session == NULL || session->page.runtime == NULL) return false;
+    script_runtime_answer_heavy_frames(session->page.runtime, run);
+    bool waiting = false;
+    for (size_t i = 0; i < session->page.frame_count; i++) {
+        NavigationFrame *frame = &session->page.frames[i];
+        if (frame->retired) continue;
+        if (frame->runtime != NULL) {
+            bool realm_waiting = script_runtime_answer_heavy(
+                frame->runtime, run);
+            if (frame->heavy_held || realm_waiting) waiting = true;
+        } else if (frame->heavy_held)
+            waiting = true;
+    }
+    return waiting;
+}
+
 static bool navigation_progress_frames(NavigationSession *session)
 {
     if (!navigation_retire_detached_frames(session)) return false;
     if (session->page.resource_scheduler == NULL) return true;
+    if (!navigation_resume_heavy_frames(session)) return false;
     (void) fetch_scheduler_pump(session->page.resource_scheduler,
                                 NAVIGATION_FRAME_LIMIT, 4);
     for (size_t i = 0; i < session->page.frame_count; i++) {

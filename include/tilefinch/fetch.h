@@ -15,9 +15,12 @@ struct ContentBlocker;
 struct TilefinchContentSecurityPolicy;
 
 #define FETCH_SET_COOKIE_LIMIT 4096
-/* Cumulative over a redirect transaction. Sign-in chains set the full
-   credential cookie set on each of several hosts; the same size as the jar. */
-#define FETCH_RESPONSE_COOKIE_CAPACITY 64
+/* Set-Cookie fields kept over a whole redirect chain, not per response:
+   every hop's fields stay in the FetchResult until the caller commits them.
+   A Google sign-in sets the credential set on each of several hosts, about
+   60 to 80 fields from the password POST to the YouTube landing page.
+   Each entry is two pointers per FetchResult (8 bytes on the PSP). */
+#define FETCH_RESPONSE_COOKIE_CAPACITY 128
 /* Page fetch/XHR bodies are retained once by the JavaScript value and once by
    the bounded scheduler while a request is in flight. 96 KiB admits measured
    standards-based challenge redemption payloads (about 87 KiB) without
@@ -98,6 +101,82 @@ typedef struct {
 
 _Static_assert(sizeof(FetchTransportTiming) == 28u,
                "transport timing must stay compact on PSP");
+
+/* Which rule ended a request's redirect chain (FetchChainFacts.limit). */
+typedef enum {
+    FETCH_CHAIN_LIMIT_NONE = 0,
+    /* The request deadline passed before a hop could start or before its
+       response headers arrived. */
+    FETCH_CHAIN_LIMIT_DEADLINE,
+    /* More redirects than the transport follows. */
+    FETCH_CHAIN_LIMIT_HOPS,
+    FETCH_CHAIN_LIMIT_LOOP,
+    /* A redirect without a usable target: one the redirect rules refuse,
+       or that does not resolve. */
+    FETCH_CHAIN_LIMIT_TARGET,
+    /* Set-Cookie fields over the transport's bounds: a redirect's over the
+       count kept for the whole chain, one response's over its bytes, or
+       memory to keep them. */
+    FETCH_CHAIN_LIMIT_COOKIES,
+    /* The next hop's request does not fit the transport. */
+    FETCH_CHAIN_LIMIT_REQUEST,
+    /* No byte arrived for the stall allowance. */
+    FETCH_CHAIN_LIMIT_STALL,
+    /* The response body crossed the request's maximum. */
+    FETCH_CHAIN_LIMIT_BODY,
+    /* A redirect's Location longer than a hop's address may be
+       (TILEFINCH_URL_LONG_LIMIT for a navigation,
+       TILEFINCH_URL_SERIALIZED_LIMIT for any other request), or one the
+       transport could not keep whole. */
+    FETCH_CHAIN_LIMIT_TARGET_LENGTH,
+    /* The chain ended (a response that is not a followed redirect) on a hop
+       whose address is longer than a document's may be
+       (TILEFINCH_URL_SERIALIZED_LIMIT): hops in between may be longer. */
+    FETCH_CHAIN_LIMIT_DOCUMENT_LENGTH
+} FetchChainLimit;
+
+/* What kind of failure ended a request (FetchChainFacts.failure). */
+typedef enum {
+    FETCH_CHAIN_FAILURE_NONE = 0,
+    FETCH_CHAIN_FAILURE_TIMEOUT,
+    FETCH_CHAIN_FAILURE_RESOLVE,
+    FETCH_CHAIN_FAILURE_CONNECT,
+    FETCH_CHAIN_FAILURE_TLS,
+    FETCH_CHAIN_FAILURE_HTTP2,
+    FETCH_CHAIN_FAILURE_TRANSFER,
+    /* A redirect or transport rule (limit says which), not the network. */
+    FETCH_CHAIN_FAILURE_RULE,
+    FETCH_CHAIN_FAILURE_CANCELLED,
+    FETCH_CHAIN_FAILURE_OTHER
+} FetchChainFailure;
+
+/* Where a request's redirect chain got to: typed facts beside timed_out,
+   set by the scheduler when the request completes. Counts and classes; the
+   host is the only text, and a report may only classify it. */
+typedef struct {
+    /* Redirects followed. */
+    uint8_t redirects;
+    /* FetchChainFailure, and for a failure the hop it happened on (0: the
+       first request) and FetchChainLimit. */
+    uint8_t failure;
+    uint8_t failed_hop;
+    uint8_t limit;
+    /* The last hop that answered: its Set-Cookie fields, its response
+       header bytes as the transport kept them (at most
+       FETCH_RESPONSE_HEADERS_LIMIT besides cookies), and the time from the
+       request's start to its headers. Zero when that hop never answered. */
+    uint8_t hop_set_cookies;
+    uint16_t hop_header_bytes;
+    uint32_t first_byte_ms;
+    /* Over the whole chain. */
+    uint16_t maximum_header_bytes;
+    uint8_t set_cookies;
+    uint32_t elapsed_ms;
+    uint32_t timeout_ms;
+    /* Host of the hop a failure happened on; "*" for one too long to keep,
+       which a report classifies as any other host. */
+    char failed_host[48];
+} FetchChainFacts;
 
 typedef struct {
     Budget *budget;
@@ -196,6 +275,7 @@ typedef struct {
        response by mutating the Response wrapper. */
     bool redirected;
     bool opaque_redirect;
+    FetchChainFacts chain;
     /* Internal deterministic replay timing; not exposed to page script. */
     size_t trace_delay_pumps;
     bool trace_external_cancel;
@@ -695,6 +775,8 @@ typedef struct {
     bool response_referrer_policy_metadata_valid;
     bool response_security_headers_truncated;
     bool set_cookies_truncated;
+    /* FetchChainLimit: the rule the worker ended the hop under, if any. */
+    uint8_t chain_limit;
     char error[256];
 } FetchBackgroundResult;
 
@@ -788,7 +870,8 @@ uint64_t fetch_background_transport_enqueue_media_diagnosed(
  */
 uint64_t fetch_background_transport_enqueue_hop_stream(
     const char *url, const FetchRequest *request,
-    size_t maximum_bytes, long timeout_ms);
+    size_t maximum_bytes, long timeout_ms,
+    FetchBackgroundEnqueueStatus *status);
 /* A hop of a request the browser thread blocks on (a sync XHR, its CORS
    preflight, a module import). Besides the descriptors every request
    shares it may take the one kept free for such hops: a descriptor frees
@@ -796,7 +879,8 @@ uint64_t fetch_background_transport_enqueue_hop_stream(
    only its own (src/fetch/background_slot_policy.h). */
 uint64_t fetch_background_transport_enqueue_blocking_hop_stream(
     const char *url, const FetchRequest *request,
-    size_t maximum_bytes, long timeout_ms);
+    size_t maximum_bytes, long timeout_ms,
+    FetchBackgroundEnqueueStatus *status);
 bool fetch_background_transport_hop_supported(
     const char *url, const FetchRequest *request,
     size_t maximum_bytes, long timeout_ms);
@@ -816,6 +900,31 @@ bool fetch_background_transport_metrics(
    with the browser thread and are delivered by the chunk/result APIs. */
 bool fetch_background_transport_take_headers(
     uint64_t request_id, FetchResult *metadata);
+/* How take_headers_with_cookies handed over the response's own Set-Cookie
+   fields. */
+typedef enum {
+    /* All of them, or as many as the chain's FETCH_RESPONSE_COOKIE_CAPACITY
+       left room for (then set_cookies_truncated is set). */
+    FETCH_BACKGROUND_COOKIES_HANDED = 0,
+    /* A redirect the worker follows itself had more than the capacity. */
+    FETCH_BACKGROUND_COOKIES_OVERFLOW,
+    /* The budget refused a copy. */
+    FETCH_BACKGROUND_COOKIES_MEMORY
+} FetchBackgroundCookieHandoff;
+/* As take_headers, and also appends the response's own Set-Cookie fields
+   (copies from `budget`) to metadata's, so a consumer that commits cookies
+   at the header boundary, as a navigation does, has them before the body
+   runs. The completed result then carries only fields not handed over
+   here. `cookies` receives how the hand-over went. */
+bool fetch_background_transport_take_headers_with_cookies(
+    uint64_t request_id, Budget *budget, FetchResult *metadata,
+    FetchBackgroundCookieHandoff *cookies);
+/* The Location of the response whose headers a scheduler hop just took,
+   whole, when it has one: the worker keeps it beside the header snapshot,
+   which a long one need not fit. The text stays valid until the request is
+   released or cancelled; the caller copies it at once. Browser thread. */
+bool fetch_background_transport_response_location(
+    uint64_t request_id, const char **location);
 /* Media-only header view. Consumes the same one-shot header publication as
    take_headers; a caller must select exactly one representation. */
 bool fetch_background_transport_take_media_headers(
@@ -1283,6 +1392,13 @@ bool fetch_scheduler_stream_metrics(
 bool fetch_scheduler_request_progress(
     const FetchScheduler *scheduler, uint64_t request_id,
     FetchRequestProgress *progress);
+/* How far a request the scheduler still holds has got along its redirect
+   chain (FetchChainFacts), and the status of the last response it saw: a
+   running request's counts as if it ended now, a completed one's as it
+   ended. False when the scheduler holds no such request. */
+bool fetch_scheduler_request_chain(
+    const FetchScheduler *scheduler, uint64_t request_id,
+    FetchChainFacts *chain, long *status_code);
 bool fetch_scheduler_request(FetchScheduler *scheduler, const char *url,
                              const FetchRequest *request,
                              size_t maximum_bytes, long timeout_ms,

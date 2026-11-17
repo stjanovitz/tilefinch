@@ -270,6 +270,31 @@ void psp_report_job_failure(
     if (checkpoint != NULL) psp_log_checkpoint(checkpoint);
 }
 
+/* Opening in Basic view by default and "Try full page"
+   (psp_basic_fallback.h): one state for the browser, moved by every
+   navigation start below and by the commit and failure handlers. */
+static PspBasicDefault psp_basic_default_state_storage;
+
+PspBasicDefault *psp_app_basic_default(void)
+{
+    return &psp_basic_default_state_storage;
+}
+
+bool psp_navigation_begin_javascript(BrowserEngine *engine,
+                                     const BrowserProfile *profile,
+                                     const char *url, const char *method)
+{
+    return psp_basic_default_begin(&psp_basic_default_state_storage,
+                                   profile, engine, url, method);
+}
+
+void psp_navigation_abandon_javascript(BrowserEngine *engine,
+                                       const BrowserProfile *profile)
+{
+    psp_basic_default_abandon(&psp_basic_default_state_storage, profile,
+                              engine);
+}
+
 bool psp_begin_page_load(BrowserEngine *engine, PspUiState *ui,
                                 const BrowserProfile *profile,
                                 const uint16_t *frame,
@@ -283,9 +308,7 @@ bool psp_begin_page_load(BrowserEngine *engine, PspUiState *ui,
             security_session, url,
             browser_profile_third_party_cookie_site_allowed(profile, url));
     }
-    bool javascript_allowed =
-        browser_profile_javascript_allowed_for_url(profile, url);
-    if (!browser_engine_set_javascript_enabled(engine, javascript_allowed)) {
+    if (!psp_navigation_begin_javascript(engine, profile, url, "GET")) {
         psp_ui_show_status(ui, "JAVASCRIPT POLICY UNAVAILABLE", 240);
         return false;
     }
@@ -315,6 +338,7 @@ bool psp_begin_page_load(BrowserEngine *engine, PspUiState *ui,
     bool started = psp_retry_navigation_url_after_reclaim(
         engine, url, maximum_bytes, timeout_ms, record_history);
     if (!started) {
+        psp_navigation_abandon_javascript(engine, profile);
         (void) psp_write_failure_report(
             "navigation-start", browser_engine_last_error(engine), url,
             0, 0);
@@ -1108,4 +1132,25 @@ void psp_app_toggle_reader(
                         : "READER MODE COULD NOT CLOSE",
             240);
     }
+}
+
+/* The notice's ordinary run, and how close to running out it is extended:
+   the wall is weighed only in that last stretch. */
+#define PSP_BOT_WALL_NOTICE_FRAMES 480u
+#define PSP_BOT_WALL_NOTICE_RENEW_FRAMES 30u
+
+void psp_app_bot_wall_poll(PspApp *app)
+{
+    if (app == NULL || app->views == NULL || app->views->navigation == NULL)
+        return;
+    PspUiState *ui = &app->process->presentation.ui;
+    if (ui->screen != PSP_UI_SCREEN_PAGE || ui->toast_frames == 0
+        || ui->toast_frames > PSP_BOT_WALL_NOTICE_RENEW_FRAMES
+        || browser_engine_navigation_pending(app->browser->engine))
+        return;
+    NavigationBotWall wall;
+    if (navigation_bot_wall(app->views->navigation, &wall)
+        && wall.paints_nothing)
+        (void) psp_ui_keep_site_blocked_status(
+            ui, wall.site, PSP_BOT_WALL_NOTICE_FRAMES);
 }

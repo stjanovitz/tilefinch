@@ -4,6 +4,7 @@
   census.py capture [--retry] [SELECTOR...]      live network, one page each
   census.py replay  [-j N] [--out DIR] [--probe]
                     [--revisit | --revisit-ticked | --restart] [--idle N]
+                    [--runtime-ticks]
                     [--verify-style-appends] [--user-css-before-load]
                     [SELECTOR...]
   census.py extract RUN_ROOT                     re-extract a replay's JSONL
@@ -41,12 +42,20 @@ import trace_document  # noqa: E402
 DEFAULT_CENSUS = os.environ.get(
     "CENSUS_DIR", os.path.normpath(os.path.join(REPO, "..", "census")))
 PROBE_CHUNKS = 64
-TICKS = "tick 150 33"
+# A visit's 150 x 33 ms frames. Each "pump" turn is one PSP loop frame: the
+# page runtime, then the page-idle work and the post-commit image queue's
+# unit (src/psp_script_main.c psp_deferred_image_after_present), as the PSP
+# loop runs them after presenting a frame. --runtime-ticks restores the
+# runtime-only "tick" of runs before 2026-11-16: its frames never load the
+# images a scripted page leaves on that queue.
+PUMP_TICKS = "pump 150 33"
+RUNTIME_TICKS = "tick 150 33"
+TICKS = PUMP_TICKS
 # Page-idle turns after a visit's ticks (at most this many; the lab's "idle"
-# stops at the first turn that leaves no work): the lab's "tick" advances only the
-# page runtime, while the PSP loop also runs the engine's idle work (deferred
-# bytecode stores, persistent-tier writes, tiles, background resources)
-# whenever the page is quiet. A visit that is followed by another runs these.
+# stops at the first turn that leaves no work): the engine's idle work
+# (deferred bytecode stores, persistent-tier writes, tiles, background
+# resources) that the PSP loop keeps running whenever the page is quiet,
+# beyond the visit's frames. A visit that is followed by another runs these.
 IDLE_TURNS = 300
 # --focus-moves: idle turns after the moves (a bounded focus layout's
 # completion is one turn; image and font work may take others).
@@ -327,6 +336,8 @@ def trace_complete(trace):
 
 
 def replay(args):
+    global TICKS
+    TICKS = RUNTIME_TICKS if args.runtime_ticks else PUMP_TICKS
     corpus = corpus_dir(args)
     sites = [s for s in select(load_sites(args.sites), args.selectors)
              if trace_complete(os.path.join(corpus, s["name"], "capture"))]
@@ -382,6 +393,7 @@ def replay(args):
                    "revisit_ticked": args.revisit_ticked,
                    "restart": args.restart,
                    "idle": args.idle,
+                   "ticks": TICKS,
                    "focus_moves": args.focus_moves,
                    "focus_hashes": args.focus_hashes,
                    "verify_style_appends": args.verify_style_appends,
@@ -545,6 +557,11 @@ def main():
                    help="owner idle turns after the ticks (background "
                         "images, fonts, display retargeting, classic "
                         "bytecode stores); default none")
+    p.add_argument("--runtime-ticks", action="store_true",
+                   help="advance only the page runtime in the visit's 150 "
+                        "frames (lab 'tick', the default before 2026-11-16) "
+                        "instead of whole PSP loop turns (lab 'pump'); for "
+                        "comparison with older runs only")
     p.add_argument("--repeat", type=int, default=3,
                    help="runs per page; timings are the minimum (default 3)")
     p.add_argument("--focus-moves", type=int, default=0,

@@ -93,7 +93,7 @@ static bool portal_probe_begin(PspApp *app, PspCaptivePortal *portal,
     portal->request_id = fetch_background_transport_enqueue_hop_stream(
         TILEFINCH_CAPTIVE_PORTAL_PROBE_URL, &request,
         TILEFINCH_CAPTIVE_PORTAL_PROBE_BODY_LIMIT,
-        PSP_CAPTIVE_PORTAL_PROBE_TIMEOUT_MS);
+        PSP_CAPTIVE_PORTAL_PROBE_TIMEOUT_MS, NULL);
     if (portal->request_id == 0) return false;
     portal->body_length = 0;
     portal->phase = verifying ? PSP_CAPTIVE_PORTAL_VERIFYING

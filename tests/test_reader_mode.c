@@ -351,6 +351,44 @@ static bool test_basic_layout_tables_and_embedded_images(void)
     return true;
 }
 
+/* A page's own no-script path: lazy-loading sites put the full-size image in
+   <noscript> beside a script-driven placeholder. A load with scripting off
+   (Basic view by default after a memory stop) parses that content as markup
+   and the page shows it, so Basic view keeps it too. With scripting on the
+   same <noscript> is one raw-text node the page never shows, and Basic view
+   leaves it out. */
+static bool test_basic_keeps_rendered_noscript_images(void)
+{
+    static const char html[] = "<!doctype html><body><h1>Front page</h1>"
+        "<div class=card><img alt='Placeholder story' loading=lazy width=640"
+        " height=360><noscript><img alt='Story photo' src='/story.jpg'"
+        " width=640 height=360></noscript><p>A story summary that is long"
+        " enough to be ordinary readable page content.</p></div></body>";
+    Budget budget;
+    budget_init(&budget, 32u * 1024u * 1024u);
+    CHECK(budget_install_lexbor(&budget));
+    for (int scripting = 0; scripting < 2; scripting++) {
+        DocumentParser parser = {0};
+        PocDocument document = {0};
+        ReaderDocumentAnalysis analysis = {0};
+        CHECK(document_parser_begin(&parser, &budget)
+            && document_parser_set_scripting(&parser, scripting != 0)
+            && document_parser_feed(&parser, html, sizeof(html) - 1u)
+            && document_parser_finish(&parser, &document)
+            && reader_document_prepare_basic_with_stylesheet(
+                   &document, NULL, &analysis));
+        lxb_dom_node_t *root = find_reader_root(&document);
+        CHECK(root != NULL && analysis.kind == READER_PAGE_BASIC);
+        bool kept = find_attribute_value_within(root, "src", "/story.jpg")
+            != NULL;
+        CHECK(kept == (scripting == 0));
+        document_parser_abort(&parser);
+        document_destroy(&document);
+    }
+    CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0);
+    return true;
+}
+
 static bool test_article(void)
 {
     static const char html[] =
@@ -2067,6 +2105,51 @@ static bool test_basic_navigation_and_link_boundaries(void)
     return true;
 }
 
+/* Story cards wrap their label, headline and summary in divs inside one
+   link, and menus wrap link text in <p>. Basic view flattens those wrappers
+   but keeps their line breaks, as unstyled HTML lays them out, so a front
+   page's cards do not run together into one paragraph (cnn.com, 0.1.51
+   census) and a list item's marker stays on its link's line. */
+static bool test_basic_block_wrappers_keep_line_breaks(void)
+{
+    static const char html[] =
+        "<!doctype html><body><main>"
+        "<a href='/one'><div><div><span>Analysis</span></div>"
+        "<div><span>First headline</span></div>"
+        "<div>First summary</div></div></a>"
+        "<a href='/two'><div><div>Second headline</div></div></a>"
+        "<p><span>word</span><span>piece</span> <span>stays</span></p>"
+        "<ul><li><a href='/politics'><p>Politics</p></a></li>"
+        "<li><a href='/opinions'><p>Opinions</p></a></li></ul>"
+        "</main></body>";
+    Budget budget;
+    budget_init(&budget, 32u * 1024u * 1024u);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    ReaderDocumentAnalysis analysis = {0};
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 114u)
+          && reader_document_prepare_basic_complete_with_stylesheet(
+                 &document, NULL, &analysis));
+    lxb_dom_node_t *root = find_direct_reader_root(&document);
+    CHECK(root != NULL && analysis.kind == READER_PAGE_BASIC
+          && !analysis.bounded_out && !analysis.extraction_truncated);
+    /* Label, headline and summary of the first card, then the second card:
+       three line breaks, none before the first text and none after the
+       last line of a card that ends the run. */
+    CHECK(count_named_within(root, "br") == 3u);
+    CHECK(subtree_text_contains_words(root, "wordpiece stays"));
+    /* The paragraphs inside menu links are flattened (only the prose
+       paragraph remains), so each item stays one line beside its marker. */
+    CHECK(count_named_within(root, "li") == 2u
+          && count_named_within(root, "p") == 1u
+          && subtree_text_contains_words(root, "Politics")
+          && subtree_text_contains_words(root, "Opinions"));
+    document_destroy(&document);
+    CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0u
+          && budget_categories_reconcile(&budget));
+    return true;
+}
+
 static bool test_basic_view_preserves_actions_without_guessing(void)
 {
     static const char html[] =
@@ -2348,15 +2431,19 @@ static bool test_basic_view_bounds_emitted_not_inspected_nodes(void)
         && subtree_contains_text(root, "The first story survives")
         && subtree_contains_text(root, "Basic view shortened")
         && count_named_within(root, "form") == 0u
-        && count_named_within(root, "input") == 0u;
+        && count_named_within(root, "input") == 0u
+        /* Both of the form's fields are left out, the one withdrawn with
+           the form and the one past the cut. */
+        && analysis.dropped_controls == 2u;
     if (!ok) {
         fprintf(stderr, "basic large page: kind=%d bounded=%d truncated=%d "
-                "visited=%u forms=%u nodes=%u root=%d\n",
+                "visited=%u forms=%u nodes=%u dropped=%u root=%d\n",
                 (int) analysis.kind, (int) analysis.bounded_out,
                 (int) analysis.extraction_truncated,
                 (unsigned) analysis.visited_nodes,
                 (unsigned) analysis.retained_forms,
-                (unsigned) analysis.extracted_nodes, root != NULL);
+                (unsigned) analysis.extracted_nodes,
+                (unsigned) analysis.dropped_controls, root != NULL);
     }
     stylesheet_destroy(&stylesheet);
     document_destroy(&document);
@@ -2821,7 +2908,9 @@ int main(void)
         || !test_complete_bounded_walk_is_transactional()
         || !test_reading_identity_and_semantic_selection()
         || !test_basic_layout_tables_and_embedded_images()
+        || !test_basic_keeps_rendered_noscript_images()
         || !test_basic_navigation_and_link_boundaries()
+        || !test_basic_block_wrappers_keep_line_breaks()
         || !test_basic_view_preserves_actions_without_guessing()
         || !test_extracted_fragment_markers_preserve_empty_targets()
         || !test_basic_anchor_bounds_are_transactional()

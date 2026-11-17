@@ -115,6 +115,8 @@ _Static_assert(MBEDTLS_X509_BADCERT_BAD_KEY == TILEFINCH_TLS_VERIFY_BAD_KEY,
 #define FETCH_TRACE_PATH_CAPACITY 4096
 #define FETCH_REDIRECT_LIMIT 8u
 #define FETCH_REDIRECT_LIMIT_ERROR "response exceeded the eight-hop redirect limit"
+#define FETCH_LONG_DOCUMENT_ERROR \
+    "redirect chain ended on an address longer than a document may have"
 /* The pool is process-global because libcurl's allocator hooks are global.
    A streaming navigation and the document resource scheduler deliberately
    overlap, so sizing this for only one four-request scheduler causes valid
@@ -344,6 +346,10 @@ typedef struct TraceReplayRekey TraceReplayRekey;
 
 static const char *fetch_hop_logical_url(const FetchHopState *hop);
 static const char *fetch_hop_wire_url(const FetchHopState *hop);
+static void fetch_hop_clear_location(FetchHopState *hop);
+static bool fetch_hop_note_location(FetchHopState *hop, const char *value,
+                                    size_t length);
+static bool fetch_hop_url_is_long(const FetchHopState *hop);
 static bool referrer_policy_known(const char *value, size_t length);
 static bool referrer_policy_normalized(const char *value);
 

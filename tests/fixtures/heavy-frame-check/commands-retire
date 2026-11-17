@@ -1,0 +1,6 @@
+drain
+script-report
+stop-scripts
+drain
+script-report
+quit

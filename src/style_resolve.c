@@ -3935,6 +3935,20 @@ ComputedStyle style_for_node(const Stylesheet *sheet, lxb_dom_node_t *node,
     return style;
 }
 
+bool computed_style_same(const Stylesheet *sheet, const ComputedStyle *left,
+                         const ComputedStyle *right)
+{
+    if (left == NULL || right == NULL) return false;
+    StylePaintStack paint_left = style_paint_stack_copy(sheet, left);
+    StylePaintStack paint_right = style_paint_stack_copy(sheet, right);
+    if (memcmp(&paint_left, &paint_right, sizeof(paint_left)) != 0)
+        return false;
+    ComputedStyle a = *left, b = *right;
+    computed_style_set_paint_stack_id(&a, 0);
+    computed_style_set_paint_stack_id(&b, 0);
+    return memcmp(&a, &b, sizeof(a)) == 0;
+}
+
 static ComputedStyle style_for_node_scoped(const Stylesheet *sheet,
                                            lxb_dom_node_t *node,
                                            const ComputedStyle *parent)

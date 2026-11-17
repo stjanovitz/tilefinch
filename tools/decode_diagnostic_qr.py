@@ -362,6 +362,30 @@ def recover_pages(
     return first_metadata, complete
 
 
+# The sign-in report's compact `post-chain=` line (version 5,
+# docs/DIAGNOSTIC_QR.md): the redirect chain of the last submitted form.
+POST_CHAIN_FIELDS = (
+    "class", "hops", "failed-hop", "failed-host", "limit",
+    "hop-header-bytes", "hop-set-cookies", "max-header-bytes",
+    "chain-set-cookies", "first-byte-ms", "elapsed-ms", "timeout-ms",
+)
+
+
+def describe_post_chain(report: bytes) -> str | None:
+    """Names the values of a sign-in report's post-chain line, if any."""
+    for line in report.decode("utf-8", "replace").splitlines():
+        if not line.startswith("post-chain="):
+            continue
+        values = line[len("post-chain="):].split(",")
+        if len(values) != len(POST_CHAIN_FIELDS) or not all(
+                value.isdigit() for value in values):
+            return None
+        return " ".join(
+            f"{name}={value}"
+            for name, value in zip(POST_CHAIN_FIELDS, values))
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Recover Tilefinch logs from QR-decoder text."
@@ -395,6 +419,10 @@ def main() -> int:
                 f"  {name}: {len(data)} recent bytes "
                 f"(offset {offset} of {original_size})"
             )
+    for name, data, _original_size, _offset in files:
+        chain = describe_post_chain(data)
+        if chain is not None:
+            print(f"  {name} post-chain: {chain}")
     print(f"Logs written to {arguments.output}")
     return 0
 

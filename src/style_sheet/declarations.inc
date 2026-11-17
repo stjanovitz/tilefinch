@@ -2773,8 +2773,10 @@ static uint16_t style_declaration_values_summary(const ComputedStyle *values)
     if (computed_style_paint_stack_id(values) != 0) {
         flags |= STYLE_DECLARATION_VALUES_PAINT_STACK;
     }
-    if (values->generated_attr_length != STYLE_GENERATED_SCALAR_LENGTH
-        && values->generated_attr != NULL) {
+    if ((values->generated_attr_length != STYLE_GENERATED_SCALAR_LENGTH
+         && values->generated_attr != NULL)
+        || (values->generated_expression && values->generated_text != NULL
+            && strstr(values->generated_text, "attr(") != NULL)) {
         flags |= STYLE_DECLARATION_VALUES_GENERATED_ATTR;
     }
     return flags;

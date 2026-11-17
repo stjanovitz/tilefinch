@@ -345,11 +345,14 @@ static bool test_redirect_short_circuit_and_cookie_bounds(
         snprintf(url, sizeof(url), "http://127.0.0.1:%u/%s", port,
                  rejected_paths[i]);
         result = (FetchResult) {.budget = budget};
+        /* The rule is a typed fact, not read back from the message. */
         CHECK(!fetch_scheduler_request(
               scheduler, url, &request, 64 * 1024, 1000, &result)
               && response_cookie_storage_empty(&result)
               && (strstr(result.error, "cookie") != NULL
-                  || strstr(result.error, "Cookie") != NULL));
+                  || strstr(result.error, "Cookie") != NULL)
+              && result.chain.failure == FETCH_CHAIN_FAILURE_RULE
+              && result.chain.limit == FETCH_CHAIN_LIMIT_COOKIES);
         fetch_result_destroy(&result);
     }
     fetch_scheduler_destroy(scheduler);
@@ -539,5 +542,308 @@ static bool test_proxy_connect_headers_suppressed(Budget *budget)
           && strstr(result.response_headers, "x-proxy-only") == NULL);
     fetch_result_destroy(&result);
     fetch_scheduler_destroy(scheduler);
+    return true;
+}
+
+/* One run of the sign-in handoff chain (run_fetch_redirect_test.py,
+   account_chain): the POST and its redirects on the scheduler, with a
+   cookie session, as a form submission makes them. */
+static bool account_chain_run(Budget *budget, BrowserSession *browser,
+                              unsigned port, const char *query,
+                              FetchResult *result)
+{
+    char url[256];
+    snprintf(url, sizeof(url), "http://127.0.0.1:%u/account-chain/pwd?%s",
+             port, query);
+    static const char body[] =
+        "identifier=someone%40example.test&Passwd=synthetic&at=1";
+    TilefinchRequestContext context = {
+        .target_url = url, .initiator_url = url, .top_level_url = url,
+        .method = "POST", .mode = TILEFINCH_REQUEST_MODE_NAVIGATE,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .destination = TILEFINCH_DESTINATION_DOCUMENT,
+        .top_level_navigation = true, .user_activated = true
+    };
+    FetchRequest request = {
+        .method = "POST", .body = body, .body_length = sizeof(body) - 1u,
+        .content_type = "application/x-www-form-urlencoded",
+        .allow_http_errors = true,
+        .credentials = FETCH_CREDENTIALS_INCLUDE,
+        .credential_origin = url, .initiator_url = url,
+        .cookie_session = browser, .cookie_context = &context
+    };
+    FetchScheduler *scheduler = fetch_scheduler_create(budget, 1, 64 * 1024);
+    if (scheduler == NULL) return false;
+    uint64_t id = fetch_scheduler_enqueue(scheduler, url, &request,
+                                          64 * 1024, 5000);
+    bool success = false, taken = false;
+    *result = (FetchResult) {.budget = budget};
+    for (size_t pump = 0; id != 0 && pump < 4000 && !taken; pump++) {
+        (void) fetch_scheduler_pump(scheduler, 1, 4);
+        taken = fetch_scheduler_take(scheduler, id, &success, result);
+    }
+    fetch_scheduler_destroy(scheduler);
+    return id != 0 && taken && success;
+}
+
+/* Requests the host has seen for `step`, and (when asked) the length of
+   the last token its setsid step received. */
+static unsigned account_chain_hits_token(Budget *budget, unsigned port,
+                                         const char *step, unsigned *token)
+{
+    char url[256];
+    snprintf(url, sizeof(url),
+             "http://localhost:%u/account-chain/hits?step=%s", port, step);
+    FetchRequest request = {.method = "GET", .allow_http_errors = true};
+    FetchResult result = {.budget = budget};
+    unsigned hits = 9999u, seen = 0u;
+    if (fetch_redirect(budget, url, &request, &result)
+        && result.data != NULL)
+        (void) sscanf(result.data, "hits=%u token=%u", &hits, &seen);
+    fetch_result_destroy(&result);
+    if (token != NULL) *token = seen;
+    return hits;
+}
+
+static unsigned account_chain_hits(Budget *budget, unsigned port,
+                                   const char *step)
+{
+    return account_chain_hits_token(budget, port, step, NULL);
+}
+
+/* The redirect chain after a password form (issue 7): a POST answered 302
+   with the account's whole cookie set and several kilobytes of other
+   headers, a cross-host hop whose Location carries a long one-time token,
+   that host's own cookie set, and two more hops. The chain completes with
+   every cookie, and its typed facts (FetchChainFacts) describe it; at each
+   limit it ends with that limit's own reason, and a Location too long for a
+   URL is refused, never followed cut short. */
+static bool test_account_redirect_chain(Budget *budget, unsigned port,
+                                        unsigned cross_port)
+{
+    BrowserSession browser;
+    CHECK(browser_session_init(&browser, budget, 64 * 1024));
+    BrowserCookieDiagnostics cookies = {0};
+    browser_session_cookie_diagnostics(&browser, true, &cookies);
+    FetchResult result;
+
+    /* The larger end of a real handoff: 24 + 14 cookies, 4 KiB of other
+       headers on the first two responses, a 1,200-byte token. */
+    bool completed = account_chain_run(budget, &browser, port,
+                                       "sidt=1200&pad=4096", &result);
+    if (!completed)
+        fprintf(stderr, "account chain: error=%s limit=%u hop=%u\n",
+                result.error, (unsigned) result.chain.limit,
+                (unsigned) result.chain.failed_hop);
+    CHECK(completed && result.status_code == 200 && result.data != NULL
+          /* The POST became a GET; the second host got its own 14 cookies
+             back on the same chain, none of the first host's. */
+          && strstr(result.data, "landed method=GET cookies=14 ") != NULL
+          && strstr(result.data, " login-info=1") != NULL
+          && result.set_cookie_count == 38u && !result.set_cookies_truncated
+          && result.chain.redirects == 4u
+          && result.chain.failure == FETCH_CHAIN_FAILURE_NONE
+          && result.chain.limit == FETCH_CHAIN_LIMIT_NONE
+          && result.chain.set_cookies == 38u
+          && result.chain.maximum_header_bytes > 8000u
+          && result.chain.first_byte_ms != 0u
+          && result.chain.timeout_ms == 5000u);
+    /* The jar takes the whole set with nothing refused or evicted. */
+    for (size_t i = 0; i < result.set_cookie_count; i++)
+        CHECK(browser_session_cookie_set_http(
+            &browser, fetch_set_cookie_url(&result, i, ""),
+            result.set_cookies[i]));
+    char header[BROWSER_COOKIE_HEADER_CAPACITY];
+    char root[64];
+    snprintf(root, sizeof(root), "http://127.0.0.1:%u/", port);
+    CHECK(cookies.refused == 0 && cookies.evictions == 0
+          && browser_session_cookie_header(&browser, root, header,
+                                           sizeof(header))
+          && strstr(header, "LSID=") != NULL
+          && strstr(header, "NID=") != NULL && strlen(header) > 3000u);
+    fetch_result_destroy(&result);
+
+    /* The transport keeps Set-Cookie fields over the whole chain, not per
+       response: a chain that passes 64 only across its hops (84 here, none
+       more than 24 on one response) completes with all of them. */
+    completed = account_chain_run(budget, &browser, port,
+                                  "sidt=600&wide=1", &result);
+    if (!completed)
+        fprintf(stderr, "wide account chain: error=%s limit=%u hop=%u\n",
+                result.error, (unsigned) result.chain.limit,
+                (unsigned) result.chain.failed_hop);
+    CHECK(completed && result.data != NULL
+          && strstr(result.data, "landed method=GET cookies=14 ") != NULL
+          && result.set_cookie_count == 84u && !result.set_cookies_truncated
+          && result.chain.redirects == 4u
+          && result.chain.set_cookies == 84u
+          && result.chain.hop_set_cookies == 8u);
+    fetch_result_destroy(&result);
+
+    /* A navigation's chain passes through a Location far longer than a
+       document's address may be (a sign-in hand-over's one-time token runs
+       to several kilobytes): the hop is made with the whole address, the
+       second host's cookies come back, and the chain completes. The
+       cross-host address is
+       "http://localhost:PORT/account-chain/setsid?ssdc=1&sidt=" plus the
+       token. */
+    char prefix[96];
+    int prefix_length = snprintf(
+        prefix, sizeof(prefix),
+        "http://localhost:%u/account-chain/setsid?ssdc=1&sidt=", cross_port);
+    CHECK(prefix_length > 0);
+    char query[64];
+    unsigned before = account_chain_hits(budget, cross_port, "setsid");
+    static const unsigned location_lengths[] = {
+        TILEFINCH_URL_SERIALIZED_LIMIT - 1u, TILEFINCH_URL_SERIALIZED_LIMIT,
+        3000u, 7000u, TILEFINCH_URL_LONG_LIMIT - 1u
+    };
+    for (size_t at = 0;
+         at < sizeof(location_lengths) / sizeof(location_lengths[0]); at++) {
+        unsigned token = location_lengths[at] - (unsigned) prefix_length;
+        unsigned seen = 0;
+        snprintf(query, sizeof(query), "sidt=%u&pad=4096", token);
+        completed = account_chain_run(budget, &browser, port, query, &result);
+        if (!completed)
+            fprintf(stderr, "account chain, %u-byte Location: error=%s "
+                            "limit=%u hop=%u\n", location_lengths[at],
+                    result.error, (unsigned) result.chain.limit,
+                    (unsigned) result.chain.failed_hop);
+        CHECK(completed && result.status_code == 200 && result.data != NULL
+              && strstr(result.data, "landed method=GET cookies=14 ") != NULL
+              && strstr(result.data, " login-info=1") != NULL
+              && result.set_cookie_count == 38u
+              && !result.set_cookies_truncated
+              && result.chain.redirects == 4u
+              && result.chain.limit == FETCH_CHAIN_LIMIT_NONE
+              /* The response's address is the landing page's. */
+              && strstr(result.effective_url, "/account-chain/landed") != NULL
+              && account_chain_hits_token(budget, cross_port, "setsid",
+                                          &seen) == before + 1u + at
+              /* Whole: not one byte of the token was cut. */
+              && seen == token);
+        /* The long hop's cookies are attributed to its own address. */
+        bool long_hop_cookie = false;
+        for (size_t i = 0; i < result.set_cookie_count; i++) {
+            const char *source = fetch_set_cookie_url(&result, i, "");
+            if (strncmp(source, prefix, (size_t) prefix_length) == 0
+                && strlen(source) == location_lengths[at])
+                long_hop_cookie = true;
+        }
+        CHECK(long_hop_cookie);
+        fetch_result_destroy(&result);
+    }
+    before += sizeof(location_lengths) / sizeof(location_lengths[0]);
+
+    /* One byte past a hop's bound is refused: the hop is not made with the
+       address cut short (the second host never hears of it), and the
+       failure names the rule and the hop, not a timeout. */
+    snprintf(query, sizeof(query), "sidt=%u",
+             (unsigned) (TILEFINCH_URL_LONG_LIMIT - prefix_length));
+    CHECK(!account_chain_run(budget, &browser, port, query, &result)
+          && !result.timed_out
+          && result.chain.failure == FETCH_CHAIN_FAILURE_RULE
+          && result.chain.limit == FETCH_CHAIN_LIMIT_TARGET_LENGTH
+          && result.chain.redirects == 1u && result.chain.failed_hop == 1u
+          && strcmp(result.chain.failed_host, "127.0.0.1") == 0
+          && account_chain_hits(budget, cross_port, "setsid") == before);
+    fetch_result_destroy(&result);
+
+    /* Other headers past the transport's 8 KiB snapshot leave no room in
+       it for the Location. It is kept beside the snapshot, so the chain
+       still completes. */
+    completed = account_chain_run(budget, &browser, port,
+                                  "sidt=3000&pad=9000", &result);
+    if (!completed)
+        fprintf(stderr, "account chain header overflow: error=%s failure=%u "
+                        "limit=%u redirects=%u hop=%u\n", result.error,
+                (unsigned) result.chain.failure,
+                (unsigned) result.chain.limit,
+                (unsigned) result.chain.redirects,
+                (unsigned) result.chain.failed_hop);
+    CHECK(completed && result.data != NULL
+          && strstr(result.data, "landed method=GET cookies=14 ") != NULL
+          && result.chain.redirects == 4u
+          && result.chain.maximum_header_bytes > 8192u
+          && account_chain_hits(budget, cross_port, "setsid")
+                 == before + 1u);
+    fetch_result_destroy(&result);
+    before++;
+
+    /* A chain may pass through a long address, not end on one: nothing
+       past the transport holds a document address over the smaller bound.
+       The hop is made (the server answers it) and the chain then fails
+       under its own rule, with no response handed on. */
+    CHECK(!account_chain_run(budget, &browser, port, "sidt=3000&end=1",
+                             &result)
+          && !result.timed_out
+          && result.chain.failure == FETCH_CHAIN_FAILURE_RULE
+          && result.chain.limit == FETCH_CHAIN_LIMIT_DOCUMENT_LENGTH
+          && result.chain.redirects == 2u && result.chain.failed_hop == 2u
+          && strcmp(result.chain.failed_host, "localhost") == 0
+          && account_chain_hits(budget, cross_port, "setsid")
+                 == before + 1u);
+    fetch_result_destroy(&result);
+    before++;
+    /* The same chain with an address a document may have ends well. */
+    CHECK(account_chain_run(budget, &browser, port, "sidt=600&end=1",
+                            &result)
+          && result.status_code == 200 && result.data != NULL
+          && strcmp(result.data, "ended on the token address") == 0
+          && result.chain.redirects == 2u);
+    fetch_result_destroy(&result);
+    before++;
+
+    /* Only a navigation's chain: any other request's hop keeps the bound
+       of a stored address, and a longer Location is refused before the
+       hop is made. */
+    char check[160];
+    FetchRequest plain = {.method = "GET", .allow_http_errors = true};
+    FetchScheduler *plain_scheduler =
+        fetch_scheduler_create(budget, 1, 64 * 1024);
+    CHECK(plain_scheduler != NULL);
+    snprintf(check, sizeof(check),
+             "http://127.0.0.1:%u/account-chain/check?sidt=%u", port,
+             (unsigned) (TILEFINCH_URL_SERIALIZED_LIMIT - prefix_length));
+    result = (FetchResult) {.budget = budget};
+    CHECK(!fetch_scheduler_request(plain_scheduler, check, &plain,
+                                   64 * 1024, 5000, &result)
+          && result.chain.failure == FETCH_CHAIN_FAILURE_RULE
+          && result.chain.limit == FETCH_CHAIN_LIMIT_TARGET_LENGTH
+          && result.chain.redirects == 0u
+          && account_chain_hits(budget, cross_port, "setsid") == before);
+    fetch_result_destroy(&result);
+    snprintf(check, sizeof(check),
+             "http://127.0.0.1:%u/account-chain/check?sidt=%u", port,
+             (unsigned) (TILEFINCH_URL_SERIALIZED_LIMIT - 1 - prefix_length));
+    result = (FetchResult) {.budget = budget};
+    CHECK(fetch_scheduler_request(plain_scheduler, check, &plain,
+                                  64 * 1024, 5000, &result)
+          && result.chain.redirects == 3u
+          && account_chain_hits(budget, cross_port, "setsid")
+                 == before + 1u);
+    fetch_result_destroy(&result);
+    fetch_scheduler_destroy(plain_scheduler);
+
+    /* A request whose redirect mode is "error" names that rule too. */
+    char url[128];
+    snprintf(url, sizeof(url),
+             "http://127.0.0.1:%u/account-chain/handoff", port);
+    FetchRequest forbidden = {
+        .method = "GET", .allow_http_errors = true,
+        .page_redirect_mode = FETCH_PAGE_REDIRECT_ERROR
+    };
+    FetchScheduler *scheduler = fetch_scheduler_create(budget, 1, 64 * 1024);
+    CHECK(scheduler != NULL);
+    result = (FetchResult) {.budget = budget};
+    CHECK(!fetch_scheduler_request(scheduler, url, &forbidden, 64 * 1024,
+                                   5000, &result)
+          && strstr(result.error, "redirect mode forbids") != NULL
+          && result.chain.failure == FETCH_CHAIN_FAILURE_RULE
+          && result.chain.limit == FETCH_CHAIN_LIMIT_TARGET
+          && result.chain.failed_hop == 0u);
+    fetch_result_destroy(&result);
+    fetch_scheduler_destroy(scheduler);
+    browser_session_destroy(&browser);
     return true;
 }

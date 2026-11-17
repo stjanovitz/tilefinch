@@ -45,7 +45,21 @@ requires the exact normalized logical URL. Consequently two navigations that
 would send the same HTTP request but name different fragments cannot alias the
 same current-format replay record.
 
-Inputs are bounded to 2,047 serialized bytes and must already be ASCII. Raw
+Inputs are bounded to 2,047 serialized bytes. The one exception is an
+intermediate hop of a navigation's redirect chain, which may be 8,191 (a
+sign-in hand-over carries one-time tokens of several kilobytes in a
+Location). The fetch layer keeps such a hop in a budget-owned string and
+builds it with the `_long` URL writers. The rules a hop must pass (HSTS,
+mixed content, CSP, the blocked-origin list, the content blocker, the
+local-network rule, the request context, cookies, site identity) read it
+whole with `tilefinch_url_parse_long`; the origin, same-origin, site,
+downgrade and potentially-trustworthy helpers, the cookie parser, the
+request context, CSP and the content blocker accept addresses up to 8,191
+bytes. A chain that would end on such an address fails
+(`FETCH_CHAIN_LIMIT_DOCUMENT_LENGTH`): no document, history entry, session
+record, referrer or script-visible value holds an address over 2,047
+bytes, and the URL parser and writers used outside the hop machine refuse
+one. Inputs must already be ASCII. Raw
 Unicode hostnames, whitespace, control bytes, non-HTTP schemes, and malformed
 ports/authorities are rejected. A caller that accepts internationalized names
 must perform standards-correct Unicode and IDNA processing before calling this
@@ -395,14 +409,15 @@ licenses, and deterministic refresh command are recorded in
 `third_party/public_suffix/README.md`; updating it is security maintenance,
 not an acceptance-site compatibility tweak.
 
-The host transport exposes at most `FETCH_RESPONSE_COOKIE_CAPACITY` (64)
-`Set-Cookie` fields in one bounded redirect transaction, and each
+The host transport exposes at most `FETCH_RESPONSE_COOKIE_CAPACITY` (128)
+`Set-Cookie` fields in one bounded redirect transaction, counted over all of
+its hops rather than per response, and each
 serialized field must fit its 4,095-byte storage ceiling. Cookie values and
 their response-URL attributions are allocated from the shared budget only when
 received; `FetchResult` retains only the fixed pointer inventory, avoiding a
 large worst-case payload in every result and scheduler/stack frame. The PSP
-worker also bounds captured cookie text to a fixed 16 KiB pool. If a final
-response exceeds either the 64-field inventory or that aggregate pool,
+worker also bounds one response's captured cookie text to a fixed 16 KiB
+pool. If a final response exceeds either the 128-field inventory or that pool,
 Tilefinch accepts the page, retains the bounded prefix, and marks the cookie set
 as truncated so capture and replay preserve the same outcome. The same
 overflow on a followed redirect hop fails closed: a partial intermediate set

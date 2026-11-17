@@ -282,17 +282,17 @@ static bool start_runtime_page(NavigationSession *navigation, Budget *budget,
    when one is given. */
 static bool start_custom_runtime_page_heavy(
     NavigationSession *navigation, Budget *budget, BrowserSession *browser,
-    const char *url, const char *html, size_t maximum_scripts,
-    size_t maximum_total_bytes, size_t maximum_file_bytes,
-    ScriptHeavyPolicy heavy_default, ScriptHeavyPolicyResolver heavy_resolver,
-    void *heavy_opaque)
+    const char *url, const char *html, size_t heap_bytes,
+    size_t maximum_scripts, size_t maximum_total_bytes,
+    size_t maximum_file_bytes, ScriptHeavyPolicy heavy_default,
+    ScriptHeavyPolicyResolver heavy_resolver, void *heavy_opaque)
 {
     if (!navigation_init(navigation, budget, 4)) return false;
     navigation->heavy_script_policy = heavy_default;
     navigation->heavy_policy_resolver = heavy_resolver;
     navigation->heavy_policy_opaque = heavy_opaque;
     navigation_attach_browser_session(navigation, browser);
-    navigation_enable_scripts(navigation, 8u * MIB, 1000);
+    navigation_enable_scripts(navigation, heap_bytes, 1000);
     navigation_enable_document_scripts(
         navigation, maximum_scripts, maximum_total_bytes,
         maximum_file_bytes, 1000);
@@ -310,7 +310,7 @@ static bool start_custom_runtime_page(
     size_t maximum_total_bytes, size_t maximum_file_bytes)
 {
     return start_custom_runtime_page_heavy(
-        navigation, budget, browser, url, html, maximum_scripts,
+        navigation, budget, browser, url, html, 8u * MIB, maximum_scripts,
         maximum_total_bytes, maximum_file_bytes, SCRIPT_HEAVY_POLICY_RUN,
         NULL, NULL);
 }

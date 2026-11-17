@@ -1,0 +1,11 @@
+drain
+script-report
+heavy-frame-answer stop
+drain
+node-text result
+js addBig()
+drain
+node-text top
+script-report
+node-text cookie
+quit

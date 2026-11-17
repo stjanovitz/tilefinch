@@ -839,6 +839,14 @@ rather than by its size ([PSP envelope](engineering/PSP_ENVELOPE.md#memory-profi
   `document_parser_set_inline_script_admit_callback`) and drops the text of a
   script it can no longer admit, since more text only needs more; the
   element is then empty and the refusal is reported as pressure.
+- **A large unit needs room for the expensive case.** Only the source size
+  is known before a compile, and units of 1 MiB or more compile either near
+  their source size or at 7-10 times it (cnn.com's 2.3 MB inline bundle,
+  ign.com's 1.4 MB application chunk). Such a unit is compiled only when the
+  heap it can obtain now (`script_runtime_heap_obtainable`) is at least 4
+  times its source (`script_admission_large_unit_heap`), so a compile that
+  would fail after seconds of PSP time is refused instead; a bytecode
+  restore keeps only the floor.
 - **Inline text is compiled in place.** A script of one text child (every
   parsed script) compiles from the DOM's own NUL-terminated text, so its
   compile needs no second copy of the source; nothing can change or free that

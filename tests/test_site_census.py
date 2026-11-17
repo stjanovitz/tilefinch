@@ -198,6 +198,30 @@ def check_user_css_before_load(lab, root):
         "lab", {"url": "https://a.test/"}, str(root), [], 0)
 
 
+def check_image_queue_frames(lab, root):
+    """A scripted page leaves its <img> elements to the post-commit image
+    queue. The census frames are PSP loop turns (lab "pump"), which run it,
+    so the record shows the images loaded; the runtime-only "tick" of older
+    runs leaves them all queued."""
+    source = ["--url", "https://interactive-images.test/page", "--replay-http",
+              str(ROOT / "tests/fixtures/http-interactive-image-unsized"),
+              "--fetch-scripts", "--deterministic-replay-seed", "1"]
+    pumped = extract.extract(str(run(lab, root, "queue-pump", {}, False, source)))
+    assert pumped["images"]["loaded"] >= 2, pumped["images"]
+    assert pumped["images"]["queue_batches"] > 0, pumped["images"]
+    saved = census.TICKS
+    census.TICKS = census.RUNTIME_TICKS
+    try:
+        ticked = extract.extract(str(run(lab, root, "queue-tick", {}, False,
+                                         source)))
+    finally:
+        census.TICKS = saved
+    assert ticked["images"]["loaded"] == 0, ticked["images"]
+    assert ticked["images"]["queue_queued"] == 4, ticked["images"]
+    assert ticked["images"]["queue_batches"] == 0, ticked["images"]
+    assert ticked["images"]["queue_pending"], ticked["images"]
+
+
 def check_null_exception_limits(root):
     """A page can throw null without any memory refusal; real refusals must
     remain visible even when the engine could not allocate its error."""
@@ -308,6 +332,7 @@ def main():
 
         check_focus_moves(lab, root)
         check_user_css_before_load(lab, root)
+        check_image_queue_frames(lab, root)
 
 
 if __name__ == "__main__":

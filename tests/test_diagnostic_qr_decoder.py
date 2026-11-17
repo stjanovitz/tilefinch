@@ -115,6 +115,17 @@ def main() -> None:
         ("tilefinch-last-error.txt", expected_log, len(expected_log), 0)
     ]
 
+    # The sign-in report's compact chain line gets its field names back.
+    assert DECODER.describe_post_chain(
+        b"form-posts=1 token-kind=4\n"
+        b"post-chain=7,1,1,3,4,7312,14,9311,38,8734,9871,30000\n"
+    ) == ("class=7 hops=1 failed-hop=1 failed-host=3 limit=4 "
+          "hop-header-bytes=7312 hop-set-cookies=14 max-header-bytes=9311 "
+          "chain-set-cookies=38 first-byte-ms=8734 elapsed-ms=9871 "
+          "timeout-ms=30000")
+    assert DECODER.describe_post_chain(b"post-chain=7,1\n") is None
+    assert DECODER.describe_post_chain(expected_log) is None
+
     name = b"tilefinch-validation.txt"
     original = bytes(range(256)) * 400
     split = 55_000

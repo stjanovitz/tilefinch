@@ -300,6 +300,23 @@ static int test_long_lines_and_rule_limit(void)
           && !content_blocker_should_block(
               blocker, "https://last.example/a.js",
               "https://publisher.example/", "script", "no-cors"));
+    /* A frame's redirect chain may pass through an address of several
+       kilobytes: the rule for its host still applies. */
+    static char long_frame[7000];
+    static const char long_frame_prefix[] = "https://first.example/frame?t=";
+    memcpy(long_frame, long_frame_prefix, sizeof(long_frame_prefix) - 1u);
+    memset(long_frame + sizeof(long_frame_prefix) - 1u, 't',
+           sizeof(long_frame) - sizeof(long_frame_prefix));
+    long_frame[sizeof(long_frame) - 1u] = '\0';
+    CHECK(content_blocker_should_block(
+              blocker, long_frame, "https://publisher.example/", "iframe",
+              "navigate"));
+    memcpy(long_frame, "https://last.example/frame?t=",
+           sizeof(long_frame_prefix) - 2u);
+    long_frame[sizeof(long_frame_prefix) - 2u] = 't';
+    CHECK(!content_blocker_should_block(
+              blocker, long_frame, "https://publisher.example/", "iframe",
+              "navigate"));
     content_blocker_destroy(blocker);
     CHECK(unlink(path) == 0 && budget.current == 0);
     return 0;

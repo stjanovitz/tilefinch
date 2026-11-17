@@ -373,6 +373,13 @@ def extract(run_dir, name=None, url=None, tags=None):
         # libwebp allocations plus the output). Absent in older labs.
         "decode_peak_bytes": num(res.get("image-decode-peak")),
     }
+    # The post-commit image queue when the summary was printed: targets
+    # still queued, queue units run, and whether it still had work (absent
+    # in labs before 2026-11-07).
+    queue = fields(last_line(lines, "image-queue ") or "")
+    rec["images"]["queue_queued"] = num(queue.get("queued"))
+    rec["images"]["queue_batches"] = num(queue.get("batches"))
+    rec["images"]["queue_pending"] = queue.get("pending") == "yes"
     # Display retargeting after layout (absent in older labs).
     rt = fields(last_line(lines, "image-retarget ") or "")
     rec["images"]["retarget"] = {

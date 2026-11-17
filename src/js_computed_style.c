@@ -2583,6 +2583,52 @@ static bool computed_style_answer(JSValue *answer, JSValue value)
     return false;
 }
 
+/* Whether `node` sits in a <head> that renders nothing, where the only
+   container its container queries and units can find is the root element:
+   <head> lays out no box, so it is never a query container. The root's
+   contained size follows the viewport and the root's own style, never its
+   content, so the container state the last complete layout measured is the
+   one a new layout would measure while the journal leaves the root's style
+   alone: no record on the root itself, no :has() answer that may move, no
+   sheet change. A script probing colours or features with an element in the
+   head (Stripe.js on npr.org) then reads a style-only value without the
+   whole page's layout, as it does on a page without container queries. */
+static bool computed_style_root_container_only(
+    const DomBridge *bridge, lxb_dom_node_t *node,
+    const ScriptMutationJournal *journal)
+{
+    const Stylesheet *sheet = bridge->stylesheet;
+    if (journal == NULL || journal->overflowed
+        || journal->relational_selector_sensitive
+        || journal->resource_rebuild_required
+        || journal->conservative_resource_scan
+        || bridge->mutations_unrecorded || bridge->shadow_root_count != 0
+        || !style_container_layout_state_present(sheet)
+        || !sheet->container_state_complete) return false;
+    lxb_dom_node_t *head = NULL, *root = NULL;
+    unsigned depth = 0;
+    for (lxb_dom_node_t *at = node; at != NULL; at = at->parent) {
+        if (at->type == LXB_DOM_NODE_TYPE_DOCUMENT) break;
+        if (at->type != LXB_DOM_NODE_TYPE_ELEMENT || ++depth > 64u)
+            return false;
+        if (at->parent != NULL
+            && at->parent->type == LXB_DOM_NODE_TYPE_DOCUMENT) root = at;
+        else if (at->local_name == LXB_TAG_HEAD && at->ns == LXB_NS_HTML)
+            head = at;
+    }
+    if (root == NULL || root->local_name != LXB_TAG_HTML
+        || root->ns != LXB_NS_HTML || head == NULL || head->parent != root)
+        return false;
+    for (size_t i = 0; i < journal->count; i++) {
+        const ScriptMutationRecord *record = &journal->records[i];
+        if (record->kind == SCRIPT_MUTATION_UNKNOWN || record->node == root)
+            return false;
+    }
+    ComputedStyle root_style = style_for_node(sheet, root, NULL);
+    ComputedStyle head_style = style_for_node(sheet, head, &root_style);
+    return head_style.display == DISPLAY_NONE;
+}
+
 /* Resolves `name` (dashed, lower-case) on `node` for one read: the layout
    flush the property needs, then the cascade (memo, ancestor ring) and the
    pseudo-element argv[2] names. Returns true with `read` filled, or false
@@ -2631,7 +2677,11 @@ static bool computed_style_resolve(JSContext *context, DomBridge *bridge,
                 && !journal->overflowed
                 && !journal->resource_rebuild_required
                 && !journal->conservative_resource_scan))
-        && geometry_independent;
+        && (geometry_independent
+            /* Only a read that would flush pays for the check. */
+            || (bridge->relayout_dirty != NULL && *bridge->relayout_dirty
+                && computed_style_root_container_only(bridge, node,
+                                                      journal)));
     /* Transitions and the watcher's snapshots need the cascade, not
        geometry: only a stylesheet change waiting to be applied forces the
        flush. */

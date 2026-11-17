@@ -342,6 +342,22 @@ static unsigned browser_engine_youtube_signin_page_class(const char *url)
     return 6u;
 }
 
+/* The sign-in hosts a redirect chain passes through, as a fixed class: 0
+   none, 1 accounts.google.com, 2 a YouTube host other than
+   accounts.youtube.com, 3 accounts.youtube.com, 4 another Google host
+   (country sites take part in the handoff), 5 anything else. */
+static unsigned browser_engine_youtube_host_class(const char *host)
+{
+    if (host == NULL || host[0] == '\0') return 0u;
+    if (strcasecmp(host, "accounts.google.com") == 0) return 1u;
+    if (strcasecmp(host, "accounts.youtube.com") == 0) return 3u;
+    size_t length = strlen(host);
+    if (tilefinch_host_within(host, length, "youtube.com", 11u)) return 2u;
+    if (tilefinch_host_within(host, length, "google.com", 10u)
+        || strncasecmp(host, "accounts.google.", 16u) == 0) return 4u;
+    return 5u;
+}
+
 /* What the page's anti-bot check put in the form, by kind and length:
    0 no field, 1 empty, 2 script-disabled marker, 3 failure marker, 4 token. */
 static unsigned browser_engine_youtube_token_kind(const char *body, size_t length,
@@ -386,6 +402,9 @@ static void browser_engine_youtube_note_request(
     engine->youtube.signin_trail.post_landing = 0u;
     engine->youtube.signin_trail.post_outcome = 0u;
     engine->youtube.signin_trail.post_http_status = 0;
+    memset(&engine->youtube.signin_trail.post_chain, 0,
+           sizeof(engine->youtube.signin_trail.post_chain));
+    engine->youtube.signin_trail.post_failed_host = 0u;
     engine->youtube.signin_trail.post_pending = true;
     engine->youtube.signin_trail.token_kind = browser_engine_youtube_token_kind(
         body, body_length, &engine->youtube.signin_trail.token_length);
@@ -447,7 +466,7 @@ bool browser_engine_youtube_signin_report(const BrowserEngine *engine, char *out
     }
     /* Only enum/boolean/count fields, never generic errors or identity hashes. */
     int n = snprintf(out, capacity,
-        "Tilefinch YouTube sign-in diagnostics v4\n"
+        "Tilefinch YouTube sign-in diagnostics v5\n"
         "stage=%u recovery-attempts=%u scripts-enabled=%u runtime-present=%u degraded=%u\n"
         "handoff-http-status=%ld handoff-service-origin=%u\n"
         "dynamic-transport-failures=%zu dynamic-authority-failures=%zu dynamic-source-failures=%zu allocation-refusals=%zu\n"
@@ -467,7 +486,13 @@ bool browser_engine_youtube_signin_report(const BrowserEngine *engine, char *out
         "page-class=%u document-http-status=%ld text-present=%u auth-navigations=%u\n"
         "activations=%u activations-without-scripts=%u form-submits=%u forms-not-sent=%u text-edits=%u\n"
         "form-posts=%u token-kind=%u token-length=%zu post-target=%u post-outcome=%u post-http-status=%ld post-landing=%u\n"
-        "accounts-refusals=%u refusal-class=%u refusal-reason=%u\n",
+        "accounts-refusals=%u refusal-class=%u refusal-reason=%u\n"
+        /* One compact line, so the report still fits one QR code: class,
+           hops, failed hop, failed host class, limit, the failing hop's
+           header bytes and Set-Cookie count, the chain's largest header
+           block and Set-Cookie count, then milliseconds to the first byte,
+           to the end, and allowed (docs/DIAGNOSTIC_QR.md). */
+        "post-chain=%u,%u,%u,%u,%u,%u,%u,%u,%u,%lu,%lu,%lu\n",
         engine->youtube.signin_state, engine->youtube.signin_retries,
         engine->navigation.scripts_enabled, engine->navigation.page.runtime != NULL,
         engine->navigation.page.script_degradation_observed,
@@ -524,7 +549,15 @@ bool browser_engine_youtube_signin_report(const BrowserEngine *engine, char *out
         trail->post_http_status >= 100 && trail->post_http_status <= 599
             ? trail->post_http_status : 0L,
         trail->post_landing,
-        trail->refusals, trail->refusal_class, trail->refusal_reason);
+        trail->refusals, trail->refusal_class, trail->refusal_reason,
+        trail->post_chain.failure, trail->post_chain.redirects,
+        trail->post_chain.failed_hop, trail->post_failed_host,
+        trail->post_chain.limit,
+        trail->post_chain.hop_header_bytes, trail->post_chain.hop_set_cookies,
+        trail->post_chain.maximum_header_bytes, trail->post_chain.set_cookies,
+        (unsigned long) trail->post_chain.first_byte_ms,
+        (unsigned long) trail->post_chain.elapsed_ms,
+        (unsigned long) trail->post_chain.timeout_ms);
     if (n < 0 || (size_t) n >= capacity) { out[0] = '\0'; return false; }
     return true;
 }
@@ -1228,15 +1261,25 @@ static void browser_engine_youtube_on_commit(BrowserEngine *engine,
    retried. An interstitial or HTTP 429 is only counted: Google's page says
    what to do. */
 static void browser_engine_youtube_note_landing(
-    BrowserEngine *engine, BrowserNavigationJobStatus outcome)
+    BrowserEngine *engine, BrowserNavigationJobStatus outcome,
+    const FetchChainFacts *handoff_chain, long handoff_http_status)
 {
     BrowserSigninTrail *trail = &engine->youtube.signin_trail;
     if (trail->post_pending) {
         trail->post_pending = false;
         trail->post_outcome = (unsigned) outcome;
-        trail->post_http_status = engine->navigation.last_http_status;
+        /* After a hand-over to a site adapter the session's chain is the
+           adapter's load's (or nothing): the chain the POST followed is the
+           one the dropped load kept (browser_engine_handoff_chain). */
+        trail->post_http_status = handoff_chain != NULL
+            ? handoff_http_status : engine->navigation.last_http_status;
         trail->post_landing = browser_engine_youtube_signin_page_class(
             engine->navigation.page.document_url);
+        trail->post_chain = handoff_chain != NULL
+            ? *handoff_chain : engine->navigation.last_chain;
+        trail->post_failed_host = browser_engine_youtube_host_class(
+            trail->post_chain.failed_host);
+        trail->post_chain.failed_host[0] = '\0';
     }
     bool accounts_request = engine->youtube.accounts_request;
     engine->youtube.accounts_request = false;
@@ -1266,7 +1309,11 @@ static void browser_engine_youtube_on_finish(
         engine->youtube.handoff_http_status = adapter->handoff_http_status;
         engine->youtube.handoff_service_origin = adapter->handoff_service_origin;
     }
-    browser_engine_youtube_note_landing(engine, outcome);
+    const BrowserEngineNavigationWork *work = &engine->navigation_work;
+    browser_engine_youtube_note_landing(
+        engine, outcome,
+        work->handoff_chain_kept ? &work->handoff_chain : NULL,
+        work->handoff_http_status);
     if (!browser_engine_youtube_signin_pending(engine)) return;
     if (outcome == BROWSER_NAVIGATION_JOB_CANCELLED) {
         engine->youtube.signin_state = YOUTUBE_SIGNIN_CANCELLED;

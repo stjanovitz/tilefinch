@@ -2777,7 +2777,8 @@
         CHECK(navigation_bot_wall(&session, &wall)
               && strcmp(wall.vendor, "HUMAN") == 0 && wall.status == 403
               && strcmp(wall.site, "example.com") == 0
-              && !wall.blank_after_refused_script);
+              && !wall.blank_after_refused_script
+              && wall.paints_nothing);
         /* Headers recorded for the response name the vendor. */
         snprintf(session.last_bot_wall_vendor,
                  sizeof(session.last_bot_wall_vendor), "%s", "DataDome");
@@ -2796,6 +2797,36 @@
         CHECK(navigation_bot_wall(&session, &wall)
               && wall.vendor[0] == '\0' && wall.blank_after_refused_script
               && strcmp(wall.site, "shop.example") == 0);
+        /* A wall that shows its message paints; AWS WAF's silent
+           challenge (imdb.com) leaves an empty container (its <noscript>
+           text is hidden while its script runs), so its page paints
+           nothing and the PSP keeps the notice up over it. */
+        static const char message_page[] =
+            "<!doctype html><title>example</title><body>"
+            "<p>Verification Required</p>";
+        static const char silent_page[] =
+            "<!doctype html><title></title><body>"
+            "<div id=challenge-container></div>"
+            "<script src=/challenge.js></script>";
+        generation = navigation_begin(&session);
+        CHECK(navigation_commit_html(&session, generation,
+            "https://www.example.com/b", message_page, strlen(message_page),
+            480, NULL, NULL, true));
+        session.last_http_status = 403;
+        snprintf(session.last_bot_wall_vendor,
+                 sizeof(session.last_bot_wall_vendor), "%s", "DataDome");
+        CHECK(navigation_bot_wall(&session, &wall) && !wall.paints_nothing);
+        generation = navigation_begin(&session);
+        CHECK(navigation_commit_html(&session, generation,
+            "https://www.imdb.com/title/tt0133093/", silent_page,
+            strlen(silent_page), 480, NULL, NULL, true));
+        session.last_http_status = 202;
+        snprintf(session.last_bot_wall_vendor,
+                 sizeof(session.last_bot_wall_vendor), "%s", "AWS WAF");
+        CHECK(navigation_bot_wall(&session, &wall)
+              && strcmp(wall.vendor, "AWS WAF") == 0 && wall.status == 202
+              && strcmp(wall.site, "imdb.com") == 0
+              && wall.paints_nothing && !wall.blank_after_refused_script);
         /* A successful page is never a wall, whatever its title. */
         generation = navigation_begin(&session);
         session.script_skipped_quota = 0;

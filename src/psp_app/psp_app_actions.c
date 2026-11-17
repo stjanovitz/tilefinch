@@ -38,6 +38,8 @@ static void psp_app_toggle_basic_view(
             basic_analysis.prepared
                 && basic_analysis.kind != READER_PAGE_BASIC
                 ? "RELOAD PAGE TO SWITCH EXTRACTED VIEWS"
+                : basic_analysis.scripts_stopped
+                ? "BASIC VIEW UNAVAILABLE\nPAGE SCRIPTS STOPPED"
                 : "BASIC VIEW UNAVAILABLE",
             240);
         return;
@@ -54,9 +56,12 @@ static void psp_app_toggle_basic_view(
     if (have_basic_anchor)
         (void) browser_engine_restore_text_anchor(
             engine, basic_anchor, basic_anchor_y);
-    psp_ui_show_status(
-        &app->process->presentation.ui,
-        enable ? "BASIC VIEW ON" : "BASIC VIEW OFF", 180);
+    /* The view's preparation stopped the page's scripts to make room
+       (browser_engine_prepare_basic_view): turning Basic view off again
+       does not bring them back, so say so. */
+    psp_ui_show_status(&app->process->presentation.ui,
+                       psp_basic_view_toggle_status(enable, &basic_analysis),
+                       180);
 }
 
 __attribute__((noinline))
@@ -233,7 +238,7 @@ typedef struct {
     TilefinchDiagnosticSource sources[TILEFINCH_DIAGNOSTIC_QR_SOURCE_LIMIT];
     char paths[TILEFINCH_DIAGNOSTIC_QR_SOURCE_LIMIT]
               [TILEFINCH_INSTALL_PATH_LIMIT];
-    char signin_report[2304];
+    char signin_report[2816];
 } PspDiagnosticPathSet;
 
 /* Keep the five long install paths and zlib/QR setup out of the already-large
@@ -764,10 +769,8 @@ static void psp_app_history_step(
         &app->process->presentation.ui, engine_frame, engine);
     psp_text_input_before_navigation(&app->process->text_input);
     bool javascript_ready = history_url != NULL
-        && browser_engine_set_javascript_enabled(
-            engine,
-            browser_profile_javascript_allowed_for_url(
-                profile, history_url));
+        && psp_navigation_begin_javascript(engine, profile, history_url,
+                                           "GET");
     bool started = javascript_ready
         && browser_engine_begin_navigation_history(
             engine, forward, PSP_NAVIGATION_DOCUMENT_BYTES, PSP_NAVIGATION_TIMEOUT_MS);
@@ -776,6 +779,8 @@ static void psp_app_history_step(
         app->interactive->navigation_job_started_us =
             (uint64_t) sceKernelGetSystemTimeWide();
     } else {
+        if (javascript_ready)
+            psp_navigation_abandon_javascript(engine, profile);
         psp_navigation_cooperate_end(
             "interactive-history-start-failed");
         psp_ui_set_loading(&app->process->presentation.ui, false, 0);
@@ -1718,6 +1723,8 @@ static void psp_app_dispatch_heavy_action(
         case PSP_UI_ACTION_HEAVY_RUN_SESSION:
         case PSP_UI_ACTION_HEAVY_RUN_ALWAYS:
         case PSP_UI_ACTION_HEAVY_CANCEL:
+        case PSP_UI_ACTION_HEAVY_FRAME_START:
+        case PSP_UI_ACTION_HEAVY_FRAME_NOT_NOW:
             psp_app_heavy_action(app, frame, intent);
             frame->page_dirty = true;
             break;
@@ -1747,6 +1754,20 @@ static void psp_app_dispatch_heavy_action(
             psp_app_scripts_off_answer(app, frame, false);
             frame->page_dirty = true;
             break;
+        case PSP_UI_ACTION_TRY_FULL_PAGE:
+        {
+            /* The page opened in Basic view by default: load it once with
+               its scripts (psp_basic_default_*). */
+            char full_buffer[NAVIGATION_URL_LIMIT];
+            const char *full_url = psp_app_current_url(
+                engine, full_buffer, sizeof(full_buffer));
+            if (full_url == NULL) full_url = app->process->presentation.ui.url;
+            psp_basic_default_request_full_page(psp_app_basic_default(),
+                                                full_url);
+            psp_app_reload(app, frame, engine_frame);
+            frame->page_dirty = true;
+            break;
+        }
         case PSP_UI_ACTION_CLOSE_DIAGNOSTIC_QR:
             psp_ui_set_diagnostic_qr(&app->process->presentation.ui, NULL);
             tilefinch_diagnostic_qr_destroy(app->process->diagnostic_qr);

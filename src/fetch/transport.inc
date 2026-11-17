@@ -24,6 +24,7 @@ static void fetch_hop_destroy(FetchHopState *hop)
     budget_free(budget, hop->initiator);
     budget_free(budget, hop->logical_url);
     budget_free(budget, hop->url);
+    budget_free(budget, hop->response_location);
     budget_free(budget, hop);
 }
 
@@ -159,6 +160,7 @@ static FetchHopState *fetch_hop_create(Budget *budget, const char *url,
     uint64_t duration = (uint64_t) timeout_ms * UINT64_C(1000000);
     hop->deadline_ns = duration > UINT64_MAX - now ? UINT64_MAX
                                                    : now + duration;
+    hop->timeout_ms = timeout_ms;
     hop->redirect_transition_count = 0u;
     return hop;
 }
@@ -372,7 +374,7 @@ bool fetch_page_redirect_next(
     char secured[TILEFINCH_URL_SERIALIZED_LIMIT];
     char key[TILEFINCH_URL_SERIALIZED_LIMIT];
     BrowserSession *session = (BrowserSession *) page_request->cookie_session;
-    if (!fetch_response_header_value(
+    if (!response_header_whole_value(
             response, "location", location, sizeof(location))
         || !tilefinch_url_resolve(
                current_url, location, resolved, sizeof(resolved))
@@ -424,18 +426,103 @@ bool fetch_page_request_first_hop(
     return true;
 }
 
+/* The Location of the redirect `response`: the value its headers handed
+   the hop whole, or else what the header snapshot holds (a response that
+   reached the hop machine without them). */
+static bool fetch_hop_response_location(FetchHopState *hop,
+                                        const FetchResult *response,
+                                        char *fallback, size_t fallback_size,
+                                        const char **location)
+{
+    if (hop->response_location_oversize) return false;
+    if (hop->response_location != NULL) {
+        *location = hop->response_location;
+        return true;
+    }
+    if (!response_header_whole_value(
+            response, "location", fallback, fallback_size)) return false;
+    *location = fallback;
+    return true;
+}
+
+static bool fetch_hop_advance_with(FetchHopState *hop,
+                                   const FetchResult *response,
+                                   const char *location, bool long_hop,
+                                   char *next_logical, char *secured,
+                                   char *next, size_t capacity);
+
+/* A navigation's chain may pass through an address up to
+   TILEFINCH_URL_LONG_LIMIT - 1 bytes (sign-in hand-overs carry one-time
+   tokens of several kilobytes); any other request's hops keep
+   TILEFINCH_URL_SERIALIZED_LIMIT. The three working addresses of a
+   navigation's hop come from the budget, sized to this redirect, so the
+   common short one costs a few hundred bytes and no caller's stack grows. */
 static bool fetch_hop_advance(FetchHopState *hop,
                               const FetchResult *response)
 {
     if (hop == NULL || response == NULL
         || hop->redirects >= FETCH_REDIRECT_LIMIT) return false;
-    char location[TILEFINCH_URL_SERIALIZED_LIMIT];
-    char next_logical[TILEFINCH_URL_SERIALIZED_LIMIT];
-    if (!fetch_response_header_value(
-            response, "location", location, sizeof(location))
-        || !tilefinch_url_resolve(
-               hop->logical_url, location,
-               next_logical, sizeof(next_logical))) {
+    /* The cookie context's mode is the hop's own copy: a scheduled request
+       drops its session pointers once the hop is built. */
+    bool long_hop = fetch_request_is_navigation(hop->base)
+        || (hop->cookie_overlay != NULL
+            && (hop->cookie_top_level_navigation
+                || (hop->cookie_mode == TILEFINCH_REQUEST_MODE_NAVIGATE
+                    && hop->cookie_destination
+                           == TILEFINCH_DESTINATION_FRAME)));
+    char short_scratch[3][TILEFINCH_URL_SERIALIZED_LIMIT];
+    const char *location = NULL;
+    /* A Location longer than a hop's address may be is refused, never
+       followed cut short: the cut address is not the one the server
+       named. */
+    hop->location_too_long = !fetch_hop_response_location(
+        hop, response, short_scratch[0], sizeof(short_scratch[0]),
+        &location);
+    if (!hop->location_too_long && !long_hop
+        && strlen(location) >= TILEFINCH_URL_SERIALIZED_LIMIT)
+        hop->location_too_long = true;
+    if (hop->location_too_long) return false;
+    /* `location` may be short_scratch[0] (the snapshot's copy), which is
+       also the short path's `next`: nothing writes `next` until the
+       Location has been resolved and searched for a fragment. */
+    if (!long_hop) {
+        return fetch_hop_advance_with(
+            hop, response, location, false, short_scratch[1],
+            short_scratch[2], short_scratch[0],
+            TILEFINCH_URL_SERIALIZED_LIMIT);
+    }
+    /* The result is at most base + reference; normalization adds a few
+       bytes at most (a path for an empty one, an address written out). */
+    size_t capacity = strlen(hop->logical_url) + strlen(location) + 64u;
+    if (capacity > TILEFINCH_URL_LONG_LIMIT)
+        capacity = TILEFINCH_URL_LONG_LIMIT;
+    char *scratch = budget_malloc(hop->budget, 3u * capacity);
+    if (scratch == NULL) return false;
+    bool advanced = fetch_hop_advance_with(
+        hop, response, location, true, scratch, scratch + capacity,
+        scratch + 2u * capacity, capacity);
+    budget_free(hop->budget, scratch);
+    return advanced;
+}
+
+static bool fetch_hop_advance_with(FetchHopState *hop,
+                                   const FetchResult *response,
+                                   const char *location, bool long_hop,
+                                   char *next_logical, char *secured,
+                                   char *next, size_t capacity)
+{
+    if (!(long_hop ? tilefinch_url_resolve_long(
+                         hop->logical_url, location, next_logical, capacity)
+                   : tilefinch_url_resolve(
+                         hop->logical_url, location, next_logical,
+                         capacity))) {
+        /* A target that fails for its length says so (an absolute
+           Location stands alone; a relative one extends the hop's). */
+        const char *scheme = strstr(location, "://");
+        bool absolute = scheme != NULL && scheme - location <= 5;
+        if (strlen(location) + (absolute ? 0u : strlen(hop->logical_url))
+                >= capacity)
+            hop->location_too_long = true;
         return false;
     }
     /* HTTP redirect processing inherits the current logical fragment only
@@ -446,20 +533,21 @@ static bool fetch_hop_advance(FetchHopState *hop,
         if (fragment != NULL) {
             size_t used = strlen(next_logical);
             size_t fragment_length = strlen(fragment);
-            if (fragment_length >= sizeof(next_logical) - used) return false;
+            if (fragment_length >= capacity - used) return false;
             memcpy(next_logical + used, fragment, fragment_length + 1);
         }
     }
-    /* Reuse the Location scratch after resolution: all subsequent transport,
-       cookie, CORS, and cache decisions use the fragmentless request key. */
-    char secured[TILEFINCH_URL_SERIALIZED_LIMIT];
-    if (!fetch_request_prepare_security_url_with_session(
+    /* All subsequent transport, cookie, CORS, and cache decisions use the
+       fragmentless request key. `next` is scratch for the upgrade first. */
+    if (!fetch_request_prepare_security_url_sized(
             hop->base, hop->security_session,
-            next_logical, false, secured)
-        || !tilefinch_url_request_key(
-               secured, location, sizeof(location))) return false;
-    snprintf(next_logical, sizeof(next_logical), "%s", secured);
-    const char *next = location;
+            next_logical, false, secured, next, capacity, long_hop))
+        return false;
+    memcpy(next_logical, secured, strlen(secured) + 1u);
+    if (!(long_hop
+              ? tilefinch_url_request_key_long(next_logical, next, capacity)
+              : tilefinch_url_request_key(next_logical, next, capacity)))
+        return false;
     uint32_t transition_hash =
         fetch_redirect_transition_hash(hop->url, next);
     for (uint8_t i = 0; i < hop->redirect_transition_count; i++) {
@@ -540,8 +628,11 @@ static bool fetch_hop_advance(FetchHopState *hop,
         : hop->fetch_site_crossed ? "cross-site" : "same-origin";
     if (!hop_replace(hop->budget, &hop->fetch_site, site, 63)
         || !hop_replace(
-               hop->budget, &hop->logical_url, next_logical, 4095)
-        || !hop_replace(hop->budget, &hop->url, next, 4095)) return false;
+               hop->budget, &hop->logical_url, next_logical,
+               TILEFINCH_URL_LONG_LIMIT - 1u)
+        || !hop_replace(hop->budget, &hop->url, next,
+                        TILEFINCH_URL_LONG_LIMIT - 1u)) return false;
+    fetch_hop_clear_location(hop);
     if (hop->redirect_transition_count < FETCH_REDIRECT_LIMIT) {
         hop->redirect_transition_hashes[
             hop->redirect_transition_count++] = transition_hash;
@@ -557,6 +648,125 @@ static long fetch_hop_remaining_ms(const FetchHopState *hop)
     uint64_t remaining = hop->deadline_ns - now;
     uint64_t ms = (remaining + UINT64_C(999999)) / UINT64_C(1000000);
     return ms > (uint64_t) LONG_MAX ? LONG_MAX : (long) ms;
+}
+
+/* The rule fetch_hop_advance() refused a redirect under. */
+static uint8_t fetch_hop_advance_limit(const FetchHopState *hop)
+{
+    return hop->redirect_loop_detected ? FETCH_CHAIN_LIMIT_LOOP
+        : hop->location_too_long ? FETCH_CHAIN_LIMIT_TARGET_LENGTH
+        : FETCH_CHAIN_LIMIT_TARGET;
+}
+
+/* Milliseconds since the request this hop belongs to began. */
+static uint32_t fetch_hop_elapsed_ms(const FetchHopState *hop)
+{
+    long remaining = fetch_hop_remaining_ms(hop);
+    return hop == NULL || hop->timeout_ms <= remaining
+        ? 0u : (uint32_t) (hop->timeout_ms - remaining);
+}
+
+/* The hop's response has arrived (FetchChainFacts): its header bytes as
+   kept, and its Set-Cookie fields from `first_cookie` on. `stamp` on the
+   call that sees its headers first. */
+static void fetch_chain_note_response(FetchResult *result,
+                                      const FetchHopState *hop,
+                                      size_t first_cookie, bool stamp)
+{
+    FetchChainFacts *chain = &result->chain;
+    size_t bytes = result->response_headers_length;
+    size_t cookies = 0;
+    for (size_t i = first_cookie; i < result->set_cookie_count; i++) {
+        if (result->set_cookies[i] == NULL) continue;
+        bytes += strlen(result->set_cookies[i]) + sizeof("set-cookie: ");
+        cookies++;
+    }
+    chain->hop_header_bytes = bytes > UINT16_MAX ? UINT16_MAX
+                                                 : (uint16_t) bytes;
+    chain->hop_set_cookies = cookies > UINT8_MAX ? UINT8_MAX
+                                                 : (uint8_t) cookies;
+    if (chain->hop_header_bytes > chain->maximum_header_bytes)
+        chain->maximum_header_bytes = chain->hop_header_bytes;
+    size_t all = result->set_cookie_count;
+    chain->set_cookies = all > UINT8_MAX ? UINT8_MAX : (uint8_t) all;
+    if (stamp) {
+        chain->first_byte_ms = fetch_hop_elapsed_ms(hop);
+        if (chain->first_byte_ms == 0) chain->first_byte_ms = 1u;
+    }
+}
+
+/* A redirect was followed: the next hop has not answered yet. */
+static void fetch_chain_note_redirect(FetchResult *result)
+{
+    result->chain.hop_header_bytes = 0;
+    result->chain.hop_set_cookies = 0;
+    result->chain.first_byte_ms = 0;
+}
+
+/* The request is over. `limit` is the rule its caller knows ended it;
+   FETCH_CHAIN_LIMIT_NONE reads the typed result instead. */
+static void fetch_chain_note_end(FetchResult *result,
+                                 const FetchHopState *hop, bool success,
+                                 bool cancelled)
+{
+    FetchChainFacts *chain = &result->chain;
+    if (hop == NULL) return;
+    chain->redirects = hop->redirects > UINT8_MAX
+        ? UINT8_MAX : (uint8_t) hop->redirects;
+    chain->elapsed_ms = fetch_hop_elapsed_ms(hop);
+    chain->timeout_ms = hop->timeout_ms > 0 ? (uint32_t) hop->timeout_ms : 0u;
+    if (success) {
+        chain->failure = FETCH_CHAIN_FAILURE_NONE;
+        chain->limit = FETCH_CHAIN_LIMIT_NONE;
+        return;
+    }
+    chain->failed_hop = chain->redirects;
+    TilefinchUrl parsed;
+    chain->failed_host[0] = '\0';
+    if (hop->url != NULL && tilefinch_url_parse_long(hop->url, &parsed)) {
+        if (parsed.host_length < sizeof(chain->failed_host)) {
+            memcpy(chain->failed_host, hop->url + parsed.host_offset,
+                   parsed.host_length);
+            chain->failed_host[parsed.host_length] = '\0';
+        } else {
+            memcpy(chain->failed_host, "*", 2u);
+        }
+    }
+    /* Rules set the limit where they fire (and the worker's travel in
+       FetchBackgroundResult.chain_limit); these two are typed results. */
+    if (chain->limit == FETCH_CHAIN_LIMIT_NONE) {
+        if (result->response_limit_exceeded)
+            chain->limit = FETCH_CHAIN_LIMIT_BODY;
+        else if (result->timed_out)
+            chain->limit = FETCH_CHAIN_LIMIT_DEADLINE;
+    }
+    CURLcode code = (CURLcode) result->transport_code;
+    if (cancelled || code == CURLE_ABORTED_BY_CALLBACK)
+        chain->failure = FETCH_CHAIN_FAILURE_CANCELLED;
+    else if (chain->limit != FETCH_CHAIN_LIMIT_NONE
+             && chain->limit != FETCH_CHAIN_LIMIT_DEADLINE
+             && chain->limit != FETCH_CHAIN_LIMIT_STALL)
+        chain->failure = FETCH_CHAIN_FAILURE_RULE;
+    else if (result->timed_out || code == CURLE_OPERATION_TIMEDOUT)
+        chain->failure = FETCH_CHAIN_FAILURE_TIMEOUT;
+    else if (code == CURLE_COULDNT_RESOLVE_HOST)
+        chain->failure = FETCH_CHAIN_FAILURE_RESOLVE;
+    else if (code == CURLE_COULDNT_CONNECT)
+        chain->failure = FETCH_CHAIN_FAILURE_CONNECT;
+    else if (code == CURLE_SSL_CONNECT_ERROR
+             || code == CURLE_PEER_FAILED_VERIFICATION
+             || code == CURLE_SSL_CERTPROBLEM || code == CURLE_SSL_CIPHER
+             || code == CURLE_SSL_CACERT_BADFILE
+             || result->tls_verification_failed)
+        chain->failure = FETCH_CHAIN_FAILURE_TLS;
+    else if (code == CURLE_HTTP2 || code == CURLE_HTTP2_STREAM)
+        chain->failure = FETCH_CHAIN_FAILURE_HTTP2;
+    else if (code == CURLE_SEND_ERROR || code == CURLE_RECV_ERROR
+             || code == CURLE_GOT_NOTHING || code == CURLE_PARTIAL_FILE
+             || code == CURLE_WEIRD_SERVER_REPLY)
+        chain->failure = FETCH_CHAIN_FAILURE_TRANSFER;
+    else
+        chain->failure = FETCH_CHAIN_FAILURE_OTHER;
 }
 
 static bool hop_add_header(struct curl_slist **headers, const char *value)

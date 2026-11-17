@@ -27,11 +27,18 @@ typedef struct {
     uint16_t listing_entries;
     uint16_t extracted_nodes;
     uint16_t retained_forms;
+    /* Basic only: visible form controls (inputs other than hidden ones,
+       selects and text areas) the view leaves out, such as those of a POST
+       form or of one whose action Basic view cannot keep. */
+    uint16_t dropped_controls;
     uint16_t mapped_anchors;
     bool high_confidence;
     bool prepared;
     bool bounded_out;
     bool extraction_truncated;
+    /* browser_engine_prepare_basic_view stopped the page's scripts to
+       make room for this view (its reclaim); never stored. */
+    bool scripts_stopped;
 } ReaderDocumentAnalysis;
 
 /* The floor of an extracted view's bounds (Reader and Basic, see
@@ -39,6 +46,10 @@ typedef struct {
    markup bytes, however little memory is left; free memory raises both. */
 #define READER_EXTRACT_NODE_FLOOR 512u
 #define READER_EXTRACT_BYTE_FLOOR (256u * 1024u)
+/* The node bound a preparation started now would get from BUDGET's free
+   room: from the floor up to its 8,192-node ceiling. */
+#define READER_EXTRACT_NODE_CEILING_PUBLIC 8192u
+size_t reader_extract_node_bound(const Budget *budget);
 
 /* Analyze one loaded DOM and install one hidden, bounded semantic Reader tree
    in a single operation. The raw DOM remains intact; the generic Reader

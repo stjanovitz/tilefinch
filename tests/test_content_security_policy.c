@@ -66,6 +66,19 @@ static int test_directives(void)
     CHECK(tilefinch_csp_allows_request(
         &csp, TILEFINCH_DESTINATION_IMAGE,
         "https://img.test/photo.png"));
+    /* A frame's redirect hop of several kilobytes is matched whole. */
+    static char long_frame[7000];
+    static const char *const long_frames[] = {
+        "https://frames.test/embed?t=", "https://other.test/embed?t="
+    };
+    for (size_t i = 0; i < 2u; i++) {
+        size_t prefix = strlen(long_frames[i]);
+        memcpy(long_frame, long_frames[i], prefix);
+        memset(long_frame + prefix, 't', sizeof(long_frame) - 1u - prefix);
+        long_frame[sizeof(long_frame) - 1u] = '\0';
+        CHECK(tilefinch_csp_allows_request(
+                  &csp, TILEFINCH_DESTINATION_FRAME, long_frame) == (i == 0u));
+    }
     CHECK(tilefinch_csp_allows_request(
         &csp, TILEFINCH_DESTINATION_IMAGE, "data:image/png;base64,AA=="));
     CHECK(!tilefinch_csp_allows_request(

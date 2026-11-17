@@ -550,6 +550,19 @@ int main(int argc, char **argv)
         ui.screen = PSP_UI_SCREEN_OPTION_ITEMS;
         ui.options_selection = argc > 4 ? (uint8_t) atoi(argv[4]) : 44;
         ui.toast_frames = 0;
+    } else if (strcmp(mode, "basic-default") == 0) {
+        /* A page opened in Basic view by default, under its notice. */
+        psp_ui_set_page(&ui, "World news", "https://news.example/world", true);
+        ui.basic_mode = true;
+        ui.basic_default_page = 1u;
+        psp_ui_show_basic_default_notice(&ui);
+        ui.toast_entry_frames = 0;
+    } else if (strcmp(mode, "page-tools-basic-default") == 0) {
+        ui.screen = PSP_UI_SCREEN_PAGE_TOOLS;
+        ui.menu_selection = 3;
+        ui.basic_mode = true;
+        ui.basic_default_page = 1u;
+        ui.toast_frames = 0;
     } else if (strcmp(mode, "page-tools") == 0) {
         ui.screen = PSP_UI_SCREEN_PAGE_TOOLS;
         ui.menu_selection = 5;

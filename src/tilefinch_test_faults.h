@@ -196,6 +196,8 @@ typedef struct {
         char url[256];
         char user_agent[192];
         bool cookie_present;
+        /* The request's Cookie header, cut to fit. */
+        char cookie[192];
         unsigned fetch_site; /* 0 unknown, 1 none, 2 origin, 3 site, 4 cross-site. */
     } replayed_requests[16];
     unsigned replayed_request_count;
@@ -215,6 +217,28 @@ typedef struct {
        chain, so a page's requests hold worker descriptors as they do on the
        PSP: until their own scheduler is pumped. */
     bool replay_lane_runs_page_hops;
+    /* The replay lane answers a request for this URL as the worker answers
+       one it can never carry (FETCH_BACKGROUND_ENQUEUE_UNSUPPORTED). */
+    const char *replay_lane_unsupported_url;
+    /* The replay lane gives each redirect it hands a hop (a recording that
+       followed one) this many Set-Cookie fields, as a worker hop's 3xx
+       carries its own, keeping the worker's chain capacity. */
+    unsigned replay_lane_redirect_cookies;
+    /* The replay lane gives its answer for this URL (any status)
+       replay_lane_url_cookies Set-Cookie fields "page<n>=1; Path=/", handed
+       over as the worker hands a response's own. */
+    const char *replay_lane_cookie_url;
+    unsigned replay_lane_url_cookies;
+    /* The replay lane answers a scheduler hop for replay_lane_detour_from
+       with a redirect (302) to replay_lane_detour_through, an address no
+       record holds and of any length (a recording keeps only addresses a
+       document may have), handed over beside the header snapshot as the
+       worker hands a Location. A hop for that address is answered with a
+       redirect to replay_lane_detour_to, or, when that is NULL, as an empty
+       document: a chain that ends on it. All three are request keys. */
+    const char *replay_lane_detour_from;
+    const char *replay_lane_detour_through;
+    const char *replay_lane_detour_to;
 } TilefinchTestFaults;
 
 TilefinchTestFaults *tilefinch_test_faults(void);

@@ -25,6 +25,13 @@ size_t script_admission_compile_floor(size_t unit_bytes)
     return saturating_add(unit_bytes, SCRIPT_ADMISSION_FLOOR_FIXED_BYTES);
 }
 
+size_t script_admission_large_unit_heap(size_t unit_bytes)
+{
+    if (unit_bytes < SCRIPT_ADMISSION_LARGE_UNIT_BYTES) return 0;
+    return unit_bytes > SIZE_MAX / SCRIPT_ADMISSION_LARGE_UNIT_HEAP_MULTIPLIER
+        ? SIZE_MAX : unit_bytes * SCRIPT_ADMISSION_LARGE_UNIT_HEAP_MULTIPLIER;
+}
+
 size_t script_admission_work_reserve(size_t source_bytes, size_t multiplier,
                                      size_t ceiling)
 {

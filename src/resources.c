@@ -713,6 +713,45 @@ static bool stylesheet_http_status_is_error(const FetchResult *result)
         && result->status_code <= 599;
 }
 
+static uint64_t stylesheet_url_hash64(const char *url);
+
+/* The overflow record of a failed URL the full ledger cannot hold. */
+static size_t document_resource_overflow_find(
+    const StylesheetDocumentResources *resources, uint64_t url_hash)
+{
+    for (size_t i = 0; i < resources->overflow_failure_count; i++) {
+        if (resources->overflow_failures[i].url_hash == url_hash) return i;
+    }
+    return SIZE_MAX;
+}
+
+static void document_resource_record_overflow_failure(
+    StylesheetDocumentResources *resources, const char *url,
+    const FetchResult *result, bool terminal)
+{
+    if (url == NULL || resources->count < STYLESHEET_DOCUMENT_RESOURCE_LIMIT)
+        return;
+    uint64_t url_hash = stylesheet_url_hash64(url);
+    size_t index = document_resource_overflow_find(resources, url_hash);
+    if (index == SIZE_MAX) {
+        if (resources->overflow_failure_count
+            == STYLESHEET_OVERFLOW_FAILURE_LIMIT) return;
+        index = resources->overflow_failure_count++;
+        resources->overflow_failures[index].url_hash = url_hash;
+        resources->overflow_failures[index].attempts = 0;
+        resources->overflow_failures[index].terminal = false;
+    }
+    if (resources->overflow_failures[index].attempts != UINT8_MAX)
+        resources->overflow_failures[index].attempts++;
+    if (terminal || stylesheet_failure_is_terminal(result)) {
+        if (!resources->overflow_failures[index].terminal)
+            resources->terminal_failures++;
+        resources->overflow_failures[index].terminal = true;
+    } else {
+        resources->transient_failures++;
+    }
+}
+
 static void document_resource_record_failure(
     ResourceContext *context, const char *url, char **owned_url,
     const FetchResult *result, bool terminal)
@@ -721,7 +760,11 @@ static void document_resource_record_failure(
     if (resources == NULL) return;
     StylesheetDocumentResource *entry = document_resource_get_or_add(
         context, url, owned_url);
-    if (entry == NULL) return;
+    if (entry == NULL) {
+        document_resource_record_overflow_failure(
+            resources, url, result, terminal);
+        return;
+    }
     if (entry->attempts != SIZE_MAX) entry->attempts++;
     if (terminal || stylesheet_failure_is_terminal(result)) {
         if (entry->state != STYLESHEET_DOCUMENT_RESOURCE_TERMINAL_FAILURE) {
@@ -872,10 +915,27 @@ static void style_preload_charge_release(ResourceContext *context,
 }
 
 static bool document_resource_suppresses(
-    ResourceContext *context, StylesheetDocumentResource *entry)
+    ResourceContext *context, StylesheetDocumentResource *entry,
+    const char *url)
 {
-    if (entry == NULL) return false;
     StylesheetDocumentResources *resources = context->document_resources;
+    if (entry == NULL) {
+        /* Past a full ledger, a failed URL keeps the same attempt limit. */
+        if (resources == NULL || url == NULL
+            || resources->overflow_failure_count == 0) return false;
+        size_t index = document_resource_overflow_find(
+            resources, stylesheet_url_hash64(url));
+        if (index == SIZE_MAX
+            || (!resources->overflow_failures[index].terminal
+                && resources->overflow_failures[index].attempts
+                       < STYLESHEET_TRANSIENT_ATTEMPT_LIMIT)) {
+            if (index != SIZE_MAX) resources->transient_retries++;
+            return false;
+        }
+        context->stats->failed++;
+        resources->retry_suppressed++;
+        return true;
+    }
     if (entry->state == STYLESHEET_DOCUMENT_RESOURCE_TERMINAL_FAILURE
         || (entry->state == STYLESHEET_DOCUMENT_RESOURCE_TRANSIENT_FAILURE
             && entry->attempts >= STYLESHEET_TRANSIENT_ATTEMPT_LIMIT)) {
@@ -2163,7 +2223,7 @@ static bool load_stylesheet_url(
         context->document_resources, resolved);
     TilefinchRequestContext request_context = stylesheet_request_context(
         context, resolved, false, TILEFINCH_CREDENTIALS_INCLUDE);
-    if (document_resource_suppresses(context, document_resource)) {
+    if (document_resource_suppresses(context, document_resource, resolved)) {
         return true;
     }
     if (!stylesheet_count_available(context, resolved)
@@ -2890,8 +2950,10 @@ static bool queue_stylesheet_link(ResourceContext *context,
     }
     StylesheetDocumentResource *document_resource = document_resource_find(
         context->document_resources, resolved);
-    if (document_resource_suppresses(context, document_resource)) {
-        if (!stylesheet)
+    if (document_resource_suppresses(context, document_resource, resolved)) {
+        /* An overflow failure has no ledger entry. Preloads already start
+           settled as failed above, so there is no state to copy from it. */
+        if (!stylesheet && document_resource != NULL)
             style_preload_settlement(context, node, document_resource->state);
         return true;
     }

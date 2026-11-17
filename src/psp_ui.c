@@ -3334,6 +3334,20 @@ bool psp_ui_show_site_blocked_status(PspUiState *ui, const char *site,
     return true;
 }
 
+bool psp_ui_keep_site_blocked_status(PspUiState *ui, const char *site,
+                                     unsigned duration_frames)
+{
+    char notice[PSP_UI_STATUS_CAPACITY];
+    if (ui == NULL || ui->toast_frames == 0
+        || ui->toast_kind != PSP_UI_TOAST_PLAIN
+        || !tilefinch_bot_wall_notice(site, notice, sizeof(notice))
+        || strcmp(ui->status, notice) != 0) {
+        return false;
+    }
+    psp_ui_keep_status(ui, notice, duration_frames);
+    return true;
+}
+
 void psp_ui_show_tls_status(
     PspUiState *ui, const char *headline,
     TilefinchTlsGuidance guidance, unsigned duration_frames)
@@ -3791,8 +3805,17 @@ void psp_ui_show_heavy_offer(PspUiState *ui, const char *site,
     ui->heavy_offer_seconds = (uint16_t) (seconds > UINT16_MAX
                                               ? UINT16_MAX : seconds);
     ui->heavy_offer_arming = PSP_UI_STORAGE_OFFER_ARMING_FRAMES;
+    ui->heavy_offer_frame = 0u;
     ui->cursor_visible = false;
     ui_open_overlay(ui, PSP_UI_SCREEN_HEAVY_OFFER);
+}
+
+void psp_ui_show_heavy_frame_offer(PspUiState *ui, const char *site,
+                                   size_t script_bytes)
+{
+    if (ui == NULL || site == NULL) return;
+    psp_ui_show_heavy_offer(ui, site, script_bytes, 0u);
+    ui->heavy_offer_frame = 1u;
 }
 
 void psp_ui_show_youtube_login_offer(PspUiState *ui)
@@ -3823,6 +3846,43 @@ void psp_ui_show_scripts_off_offer(PspUiState *ui)
     psp_ui_show_status_ms(ui, "THIS PAGE RAN OUT OF SCRIPT MEMORY LAST TIME",
                           PSP_UI_SCRIPTS_OFF_OFFER_MS);
     ui->toast_kind = PSP_UI_TOAST_SCRIPTS_OFF_OFFER;
+}
+
+void psp_ui_show_basic_default_notice(PspUiState *ui)
+{
+    if (ui == NULL) return;
+    psp_ui_show_basic_default_status(ui);
+    ui->toast_kind = PSP_UI_TOAST_BASIC_DEFAULT;
+}
+
+void psp_ui_show_basic_default_status(PspUiState *ui)
+{
+    if (ui == NULL) return;
+    psp_ui_show_status_ms(ui, "BASIC VIEW: SCRIPTS RAN OUT OF MEMORY LAST TIME",
+                          PSP_UI_BASIC_DEFAULT_NOTICE_MS);
+}
+
+void psp_ui_show_commit_status(PspUiState *ui, const char *ready_status,
+                               unsigned ready_frames,
+                               const char *bot_wall_site,
+                               unsigned bot_wall_frames,
+                               PspUiCommitNotice notice)
+{
+    if (ui == NULL) return;
+    if (bot_wall_site != NULL && bot_wall_site[0] != '\0'
+        && psp_ui_show_site_blocked_status(ui, bot_wall_site,
+                                           bot_wall_frames))
+        return;
+    if (notice == PSP_UI_COMMIT_NOTICE_BASIC_DEFAULT) {
+        psp_ui_show_basic_default_notice(ui);
+        return;
+    }
+    if (notice == PSP_UI_COMMIT_NOTICE_BASIC_DEFAULT_PASSIVE) {
+        psp_ui_show_basic_default_status(ui);
+        return;
+    }
+    if (ready_status != NULL)
+        psp_ui_show_status(ui, ready_status, ready_frames);
 }
 
 void psp_ui_show_heavy_recovery(PspUiState *ui, const char *detail,
@@ -4442,12 +4502,15 @@ static TILEFINCH_OUT_OF_LINE void ui_update_heavy_offer(
     PspUiState *ui, uint32_t pressed, PspUiIntent *intent)
 {
     PspUiAction answer = PSP_UI_ACTION_NONE;
+    bool frame = ui->heavy_offer_frame != 0u;
     if (pressed & PSP_UI_BUTTON_CONFIRM)
-        answer = PSP_UI_ACTION_HEAVY_RUN_SESSION;
-    else if (pressed & PSP_UI_BUTTON_TOOLBAR)
+        answer = frame ? PSP_UI_ACTION_HEAVY_FRAME_START
+                       : PSP_UI_ACTION_HEAVY_RUN_SESSION;
+    else if ((pressed & PSP_UI_BUTTON_TOOLBAR) && !frame)
         answer = PSP_UI_ACTION_HEAVY_RUN_ALWAYS;
     else if (pressed & PSP_UI_BUTTON_CANCEL)
-        answer = PSP_UI_ACTION_HEAVY_CANCEL;
+        answer = frame ? PSP_UI_ACTION_HEAVY_FRAME_NOT_NOW
+                       : PSP_UI_ACTION_HEAVY_CANCEL;
     if (answer == PSP_UI_ACTION_NONE) return;
     intent->action = answer;
     ui_close_overlay(ui);
@@ -4653,6 +4716,16 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
             intent.visual_changed = true;
             return intent;
         }
+    }
+    if (ui->toast_kind == PSP_UI_TOAST_BASIC_DEFAULT
+        && ui->toast_frames != 0 && ui->screen == PSP_UI_SCREEN_PAGE
+        && (pressed & (PSP_UI_BUTTON_CONFIRM | PSP_UI_BUTTON_CANCEL)) != 0) {
+        if ((pressed & PSP_UI_BUTTON_CONFIRM) != 0)
+            intent.action = PSP_UI_ACTION_TRY_FULL_PAGE;
+        ui->toast_kind = PSP_UI_TOAST_PLAIN;
+        ui->toast_frames = 0;
+        intent.visual_changed = true;
+        return intent;
     }
     if (ui->toast_kind == PSP_UI_TOAST_SCRIPTS_OFF_OFFER
         && ui->toast_frames != 0 && ui->screen == PSP_UI_SCREEN_PAGE
@@ -6661,21 +6734,25 @@ static TILEFINCH_OUT_OF_LINE void draw_page_tools(
     const PspUiState *ui, uint16_t *pixels, int width, int height,
     int stride, uint16_t accent, uint16_t text, uint16_t muted)
 {
-    const char *labels[UI_PAGE_TOOLS_ITEM_COUNT + 2u] = {
+    static const char *const row_labels[UI_PAGE_TOOLS_ROW_LIMIT] = {
         "Find in page", "Reader mode", "Basic view",
         "Add/remove bookmark", "Save article", "Save screenshot",
         "Site information", "Install offline app", "Download focused link",
-        "Continue to YouTube", "Stop microphone"
+        "Continue to YouTube", "Stop microphone", "Try full page"
     };
-    const char *values[UI_PAGE_TOOLS_ITEM_COUNT + 2u] = {
+    const char *row_values[UI_PAGE_TOOLS_ROW_LIMIT] = {
         ">", ui->reader_mode ? "On" : "Off",
         ui->basic_mode ? "On" : "Off", NULL, NULL, NULL, ">", NULL, ">", ">",
-        NULL
+        NULL, NULL
     };
-    /* The optional rows follow the fixed ones in this order. */
-    if (!ui->youtube_signin_continue) {
-        labels[UI_PAGE_TOOLS_ITEM_COUNT] = labels[UI_PAGE_TOOLS_ITEM_COUNT + 1u];
-        values[UI_PAGE_TOOLS_ITEM_COUNT] = NULL;
+    /* Rows in display order (psp_ui_page_tools_row): the optional ones
+       appear only while they apply. */
+    const char *labels[UI_PAGE_TOOLS_ROW_LIMIT];
+    const char *values[UI_PAGE_TOOLS_ROW_LIMIT];
+    for (size_t row = 0; row < psp_ui_page_tools_count(ui); row++) {
+        size_t at = psp_ui_page_tools_row(ui, row);
+        labels[row] = row_labels[at];
+        values[row] = row_values[at];
     }
     draw_routed_list(
         ui, pixels, width, height, stride, "Page tools", NULL,
@@ -8934,6 +9011,41 @@ static TILEFINCH_OUT_OF_LINE void draw_youtube_login_offer(
         box.x + box.width - 14, muted, 1, false);
 }
 
+/* The frame offer (psp_ui_show_heavy_frame_offer), in the interface
+   language: the frame's site, its held scripts' size, no time. */
+static TILEFINCH_OUT_OF_LINE void draw_heavy_frame_offer(
+    const PspUiState *ui, uint16_t *pixels, int width, int height,
+    int stride, UiRect box, uint16_t text, uint16_t muted)
+{
+    int left = box.x + 16, right = box.x + box.width - 14;
+    draw_fitted_ui_text(pixels, width, height, stride, left, box.y + 14,
+                        tilefinch_ui_text("A frame has a large script"),
+                        right, text, 2, true);
+    draw_host_text(pixels, width, height, stride, left, box.y + 52,
+                   ui->heavy_offer_site, right, text, 2, false);
+    char size[16];
+    psp_ui_format_bytes(size, sizeof(size), ui->heavy_offer_script_bytes);
+    const char *pieces[] = {tilefinch_ui_text("Script size:"), " ", size};
+    char line[160];
+    psp_ui_join_reading_order(line, sizeof(line), pieces,
+                              sizeof(pieces) / sizeof(pieces[0]));
+    draw_fitted_ui_text(pixels, width, height, stride, left, box.y + 78,
+                        line, right, text, 2, false);
+    draw_fitted_ui_text(pixels, width, height, stride, left, box.y + 100,
+                        tilefinch_ui_text("It may take a minute or more."),
+                        right, text, 2, false);
+    draw_fitted_ui_text(pixels, width, height, stride, left, box.y + 126,
+                        tilefinch_ui_text("Start it?"), right, text, 2,
+                        false);
+    draw_fitted_ui_text(pixels, width, height, stride, left, box.y + 152,
+                        tilefinch_ui_text("Scripts can run out of PSP memory."),
+                        right, muted, 1, false);
+    draw_fitted_ui_text(pixels, width, height, stride, left,
+                        box.y + box.height - 22,
+                        tilefinch_ui_text("X Start   O Not now"), right,
+                        muted, 2, false);
+}
+
 static TILEFINCH_OUT_OF_LINE void draw_heavy_offer(
     const PspUiState *ui, uint16_t *pixels, int width, int height,
     int stride, uint16_t text, uint16_t muted)
@@ -8941,6 +9053,11 @@ static TILEFINCH_OUT_OF_LINE void draw_heavy_offer(
     UiRect box = {40, 34, width - 80, 204};
     ui_apply_overlay_motion(ui, &box);
     draw_panel_furniture(pixels, width, height, stride, box, 41, 22);
+    if (ui->heavy_offer_frame) {
+        draw_heavy_frame_offer(ui, pixels, width, height, stride, box, text,
+                               muted);
+        return;
+    }
     draw_text_bold(pixels, width, height, stride,
                    box.x + 16, box.y + 14, "This site is a large app", 28,
                    text, 2);
@@ -10407,6 +10524,8 @@ static void draw_toast(const PspUiState *ui, uint16_t *pixels, int width,
         second_line = tilefinch_ui_text("X Stop page scripts  O Keep reading");
     else if (ui->toast_kind == PSP_UI_TOAST_SCRIPTS_OFF_OFFER)
         second_line = tilefinch_ui_text("Load without scripts?  X Yes  O No");
+    else if (ui->toast_kind == PSP_UI_TOAST_BASIC_DEFAULT)
+        second_line = tilefinch_ui_text("X Try full page  O Keep Basic view");
     bool multiline = second_line != NULL && second_line[0] != '\0';
     int scale = browser_ui_scale(ui);
     size_t viewport_maximum = width > 48

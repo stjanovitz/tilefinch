@@ -2691,6 +2691,7 @@ static int test_foundation(void)
     CHECK(test_stylesheet_shared_cache_body(&budget));
     CHECK(test_stylesheet_transient_retry_recovers(&budget));
     CHECK(test_stylesheet_transient_retry_cap(&budget));
+    CHECK(test_stylesheet_failure_past_full_ledger_is_suppressed(&budget));
     CHECK(test_script_shared_cache_lifetimes(&budget));
     CHECK(test_image_virtual_cancel_bound(&budget));
     CHECK(test_image_virtual_delayed_progress(&budget));

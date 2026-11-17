@@ -2,6 +2,8 @@ void script_runtime_destroy(ScriptRuntime *runtime)
 {
     if (runtime == NULL) return;
     Budget *budget = runtime->budget;
+    budget_free(budget, runtime->bridge.heavy.frame_completed_scripts);
+    runtime->bridge.heavy.frame_completed_scripts = NULL;
     if (runtime->document != NULL
         && runtime->document->content_security_policy_changed_opaque
                == runtime) {

@@ -306,11 +306,19 @@ typedef enum {
     PSP_UI_ACTION_HEAVY_RUN_ALWAYS,
     PSP_UI_ACTION_HEAVY_CANCEL,
     PSP_UI_ACTION_HEAVY_STOP_SCRIPTS,
+    /* The frame offer (psp_ui_show_heavy_frame_offer): start the page's
+       held frame scripts, or not now. Neither touches the page's own
+       answer or the site's Heavy pages allowance. */
+    PSP_UI_ACTION_HEAVY_FRAME_START,
+    PSP_UI_ACTION_HEAVY_FRAME_NOT_NOW,
     /* The "load without scripts?" offer for a site whose page last ran
        out of script memory: X accepts (site JavaScript off, reload), O
        declines. */
     PSP_UI_ACTION_SCRIPTS_OFF_ACCEPT,
     PSP_UI_ACTION_SCRIPTS_OFF_DECLINE,
+    /* A page opened in Basic view by default: load the full page, with its
+       scripts, this once (the notice's X, or Page tools). */
+    PSP_UI_ACTION_TRY_FULL_PAGE,
     PSP_UI_ACTION_EXIT,
     PSP_UI_ACTION_YOUTUBE_LOGIN_SAVE,
     PSP_UI_ACTION_YOUTUBE_LOGIN_ALWAYS,
@@ -619,7 +627,11 @@ typedef enum {
     PSP_UI_TOAST_LOADING,
     /* The site's page ran out of script memory last time: X loads it
        without scripts, O keeps them (PSP_UI_ACTION_SCRIPTS_OFF_*). */
-    PSP_UI_TOAST_SCRIPTS_OFF_OFFER
+    PSP_UI_TOAST_SCRIPTS_OFF_OFFER,
+    /* The page opened in Basic view by default because its site's scripts
+       ran out of memory last time: X loads the full page
+       (PSP_UI_ACTION_TRY_FULL_PAGE), O keeps Basic view. */
+    PSP_UI_TOAST_BASIC_DEFAULT
 } PspUiToastKind;
 
 typedef struct {
@@ -662,6 +674,11 @@ typedef struct {
        this byte's spare bits. Every psp_ui_set_update clears it and
        psp_ui_set_update_discard sets it. */
     uint8_t update_discard_enabled : 1;
+    /* The page was opened in Basic view by default: Page tools offers Try
+       full page. Another spare bit of the same byte. */
+    uint8_t basic_default_page : 1;
+    uint8_t validation_power_test_phase : 1;
+    uint8_t validation_media_test_phase : 1;
     uint16_t cursor_shape : 4;
     uint16_t video_language : 4;
     uint16_t subtitle_language : 4;
@@ -676,11 +693,10 @@ typedef struct {
     bool persist_local_storage;
     bool update_primary_enabled;
     bool update_cancel_enabled;
-    uint8_t validation_power_test_phase : 1;
-    uint8_t validation_media_test_phase : 1;
-    /* PspUiToastKind; shares the validation byte instead of enlarging the
-       1 KiB state. */
-    uint8_t toast_kind : 3;
+    /* PspUiToastKind. The validation phases moved beside
+       basic_default_page so it could widen without enlarging the 1 KiB
+       state. */
+    uint8_t toast_kind : 4;
     unsigned youtube_240p : 1;
     unsigned youtube_compact_results : 1;
     unsigned youtube_channel_banners : 1;
@@ -960,6 +976,8 @@ typedef struct {
             uint16_t heavy_offer_seconds;
             /* Frames left before the offer accepts an answer. */
             uint8_t heavy_offer_arming;
+            /* The offer asks about the page's frames, not the page. */
+            uint8_t heavy_offer_frame;
         };
         struct {
             char site_tls_version[16];
@@ -1402,6 +1420,11 @@ void psp_ui_keep_progress_status(PspUiState *ui, const char *status,
    work" instead of leaving a silent blank page. */
 bool psp_ui_show_site_blocked_status(PspUiState *ui, const char *site,
                                      unsigned duration_frames);
+/* Extend that notice, without replaying its entry, while it is still the
+   toast on screen; false (and nothing shown) once it ran out or another
+   status took its place. For a wall whose page paints nothing. */
+bool psp_ui_keep_site_blocked_status(PspUiState *ui, const char *site,
+                                     unsigned duration_frames);
 void psp_ui_show_tls_status(
     PspUiState *ui, const char *headline,
     TilefinchTlsGuidance guidance, unsigned duration_frames);
@@ -1587,6 +1610,13 @@ void psp_ui_show_storage_offer(
    offer it ignores buttons for PSP_UI_STORAGE_OFFER_ARMING_FRAMES. */
 void psp_ui_show_heavy_offer(PspUiState *ui, const char *site,
                              size_t script_bytes, uint32_t estimate_ms);
+/* The same screen for a frame on the page that holds a large script:
+   `site` is the frame's, `script_bytes` the held scripts' own size. X
+   answers HEAVY_FRAME_START and O HEAVY_FRAME_NOT_NOW; there is no
+   Always. It shows no time: a frame's start cannot be estimated before
+   its scripts arrive. */
+void psp_ui_show_heavy_frame_offer(PspUiState *ui, const char *site,
+                                   size_t script_bytes);
 void psp_ui_show_youtube_login_offer(PspUiState *ui);
 void psp_ui_dismiss_youtube_login_offer(PspUiState *ui);
 /* A page-scripts status that X answers with HEAVY_STOP_SCRIPTS and O
@@ -1598,6 +1628,33 @@ void psp_ui_show_heavy_scripts_status(PspUiState *ui, const char *status,
    PSP_UI_SCRIPTS_OFF_OFFER_MS of real time. */
 #define PSP_UI_SCRIPTS_OFF_OFFER_MS 12000u
 void psp_ui_show_scripts_off_offer(PspUiState *ui);
+/* The notice over a page opened in Basic view by default, after its site's
+   scripts ran out of memory on an earlier visit; X answers it with
+   PSP_UI_ACTION_TRY_FULL_PAGE and O dismisses it, on the page, for
+   PSP_UI_BASIC_DEFAULT_NOTICE_MS of real time. */
+#define PSP_UI_BASIC_DEFAULT_NOTICE_MS 12000u
+void psp_ui_show_basic_default_notice(PspUiState *ui);
+/* The same notice as a plain status that takes no buttons, for a later
+   page of a site whose notice was already answerable this session. */
+void psp_ui_show_basic_default_status(PspUiState *ui);
+
+/* What a commit raised that its ready status must not replace. */
+typedef enum {
+    PSP_UI_COMMIT_NOTICE_NONE = 0,
+    /* Opened in Basic view by default: the answerable notice, or the
+       passive status. */
+    PSP_UI_COMMIT_NOTICE_BASIC_DEFAULT,
+    PSP_UI_COMMIT_NOTICE_BASIC_DEFAULT_PASSIVE
+} PspUiCommitNotice;
+/* The status a committed page ends with: the bot-wall notice when
+   BOT_WALL_SITE names one (psp_ui_show_site_blocked_status, BOT_WALL_FRAMES),
+   else the commit's own notice, else READY_STATUS for READY_FRAMES. Each
+   would replace the one before, so only the first that applies is shown. */
+void psp_ui_show_commit_status(PspUiState *ui, const char *ready_status,
+                               unsigned ready_frames,
+                               const char *bot_wall_site,
+                               unsigned bot_wall_frames,
+                               PspUiCommitNotice notice);
 /* The recovery sheet titled for a page too heavy for the PSP. */
 void psp_ui_show_heavy_recovery(PspUiState *ui, const char *detail,
                                 uint8_t actions);

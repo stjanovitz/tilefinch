@@ -1768,6 +1768,58 @@ bool script_runtime_take_memory_rescue(ScriptRuntime *runtime,
 /* Run (true) or refuse (false) the scripts waiting now and any later big
    ones on this page. Returns false when nothing was waiting. */
 bool script_runtime_answer_heavy(ScriptRuntime *runtime, bool run);
+/*
+ * Heavy scripts in child frames (script_admission.h): one answer per page
+ * load for all its frames, kept apart from the page's own answer (a
+ * frame's bot check answered "Not now" does not refuse the page's own
+ * later scripts, and "Start" does not start them) and from the site's
+ * "always" allowance. A frame's realm takes the top-level realm's policy
+ * and its frame answer as it is created, then weighs each of its classic
+ * and dynamic scripts of at least SCRIPT_HEAVY_UNIT_BYTES by size alone.
+ * A dynamic one waits like a top-level one. A parser or deferred one
+ * cannot wait in the middle of the frame's load, so the loader stops there
+ * (SCRIPT_HEAVY_FRAME_HOLD) without running it. A frame with no earlier
+ * scripts may be loaded again from its kept response; otherwise its live
+ * realm and document resume in place so earlier effects do not repeat.
+ * A refused script fails with an error event, as one that did not load.
+ */
+typedef enum {
+    SCRIPT_HEAVY_FRAME_RUN = 0,
+    SCRIPT_HEAVY_FRAME_REFUSE,
+    SCRIPT_HEAVY_FRAME_HOLD
+} ScriptHeavyFrameVerdict;
+/* Whether TOP, the top-level realm, would ask about a frame's big script
+   now: the ASK policy, its frames not yet answered. */
+bool script_runtime_heavy_frames_ask(const ScriptRuntime *top);
+/* Records the page's answer for its frames on TOP (frame realms created
+   from now on take it; live ones are answered with
+   script_runtime_answer_heavy). */
+void script_runtime_answer_heavy_frames(ScriptRuntime *top, bool run);
+/* CAN_HOLD: the frame kept its response, so a parser or deferred big
+   script may stop its load to wait; without it such a script runs. */
+void script_runtime_heavy_frame_begin(ScriptRuntime *frame,
+                                      const ScriptRuntime *top,
+                                      bool can_hold);
+/* For a parser or deferred classic script of `bytes` about to run. */
+ScriptHeavyFrameVerdict script_runtime_heavy_frame_verdict(
+    ScriptRuntime *runtime, size_t bytes);
+/* A frame realm's part of its page's heavy state, without measuring it:
+   its big dynamic scripts waiting for the answer and the scripts it
+   refused. */
+void script_runtime_heavy_frame_counts(const ScriptRuntime *runtime,
+                                       size_t *waiting_scripts,
+                                       size_t *waiting_bytes,
+                                       size_t *refused_scripts);
+/* The frame's load stopped at a script waiting for the answer; `bytes` is
+   its size. */
+bool script_runtime_heavy_frame_held(const ScriptRuntime *runtime,
+                                     size_t *bytes);
+/* A frame can be rebuilt only if no earlier script completed. */
+bool script_runtime_heavy_frame_replay_safe(const ScriptRuntime *runtime);
+/* A held script has not executed. Undo its committed source bytes and any
+   executable slots that the interrupted plan reserved but did not use. */
+bool script_runtime_heavy_frame_rollback_quota(ScriptRuntime *runtime,
+                                               size_t slots, size_t bytes);
 /* Print and clear the sampling profile (no-op unless profiling is on). */
 void script_runtime_profile_report(ScriptRuntime *runtime, const char *label);
 /* Deterministic work of one realm (its QuickJS runtime and worker realms)
@@ -2143,6 +2195,13 @@ bool script_runtime_dynamic_script_is_scheduled(
    later clone copies the flag. Never allocates state. */
 void script_runtime_script_mark_started(ScriptRuntime *runtime,
                                         const lxb_dom_node_t *node);
+/* Record completed frame scripts so an in-place resume skips them. If the
+   bounded record cannot be kept, subsequent large scripts run without a
+   prompt rather than risk replaying earlier effects. */
+void script_runtime_frame_script_completed(ScriptRuntime *runtime,
+                                           long handle);
+bool script_runtime_frame_script_was_completed(const ScriptRuntime *runtime,
+                                               long handle);
 /* The whole-document script loader (a page committed whole, not streamed)
    runs the parser-blocking `script`: until the matching end, the realm's
    document.write() keeps its markup instead of appending it to the body.

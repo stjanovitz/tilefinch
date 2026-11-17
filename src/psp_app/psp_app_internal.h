@@ -246,6 +246,18 @@ bool psp_retry_navigation_url_after_reclaim(
 void psp_report_job_failure(
     const char *kind, const char *checkpoint, int status, long http_status,
     const char *error);
+/* Sets the page JavaScript policy on ENGINE for a top-level navigation
+   to URL with METHOD, through the Basic-by-default state
+   (psp_basic_default_begin): off when the site opens in Basic view by
+   default. Every navigation start uses it; false when the engine refused,
+   and the state is unchanged. A start that then fails calls
+   psp_navigation_abandon_javascript. */
+bool psp_navigation_begin_javascript(BrowserEngine *engine,
+                                     const BrowserProfile *profile,
+                                     const char *url, const char *method);
+void psp_navigation_abandon_javascript(BrowserEngine *engine,
+                                       const BrowserProfile *profile);
+PspBasicDefault *psp_app_basic_default(void);
 bool psp_begin_page_load(BrowserEngine *engine, PspUiState *ui,
                          const BrowserProfile *profile,
                          const uint16_t *frame,
@@ -1170,6 +1182,8 @@ typedef struct {
        for, and the sites run for this session. */
     uint64_t heavy_generation;
     bool heavy_offer_shown;
+    /* The frame offer (a frame holding a large script) was shown. */
+    bool heavy_frame_offer_shown;
     bool heavy_status_shown;
     bool heavy_low_memory_shown;
     bool heavy_rescue_shown;
@@ -1466,6 +1480,12 @@ bool psp_app_site_storage_poll(PspApp *app);
    view and the sheet as they were and returns false. */
 bool psp_app_set_basic_view(PspApp *app, const char *url, bool enable,
                             bool *page_dirty);
+/* A bot wall whose page paints nothing (navigation_bot_wall) keeps its
+   notice up instead of leaving the reader a blank page: while the notice is
+   still the toast on screen it is extended before it runs out. Once the
+   page paints, or another status takes the toast, it runs out as usual.
+   The toast is already on screen, so the chrome does not change. */
+void psp_app_bot_wall_poll(PspApp *app);
 /* src/psp_app/psp_app_heavy.c */
 /* Installs the per-site heavy-page policy on the engine: every page realm
    starts with its own site's choice (remembered, this session's, else the

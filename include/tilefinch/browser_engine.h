@@ -598,6 +598,13 @@ void browser_engine_set_heavy_page_resolver(
 bool browser_engine_heavy_page(BrowserEngine *engine,
                                ScriptHeavyState *state);
 bool browser_engine_answer_heavy_page(BrowserEngine *engine, bool run);
+/* The committed page's child frames' big scripts, asked about apart from
+   the page's own (navigation_heavy_frames, navigation_answer_heavy_frames):
+   one answer per page load covers every frame, and neither answer changes
+   the other or the site's "always" allowance. */
+bool browser_engine_heavy_frames(BrowserEngine *engine,
+                                 NavigationHeavyFrames *frames);
+bool browser_engine_answer_heavy_frames(BrowserEngine *engine, bool run);
 bool browser_engine_stop_page_scripts(BrowserEngine *engine);
 /*
  * Room for a media decoder that the Budget refused. Each call takes the

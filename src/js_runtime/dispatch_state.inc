@@ -1136,6 +1136,115 @@ void js_rt_geometry_opacity_write_end(DomBridge *bridge)
     runtime->geometry_paint_stale = true;
 }
 
+/* Lazy loaders write an <img>'s sources and data-* bookkeeping, then read
+   its box to size it (lazysizes' data-autosize), image after image: each
+   read rebuilt the whole page's geometry for writes nothing lays out
+   (eurogamer: 65 of 79 builds). Such a write keeps the current geometry:
+
+   - data-* (not the engine's data-tilefinch-* state, nor data-placeholder,
+     which layout prints), and an HTML <img>'s src, srcset and sizes, which
+     layout reads only through the page's image table: the owner's relayout
+     loads the new source, and the box changes then, as a browser's does
+     when the new image arrives;
+   - no attr() reads the name, and either no selector tests it, or every
+     selector that does tests it in its subject compound only (no
+     combinator or pseudo-element after it, nothing nested, no custom
+     property) and the element's own computed style is the same after the
+     write as before (eurogamer's `img[data-autosize]` and `img[src*=..]`
+     rules): then only that element's style could change, it did not, and
+     nothing else in the cascade can see the write;
+   - no shadow root (its rules are not in the page sheet's name list), and
+     a journal that still audits every record.
+
+   The DOM write and its journal record stand; only the geometry stays
+   current, and its commands are never adopted as the new presentation. */
+bool js_rt_geometry_attribute_write_begin(DomBridge *bridge,
+                                          lxb_dom_node_t *node,
+                                          const char *name, size_t length,
+                                          JsRtGeometryAttributeWrite *write)
+{
+    ScriptRuntime *runtime = bridge == NULL ? NULL : bridge->host;
+    if (write == NULL || runtime == NULL || node == NULL || name == NULL
+        || node->type != LXB_DOM_NODE_TYPE_ELEMENT || node->ns != LXB_NS_HTML
+        || bridge->stylesheet == NULL || bridge->document == NULL
+        || bridge->shadow_root_count != 0 || bridge->mutations_unrecorded
+        || (bridge->mutations != NULL
+            && (bridge->mutations->overflowed
+                || bridge->mutations->resource_rebuild_required
+                || bridge->mutations->conservative_resource_scan)))
+        return false;
+    bool data = length > 5 && strncasecmp(name, "data-", 5) == 0
+        && !(length >= 14 && strncasecmp(name, "data-tilefinch", 14) == 0)
+        && !(length == 16 && strncasecmp(name, "data-placeholder", 16) == 0);
+    bool image_source = node->local_name == LXB_TAG_IMG
+        && ((length == 3 && strncasecmp(name, "src", 3) == 0)
+            || (length == 6 && strncasecmp(name, "srcset", 6) == 0)
+            || (length == 5 && strncasecmp(name, "sizes", 5) == 0));
+    if (!data && !image_source) return false;
+    const LayoutDocument *layout = runtime->geometry_layout != NULL
+        ? runtime->geometry_layout : runtime->geometry_incumbent;
+    if (layout == NULL || !geometry_layout_current(runtime, &layout->viewport)
+        || stylesheet_declarations_read_attribute(
+               bridge->stylesheet, name, length)) return false;
+    write->node = node;
+    write->compare = false;
+    write->has_parent = false;
+    if (!stylesheet_selectors_reference_attribute_prefix(
+            bridge->stylesheet, name, length)) return true;
+    /* This also covers the :has() rules that make the write relational
+       (eurogamer's `noscript:has(img)+img[data-autosize]`): none tests the
+       name inside :has() or ahead of a combinator. */
+    if (!stylesheet_attribute_selectors_subject_only(
+            bridge->stylesheet, name, length)) return false;
+    /* The parent chain resolves root first, as layout inherits it. */
+    lxb_dom_node_t *ancestors[64];
+    size_t count = 0;
+    lxb_dom_node_t *at = node->parent;
+    for (; at != NULL && at->type == LXB_DOM_NODE_TYPE_ELEMENT;
+         at = at->parent) {
+        if (count == sizeof(ancestors) / sizeof(ancestors[0])) return false;
+        ancestors[count++] = at;
+    }
+    if (at == NULL || at->type != LXB_DOM_NODE_TYPE_DOCUMENT)
+        return false;
+    for (size_t i = count; i-- > 0;) {
+        ComputedStyle style = style_for_node(
+            bridge->stylesheet, ancestors[i],
+            write->has_parent ? &write->parent : NULL);
+        write->parent = style;
+        write->has_parent = true;
+    }
+    write->before = style_for_node(bridge->stylesheet, node,
+                                   write->has_parent ? &write->parent : NULL);
+    write->compare = true;
+    return true;
+}
+
+void js_rt_geometry_attribute_write_end(DomBridge *bridge,
+                                        const JsRtGeometryAttributeWrite *write)
+{
+    ScriptRuntime *runtime = bridge->host;
+    /* The write's own record must still be auditable, and nothing it set
+       off may have reported a style change (begin found the geometry's
+       style generation current). */
+    if (bridge->mutations_unrecorded
+        || (bridge->mutations != NULL
+            && (bridge->mutations->overflowed
+                || bridge->mutations->resource_rebuild_required
+                || bridge->mutations->conservative_resource_scan))
+        || runtime->geometry_style_generation != document_style_generation())
+        return;
+    if (write->compare) {
+        ComputedStyle after = style_for_node(
+            bridge->stylesheet, write->node,
+            write->has_parent ? &write->parent : NULL);
+        if (!computed_style_same(bridge->stylesheet, &write->before, &after))
+            return;
+    }
+    runtime->geometry_content_generation = bridge->document->content_generation;
+    runtime->geometry_paint_stale = true;
+}
+
 void script_runtime_notify_viewport_changed(ScriptRuntime *runtime)
 {
     if (runtime != NULL) runtime->viewport_resize_phase = 1u;

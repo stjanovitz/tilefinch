@@ -626,7 +626,7 @@ static bool hsts_host_from_url(const char *url, char *host, size_t capacity)
 {
     TilefinchUrl parsed;
     if (url == NULL || host == NULL || capacity == 0
-        || !tilefinch_url_parse(url, &parsed)
+        || !tilefinch_url_parse_long(url, &parsed)
         || parsed.host_length == 0 || parsed.host_length >= capacity
         || parsed.ipv6_literal) return false;
     bool only_address = true;
@@ -647,19 +647,22 @@ static bool hsts_host_matches(const char *host, const char *stored,
         && tilefinch_host_within(host, strlen(host), stored, strlen(stored));
 }
 
-bool browser_session_hsts_upgrade_url(
+static bool hsts_upgrade_url(
     BrowserSession *session, const char *url,
-    char *output, size_t output_capacity)
+    char *output, size_t output_capacity, bool long_hop)
 {
+    bool (*normalize)(const char *, char *, size_t) = long_hop
+        ? tilefinch_url_normalize_long : tilefinch_url_normalize;
     if (url == NULL || output == NULL || output_capacity == 0) return false;
     TilefinchUrl parsed;
-    if (!tilefinch_url_parse(url, &parsed)) return false;
+    if (!(long_hop ? tilefinch_url_parse_long(url, &parsed)
+                   : tilefinch_url_parse(url, &parsed))) return false;
     if (parsed.scheme != TILEFINCH_URL_SCHEME_HTTP || session == NULL) {
-        return tilefinch_url_normalize(url, output, output_capacity);
+        return normalize(url, output, output_capacity);
     }
     char host[BROWSER_ORIGIN_LIMIT];
     if (!hsts_host_from_url(url, host, sizeof(host)))
-        return tilefinch_url_normalize(url, output, output_capacity);
+        return normalize(url, output, output_capacity);
     int64_t now = session_cookie_now();
     for (size_t i = 0; i < BROWSER_HSTS_ENTRY_LIMIT; i++) {
         if (session->hsts[i].host[0] == '\0'
@@ -669,9 +672,25 @@ bool browser_session_hsts_upgrade_url(
             continue;
         }
         session->hsts[i].stamp = ++session->hsts_clock;
-        return tilefinch_url_upgrade_to_https(url, output, output_capacity);
+        return long_hop
+            ? tilefinch_url_upgrade_to_https_long(url, output, output_capacity)
+            : tilefinch_url_upgrade_to_https(url, output, output_capacity);
     }
-    return tilefinch_url_normalize(url, output, output_capacity);
+    return normalize(url, output, output_capacity);
+}
+
+bool browser_session_hsts_upgrade_url(
+    BrowserSession *session, const char *url,
+    char *output, size_t output_capacity)
+{
+    return hsts_upgrade_url(session, url, output, output_capacity, false);
+}
+
+bool browser_session_hsts_upgrade_url_long(
+    BrowserSession *session, const char *url,
+    char *output, size_t output_capacity)
+{
+    return hsts_upgrade_url(session, url, output, output_capacity, true);
 }
 
 static bool browser_session_hsts_apply(
@@ -717,7 +736,7 @@ bool browser_session_hsts_observe_metadata(
     return session != NULL && response_url != NULL && metadata != NULL
         && metadata->version == FETCH_RESPONSE_SECURITY_METADATA_VERSION
         && metadata->hsts_state == FETCH_SECURITY_FIELD_VALID
-        && tilefinch_url_parse(response_url, &parsed)
+        && tilefinch_url_parse_long(response_url, &parsed)
         && parsed.scheme == TILEFINCH_URL_SCHEME_HTTPS
         && hsts_host_from_url(response_url, host, sizeof(host))
         && browser_session_hsts_apply(

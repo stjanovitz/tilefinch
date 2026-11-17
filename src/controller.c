@@ -4872,6 +4872,17 @@ bool controller_execute_action(BrowserController *controller,
                                const ControllerAction *action,
                                size_t maximum_bytes, long timeout_ms)
 {
+    return controller_execute_action_handoff(
+        controller, action, maximum_bytes, timeout_ms, NULL, 0);
+}
+
+bool controller_execute_action_handoff(
+    BrowserController *controller, const ControllerAction *action,
+    size_t maximum_bytes, long timeout_ms, char *adapter_redirect,
+    size_t redirect_capacity)
+{
+    if (adapter_redirect != NULL && redirect_capacity != 0)
+        adapter_redirect[0] = '\0';
     if (controller == NULL || controller->navigation == NULL
         || action == NULL
         || (action->type != CONTROLLER_ACTION_NAVIGATE
@@ -4889,7 +4900,7 @@ bool controller_execute_action(BrowserController *controller,
     uint64_t generation = navigation_begin(navigation);
     const char *method = copy.type == CONTROLLER_ACTION_FORM_SUBMIT
                          ? copy.method : "GET";
-    bool loaded = navigation_load_request(
+    bool loaded = navigation_load_request_handoff(
         navigation, generation, copy.url, method,
         copy.body_length == 0 ? NULL : controller_action_body(&copy),
         copy.body_length,
@@ -4897,7 +4908,8 @@ bool controller_execute_action(BrowserController *controller,
         maximum_bytes, timeout_ms,
         navigation->viewport.device_width == 0
           ? 480 : navigation->viewport.device_width,
-        navigation->fonts, navigation->images, true);
+        navigation->fonts, navigation->images, true,
+        adapter_redirect, redirect_capacity);
     if (loaded) {
         controller->focus_kind = CONTROLLER_FOCUS_NONE;
         controller->focus_index = 0;

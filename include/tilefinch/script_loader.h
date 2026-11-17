@@ -101,6 +101,11 @@ typedef struct {
    block parsing and must not force the blocking resource pipeline to run at
    their closing tag. */
 bool document_script_is_parser_blocking(lxb_dom_node_t *element);
+/* Whether DOCUMENT has an external classic script element (src, not a
+   module, not nomodule): the only kind whose size can stop a child frame's
+   load to wait for the page's frame answer (script_runtime_heavy_frame_
+   verdict). */
+bool script_document_has_external_classic(const PocDocument *document);
 
 /* Whether a classic inline script of `source_length` bytes could still be
    admitted by the realm's real headroom: the rule the loader applies at

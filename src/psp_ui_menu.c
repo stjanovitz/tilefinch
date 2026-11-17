@@ -192,7 +192,9 @@ static bool menu_handle_escape(
         else if (ui->screen == PSP_UI_SCREEN_GLYPH_OFFER)
             intent->glyph_offer_answer = PSP_UI_GLYPH_OFFER_CANCEL;
         else if (ui->screen == PSP_UI_SCREEN_HEAVY_OFFER)
-            intent->action = PSP_UI_ACTION_HEAVY_CANCEL;
+            intent->action = ui->heavy_offer_frame
+                ? PSP_UI_ACTION_HEAVY_FRAME_NOT_NOW
+                : PSP_UI_ACTION_HEAVY_CANCEL;
         else if (ui->screen == PSP_UI_SCREEN_YOUTUBE_LOGIN)
             intent->action = PSP_UI_ACTION_YOUTUBE_LOGIN_NOT_NOW;
         else if (ui->screen == PSP_UI_SCREEN_FIND) {
@@ -553,6 +555,9 @@ static void menu_update_page_tools(
                 break;
             case UI_PAGE_TOOLS_ROW_MICROPHONE:
                 intent->action = PSP_UI_ACTION_STOP_MICROPHONE;
+                break;
+            case UI_PAGE_TOOLS_ROW_FULL_PAGE:
+                intent->action = PSP_UI_ACTION_TRY_FULL_PAGE;
                 break;
         }
         ui->menu_selection = UI_MENU_ROW_PAGE_TOOLS;

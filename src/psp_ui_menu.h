@@ -21,14 +21,25 @@
 static inline size_t psp_ui_page_tools_count(const PspUiState *ui)
 {
     return UI_PAGE_TOOLS_ITEM_COUNT + (ui->youtube_signin_continue ? 1u : 0u)
-        + (ui->microphone_live ? 1u : 0u);
+        + (ui->microphone_live ? 1u : 0u)
+        + (ui->basic_default_page ? 1u : 0u);
 }
-/* The page tools row ROW stands for: the fixed rows, then Continue to
-   YouTube and Stop microphone when they show. */
+/* The page tools row ROW stands for: the fixed rows, with Try full page
+   right after Basic view on a page opened in Basic view by default, then
+   Continue to YouTube and Stop microphone when they show. */
 #define UI_PAGE_TOOLS_ROW_YOUTUBE UI_PAGE_TOOLS_ITEM_COUNT
 #define UI_PAGE_TOOLS_ROW_MICROPHONE (UI_PAGE_TOOLS_ITEM_COUNT + 1u)
+#define UI_PAGE_TOOLS_ROW_FULL_PAGE (UI_PAGE_TOOLS_ITEM_COUNT + 2u)
+#define UI_PAGE_TOOLS_ROW_LIMIT (UI_PAGE_TOOLS_ITEM_COUNT + 3u)
+/* Display row of Try full page: the one after Basic view. */
+#define UI_PAGE_TOOLS_FULL_PAGE_AT 3u
 static inline size_t psp_ui_page_tools_row(const PspUiState *ui, size_t row)
 {
+    if (ui->basic_default_page) {
+        if (row == UI_PAGE_TOOLS_FULL_PAGE_AT)
+            return UI_PAGE_TOOLS_ROW_FULL_PAGE;
+        if (row > UI_PAGE_TOOLS_FULL_PAGE_AT) row--;
+    }
     if (row == UI_PAGE_TOOLS_ITEM_COUNT && !ui->youtube_signin_continue)
         return UI_PAGE_TOOLS_ROW_MICROPHONE;
     return row;

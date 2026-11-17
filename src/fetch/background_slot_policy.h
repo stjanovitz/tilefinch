@@ -244,6 +244,19 @@ static inline bool fetch_background_redirect_cookie_overflow_fatal(
         || status_code == 308;
 }
 
+/* A redirect that will be followed lost part of its Location, so following
+   it would open another address. The worker keeps the field in a buffer of
+   `capacity` bytes, for the browser thread (a single hop's redirect) or for
+   itself; the header snapshot need not hold it. Only the statuses either
+   one follows count. */
+static inline bool fetch_background_redirect_location_lost(
+    long status_code, size_t value_length, size_t capacity)
+{
+    if (!fetch_background_redirect_cookie_overflow_fatal(
+            false, status_code, true)) return false;
+    return value_length >= capacity;
+}
+
 /* Once the terminating blank line has published a header snapshot, libcurl
    may still route HTTP trailers through the header callback. A trailer is
    never part of the already-published response-header authority. */

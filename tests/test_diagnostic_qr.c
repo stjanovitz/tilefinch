@@ -389,6 +389,102 @@ static void test_memory_report_is_owned_and_complete(void)
         error, sizeof(error)) == NULL);
 }
 
+/* Builds the Diagnostic QR of one sign-in report; its page count. */
+static unsigned signin_report_pages(const char *report_text);
+/* Pages the populated sample below takes (measured 2026-11-16). */
+#define SIGNIN_REPORT_POPULATED_PAGES 2u
+
+/* The YouTube sign-in report (browser_engine_youtube_signin_report) is
+   normally one code to photograph: a version 5 report of a sign-in whose
+   redirect chain failed late, after several attempts, with no script stop
+   or feed failure, stays within one page. */
+static void test_signin_report_is_one_code(void)
+{
+    static const char report_text[] =
+        "Tilefinch YouTube sign-in diagnostics v5\n"
+        "stage=6 recovery-attempts=0 scripts-enabled=1 runtime-present=1 degraded=0\n"
+        "handoff-http-status=0 handoff-service-origin=0\n"
+        "dynamic-transport-failures=0 dynamic-authority-failures=0 dynamic-source-failures=0 allocation-refusals=0\n"
+        "session-cookie-present=0 server-verified=0 feed-state=4\n"
+        "parsed-results=0 pending-publication=0\n"
+        "build-outcome=0 publication-outcome=0 continue-available=1\n"
+        "bootstrap-status=0 api-status=0 history-status=0 failure-kind=0\n"
+        "configuration-valid=0 clock-available=0 api-request-admitted=0 history-outcome=0\n"
+        "feed-phase=0 http-status=0 transported=0 same-origin=0 bootstrap-signed-in=0 auth-index-known=0 request-signed=0 api-authenticated=0\n"
+        "transport-code=0 transport-timed-out=0 tls-result-available=0 tls-result=0 tls-failed=0\n"
+        "cookie-refusals=0 byte-refusals=0 slot-refusals=0 allocation-refusals=0 policy-ignored=0 evictions=0\n"
+        "script-stop=0 stop-after-commit-ms=0 stop-heap-limit-kib=0 stop-heap-used-kib=0 stop-heap-refusals=0 stop-refused-kib=0 stop-refused-reason=0 stop-budget-free-kib=0\n"
+        "document-scripts-enabled=1 memory-limited=0 memory-rescued=0 heap-used-kib=3308 heap-limit-kib=9216\n"
+        "budget-current-kib=11693 budget-peak-kib=19490 budget-limit-kib=32768 page-age-s=216\n"
+        "scripts-discovered=7 scripts-loaded=0 scripts-failed=0 scripts-skipped-quota=0 scripts-skipped-pressure=0 scripts-cost-rejected=0\n"
+        "frames-discovered=10 frames-loaded=10 frames-failed=0\n"
+        "page-class=2 document-http-status=200 text-present=1 auth-navigations=14\n"
+        "activations=17 activations-without-scripts=1 form-submits=10 forms-not-sent=0 text-edits=10\n"
+        "form-posts=10 token-kind=4 token-length=1571 post-target=2 post-outcome=3 post-http-status=302 post-landing=2\n"
+        "accounts-refusals=1 refusal-class=1 refusal-reason=46\n"
+        "post-chain=7,5,5,3,4,14823,24,15311,64,18734,29871,30000\n";
+    assert(signin_report_pages(report_text) == 1u);
+}
+
+/* The same report after a script stop and a failed feed, every such field
+   non-zero: the known bound, so a format change that makes it longer is
+   seen. Two pages still decode as one report. */
+static void test_signin_report_populated_bound(void)
+{
+    static const char report_text[] =
+        "Tilefinch YouTube sign-in diagnostics v5\n"
+        "stage=6 recovery-attempts=2 scripts-enabled=1 runtime-present=1 degraded=1\n"
+        "handoff-http-status=302 handoff-service-origin=3\n"
+        "dynamic-transport-failures=3 dynamic-authority-failures=1 dynamic-source-failures=2 allocation-refusals=4\n"
+        "session-cookie-present=1 server-verified=0 feed-state=6\n"
+        "parsed-results=12 pending-publication=1\n"
+        "build-outcome=2 publication-outcome=3 continue-available=1\n"
+        "bootstrap-status=200 api-status=401 history-status=403 failure-kind=3\n"
+        "configuration-valid=1 clock-available=1 api-request-admitted=1 history-outcome=2\n"
+        "feed-phase=4 http-status=401 transported=1 same-origin=1 bootstrap-signed-in=1 auth-index-known=1 request-signed=1 api-authenticated=0\n"
+        "transport-code=28 transport-timed-out=1 tls-result-available=1 tls-result=0 tls-failed=0\n"
+        "cookie-refusals=4 byte-refusals=2 slot-refusals=1 allocation-refusals=1 policy-ignored=3 evictions=6\n"
+        "script-stop=3 stop-after-commit-ms=18234 stop-heap-limit-kib=9216 stop-heap-used-kib=9104 stop-heap-refusals=12 stop-refused-kib=384 stop-refused-reason=2 stop-budget-free-kib=1210\n"
+        "document-scripts-enabled=1 memory-limited=1 memory-rescued=1 heap-used-kib=8812 heap-limit-kib=9216\n"
+        "budget-current-kib=21693 budget-peak-kib=29490 budget-limit-kib=32768 page-age-s=216\n"
+        "scripts-discovered=37 scripts-loaded=21 scripts-failed=3 scripts-skipped-quota=4 scripts-skipped-pressure=6 scripts-cost-rejected=2\n"
+        "frames-discovered=10 frames-loaded=8 frames-failed=2\n"
+        "page-class=2 document-http-status=200 text-present=1 auth-navigations=14\n"
+        "activations=17 activations-without-scripts=1 form-submits=10 forms-not-sent=2 text-edits=10\n"
+        "form-posts=10 token-kind=4 token-length=1571 post-target=2 post-outcome=3 post-http-status=302 post-landing=2\n"
+        "accounts-refusals=1 refusal-class=1 refusal-reason=46\n"
+        "post-chain=7,5,5,3,4,14823,24,15311,84,18734,29871,30000\n";
+    unsigned pages = signin_report_pages(report_text);
+    assert(pages == SIGNIN_REPORT_POPULATED_PAGES);
+}
+
+static unsigned signin_report_pages(const char *report_text)
+{
+    TilefinchDiagnosticSource source = {
+        .name = "tilefinch-youtube-signin.txt",
+        .memory = report_text, .memory_size = strlen(report_text)
+    };
+    TilefinchDiagnosticMetadata metadata = {
+        .app_version = "0.1.51",
+        .release_sequence = 61u,
+        .created_unix_time = UINT64_C(1794789923),
+        .psp_model = 2u,
+        .psp_firmware = UINT32_C(0x06060110)
+    };
+    char error[96];
+    TilefinchDiagnosticQrReport *report = tilefinch_diagnostic_qr_build(
+        &metadata, &source, 1, error, sizeof(error));
+    assert(report != NULL);
+    const TilefinchDiagnosticQrView *view = tilefinch_diagnostic_qr_view(report);
+    fprintf(stderr, "sign-in report: %zu raw, %zu compressed, "
+                    "%u part(s), %u page(s)\n", view->raw_bytes,
+            view->compressed_bytes, view->part_count, view->page_count);
+    assert(view->part_count == 1u);
+    unsigned pages = view->page_count;
+    tilefinch_diagnostic_qr_destroy(report);
+    return pages;
+}
+
 int main(void)
 {
     test_base45_vectors();
@@ -397,6 +493,8 @@ int main(void)
     test_missing_logs_refused();
     test_error_summary_prefers_transport_diagnostics();
     test_memory_report_is_owned_and_complete();
+    test_signin_report_is_one_code();
+    test_signin_report_populated_bound();
     puts("diagnostic QR tests passed");
     return 0;
 }

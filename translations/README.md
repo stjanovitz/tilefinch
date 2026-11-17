@@ -35,33 +35,36 @@ all possible complex-script shaping.
 The Hebrew translation, and the rows v18 adds for the other languages (the
 page's bottom bar, the Collections, Themes and Experimental screens, Settings
 descriptions, HOME, tabs, the YouTube login question, the player's titles and
-language names, and a few settings values), have not been reviewed by native
+language names, and a few settings values), and v20's Basic-by-default and
+frame offer rows in every language, have not been reviewed by native
 speakers.
 
 ## Editing and publishing
 
-The newest catalog version is **v19**, which holds every language, Hebrew
-last, and adds the sign-in refusal notices. Hebrew joined in v18. Published
-v18 downloads remain unchanged for released browsers; v19 must be published
-before distributing a browser that pins it.
+The newest catalog version is **v20**, which holds every language, Hebrew
+last, and adds the Basic-by-default notice, **Try full page** and the
+frame offer ("A frame has a large script") rows. v19
+(pinned by 0.1.51) added the sign-in refusal notices; Hebrew joined in v18.
+Published downloads remain unchanged for released browsers; v20 must be
+published before distributing a browser that pins it.
 `src/generated/ui_languages.inc` pins each language's file name, SHA-256
 and the signed glyph-pack revision its shaped labels need (Devanagari
 revision 9 for Hindi, Bengali–Assamese revision 5 for Bengali and
 Assamese).
 
-v17 and v18 are immutable. The next change to any row after v19 is published
-makes v20: copy v19's source into
-`translations/ui/v20/source.tsv`, add
-`CATALOGS.append((20, list(latest_languages.values())))` to the generator,
+v17, v18 and v19 are immutable. The next change to any row after v20 is
+published makes v21: copy v20's source into
+`translations/ui/v21/source.tsv`, add
+`CATALOGS.append((21, list(latest_languages.values())))` to the generator,
 then run `python3 tools/generate_ui_translations.py`. A new version keeps
 every key of the one before it, except keys listed under its number in the
 generator's `RETIRED_KEYS` (for a label the browser no longer draws, or one
 whose English text changed).
 
-A browser that pins v19 can install a language only once its
-`translations/ui/v19/<code>.tful` is published to tilefinch-models, so all
-fourteen v19 files are published together. They need no new glyph-pack
-revision: v19's Hindi, Bengali and Assamese labels stay within the
+A browser that pins v20 can install a language only once its
+`translations/ui/v20/<code>.tful` is published to tilefinch-models, so all
+fourteen v20 files are published together. They need no new glyph-pack
+revision: v20's Hindi, Bengali and Assamese labels stay within the
 sequences their current packs were built from, and both published Hebrew
 pack revisions cover every Hebrew label.
 Commit the authored sources, generated Hindi and Bengali–Assamese sequences

@@ -31,7 +31,10 @@ keeps a 3 MiB presentation reserve. A script may be up to 4 MiB
 (`BROWSER_PSP_APP_SCRIPT_FILE_KB`), a page's scripts up to 16 MiB in all
 (`BROWSER_PSP_APP_SCRIPT_TOTAL_MB`); both are sanity ceilings for hostile
 input. A compile that needs more than planned is stopped by the heap limit
-and refused alone. "The heap the realm can still grow to" is the heap a
+and refused alone. A unit of 1 MiB or more is also refused before it
+compiles unless the heap it can obtain is at least 4 times its source: such
+units compile either near their source size or at 7-10 times it, and a
+failed compile that large costs 6-10 s of PSP time. "The heap the realm can still grow to" is the heap a
 compile can really reach: the heap left under its limit and the growth the
 free page Budget can back, which come out of the same free Budget and are
 not added (after the Budget has given an inline compile its copy of the

@@ -314,6 +314,7 @@ uint64_t navigation_begin(NavigationSession *session)
     session->last_tls_verify_result_available = false;
     session->last_tls_verification_failed = false;
     session->last_transport_timed_out = false;
+    memset(&session->last_chain, 0, sizeof(session->last_chain));
     session->last_response_limit_exceeded = false;
     session->last_response_started = false;
     session->last_tls12_compatibility_retry = false;

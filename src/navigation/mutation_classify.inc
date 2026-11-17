@@ -48,28 +48,10 @@ static bool navigation_selector_mentions_attribute(
                                attribute_length) == 0) return true;
         }
     }
-    for (size_t i = 0; i < sheet->declaration_count; i++) {
-        const StyleDeclaration *declaration = &sheet->declarations[i];
-        if ((declaration->values_flags
-             & STYLE_DECLARATION_VALUES_GENERATED_ATTR) != 0) {
-            ComputedStyle values;
-            stylesheet_declaration_values(sheet, declaration, &values);
-            if (values.generated_attr != NULL
-                && values.generated_attr_length == attribute_length
-                && memcmp(values.generated_attr, attribute,
-                          attribute_length) == 0) {
-                return true;
-            }
-        }
-        /* A var()-dependent declaration is resolved against the element at
-           match time, so its final attr() name is not necessarily present in
-           values yet. Relayout rather than guessing about generated text. */
-        if (declaration->deferred_declarations != NULL
-            && strstr(declaration->deferred_declarations, "attr(") != NULL) {
-            return true;
-        }
-    }
-    return false;
+    /* Includes plain attr(), mixed generated expressions and deferred
+       var()-dependent declarations, using the sheet's cached summary. */
+    return stylesheet_declarations_read_attribute(
+        sheet, attribute, attribute_length);
 }
 
 static bool navigation_node_connected(const lxb_dom_node_t *node);

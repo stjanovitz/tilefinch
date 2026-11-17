@@ -2684,6 +2684,191 @@ static int test_opacity_geometry_snapshot_reuse(void)
     return 0;
 }
 
+/* A lazy loader writes an image's sources and its own data-* bookkeeping,
+   then reads the box, image after image (lazysizes' data-autosize on
+   eurogamer.net). Writes nothing lays out keep the geometry current: one
+   build for the loop, not one per image. A selector that tests the
+   attribute in the element's own compound keeps the geometry while the
+   element's style stays the same; a match that changes, a combinator or
+   :not() after or around the test, and attr() keep the rebuild, and every
+   answer stays exact. */
+static int test_inert_attribute_geometry_snapshot_reuse(void)
+{
+    static const char *const rules[] = {
+        "",
+        "#card[data-state=b]{width:200px}",
+        "#card::before{content:attr(data-state)}",
+        "img[srcset]{width:150px}",
+        /* Subject tests whose match the writes never change. */
+        "img[data-autosize]{display:block}img[src*=\"zdbb\"]{height:9px}"
+        "#card[data-state]{height:32px}",
+        "#card[data-state=b]+img{width:150px}",
+        "#card{width:200px}#card:not([data-state=b]){width:100px}",
+        /* eurogamer's shape: the :has() makes the write relational, but
+           the attribute is tested only in the subject. */
+        "div:has(+img)+img[data-autosize]{display:block}",
+    };
+    for (unsigned mode = 0; mode < 8; mode++) {
+        BrowserDeviceProfile profile;
+        browser_device_profile_psp3000(&profile);
+        BrowserConfig config;
+        browser_config_init(&config, &profile);
+        config.javascript.enabled = true;
+        config.resources.enabled = false;
+        char page[512], script[1024], error[256] = {0};
+        int length = snprintf(page, sizeof(page),
+            "<!doctype html><style>body{margin:0}#card{width:100px;height:32px}"
+            "img{display:block;width:120px;height:40px}%s</style>"
+            "<div id=card></div><img id=pic alt=''>", rules[mode]);
+        CHECK(length > 0 && (size_t) length < sizeof(page));
+        BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+        CHECK(engine != NULL && browser_engine_commit_html(engine,
+            "https://geometry-reuse.test/", page, (size_t) length, true));
+        NavigationSession *nav = browser_engine_navigation(engine);
+        int script_length = snprintf(script, sizeof(script),
+            "(()=>{const M=%u,n=document.getElementById('card'),"
+            "p=document.getElementById('pic');"
+            "n.dataset.state='a';const w=n.offsetWidth;"
+            "for(let i=0;i<40;i++){const s=i%%2?'a':'b';"
+            "if(i%%3)n.setAttribute('data-state',s);else n.dataset.state=s;"
+            "p.src='https://geometry-reuse.test/i'+i+'.png';"
+            "p.setAttribute('srcset','x'+i+'.png 2x');"
+            "p.setAttribute('sizes',i+'px');p.removeAttribute('data-done');"
+            "p.dataset.autosize=String(i);"
+            "if(n.offsetWidth!==((M===1||M===6)&&s==='b'?200:100))"
+            "throw Error('card '+i);"
+            "if(p.offsetWidth!==(M===3||(M===5&&s==='b')?150:120))"
+            "throw Error('image '+i)}"
+            "globalThis.pocSummary=String(w)})()", mode);
+        CHECK(script_length > 0 && (size_t) script_length < sizeof(script));
+        ScriptResult result = {0};
+        CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime, script,
+            "<attribute-geometry>", &result) && result.success);
+        CHECK(strcmp(result.summary, "100") == 0);
+        /* Mode 3's srcset match changes once, at the first write. */
+        bool kept = mode == 0 || mode == 4 || mode == 7;
+        CHECK(kept ? result.geometry_snapshot_builds == 1
+                && result.geometry_snapshot_hits >= 80
+            : mode == 3 ? result.geometry_snapshot_builds == 2
+            : result.geometry_snapshot_builds > 20);
+        LayoutDocument declined = {0};
+        if (kept) CHECK(!script_runtime_take_geometry_layout(
+            nav->page.runtime, &nav->viewport, &declined));
+        CHECK(script_runtime_has_pending_mutations(nav->page.runtime));
+        /* A box change in the same turn as a kept write is still seen. */
+        CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+            "(()=>{const n=document.getElementById('card');"
+            "n.dataset.state='c';n.style.width='130px';"
+            "if(n.offsetWidth!==130)throw Error('lost invalidation');"
+            "n.dataset.state='d';n.style.width='140px';n.dataset.state='e';"
+            "if(n.offsetWidth!==140)throw Error('stale width')})()",
+            "<attribute-mixed-change>", &result) && result.success);
+        CHECK(result.geometry_snapshot_builds >= 2);
+        CHECK(navigation_relayout(nav));
+        script_length = snprintf(script, sizeof(script),
+            "(()=>{if(document.getElementById('card').offsetWidth!==140"
+            "||document.getElementById('pic').offsetWidth!==%d)"
+            "throw Error('published')})()", mode == 3 ? 150 : 120);
+        CHECK(script_length > 0 && (size_t) script_length < sizeof(script));
+        CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime, script,
+            "<attribute-published>", &result) && result.success);
+        browser_engine_destroy(engine);
+    }
+    return 0;
+}
+
+/* A mixed generated-content expression also reads an attribute. Keeping a
+   geometry snapshot after that attribute changes leaves pseudo text and its
+   containing inline box at the old width until an unrelated relayout. */
+static int test_generated_expression_attribute_invalidates_geometry(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.javascript.enabled = true;
+    config.resources.enabled = false;
+    static const char page[] =
+        "<!doctype html><style>#n{display:inline-block;font-size:16px}"
+        "#n::before{content:'label ' attr(data-state)}</style>"
+        "<span id=n data-state=Z></span>";
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error,
+                                                   sizeof(error));
+    CHECK(engine != NULL && browser_engine_commit_html(
+        engine, "https://generated-attr.test/", page, sizeof(page) - 1u,
+        true));
+    NavigationSession *nav = browser_engine_navigation(engine);
+    CHECK(stylesheet_declarations_read_attribute(
+        &nav->page.stylesheet, "data-state", 10u));
+    CHECK(!stylesheet_declarations_read_attribute(
+        &nav->page.stylesheet, "data-unrelated", 14u));
+    ScriptResult result = {0};
+    CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+        "(()=>{const n=document.getElementById('n');"
+        "n.dataset.state='A';const a=n.offsetWidth;"
+        "n.dataset.state='ABCDEFGHIJKLMNOPQRST';const b=n.offsetWidth;"
+        "if(b<=a)throw Error('stale generated width '+a+','+b);"
+        "globalThis.pocSummary=a+','+b})()",
+        "<generated-attr-geometry>", &result) && result.success);
+    CHECK(result.geometry_snapshot_builds >= 2);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* Stripe.js probes colours with an element it appends to <head> and reads
+   through getComputedStyle (npr.org). A page with container queries used to
+   lay out the whole page for each probe; the head renders nothing, so only
+   the root's container state reaches it. A rendered head, and a root whose
+   own style changes, still lay out. */
+static int test_head_probe_style_read_skips_container_layout(void)
+{
+    for (unsigned mode = 0; mode < 3; mode++) {
+        BrowserDeviceProfile profile;
+        browser_device_profile_psp3000(&profile);
+        BrowserConfig config;
+        browser_config_init(&config, &profile);
+        config.javascript.enabled = true;
+        config.resources.enabled = false;
+        char page[512], script[768], error[256] = {0};
+        int length = snprintf(page, sizeof(page),
+            "<!doctype html><style>body{margin:0}"
+            "main{container-type:inline-size}"
+            "@container (min-width:100px){p{color:rgb(1, 2, 3)}}"
+            "html.x{padding-left:1px}%s</style><main><p id=t>t</p></main>",
+            mode == 1 ? "head{display:block}" : "");
+        CHECK(length > 0 && (size_t) length < sizeof(page));
+        BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+        CHECK(engine != NULL && browser_engine_commit_html(engine,
+            "https://head-probe.test/", page, (size_t) length, true));
+        NavigationSession *nav = browser_engine_navigation(engine);
+        CHECK(stylesheet_has_container_queries(&nav->page.stylesheet));
+        int script_length = snprintf(script, sizeof(script),
+            "(()=>{for(let i=0;i<40;i++){%s"
+            "const d=document.createElement('div');"
+            "d.style.backgroundColor='rgb('+i+', 0, 0)';"
+            "document.head.appendChild(d);"
+            "const c=getComputedStyle(d).backgroundColor;d.remove();"
+            "if(c!=='rgb('+i+', 0, 0)')throw Error('colour '+c)}})()",
+            mode == 2 ? "document.documentElement.classList.toggle('x');" : "");
+        CHECK(script_length > 0 && (size_t) script_length < sizeof(script));
+        ScriptResult result = {0};
+        CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime, script,
+            "<head-probe>", &result) && result.success);
+        CHECK(mode == 0 ? result.geometry_snapshot_builds == 0
+                        : result.geometry_snapshot_builds >= 20);
+        /* A body element's container-dependent style still lays out. */
+        CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+            "(()=>{document.getElementById('t').dataset.k='1';"
+            "globalThis.pocSummary=getComputedStyle("
+            "document.getElementById('t')).color})()",
+            "<head-probe-body>", &result) && result.success);
+        CHECK(strcmp(result.summary, "rgb(1, 2, 3)") == 0);
+        browser_engine_destroy(engine);
+    }
+    return 0;
+}
+
 static int test_computed_style_tracks_container_geometry(void)
 {
     CHECK(computed_style_container_geometry_case(false) == 0);

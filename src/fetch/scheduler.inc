@@ -465,6 +465,13 @@ static FetchRequest scheduled_background_hop_shape(
 {
     FetchHopState *hop = item == NULL ? NULL : item->hop;
     const FetchRequest *base = item == NULL ? NULL : &item->request;
+    /* High-entropy client hints stay with the origin that asked for them:
+       once a redirect has left it, no later hop sends them, even one that
+       comes back to it (A -> B -> A) or goes to an origin with its own
+       stored Accept-CH. That only sends less; a GET document whose
+       Critical-CH names a missing hint is retried with it (load_state.inc). */
+    bool hints = base != NULL && base->send_client_hints
+        && hop != NULL && !hop->client_hints_tainted;
     return (FetchRequest) {
         .method = hop == NULL ? NULL : hop->method,
         .body = hop != NULL && hop->body_enabled ? item->body : NULL,
@@ -479,10 +486,12 @@ static FetchRequest scheduled_background_hop_shape(
         .if_none_match = base == NULL ? NULL : base->if_none_match,
         .if_modified_since = base == NULL ? NULL : base->if_modified_since,
         .allow_http_errors = base != NULL && base->allow_http_errors,
-        .send_client_hints = base != NULL && base->send_client_hints
-            && hop != NULL && !hop->client_hints_tainted,
-        .client_hint_tokens = base == NULL ? NULL : base->client_hint_tokens,
-        .client_hint_origin = base == NULL ? NULL : base->client_hint_origin,
+        .send_client_hints = hints,
+        /* A hop that may not carry the hints names none: a request with
+           hint names it may not send is not a valid request, and the
+           worker refuses it (fetch_request_validate). */
+        .client_hint_tokens = hints ? base->client_hint_tokens : NULL,
+        .client_hint_origin = hints ? base->client_hint_origin : NULL,
         .send_low_client_hints = base != NULL
             && base->send_low_client_hints,
         .referer = hop == NULL ? NULL : hop->referer,
@@ -609,30 +618,53 @@ static bool scheduled_background_start_hop_with(ScheduledFetch *item,
     if (!cookie_ready
         && !fetch_hop_configure_cookie(
             NULL, item->hop, &item->request,
-            item->hop->redirects == 0)) return false;
+            item->hop->redirects == 0)) {
+        item->result.chain.limit = FETCH_CHAIN_LIMIT_REQUEST;
+        snprintf(item->result.error, sizeof(item->result.error), "%s",
+                 "request cookies exceeded URL or memory policy");
+        return false;
+    }
     FetchRequest shape = scheduled_background_hop_shape(item);
     long remaining_ms = fetch_hop_remaining_ms(item->hop);
     if (remaining_ms <= 0) {
         item->result.timed_out = true;
+        item->result.chain.limit = FETCH_CHAIN_LIMIT_DEADLINE;
         snprintf(item->result.error, sizeof(item->result.error), "%s",
                  "request deadline expired before background hop");
         return false;
     }
+    FetchBackgroundEnqueueStatus admission = FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE;
     item->background_request_id =
         item->background_media_publication_bytes != 0
         ? fetch_background_transport_enqueue_media_hop_stream_sized_diagnosed(
               item->hop->url, &shape, item->reserved_bytes, remaining_ms,
-              item->background_media_publication_bytes, NULL)
+              item->background_media_publication_bytes, &admission)
         : item->blocking
         ? fetch_background_transport_enqueue_blocking_hop_stream(
-              item->hop->url, &shape, item->reserved_bytes, remaining_ms)
+              item->hop->url, &shape, item->reserved_bytes, remaining_ms,
+              &admission)
         : fetch_background_transport_enqueue_hop_stream(
-              item->hop->url, &shape, item->reserved_bytes, remaining_ms);
+              item->hop->url, &shape, item->reserved_bytes, remaining_ms,
+              &admission);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     if (item->background_request_id != 0)
         scheduled_timeline(NULL, item, "submit");
 #endif
-    return item->background_request_id != 0;
+    if (item->background_request_id != 0) return true;
+    /* Only a full queue, a paused admission or memory still in use waits
+       for a later pump. A hop the worker can never carry, or a worker that
+       is gone, fails now with its own reason: left pending it would sit out
+       the whole request deadline and end as a timeout. */
+    if (admission == FETCH_BACKGROUND_ENQUEUE_UNSUPPORTED
+        || admission == FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE) {
+        if (admission == FETCH_BACKGROUND_ENQUEUE_UNSUPPORTED)
+            item->result.chain.limit = FETCH_CHAIN_LIMIT_REQUEST;
+        snprintf(item->result.error, sizeof(item->result.error), "%s",
+                 admission == FETCH_BACKGROUND_ENQUEUE_UNSUPPORTED
+                     ? "hop request exceeded the background transport's bounds"
+                     : "background transport is unavailable");
+    }
+    return false;
 }
 
 static bool scheduled_background_start_hop(ScheduledFetch *item)
@@ -1553,6 +1585,7 @@ static void scheduled_mark_complete(FetchScheduler *scheduler,
     if (!success && error != NULL && error[0] != '\0') {
         snprintf(item->result.error, sizeof(item->result.error), "%s", error);
     }
+    fetch_chain_note_end(&item->result, item->hop, success, external_cancel);
     scheduled_capture_finish(scheduler, item, external_cancel);
     if (!success) fetch_result_discard_all_cookie_storage(&item->result);
     item->active = false;
@@ -1800,6 +1833,7 @@ static bool scheduled_finish_transport(FetchScheduler *scheduler,
             bool redirected = false;
             if (item->request.page_redirect_mode
                     == FETCH_PAGE_REDIRECT_ERROR) {
+                item->result.chain.limit = FETCH_CHAIN_LIMIT_TARGET;
                 snprintf(item->result.error, sizeof(item->result.error),
                          "redirect mode forbids redirect");
             } else if (item->request.page_redirect_mode
@@ -1810,6 +1844,7 @@ static bool scheduled_finish_transport(FetchScheduler *scheduler,
                 item->result.opaque_redirect = true;
                 item->writer.redirect_response = false;
             } else if (item->hop->redirects >= FETCH_REDIRECT_LIMIT) {
+                item->result.chain.limit = FETCH_CHAIN_LIMIT_HOPS;
                 snprintf(item->result.error, sizeof(item->result.error),
                          FETCH_REDIRECT_LIMIT_ERROR);
             } else {
@@ -1822,6 +1857,7 @@ static bool scheduled_finish_transport(FetchScheduler *scheduler,
             } else if (item->result.error[0] != '\0') {
                 /* Preserve an earlier explicit redirect error. */
             } else if (!fetch_hop_advance(item->hop, &item->result)) {
+                item->result.chain.limit = fetch_hop_advance_limit(item->hop);
                 snprintf(item->result.error, sizeof(item->result.error),
                          "%s", item->hop->redirect_loop_detected
                              ? "response redirect loop detected"
@@ -1839,6 +1875,8 @@ static bool scheduled_finish_transport(FetchScheduler *scheduler,
                                   != CURLE_OK)) {
                 item->result.timed_out =
                     fetch_hop_remaining_ms(item->hop) <= 0;
+                item->result.chain.limit = item->result.timed_out
+                    ? FETCH_CHAIN_LIMIT_DEADLINE : FETCH_CHAIN_LIMIT_REQUEST;
                 snprintf(
                     item->result.error, sizeof(item->result.error), "%s",
                     item->result.timed_out
@@ -1849,6 +1887,7 @@ static bool scheduled_finish_transport(FetchScheduler *scheduler,
                 snprintf(item->result.error, sizeof(item->result.error),
                          "redirect transport could not be rescheduled");
             } else {
+                fetch_chain_note_redirect(&item->result);
                 item->result.redirected = true;
                 item->writer.redirect_response = false;
                 item->writer.redirect_callback_aborted = false;
@@ -1942,26 +1981,73 @@ static bool scheduled_background_deliver_headers(
     if (scheduler == NULL || item == NULL || !item->background_backend
         || item->background_headers_delivered
         || item->background_request_id == 0) return true;
-    if (!fetch_background_transport_take_headers(
-            item->background_request_id, &item->result)) return true;
+    /* The response's own Set-Cookie fields come with its headers, as they
+       do on the browser-thread path: a navigation commits cookies at this
+       boundary (before its parser asks for a stylesheet or script), and
+       its commit at completion is then skipped as done. */
+    size_t first_cookie = item->result.set_cookie_count;
+    FetchBackgroundCookieHandoff cookies = FETCH_BACKGROUND_COOKIES_HANDED;
+    if (!fetch_background_transport_take_headers_with_cookies(
+            item->background_request_id, scheduler->budget, &item->result,
+            &cookies)) return true;
     item->result.redirect_origin_tainted = item->hop->origin_tainted;
-    item->writer.response_cookie_start = item->result.set_cookie_count;
-    char location[TILEFINCH_URL_SERIALIZED_LIMIT];
+    item->writer.response_cookie_start = first_cookie;
+    /* Whether the header is there at all: a Location too long to follow
+       still makes the response a redirect, which fetch_hop_advance then
+       refuses, as the browser-thread path does. It is not this request's
+       document. The worker hands the value over whole, beside the header
+       snapshot (which a long one need not fit); the hop keeps a copy. */
+    char location[2];
     bool has_location = fetch_response_header_value(
         &item->result, "location", location, sizeof(location));
+    const char *whole_location = NULL;
+    fetch_hop_clear_location(item->hop);
+    bool location_kept = true;
+    if (fetch_background_transport_response_location(
+            item->background_request_id, &whole_location)) {
+        has_location = true;
+        location_kept = fetch_hop_note_location(
+            item->hop, whole_location, strlen(whole_location));
+    }
+    fetch_chain_note_response(&item->result, item->hop, first_cookie, true);
     long status = item->result.status_code;
     item->writer.redirect_response =
         (status == 301 || status == 302 || status == 303
          || status == 307 || status == 308) && has_location;
     item->writer.has_response_location = has_location;
     item->writer.credentials_tainted = item->hop->credentials_tainted;
+    if (!location_kept) {
+        scheduled_background_abort(
+            scheduler, item,
+            "background redirect target exceeded shared memory budget");
+        return false;
+    }
+    /* A chain may pass through an address longer than a document's may
+       be, not end on one (receive_header's rule on the browser-thread
+       path). */
+    if (!item->writer.redirect_response
+        && fetch_hop_url_is_long(item->hop)) {
+        item->result.chain.limit = FETCH_CHAIN_LIMIT_DOCUMENT_LENGTH;
+        scheduled_background_abort(scheduler, item,
+                                   FETCH_LONG_DOCUMENT_ERROR);
+        return false;
+    }
+    if (cookies == FETCH_BACKGROUND_COOKIES_MEMORY) {
+        item->result.chain.limit = FETCH_CHAIN_LIMIT_COOKIES;
+        scheduled_background_abort(
+            scheduler, item,
+            "background response cookies exceeded shared memory budget");
+        return false;
+    }
     if (item->writer.redirect_response
-        && item->result.set_cookies_truncated) {
+        && (item->result.set_cookies_truncated
+            || cookies == FETCH_BACKGROUND_COOKIES_OVERFLOW)) {
         char message[112];
         snprintf(
             message, sizeof(message),
             "redirect response exceeded the %u-cookie transport limit",
             (unsigned) FETCH_RESPONSE_COOKIE_CAPACITY);
+        item->result.chain.limit = FETCH_CHAIN_LIMIT_COOKIES;
         scheduled_background_abort(scheduler, item, message);
         return false;
     }
@@ -2106,6 +2192,8 @@ static bool scheduled_background_finish_hop(
         .reused = item->result.tls_connection_reused
     };
     fetch_tls_counters_add(&scheduler->tls_counters, &handshake);
+    fetch_chain_note_response(&item->result, item->hop,
+                              item->writer.response_cookie_start, false);
     if (success && !enforce_response_credential_policy(&item->writer)) {
         success = false;
     }
@@ -2126,6 +2214,7 @@ static bool scheduled_background_finish_hop(
         bool redirected = false;
         if (item->request.page_redirect_mode
                 == FETCH_PAGE_REDIRECT_ERROR) {
+            item->result.chain.limit = FETCH_CHAIN_LIMIT_TARGET;
             snprintf(item->result.error, sizeof(item->result.error), "%s",
                      "redirect mode forbids redirect");
         } else if (item->request.page_redirect_mode
@@ -2139,13 +2228,24 @@ static bool scheduled_background_finish_hop(
             scheduled_mark_complete(scheduler, item, true, NULL, false);
             return true;
         } else if (item->hop->redirects >= FETCH_REDIRECT_LIMIT) {
+            item->result.chain.limit = FETCH_CHAIN_LIMIT_HOPS;
             snprintf(item->result.error, sizeof(item->result.error), "%s",
                      FETCH_REDIRECT_LIMIT_ERROR);
+        } else if (item->result.set_cookies_truncated) {
+            /* The take ran out of room for this redirect's cookies over
+               the chain: the next request would go out without them,
+               perhaps missing a deletion. Fail, as the browser-thread
+               path does. */
+            item->result.chain.limit = FETCH_CHAIN_LIMIT_COOKIES;
+            snprintf(item->result.error, sizeof(item->result.error), "%s",
+                     "redirect response cookies exceeded transport bounds");
         } else {
             fetch_hop_stage_response_cookies(
                 item->hop, &item->result,
                 item->writer.response_cookie_start);
             redirected = fetch_hop_advance(item->hop, &item->result);
+            if (!redirected)
+                item->result.chain.limit = fetch_hop_advance_limit(item->hop);
             if (!redirected && item->result.error[0] == '\0') {
                 snprintf(item->result.error, sizeof(item->result.error), "%s",
                          item->hop->redirect_loop_detected
@@ -2154,8 +2254,13 @@ static bool scheduled_background_finish_hop(
             }
         }
         if (redirected) {
+            fetch_chain_note_redirect(&item->result);
             item->result.redirected = true;
             item->background_headers_delivered = false;
+            /* The next hop's cookies start here, also for a hop that never
+               delivers headers (scheduled_background_finish_hop counts
+               from it). */
+            item->writer.response_cookie_start = item->result.set_cookie_count;
             item->writer.redirect_response = false;
             item->writer.has_response_location = false;
             item->writer.headers_delivered = false;
@@ -2600,6 +2705,30 @@ bool fetch_scheduler_request_progress(
                 && item->background_backend
                 && item->background_request_id == 0
         };
+        return true;
+    }
+    return false;
+}
+
+bool fetch_scheduler_request_chain(
+    const FetchScheduler *scheduler, uint64_t request_id,
+    FetchChainFacts *chain, long *status_code)
+{
+    if (scheduler == NULL || request_id == 0 || chain == NULL
+        || status_code == NULL) return false;
+    for (size_t i = 0; i < scheduler->capacity; i++) {
+        const ScheduledFetch *item = scheduler->items[i];
+        if (item == NULL || item->id != request_id) continue;
+        *chain = item->result.chain;
+        *status_code = item->result.status_code;
+        /* fetch_chain_note_end fills these when the request ends. */
+        if (!item->complete && item->hop != NULL) {
+            chain->redirects = item->hop->redirects > UINT8_MAX
+                ? UINT8_MAX : (uint8_t) item->hop->redirects;
+            chain->elapsed_ms = fetch_hop_elapsed_ms(item->hop);
+            chain->timeout_ms = item->hop->timeout_ms > 0
+                ? (uint32_t) item->hop->timeout_ms : 0u;
+        }
         return true;
     }
     return false;

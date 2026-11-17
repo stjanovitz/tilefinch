@@ -16,6 +16,10 @@ struct LayoutReuseCache;
 
 #define STYLESHEET_DOCUMENT_RESOURCE_LIMIT 32
 #define STYLESHEET_TRANSIENT_ATTEMPT_LIMIT 3
+/* Failed stylesheet URLs remembered once the ledger above is full: a page
+   with many more stylesheets (amazon.com lists about 80) fails far more
+   URLs than the ledger can hold. */
+#define STYLESHEET_OVERFLOW_FAILURE_LIMIT 96
 #define STYLESHEET_REFERRER_POLICY_LIMIT 40
 #define STYLESHEET_ALTERNATE_THEME_LIMIT 16
 
@@ -81,6 +85,15 @@ typedef struct {
     } style_preloads[STYLESHEET_DOCUMENT_RESOURCE_LIMIT];
     size_t style_preload_count;
     size_t count;
+    /* Failed URLs the full ledger above cannot hold (a page with more
+       distinct stylesheet URLs than the ledger): their attempts, by URL
+       hash, so every parser checkpoint rebuild does not refetch them. */
+    struct {
+        uint64_t url_hash;
+        uint8_t attempts;
+        bool terminal;
+    } overflow_failures[STYLESHEET_OVERFLOW_FAILURE_LIMIT];
+    size_t overflow_failure_count;
     size_t retained_body_hits;
     size_t transient_retries;
     size_t transient_failures;

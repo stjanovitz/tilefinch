@@ -3572,6 +3572,248 @@ bool stylesheet_selectors_reference_attribute_prefix(
                names + offsets[low], name, name_length) == 0;
 }
 
+static bool declaration_may_read_attr(const StyleDeclaration *declaration)
+{
+    return (declaration->values_flags
+            & STYLE_DECLARATION_VALUES_GENERATED_ATTR) != 0
+        || (declaration->deferred_declarations != NULL
+            && strstr(declaration->deferred_declarations, "attr(") != NULL);
+}
+
+static bool generated_expression_reads_attribute(
+    const char *expression, const char *name, size_t name_length)
+{
+    if (expression == NULL) return false;
+    const char *at = expression;
+    while ((at = strstr(at, "attr(")) != NULL) {
+        at += 5;
+        while (isspace((unsigned char) *at)) at++;
+        const char *start = at;
+        while (isalnum((unsigned char) *at) || *at == '-'
+               || *at == '_' || *at == ':') at++;
+        if ((size_t) (at - start) == name_length
+            && strncasecmp(start, name, name_length) == 0)
+            return true;
+    }
+    return false;
+}
+
+bool stylesheet_declarations_read_attribute(
+    const Stylesheet *const_sheet, const char *name, size_t name_length)
+{
+    if (const_sheet == NULL || name == NULL || name_length == 0) return true;
+    Stylesheet *sheet = (Stylesheet *) const_sheet;
+    if (!sheet->attribute_readers_ready
+        || sheet->attribute_reader_generation != sheet->build_generation
+        || sheet->attribute_reader_declarations != sheet->declaration_count) {
+        bool present = false;
+        for (size_t i = 0; !present && i < sheet->declaration_count; i++)
+            present = declaration_may_read_attr(&sheet->declarations[i]);
+        sheet->attribute_readers_present = present;
+        sheet->attribute_reader_generation = sheet->build_generation;
+        sheet->attribute_reader_declarations = sheet->declaration_count;
+        sheet->attribute_readers_ready = true;
+    }
+    if (!sheet->attribute_readers_present) return false;
+    for (size_t i = 0; i < sheet->declaration_count; i++) {
+        const StyleDeclaration *declaration = &sheet->declarations[i];
+        if (!declaration_may_read_attr(declaration)) continue;
+        if (declaration->deferred_declarations != NULL
+            && strstr(declaration->deferred_declarations, "attr(") != NULL)
+            return true;
+        ComputedStyle values;
+        stylesheet_declaration_values(sheet, declaration, &values);
+        if (values.generated_attr != NULL
+            && values.generated_attr_length == name_length
+            && strncasecmp(values.generated_attr, name, name_length) == 0)
+            return true;
+        if (values.generated_expression
+            && generated_expression_reads_attribute(
+                values.generated_text, name, name_length))
+            return true;
+    }
+    return false;
+}
+
+/* Index just past the attribute selector whose '[' is at `open` (its value
+   may hold quotes, escapes and brackets), or `length + 1` when
+   unterminated. */
+static size_t selector_attribute_skip(const char *text, size_t length,
+                                      size_t open)
+{
+    char quote = 0;
+    for (size_t at = open + 1u; at < length; at++) {
+        char value = text[at];
+        if (quote != 0) {
+            if (value == '\\') at++;
+            else if (value == quote) quote = 0;
+        } else if (value == '\\') {
+            at++;
+        } else if (value == '"' || value == '\'') {
+            quote = value;
+        } else if (value == ']') {
+            return at + 1u;
+        }
+    }
+    return length + 1u;
+}
+
+/* Whether the compound holding position `at` (top level) is followed by a
+   combinator or a pseudo-element before its complex selector ends. */
+static bool selector_subject_continues(const char *text, size_t length,
+                                       size_t at)
+{
+    unsigned depth = 0;
+    char quote = 0;
+    while (at < length) {
+        char value = text[at];
+        if (quote != 0) {
+            if (value == '\\') at++;
+            else if (value == quote) quote = 0;
+            at++;
+            continue;
+        }
+        if (value == '\\') {
+            at += 2u;
+            continue;
+        }
+        if (value == '"' || value == '\'') {
+            quote = value;
+        } else if (value == '(') {
+            depth++;
+        } else if (value == ')') {
+            if (depth == 0) return true;
+            depth--;
+        } else if (value == '[') {
+            at = selector_attribute_skip(text, length, at);
+            continue;
+        } else if (depth == 0) {
+            if (value == ',') return false;
+            if (value == '>' || value == '+' || value == '~' || value == '|')
+                return true;
+            if (value == ':' && at + 1u < length && text[at + 1u] == ':')
+                return true;
+            if (isspace((unsigned char) value)) {
+                while (at < length && isspace((unsigned char) text[at])) at++;
+                if (at < length && text[at] != ',') return true;
+                continue;
+            }
+        }
+        at++;
+    }
+    return false;
+}
+
+/* 1 when `text` tests attribute `name` only at the top level of its subject
+   compound, 0 when it does not test it, -1 when it tests it elsewhere or
+   cannot be scanned. */
+static int selector_attribute_subject_test(const char *text, size_t length,
+                                           const char *name,
+                                           size_t name_length)
+{
+    if (memchr(text, '[', length) == NULL) return 0;
+    int found = 0;
+    unsigned depth = 0;
+    char quote = 0;
+    for (size_t at = 0; at < length; at++) {
+        char value = text[at];
+        if (quote != 0) {
+            if (value == '\\') at++;
+            else if (value == quote) quote = 0;
+            continue;
+        }
+        if (value == '\\') {
+            at++;
+            continue;
+        }
+        if (value == '"' || value == '\'') {
+            quote = value;
+            continue;
+        }
+        if (value == '(') {
+            depth++;
+            continue;
+        }
+        if (value == ')') {
+            if (depth != 0) depth--;
+            continue;
+        }
+        if (value != '[') continue;
+        size_t begin = at + 1u;
+        while (begin < length && isspace((unsigned char) text[begin])) begin++;
+        size_t end = begin;
+        while (end < length
+               && selector_attribute_name_byte((unsigned char) text[end])) {
+            end++;
+        }
+        /* Escaped and namespace-qualified names are not compared. */
+        if (end == begin || end == length || text[end] == '\\'
+            || (text[end] == '|' && end + 1u < length
+                && text[end + 1u] != '=')) return -1;
+        size_t close = selector_attribute_skip(text, length, at);
+        if (close > length || text[close - 1u] != ']') return -1;
+        at = close - 1u;
+        if (end - begin != name_length
+            || strncasecmp(text + begin, name, name_length) != 0) continue;
+        if (depth != 0 || selector_subject_continues(text, length, close))
+            return -1;
+        found = 1;
+    }
+    return quote != 0 ? -1 : found;
+}
+
+bool stylesheet_attribute_selectors_subject_only(
+    const Stylesheet *const_sheet, const char *name, size_t name_length)
+{
+    if (const_sheet == NULL || name == NULL || name_length == 0) return false;
+    Stylesheet *sheet = (Stylesheet *) const_sheet;
+    bool memo = name_length < sizeof(sheet->subject_attribute_memo[0].name);
+    if (sheet->subject_attribute_generation != sheet->build_generation
+        || sheet->subject_attribute_rules != sheet->count
+        || sheet->subject_attribute_custom_rules != sheet->custom_rule_count) {
+        sheet->subject_attribute_generation = sheet->build_generation;
+        sheet->subject_attribute_rules = sheet->count;
+        sheet->subject_attribute_custom_rules = sheet->custom_rule_count;
+        sheet->subject_attribute_memo_count = 0;
+        sheet->subject_attribute_memo_next = 0;
+    }
+    for (size_t i = 0; memo && i < sheet->subject_attribute_memo_count; i++) {
+        const char *stored = sheet->subject_attribute_memo[i].name;
+        if (strlen(stored) == name_length
+            && strncasecmp(stored, name, name_length) == 0)
+            return sheet->subject_attribute_memo[i].subject_only;
+    }
+    bool subject_only = true;
+    for (size_t i = 0; subject_only && i < sheet->count; i++) {
+        const StyleRule *rule = &sheet->rules[i];
+        if (rule->selector == NULL) continue;
+        int test = selector_attribute_subject_test(
+            rule->selector, rule->selector_length, name, name_length);
+        subject_only = test == 0 || (test > 0 && rule->pseudo == PSEUDO_NONE);
+    }
+    /* A custom property reaches descendants through var(). */
+    for (size_t i = 0; subject_only && i < sheet->custom_rule_count; i++) {
+        const StyleCustomRule *rule = &sheet->custom_rules[i];
+        subject_only = rule->selector == NULL
+            || selector_attribute_subject_test(
+                   rule->selector, rule->selector_length, name,
+                   name_length) == 0;
+    }
+    if (memo) {
+        size_t slot = sheet->subject_attribute_memo_count
+            < sizeof(sheet->subject_attribute_memo)
+                  / sizeof(sheet->subject_attribute_memo[0])
+            ? sheet->subject_attribute_memo_count++
+            : sheet->subject_attribute_memo_next++
+                  % (sizeof(sheet->subject_attribute_memo)
+                     / sizeof(sheet->subject_attribute_memo[0]));
+        memcpy(sheet->subject_attribute_memo[slot].name, name, name_length);
+        sheet->subject_attribute_memo[slot].name[name_length] = '\0';
+        sheet->subject_attribute_memo[slot].subject_only = subject_only;
+    }
+    return subject_only;
+}
+
 void stylesheet_append_result_release(Stylesheet *sheet,
                                       StylesheetAppendResult *result)
 {

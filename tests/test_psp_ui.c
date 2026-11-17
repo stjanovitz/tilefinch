@@ -3107,6 +3107,42 @@ static bool test_heavy_page_screens(void)
         ui.screen = PSP_UI_SCREEN_PAGE;
     }
 
+    /* The frame offer: X starts the frame's scripts, O (or Select) does
+       not, and Triangle has no Always to answer. */
+    static const struct {
+        uint32_t button;
+        PspUiAction action;
+    } frame_answers[] = {
+        {PSP_UI_BUTTON_CONFIRM, PSP_UI_ACTION_HEAVY_FRAME_START},
+        {PSP_UI_BUTTON_CANCEL, PSP_UI_ACTION_HEAVY_FRAME_NOT_NOW},
+        {PSP_UI_BUTTON_MENU, PSP_UI_ACTION_HEAVY_FRAME_NOT_NOW}
+    };
+    for (size_t at = 0; at < sizeof(frame_answers) / sizeof(frame_answers[0]);
+         at++) {
+        psp_ui_show_heavy_frame_offer(&ui, "frames.example", 270018u);
+        CHECK(ui.screen == PSP_UI_SCREEN_HEAVY_OFFER && ui.heavy_offer_frame
+              && ui.heavy_offer_script_bytes == 270018u
+              && ui.heavy_offer_seconds == 0u);
+        psp_ui_composite(&ui, frame, WIDTH, HEIGHT, WIDTH);
+        for (unsigned tick = 0; tick < PSP_UI_STORAGE_OFFER_ARMING_FRAMES;
+             tick++)
+            (void) site_storage_press(&ui, PSP_UI_BUTTON_DOWN);
+        CHECK(site_storage_press(&ui, PSP_UI_BUTTON_TOOLBAR).action
+                  == PSP_UI_ACTION_NONE
+              && ui.screen == PSP_UI_SCREEN_HEAVY_OFFER);
+        PspUiIntent intent = site_storage_press(&ui, frame_answers[at].button);
+        CHECK(intent.action == frame_answers[at].action
+              && ui.screen != PSP_UI_SCREEN_HEAVY_OFFER);
+        CHECK(strcmp(psp_ui_action_name(frame_answers[at].action),
+                     at == 0 ? "heavy-frame-start" : "heavy-frame-not-now")
+              == 0);
+        ui.screen = PSP_UI_SCREEN_PAGE;
+    }
+    /* The page's offer after it is the page's again. */
+    psp_ui_show_heavy_offer(&ui, "vk.ru", 5327443u, 41712u);
+    CHECK(!ui.heavy_offer_frame);
+    ui.screen = PSP_UI_SCREEN_PAGE;
+
     /* The status's X stops scripts; O only dismisses; an ordinary status
        that replaces it gives X back to the page. */
     psp_ui_show_heavy_scripts_status(&ui, "PAGE SCRIPTS: ABOUT 3.9 MB", 300u);
@@ -3328,6 +3364,30 @@ static bool test_microphone_screens(void)
     ui.menu_selection = UI_PAGE_TOOLS_ITEM_COUNT + 1u;
     intent = site_storage_press(&ui, PSP_UI_BUTTON_CONFIRM);
     CHECK(intent.action == PSP_UI_ACTION_STOP_MICROPHONE);
+    /* A page opened in Basic view by default offers Try full page right
+       after Basic view; the rows below it move down one. */
+    ui.basic_default_page = 1u;
+    CHECK(psp_ui_page_tools_count(&ui) == UI_PAGE_TOOLS_ITEM_COUNT + 3u);
+    static const PspUiAction full_page_rows[] = {
+        PSP_UI_ACTION_TOGGLE_BASIC, PSP_UI_ACTION_TRY_FULL_PAGE,
+        PSP_UI_ACTION_TOGGLE_BOOKMARK
+    };
+    for (size_t at = 0; at < 3u; at++) {
+        ui.screen = PSP_UI_SCREEN_PAGE_TOOLS;
+        ui.menu_selection = (uint8_t) (2u + at);
+        intent = site_storage_press(&ui, PSP_UI_BUTTON_CONFIRM);
+        CHECK(intent.action == full_page_rows[at]);
+    }
+    ui.screen = PSP_UI_SCREEN_PAGE_TOOLS;
+    ui.menu_selection = UI_PAGE_TOOLS_ITEM_COUNT + 1u;
+    intent = site_storage_press(&ui, PSP_UI_BUTTON_CONFIRM);
+    CHECK(intent.action == PSP_UI_ACTION_YOUTUBE_SIGNIN_CONTINUE);
+    ui.screen = PSP_UI_SCREEN_PAGE_TOOLS;
+    ui.menu_selection = UI_PAGE_TOOLS_ITEM_COUNT + 2u;
+    psp_ui_composite(&ui, frame, WIDTH, HEIGHT, WIDTH);
+    intent = site_storage_press(&ui, PSP_UI_BUTTON_CONFIRM);
+    CHECK(intent.action == PSP_UI_ACTION_STOP_MICROPHONE);
+    ui.basic_default_page = 0u;
 
     /* The prompt draws over the page, and clearing it returns there. */
     psp_ui_init(&ui);
@@ -6985,6 +7045,38 @@ static bool test_kept_status_settles(void)
     return true;
 }
 
+/* The bot-wall notice over a page that paints nothing is renewed only while
+   it is still the toast on screen: the AWS WAF silent challenge on imdb.com
+   left a white page once the 480-frame notice ran out. Renewal never
+   replays the entry motion, never brings back a notice that ran out, and
+   never displaces another status. */
+static bool test_site_blocked_notice_kept_only_while_shown(void)
+{
+    PspUiState ui;
+    psp_ui_init(&ui);
+    CHECK(!psp_ui_keep_site_blocked_status(&ui, "imdb.com", 480));
+    CHECK(ui.toast_frames == 0);
+    CHECK(psp_ui_show_site_blocked_status(&ui, "imdb.com", 480));
+    ui.toast_entry_frames = 0;
+    ui.toast_frames = 12;
+    CHECK(psp_ui_keep_site_blocked_status(&ui, "imdb.com", 480));
+    CHECK(ui.toast_frames == 480 && ui.toast_entry_frames == 0
+          && strncmp(ui.status, "imdb.com blocked Tilefinch", 26) == 0);
+    /* Another site's notice is not this one. */
+    ui.toast_frames = 12;
+    CHECK(!psp_ui_keep_site_blocked_status(&ui, "etsy.com", 480));
+    CHECK(ui.toast_frames == 12);
+    psp_ui_show_status(&ui, "PAGE SCRIPTS STOPPED: NOT ENOUGH MEMORY", 360);
+    CHECK(!psp_ui_keep_site_blocked_status(&ui, "imdb.com", 480));
+    CHECK(strncmp(ui.status, "PAGE SCRIPTS", 12) == 0
+          && ui.toast_frames == 360);
+    CHECK(psp_ui_show_site_blocked_status(&ui, "imdb.com", 480));
+    ui.toast_frames = 0;
+    CHECK(!psp_ui_keep_site_blocked_status(&ui, "imdb.com", 480));
+    CHECK(ui.toast_frames == 0);
+    return true;
+}
+
 /* A media open's toast is retired when the open ends. While the player is
    visible psp_ui_update does not run, so its 600 frames never counted down:
    the device logged status="OPENING VIDEO  O CANCEL" at every mark of a
@@ -9564,6 +9656,7 @@ int main(void)
     if (!test_media_open_live_entry_reprojected_between_presses()) return 1;
     if (!test_media_open_complete_keeps_open_menu()) return 1;
     if (!test_supervisor_copy_never_writes_presentation()) return 1;
+    if (!test_site_blocked_notice_kept_only_while_shown()) return 1;
     if (!test_presentation_setters_store_under_fence()) return 1;
     if (!test_host_label_keeps_the_registrable_end()) return 1;
     if (!test_media_ink_check_follows_glyph_state()) return 1;

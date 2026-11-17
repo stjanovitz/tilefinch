@@ -2856,6 +2856,10 @@ static bool trace_replay_response(Budget *budget, const char *method,
                  effective_user_agent == NULL ? "" : effective_user_agent);
         faults->replayed_requests[slot].cookie_present = request != NULL
             && request->cookie != NULL && request->cookie[0] != '\0';
+        snprintf(faults->replayed_requests[slot].cookie,
+                 sizeof(faults->replayed_requests[slot].cookie), "%s",
+                 request == NULL || request->cookie == NULL
+                     ? "" : request->cookie);
         const char *site = request == NULL ? NULL : request->sec_fetch_site;
         faults->replayed_requests[slot].fetch_site = site == NULL ? 0u
             : !strcmp(site, "none") ? 1u : !strcmp(site, "same-origin") ? 2u

@@ -69,7 +69,12 @@ class PrivateConsoleTests(unittest.TestCase):
                            if line.startswith("YouTube handoff diagnostics:")]
                 self.assertTrue(handoff)
                 for line in handoff:
-                    self.assertRegex(line, r"^YouTube handoff diagnostics: (?:[a-z-]+=\d+ ?)+$")
+                    # Names and numbers only; a value may be a comma-separated
+                    # list of numbers (the sign-in report's post-chain line).
+                    self.assertRegex(
+                        line,
+                        r"^YouTube handoff diagnostics: "
+                        r"(?:[a-z-]+=\d+(?:,\d+)* ?)+$")
                 self.assertRegex(text, r"YouTube session diagnostics: authenticated=0 history-flags=\d+ cookies=0 server-verified=0")
                 self.assertIn("transport-code=0 transport-timed-out=0 tls-result-available=0 tls-result=0 tls-failed=0", text)
                 self.assertNotIn("mock-private-diagnostic-secret", text)
@@ -113,6 +118,169 @@ class PrivateConsoleTests(unittest.TestCase):
                 self.assertFalse((Path(directory) / "arbitrary.bin").exists())
             finally:
                 session.close()
+
+    @unittest.skipUnless(LAB, "requires the host lab executable")
+    def test_private_signin_report_writes_fixed_counts_file_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory).chmod(0o700)
+            fixture = Path(directory) / "fixture.html"
+            fixture.write_text("<p>Local fixture with no account</p>")
+            session = PRIVATE.PrivateLab(LAB, directory, fixture=fixture)
+            try:
+                session.status(timeout=30)
+                self.assertFalse(session.send(b"private-signin-report other.txt\n")[8])
+                self.assertFalse((Path(directory) / "other.txt").exists())
+                self.assertTrue(session.send(b"private-signin-report\n")[8])
+                report_file = Path(directory) / "signin-report.txt"
+                self.assertEqual(report_file.stat().st_mode & 0o777, 0o600)
+                report = report_file.read_text()
+                self.assertTrue(report.startswith("Tilefinch YouTube sign-in diagnostics v5"))
+                self.assertIn("\npost-chain=", report)
+                self.assertNotIn("fixture", report)
+                # Never overwrites: the keeper removes the file after reading.
+                self.assertFalse(session.send(b"private-signin-report\n")[8])
+            finally:
+                session.close()
+
+    @unittest.skipUnless(LAB, "requires the host lab executable")
+    def test_private_buttons_lists_and_presses_by_label(self):
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory).chmod(0o700)
+            fixture = Path(directory) / "fixture.html"
+            fixture.write_text(
+                "<p>Add a selfie</p><button onclick=\"document.body.innerHTML="
+                "'<button>Done</button>'\">  Continue\n</button>"
+                "<button>Not   now</button><button disabled>Off</button>"
+                "<input type=submit value='Send'>")
+            session = PRIVATE.PrivateLab(LAB, directory, fixture=fixture)
+            listing = Path(directory) / "private-buttons.txt"
+
+            def labels():
+                self.assertTrue(session.send(b"private-buttons\n")[8])
+                text = listing.read_text()
+                listing.unlink()
+                return text.splitlines()
+            try:
+                session.status(timeout=30)
+                self.assertEqual(labels(), ["Continue", "Not now", "Send"])
+                self.assertFalse(session.send(b"private-buttons x.txt\n")[8])
+                for bad in (b"Off", b"Nope", b"Cont"):
+                    self.assertFalse(session.send(
+                        b"private-press " + bad.hex().encode() + b"\n")[8])
+                self.assertFalse(session.send(b"private-press zz\n")[8])
+                self.assertTrue(session.send(
+                    b"private-press " + b"continue".hex().encode() + b"\n")[8])
+                self.assertTrue(session.send(b"activate\n")[8])
+                session.send(b"pump 8 16\n")
+                self.assertEqual(labels(), ["Done"])
+            finally:
+                session.close()
+
+    @unittest.skipUnless(LAB, "requires the host lab executable")
+    def test_private_buttons_skip_what_the_user_cannot_reach(self):
+        # Only "Shown" and "Labelled" can be reached: every other button is
+        # hidden, off the page, transparent, hidden from assistive
+        # technology, clipped away or disabled. The labels reach the
+        # terminal as one line without control characters, and a long one
+        # is cut on a whole UTF-8 character.
+        hidden = [
+            "<button style='visibility:hidden'>Hidden</button>",
+            "<button style='position:absolute;left:-9999px'>Offscreen</button>",
+            "<button style='opacity:0'>Clear</button>",
+            "<div style='opacity:0'><button>Clear parent</button></div>",
+            "<div aria-hidden=true><button>Aria hidden</button></div>",
+            "<div style='width:0;height:0;overflow:hidden'>"
+            "<button>Clipped</button></div>",
+            "<button aria-disabled=true>Aria disabled</button>",
+            "<button style='pointer-events:none'>No pointer</button>",
+            "<button style='display:none'>Undisplayed</button>",
+            "<div inert><button>Inert</button></div>",
+            "<fieldset disabled><button>Fieldset</button></fieldset>",
+        ]
+        long_label = "aa" + "é" * 60
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory).chmod(0o700)
+            fixture = Path(directory) / "fixture.html"
+            fixture.write_text(
+                "<!doctype html><meta charset=utf-8>" + "".join(hidden)
+                + "<button>Sh&#x1b;[31mown&#x7f;\t now</button>"
+                + "<button aria-label='La&#x1b;bel&#x7;led'></button>"
+                + f"<button>{long_label}</button>", encoding="utf-8")
+            session = PRIVATE.PrivateLab(LAB, directory, fixture=fixture)
+            listing = Path(directory) / "private-buttons.txt"
+            try:
+                session.status(timeout=30)
+                self.assertTrue(session.send(b"private-buttons\n")[8])
+                self.assertEqual(listing.stat().st_mode & 0o777, 0o600)
+                data = listing.read_bytes()
+                listing.unlink()
+                text = data.decode("utf-8")  # a cut never splits a character
+                self.assertEqual(text.splitlines(), [
+                    "Sh[31mown now", "Labelled", "aa" + "é" * 46])
+                for label in ("Hidden", "Offscreen", "Clear", "Clear parent",
+                              "Aria hidden", "Clipped", "Aria disabled",
+                              "No pointer"):
+                    self.assertFalse(session.send(
+                        b"private-press " + label.encode().hex().encode()
+                        + b"\n")[8], label)
+                self.assertTrue(session.send(
+                    b"private-press " + b"labelled".hex().encode() + b"\n")[8])
+            finally:
+                session.close()
+
+    def test_try_signin_loads_with_its_helpers(self):
+        spec = importlib.util.spec_from_file_location(
+            "try_signin", ROOT / "scripts/try-signin.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(set(module.SERVICE_URLS), {"youtube", "google"})
+        self.assertTrue(all(url.startswith("https://accounts.google.com/")
+                            for url in module.SERVICE_URLS.values()))
+        self.assertTrue(callable(module.PRIVATE.guided_signin))
+        self.assertTrue(callable(module.QR.describe_post_chain))
+        # A chain that ends on a YouTube host is followed by the feed check.
+        self.assertTrue(module.landed_on_youtube("https://www.youtube.com"))
+        self.assertTrue(module.landed_on_youtube("https://m.youtube.com"))
+        for other in ("https://accounts.google.com", "http://www.youtube.com",
+                      "https://notyoutube.com", "https://youtube.com.example.test",
+                      "unavailable"):
+            self.assertFalse(module.landed_on_youtube(other), other)
+        # Labels reach the terminal only when printable, one per line.
+        self.assertEqual(module.printable_labels(
+            "Next\nSh\x1b[31mown\nTab\tbed\nDel\x7f\nLine\x85break\n"
+            "Twice\nTwice\n\nCafé\n"), ["Next", "Café"])
+        # A saved report names only the class of the page's origin.
+        for origin, kind in (("https://accounts.google.com", "accounts"),
+                             ("https://m.youtube.com", "youtube"),
+                             ("https://www.youtube.com", "youtube"),
+                             ("https://login.example-idp.test", "other"),
+                             ("https://accounts.google.com.example.test", "other"),
+                             ("unavailable", "other")):
+            self.assertEqual(module.origin_class(origin), kind, origin)
+        source = (ROOT / "scripts/try-signin.py").read_text()
+        self.assertIn("origin={origin_class(self.values[7])}", source)
+        submit = source.index('run.save_report("after-submit")')
+        self.assertLess(submit, source.index("if landed_on_youtube(run.values[7]):"))
+        # The hop a chain failed on, in words: hop N is the request
+        # redirect N led to, the landing page when N redirects were followed.
+        def message(chain):
+            report = ("form-posts=2 token-kind=4 token-length=1510\n"
+                      "post-chain=" + ",".join(str(n) for n in chain) + "\n")
+            return module.explain(report)[0]
+        landing = message([6, 5, 5, 2, 0, 6018, 10, 9222, 50, 1752, 1758, 30000])
+        self.assertIn("the landing page (after 5 redirects) transfer broke off", landing)
+        self.assertNotIn("redirect 5 ", landing)
+        self.assertIn("the form post itself timed out",
+                      message([1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 30000, 30000]))
+        self.assertIn("the request after redirect 1 timed out",
+                      message([1, 3, 1, 3, 1, 0, 0, 900, 20, 0, 30000, 30000]))
+        refused = message([7, 1, 1, 1, 9, 5681, 7, 5681, 21, 737, 737, 30000])
+        self.assertIn("the redirect sent by step 1 of the chain was refused", refused)
+        self.assertIn("8,191 bytes", refused)
+        # No failure, no message about the chain.
+        self.assertEqual(module.explain(
+            "form-posts=2 token-kind=4 token-length=1510\n"
+            "post-chain=0,5,0,0,0,6018,10,9222,50,1752,1758,30000\n"), [])
 
     @unittest.skipUnless(LAB, "requires the host lab executable")
     def test_synchronous_script_form_keeps_formdata_entry_list(self):
@@ -600,6 +768,10 @@ class PrivateConsoleTests(unittest.TestCase):
                   ok=ok&&JSON.parse('2',function(k,v){return k===''?v+JSON.parse('3'):v})===5;
                   document.getElementById('result').textContent=ok?'parse-preserved':'parse-failed';
                 };</script>""")
+            # The observer comes with an outcome classifier, never alone.
+            classifier = root / "outcome-classifier.js"
+            classifier.write_text("(function(){return 0})")
+            classifier.chmod(0o600)
             session = PRIVATE.PrivateLab(LAB, root, fixture=fixture)
             try:
                 session.status(timeout=30)
@@ -615,6 +787,39 @@ class PrivateConsoleTests(unittest.TestCase):
                 session.close()
 
     @unittest.skipUnless(LAB, "requires the host lab executable")
+    def test_private_session_without_classifier_leaves_page_builtins_alone(self):
+        # The sign-in test runs a private session with no classifier. A
+        # page (or an anti-bot check) can compare a built-in against the
+        # copy it took while loading: nothing the session adds may differ
+        # from what the PSP runs.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = root / "mock.html"
+            fixture.write_text("""<button id=check>Check</button><div id=result></div>
+                <script>const cached={parse:JSON.parse,stringify:JSON.stringify,
+                  open:XMLHttpRequest.prototype.open,send:XMLHttpRequest.prototype.send,
+                  fetch:window.fetch};
+                document.getElementById('check').onclick=()=>{
+                  const same=cached.parse===JSON.parse&&cached.stringify===JSON.stringify
+                    &&cached.open===XMLHttpRequest.prototype.open
+                    &&cached.send===XMLHttpRequest.prototype.send&&cached.fetch===window.fetch;
+                  document.getElementById('result').textContent=
+                    same?'builtins-untouched':'builtins-replaced';
+                };</script>""")
+            session = PRIVATE.PrivateLab(LAB, root, fixture=fixture)
+            try:
+                session.status(timeout=30)
+                session.send(b"focus-id check\n")
+                session.send(b"activate\n")
+                self.assertEqual(PRIVATE.create_private_snapshot(session, root)[8], 1)
+                text = (root / "redacted.ppm.txt").read_text()
+                self.assertIn("builtins-untouched", text)
+                self.assertIn("json-observer-installed=0", text)
+                self.assertIn("Outcome diagnostics: installed=0", text)
+            finally:
+                session.close()
+
+    @unittest.skipUnless(LAB, "requires the host lab executable")
     def test_private_json_observer_does_not_invoke_author_accessors(self):
         for target in ("globalThis", "JSON"):
             with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
@@ -625,6 +830,10 @@ class PrivateConsoleTests(unittest.TestCase):
                     "Object.defineProperty(" + target + ", '" + name + "', {configurable:true,"
                     "get(){document.getElementById('result').textContent='accessor-called';"
                     "throw Error('mock-accessor-secret')}})</script>")
+                # A classifier asks for the observer; the accessor refuses it.
+                classifier = root / "outcome-classifier.js"
+                classifier.write_text("(function(){return 0})")
+                classifier.chmod(0o600)
                 session = PRIVATE.PrivateLab(LAB, root, fixture=fixture)
                 try:
                     session.status(timeout=30)
@@ -1413,6 +1622,79 @@ class PrivateConsoleTests(unittest.TestCase):
         PRIVATE.guided_signin(session, session.values(),
                               input_value=lambda _: self.fail("must not prompt"))
         self.assertFalse(session.commands)
+
+    def test_guided_signin_waits_for_the_password_page_to_finish(self):
+        # Google's password page shows its field before its anti-bot check
+        # is ready; a form sent in between carries a failure code ("FNL~")
+        # instead of a token. The driver must let the page finish, as the
+        # time a person takes does on the PSP.
+        class Session:
+            READY_AFTER_PUMPS = 9
+
+            def __init__(self):
+                self.commands = []
+                self.stage = "username"
+                self.pumps = 0          # on the password page
+                self.ready_when_filled = None
+                self.ready_when_sent = None
+
+            def values(self, success=True, editable=False):
+                ready = self.pumps >= self.READY_AFTER_PUMPS
+                # pending tasks, then the request and handler counters:
+                # they keep changing until the page's check has loaded.
+                return ([0, 1, int(editable), 0, 0, 2, 0 if ready else 2,
+                         "https://accounts.google.com", int(success)]
+                        + [min(self.pumps, self.READY_AFTER_PUMPS)] * 8)
+
+            def send(self, command):
+                self.commands.append(command)
+                if command.startswith(b"pump ") and self.stage == "password":
+                    self.pumps += 1
+                if command.startswith(b"private-focus "):
+                    kind = command.decode().split()[1]
+                    return self.values(kind == self.stage, kind == self.stage)
+                ready = self.pumps >= self.READY_AFTER_PUMPS
+                if command == PRIVATE.secret_command("mock-password"):
+                    self.ready_when_filled = ready
+                if command == b"activate\n":
+                    if self.stage == "username":
+                        self.stage = "password"
+                    else:
+                        self.ready_when_sent = ready
+                if command == b"private-feedback\n":
+                    return self.values(False)
+                return self.values()
+
+        session = Session()
+        entries = iter(["mock-email", "mock-password"])
+        phases = []
+        with patch.object(PRIVATE.time, "sleep"):
+            PRIVATE.guided_signin(session, session.values(),
+                                  input_value=lambda _: next(entries),
+                                  progress=phases.append)
+        self.assertIn("submitting_password", phases)
+        self.assertEqual(session.commands.count(PRIVATE.secret_command("mock-password")), 1)
+        self.assertTrue(session.ready_when_filled, "password entered before the page was ready")
+        self.assertTrue(session.ready_when_sent, "password sent before the page was ready")
+        # Quiet for a while after the last change, and a minimum in all.
+        self.assertGreaterEqual(session.pumps, Session.READY_AFTER_PUMPS
+                                + PRIVATE.SETTLE_QUIET_ROUNDS)
+        self.assertGreaterEqual(session.pumps, PRIVATE.SETTLE_MINIMUM_ROUNDS)
+
+        # A page that leaves the account site while it loads gets nothing.
+        class Leaving(Session):
+            def send(self, command):
+                values = super().send(command)
+                if self.pumps >= 3:
+                    values[7] = "https://unexpected.test"
+                return values
+        session = Leaving()
+        entries = iter(["mock-email", "mock-password"])
+        with patch.object(PRIVATE.time, "sleep"):
+            PRIVATE.guided_signin(session, session.values(),
+                                  input_value=lambda _: next(entries))
+        self.assertNotIn(PRIVATE.secret_command("mock-password"), session.commands)
+        self.assertEqual(session.commands.count(b"activate\n"), 1)
 
     def test_encoding_and_bounds(self):
         mock = "  mock-ñ-中  "

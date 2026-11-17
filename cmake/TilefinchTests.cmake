@@ -2310,13 +2310,42 @@ if(PSP_BROWSER_BUILD_TESTS)
             DOWNLOAD_EXTRACT_TIMESTAMP TRUE
             PREFIX "${CMAKE_CURRENT_BINARY_DIR}/host-ws-mbedtls-build"
             INSTALL_DIR "${_ws_curl_prefix}"
+            PATCH_COMMAND "${CMAKE_COMMAND}"
+                "-DPATCH_SOURCE_DIR=<SOURCE_DIR>"
+                "-DPATCH_FILE=${TILEFINCH_MBEDTLS_CLIENT_SAFETY_PATCH}"
+                "-DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply_patch.cmake"
             CMAKE_ARGS
                 "-DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>"
                 "-DCMAKE_BUILD_TYPE=Release"
                 "-DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}"
                 "-DCMAKE_INSTALL_LIBDIR=lib"
+                "-DMBEDTLS_USER_CONFIG_FILE=${CMAKE_CURRENT_SOURCE_DIR}/tests/mbedtls_safety_config.h"
                 -DENABLE_PROGRAMS=OFF -DENABLE_TESTING=OFF
             BUILD_BYPRODUCTS ${_ws_mbedtls_libraries})
+        ExternalProject_Add_Step(tilefinch_host_ws_mbedtls patch-file
+            COMMAND "${CMAKE_COMMAND}" -E true
+            DEPENDS "${TILEFINCH_MBEDTLS_CLIENT_SAFETY_PATCH}"
+            DEPENDERS download INDEPENDENT TRUE)
+        ExternalProject_Add_Step(tilefinch_host_ws_mbedtls safety-config
+            COMMAND "${CMAKE_COMMAND}" -E true
+            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/mbedtls_safety_config.h"
+            DEPENDERS configure)
+        tilefinch_add_test_binary(tilefinch-mbedtls-client-safety-tests
+            tests/test_mbedtls_client_safety.c)
+        add_dependencies(tilefinch-mbedtls-client-safety-tests
+            tilefinch_host_ws_mbedtls)
+        target_include_directories(tilefinch-mbedtls-client-safety-tests PRIVATE
+            "${_ws_curl_prefix}/include"
+            "${CMAKE_CURRENT_BINARY_DIR}/host-ws-mbedtls-build/src/tilefinch_host_ws_mbedtls/library")
+        target_compile_definitions(tilefinch-mbedtls-client-safety-tests PRIVATE
+            "MBEDTLS_USER_CONFIG_FILE=\"${CMAKE_CURRENT_SOURCE_DIR}/tests/mbedtls_safety_config.h\"")
+        target_link_libraries(tilefinch-mbedtls-client-safety-tests PRIVATE
+            ${_ws_mbedtls_libraries})
+        add_test(NAME tilefinch-mbedtls-client-safety-tests
+            COMMAND tilefinch-mbedtls-client-safety-tests)
+        set_tests_properties(tilefinch-mbedtls-client-safety-tests PROPERTIES
+            LABELS "tilefinch;unit;security;tls" TIMEOUT 30)
         ExternalProject_Add(tilefinch_host_ws_curl
             DEPENDS tilefinch_host_ws_mbedtls
             URL "${_ws_curl_archive}"
@@ -3210,7 +3239,72 @@ if(PSP_BROWSER_BUILD_TESTS)
             --commands ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/news-compat/bot-wall-datadome/commands
             --no-loop-capture
             --output ${CMAKE_CURRENT_BINARY_DIR}/bot-wall-datadome-final.ppm
-        EXPECT "bot-wall detected=yes site=\"nytimes.com\" vendor=\"DataDome\" status=403 blank-refused-script=no notice=\"nytimes.com blocked Tilefinch[|]Bot protection: this site may not work\""
+        EXPECT "bot-wall detected=yes site=\"nytimes.com\" vendor=\"DataDome\" status=403 blank-refused-script=no paints=content notice=\"nytimes.com blocked Tilefinch[|]Bot protection: this site may not work\""
+        TIMEOUT 30)
+
+    # A child frame's big script (over SCRIPT_HEAVY_UNIT_BYTES, as a bot
+    # check's) waits for the page's frame answer instead of running
+    # unasked; the frame then loads with it (run) or without it (stop).
+    # The page's own answer stays open either way, and "top": after "Not
+    # now" for the frame, the page's own later big script still loads. The
+    # frame's Set-Cookie is taken once. Its earlier inline script runs once;
+    # a late heavy script resumes in the same realm, so the first cookie
+    # message remains the server value rather than the replayed value.
+    foreach(answer IN ITEMS run stop top)
+        set(_heavy_frame_reject "loop command-failed;interactive failure")
+        if(answer STREQUAL "run")
+            set(_heavy_frame_expect
+                "heavy-frame-answer run ok=yes"
+                "experimental-node id=\"result\" text=\"check-ran\"")
+            list(APPEND _heavy_frame_reject "answered=run"
+                "heavy-frames waiting=0/0 refused=1")
+        elseif(answer STREQUAL "stop")
+            set(_heavy_frame_expect
+                "heavy-frame-answer stop ok=yes"
+                "experimental-node id=\"result\" text=\"check-refused\""
+                "heavy-frames waiting=0/0 refused=1 asks=no")
+            list(APPEND _heavy_frame_reject "answered=refuse")
+        else()
+            set(_heavy_frame_expect
+                "heavy-frame-answer stop ok=yes"
+                "experimental-node id=\"result\" text=\"check-refused\""
+                "experimental-node id=\"top\" text=\"top-big-loaded\""
+                "heavy-page class=none script-bytes=270018 .* refused=0 .* answered=no")
+            list(APPEND _heavy_frame_reject "top-big-refused" "answered=refuse")
+        endif()
+        tilefinch_add_output_test(heavy-frame-script-${answer}
+            COMMAND psp-browser-interactive-lab
+                --url https://wall.test/
+                --replay-http-response-keyed
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/heavy-frame-check
+                --psp-profile realistic --fetch-scripts --heavy-policy ask
+                --commands ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/heavy-frame-check/commands-${answer}
+                --no-loop-capture
+                --output ${CMAKE_CURRENT_BINARY_DIR}/heavy-frame-${answer}.ppm
+            EXPECT "heavy-page class=none script-bytes=0 .* waiting=0/0 .* answered=no"
+                "heavy-frames waiting=1/270018 refused=0 asks=yes kept=1/350 url=\"https://wall.test/check/frame\""
+                ${_heavy_frame_expect}
+                "heavy-frames waiting=0/0 refused=[01] asks=no kept=0/0"
+                "experimental-node id=\"cookie\" text=\"cookie:seen=server\""
+            REJECT ${_heavy_frame_reject}
+            TIMEOUT 30)
+    endforeach()
+
+    # Stopping the page's scripts retires its realms; the held frame's kept
+    # response goes with them instead of staying until the next page.
+    tilefinch_add_output_test(heavy-frame-script-retire
+        COMMAND psp-browser-interactive-lab
+            --url https://wall.test/
+            --replay-http-response-keyed
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/heavy-frame-check
+            --psp-profile realistic --fetch-scripts --heavy-policy ask
+            --commands ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/heavy-frame-check/commands-retire
+            --no-loop-capture
+            --output ${CMAKE_CURRENT_BINARY_DIR}/heavy-frame-retire.ppm
+        EXPECT "heavy-frames waiting=1/270018 refused=0 asks=yes kept=1/350"
+            "stop-scripts ok=yes"
+            "stop-scripts ok=yes.*heavy-frames waiting=0/0 refused=0 asks=no kept=0/0"
+        REJECT "loop command-failed;interactive failure"
         TIMEOUT 30)
 
     tilefinch_add_output_test(full-document-script-order-reference

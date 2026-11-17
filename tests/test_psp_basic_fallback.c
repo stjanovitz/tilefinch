@@ -1,4 +1,5 @@
 #include "tilefinch/psp_basic_fallback.h"
+#include "tilefinch/psp_heavy_notice.h"
 #include "tilefinch/psp_ui.h"
 #include "tilefinch/content_blocker.h"
 #include "tilefinch/site_adapter.h"
@@ -147,12 +148,95 @@ static int test_presentation_sheets_fit_frontend_buffer(void)
     return 0;
 }
 
+/* The heavy-page notices in order (psp_app_heavy_poll). A page whose own
+   scripts are refused as too large still offers the large script its
+   frame holds, once the page shows again; the frame offer never reuses the
+   page's numbers, and a poll is done only once both have been said. */
+static int test_heavy_notice_order(void)
+{
+    ScriptHeavyState over = {0};
+    over.page_class = SCRIPT_HEAVY_CLASS_OVER;
+    over.oversized_scripts = 1;
+    over.oversized_bytes = 4u * 1024u * 1024u;
+    NavigationHeavyFrames frames = {0};
+    frames.waiting_scripts = 1;
+    frames.waiting_bytes = 270018;
+    frames.asks = true;
+    PspHeavyNoticeInput input = {.on_page = true};
+    CHECK(!psp_heavy_notice_done(&input));
+    CHECK(psp_heavy_notice_next(&input, &over, &frames)
+          == PSP_HEAVY_NOTICE_OVER);
+    input.offer_shown = true;
+    /* The recovery sheet is up: nothing over it. */
+    input.on_page = false;
+    CHECK(psp_heavy_notice_next(&input, &over, &frames)
+          == PSP_HEAVY_NOTICE_NONE);
+    input.on_page = true;
+    CHECK(!psp_heavy_notice_done(&input));
+    CHECK(psp_heavy_notice_next(&input, &over, &frames)
+          == PSP_HEAVY_NOTICE_FRAME_OFFER);
+    input.frame_offer_shown = true;
+    CHECK(psp_heavy_notice_done(&input));
+    CHECK(psp_heavy_notice_next(&input, &over, &frames)
+          == PSP_HEAVY_NOTICE_NONE);
+
+    /* A held page asks first; its frame waits for the page to show. */
+    ScriptHeavyState shell = {0};
+    shell.page_class = SCRIPT_HEAVY_CLASS_SHELL;
+    shell.waiting = true;
+    shell.waiting_scripts = 1;
+    PspHeavyNoticeInput fresh = {.on_page = true};
+    CHECK(psp_heavy_notice_next(&fresh, &shell, &frames)
+          == PSP_HEAVY_NOTICE_OFFER);
+    fresh.offer_shown = true;
+    fresh.on_page = false;
+    fresh.on_offer = true;
+    CHECK(psp_heavy_notice_next(&fresh, &shell, &frames)
+          == PSP_HEAVY_NOTICE_NONE);
+    /* The frame offer open: a page turning OVER does not replace it. */
+    ScriptHeavyState shell_over = shell;
+    shell_over.page_class = SCRIPT_HEAVY_CLASS_OVER;
+    fresh.offer_is_frames = true;
+    CHECK(psp_heavy_notice_next(&fresh, &shell_over, &frames)
+          == PSP_HEAVY_NOTICE_NONE);
+    fresh.offer_is_frames = false;
+    CHECK(psp_heavy_notice_next(&fresh, &shell_over, &frames)
+          == PSP_HEAVY_NOTICE_OVER_REPLACES_OFFER);
+    fresh.on_offer = false;
+    fresh.on_page = true;
+    shell.answered = true;
+    shell.allowed = true;
+    shell.waiting = false;
+    CHECK(psp_heavy_notice_next(&fresh, &shell, &frames)
+          == PSP_HEAVY_NOTICE_FRAME_OFFER);
+    /* The scripts-off offer stands first. */
+    fresh.scripts_off_offer_open = true;
+    CHECK(psp_heavy_notice_next(&fresh, &shell, &frames)
+          == PSP_HEAVY_NOTICE_NONE);
+    fresh.scripts_off_offer_open = false;
+
+    /* Frames that do not ask (answered, or the page's policy is not Ask)
+       are not offered, and an allowed site runs its page silently. */
+    frames.asks = false;
+    CHECK(psp_heavy_notice_next(&fresh, &shell, &frames)
+          == PSP_HEAVY_NOTICE_NONE);
+    CHECK(psp_heavy_notice_next(&fresh, &shell, NULL)
+          == PSP_HEAVY_NOTICE_NONE);
+    PspHeavyNoticeInput allowed = {.on_page = true, .site_runs = true};
+    shell.answered = false;
+    shell.waiting = true;
+    CHECK(psp_heavy_notice_next(&allowed, &shell, NULL)
+          == PSP_HEAVY_NOTICE_RUN_SILENTLY);
+    return 0;
+}
+
 int main(void)
 {
     CHECK(test_presentation_sheets_fit_frontend_buffer() == 0);
     CHECK(test_decisions_per_setting() == 0);
     CHECK(test_post_commit_failure_recheck() == 0);
     CHECK(test_recovery_choices() == 0);
+    CHECK(test_heavy_notice_order() == 0);
     CHECK(psp_basic_fallback_boot_page_examined(true, false, false)
           && !psp_basic_fallback_boot_page_examined(false, false, false)
           && !psp_basic_fallback_boot_page_examined(true, true, false)

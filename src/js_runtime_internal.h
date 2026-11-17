@@ -1098,6 +1098,23 @@ typedef struct DomBridge {
         size_t disk_restored_bytes;
         size_t visible_text_bytes;
         bool visible_text_known;
+        /* A child frame's realm (script_runtime_heavy_frame_begin): its
+           big scripts are asked about by size alone, and a parser or
+           deferred one that must wait stops the frame's load
+           (frame_held, script_runtime_heavy_frame_held). A response is
+           required to hold; after earlier scripts, a bounded completed
+           handle list permits resuming the live realm without replay. */
+        bool frame_gate;
+        bool frame_can_hold;
+        bool frame_held;
+        long *frame_completed_scripts;
+        size_t frame_completed_count;
+        /* The top-level realm only: the page's answer for its frames'
+           big scripts (script_runtime_answer_heavy_frames), kept apart
+           from the page's own answer above. */
+        bool frames_answered;
+        bool frames_allowed;
+        size_t frame_held_bytes;
     } heavy;
     bool allow_test_network_primitive_overrides;
     uint64_t dynamic_script_sequence;
@@ -1261,6 +1278,24 @@ typedef enum {
 #define SCRIPT_WORKER_REALM_LIMIT 4
 bool js_rt_geometry_opacity_write_begin(DomBridge *bridge, lxb_dom_node_t *node);
 void js_rt_geometry_opacity_write_end(DomBridge *bridge);
+/* An attribute write no style or box reads keeps script's current geometry
+   (see dispatch_state.inc). begin, before the DOM write: whether the write
+   may qualify (it fills `write`). end, after the write was journaled. */
+typedef struct {
+    lxb_dom_node_t *node;
+    /* The element's style before the write, and its parent's, when a
+       selector tests the attribute in the element's own compound. */
+    bool compare;
+    bool has_parent;
+    ComputedStyle before;
+    ComputedStyle parent;
+} JsRtGeometryAttributeWrite;
+bool js_rt_geometry_attribute_write_begin(DomBridge *bridge,
+                                          lxb_dom_node_t *node,
+                                          const char *name, size_t length,
+                                          JsRtGeometryAttributeWrite *write);
+void js_rt_geometry_attribute_write_end(DomBridge *bridge,
+                                        const JsRtGeometryAttributeWrite *write);
 #define SCRIPT_FRAME_REALM_LIMIT 16
 #define SCRIPT_CHECKPOINT_CONTINUATION_LIMIT 8
 /* Consecutive turns FinalizationRegistry cleanup may go without a task slot

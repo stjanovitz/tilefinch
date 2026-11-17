@@ -1167,6 +1167,34 @@ static bool test_more_chrome_language(PspUiState *ui, TilefinchGlyphProvider *pr
 /* A page's alert/confirm/prompt: every hint whole in every language and
    theme, the page's own text wrapped inside the box, and a long host cut
    from the left. */
+/* The frame offer (psp_ui_show_heavy_frame_offer) is drawn from catalog
+   rows, each whole in every language. */
+static bool test_heavy_frame_offer_language(const PspUiState *base,
+                                            TilefinchGlyphProvider *provider)
+{
+    static const char *const rows[] = {
+        "A frame has a large script", "It may take a minute or more.",
+        "Start it?", "Scripts can run out of PSP memory.",
+        "X Start   O Not now"
+    };
+    /* The offer's fields share PspUiState's union with other screens'. */
+    static PspUiState ui;
+    for (unsigned scale = 1; scale <= 2; scale++) {
+        ui = *base;
+        ui.browser_ui_scale = scale;
+        psp_ui_show_heavy_frame_offer(&ui, "frames.example.test", 270018u);
+        CHECK(ui.screen == PSP_UI_SCREEN_HEAVY_OFFER && ui.heavy_offer_frame);
+        CHECK(paint(&ui, provider));
+        for (size_t at = 0; at < sizeof(rows) / sizeof(rows[0]); at++)
+            CHECK(has_row(rows[at]) && shown_whole(tilefinch_ui_text(rows[at])));
+        char size[16];
+        psp_ui_format_bytes(size, sizeof(size), 270018u);
+        const char *line[] = {tilefinch_ui_text("Script size:"), " ", size};
+        CHECK(has_row("Script size:") && shown_joined(line, 3u));
+    }
+    return true;
+}
+
 static bool test_page_dialog_language(PspUiState *ui, TilefinchGlyphProvider *provider)
 {
     static const char *const messages[] = {
@@ -2700,6 +2728,12 @@ static bool test_long_host_keeps_its_end(void)
         draw_heavy_offer(&ui, storage, WIDTH, HEIGHT, STRIDE, 0, 0);
         CHECK(host_end_shown("large app offer"));
 
+        psp_ui_show_heavy_frame_offer(&ui, ui_lookalike_host, 4096);
+        ui.overlay_animation_frames = 0;
+        run_count = 0; run_overflow = false;
+        draw_heavy_offer(&ui, storage, WIDTH, HEIGHT, STRIDE, 0, 0);
+        CHECK(host_end_shown("frame script offer"));
+
         /* Fields filled by the frontend hold at most 47 bytes. */
         PspUiTabsView tabs = {.count = 1};
         snprintf(tabs.titles[0], sizeof(tabs.titles[0]), "Sign in");
@@ -3823,6 +3857,7 @@ static bool test_all_languages(void)
             if (theme == 0) CHECK(test_page_legend_language(&ui, provider));
             if (theme == 0) CHECK(test_settings_descriptions_language(&ui, provider));
             if (theme == 0) CHECK(test_more_chrome_language(&ui, provider));
+            if (theme == 0) CHECK(test_heavy_frame_offer_language(&ui, provider));
             if (theme == 0) CHECK(test_status_toasts(&ui, provider));
             if (theme == 0) CHECK(test_composed_toasts(&ui, provider));
             if (theme == 0) CHECK(test_state_text(&ui, provider));

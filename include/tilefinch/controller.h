@@ -354,5 +354,12 @@ bool controller_scroll_to_bottom(BrowserController *controller,
 bool controller_execute_action(BrowserController *controller,
                                const ControllerAction *action,
                                size_t maximum_bytes, long timeout_ms);
+/* As controller_execute_action, reporting a chain that landed on a site
+   adapter's address (navigation_load_request_handoff): the caller opens
+   `adapter_redirect` when it comes back non-empty. */
+bool controller_execute_action_handoff(
+    BrowserController *controller, const ControllerAction *action,
+    size_t maximum_bytes, long timeout_ms, char *adapter_redirect,
+    size_t redirect_capacity);
 
 #endif

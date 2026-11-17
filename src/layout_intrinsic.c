@@ -697,6 +697,194 @@ static bool intrinsic_wraps_single_atomic(
     return found;
 }
 
+/* The max-content width of one run of text in `parent`'s font, measured
+   exactly like flow_text lays it out. In paired mode a text node
+   (`cache_node`) also records its min-content width. */
+static int intrinsic_string_max_width(LayoutContext *context,
+                                      lxb_dom_node_t *cache_node,
+                                      const char *text, size_t length,
+                                      const ComputedStyle *parent, int limit)
+{
+    const FontFace *face = font_context_face_at_weight(
+        context->fonts, context->web_fonts, parent->font_family,
+        parent->font_italic, style_uses_bold_face(parent), computed_style_font_weight(parent));
+    bool metric_bold = style_uses_bold_face(parent);
+    FontFamily metric_family = font_context_metric_family(
+        context->web_fonts, parent->font_family, face);
+    bool synthetic_bold = style_uses_synthetic_weight(
+        context->fonts, context->web_fonts, parent, face);
+    /* Accumulate in 26.6 fixed point exactly like flow_text and take
+       the ceiling once at the end: max-content must never be narrower
+       than the single line the inline flow will actually produce, or
+       shrink-to-fit boxes wrap internally where reference browsers
+       keep one line. */
+    int width_fixed = 0;
+    bool has_word = false;
+    int minimum_width = 0;
+    bool pair_intrinsics = context->intrinsic_pair_mode
+                           && cache_node != NULL;
+    bool break_for_minimum = pair_intrinsics
+        && (computed_style_word_break(parent) == WORD_BREAK_ALL
+            || computed_style_overflow_wrap(parent)
+                   == OVERFLOW_WRAP_ANYWHERE);
+    int limit_fixed = limit > INT_MAX / 64 ? INT_MAX
+                      : layout_fixed_from_integer(limit);
+    LayoutBidiIntrinsicShaping shaping;
+    layout_bidi_intrinsic_shaping_begin(&shaping, context, text, length);
+    for (size_t at = 0; at < length;) {
+        while (at < length && isspace((unsigned char) text[at])) at++;
+        size_t end = at;
+        while (end < length && !isspace((unsigned char) text[end])) end++;
+        if (end == at) break;
+        int word_fixed = 0;
+        if (!layout_bidi_intrinsic_shaped_width(
+                &shaping, at, end, face, metric_family,
+                computed_style_font_size_fixed(parent), synthetic_bold,
+                metric_bold, parent->letter_spacing_fixed,
+                parent->text_transform,
+                !computed_style_kerning_none(parent), &word_fixed))
+            word_fixed = layout_text_measure(
+                context->reuse, face, metric_family, text + at, end - at,
+                computed_style_font_size_fixed(parent),
+                synthetic_bold, metric_bold, parent->font_scale,
+                parent->letter_spacing_fixed, parent->text_transform,
+                !computed_style_kerning_none(parent));
+        if (pair_intrinsics) {
+            int minimum_word = 0;
+            for (size_t segment_at = at; segment_at < end;) {
+                bool discard = false;
+                size_t segment_length = utf8_line_segment_length(
+                    text + segment_at, end - segment_at,
+                    computed_style_word_break(parent)
+                        == WORD_BREAK_KEEP_ALL,
+                    computed_style_hyphens_none(parent),
+                    &discard);
+                if (segment_length == 0) break;
+                int segment_width = discard ? 0 : measured_flow_text_width(
+                    face, metric_family, text + segment_at,
+                    segment_length,
+                    computed_style_font_size_fixed(parent),
+                    synthetic_bold, metric_bold, parent->font_scale,
+                    parent->letter_spacing_fixed,
+                    parent->text_transform == TEXT_TRANSFORM_CAPITALIZE
+                        && segment_at != at ? TEXT_TRANSFORM_NONE
+                        : parent->text_transform,
+                    !computed_style_kerning_none(parent));
+                int shaped_fixed = 0;
+                if (!discard && layout_bidi_intrinsic_shaped_width(
+                        &shaping, segment_at, segment_at + segment_length,
+                        face, metric_family,
+                        computed_style_font_size_fixed(parent),
+                        synthetic_bold, metric_bold,
+                        parent->letter_spacing_fixed,
+                        parent->text_transform,
+                        !computed_style_kerning_none(parent),
+                        &shaped_fixed))
+                    segment_width = layout_fixed_ceil(shaped_fixed);
+                if (break_for_minimum && !discard) {
+                    segment_width = 0;
+                    size_t segment_end = segment_at + segment_length;
+                    for (size_t character_at = segment_at;
+                         character_at < segment_end;) {
+                        size_t character_length = utf8_character_length(
+                            text + character_at,
+                            segment_end - character_at);
+                        if (character_length == 0) break;
+                        int character_width = measured_flow_text_width(
+                            face, metric_family, text + character_at,
+                            character_length,
+                            computed_style_font_size_fixed(parent),
+                            synthetic_bold, metric_bold,
+                            parent->font_scale, 0,
+                            parent->text_transform == TEXT_TRANSFORM_CAPITALIZE
+                                && character_at != at ? TEXT_TRANSFORM_NONE
+                                : parent->text_transform,
+                            !computed_style_kerning_none(parent));
+                        if (character_width > segment_width) {
+                            segment_width = character_width;
+                        }
+                        character_at += character_length;
+                    }
+                }
+                if (segment_width > minimum_word) {
+                    minimum_word = segment_width;
+                }
+                segment_at += segment_length;
+            }
+            if (minimum_word > minimum_width) {
+                minimum_width = minimum_word;
+            }
+        }
+        int space_fixed = font_text_width_for_family_at_size_fixed(
+            face, metric_family, " ", 1,
+            computed_style_font_size_fixed(parent), synthetic_bold,
+            metric_bold);
+        if (space_fixed < 0) {
+            space_fixed = 6 * parent->font_scale * 64;
+        }
+        space_fixed = layout_fixed_add(
+            space_fixed,
+            layout_fixed_from_integer(parent->word_spacing));
+        if (space_fixed < 0) space_fixed = 0;
+        width_fixed = layout_fixed_add(
+            width_fixed,
+            layout_fixed_add(
+                has_word
+                    ? layout_fixed_add(
+                          space_fixed,
+                          parent->letter_spacing_fixed * 2)
+                    : 0,
+                word_fixed));
+        has_word = true;
+        if (width_fixed >= limit_fixed) {
+            layout_bidi_intrinsic_shaping_end(&shaping);
+            return limit;
+        }
+        at = end;
+    }
+    layout_bidi_intrinsic_shaping_end(&shaping);
+    int maximum_width = layout_fixed_ceil(width_fixed);
+    if (pair_intrinsics) {
+        if (parent->white_space_mode == WHITE_SPACE_NOWRAP
+            || parent->white_space_mode == WHITE_SPACE_PRE) {
+            minimum_width = maximum_width;
+        }
+        if (minimum_width > limit) minimum_width = limit;
+        intrinsic_cache_put(
+            context, cache_node, limit, INTRINSIC_CACHE_MINIMUM,
+            false, minimum_width);
+        context->intrinsic_paired_text_measurements++;
+    }
+    return maximum_width;
+}
+
+/* An <img> that lays out as its alt text (layout_inline.c: no image, no
+   definite box, no reserved ratio box, not a zero-width spacer) contributes
+   that text's widths, so a shrink-to-fit or flex ancestor sizes around the
+   text the line will hold. Without this the ancestor collapsed to zero and
+   sibling alt texts overprinted (gitlab's project badges). */
+static const char *intrinsic_image_alt_text(lxb_dom_node_t *node,
+                                            const ComputedStyle *style,
+                                            size_t *length)
+{
+    *length = 0;
+    if (style->generated_image || !document_node_is_tag(node, LXB_TAG_IMG)
+        || (style->has_width && style->has_height)) return NULL;
+    int ratio_width = 0, ratio_height = 0;
+    if (layout_unloaded_image_ratio(node, style, &ratio_width, &ratio_height))
+        return NULL;
+    size_t width_length = 0;
+    const char *width = document_attribute(node, "width", &width_length);
+    if (width != NULL && width_length != 0 && width_length < 32) {
+        char value[32];
+        memcpy(value, width, width_length);
+        value[width_length] = '\0';
+        if (atoi(value) == 0) return NULL;
+    }
+    const char *alt = document_attribute(node, "alt", length);
+    return alt != NULL && *length != 0 ? alt : NULL;
+}
+
 static int intrinsic_text_width_impl(LayoutContext *context,
                                      lxb_dom_node_t *node,
                                      const ComputedStyle *parent, int limit,
@@ -709,156 +897,8 @@ static int intrinsic_text_width_impl(LayoutContext *context,
         size_t length = 0;
         const char *text = layout_text_data(node, &length);
         if (text == NULL) return 0;
-        const FontFace *face = font_context_face_at_weight(
-            context->fonts, context->web_fonts, parent->font_family,
-            parent->font_italic, style_uses_bold_face(parent), computed_style_font_weight(parent));
-        bool metric_bold = style_uses_bold_face(parent);
-        FontFamily metric_family = font_context_metric_family(
-            context->web_fonts, parent->font_family, face);
-        bool synthetic_bold = style_uses_synthetic_weight(
-            context->fonts, context->web_fonts, parent, face);
-        /* Accumulate in 26.6 fixed point exactly like flow_text and take
-           the ceiling once at the end: max-content must never be narrower
-           than the single line the inline flow will actually produce, or
-           shrink-to-fit boxes wrap internally where reference browsers
-           keep one line. */
-        int width_fixed = 0;
-        bool has_word = false;
-        int minimum_width = 0;
-        bool pair_intrinsics = context->intrinsic_pair_mode;
-        bool break_for_minimum = pair_intrinsics
-            && (computed_style_word_break(parent) == WORD_BREAK_ALL
-                || computed_style_overflow_wrap(parent)
-                       == OVERFLOW_WRAP_ANYWHERE);
-        int limit_fixed = limit > INT_MAX / 64 ? INT_MAX
-                          : layout_fixed_from_integer(limit);
-        LayoutBidiIntrinsicShaping shaping;
-        layout_bidi_intrinsic_shaping_begin(&shaping, context, text, length);
-        for (size_t at = 0; at < length;) {
-            while (at < length && isspace((unsigned char) text[at])) at++;
-            size_t end = at;
-            while (end < length && !isspace((unsigned char) text[end])) end++;
-            if (end == at) break;
-            int word_fixed = 0;
-            if (!layout_bidi_intrinsic_shaped_width(
-                    &shaping, at, end, face, metric_family,
-                    computed_style_font_size_fixed(parent), synthetic_bold,
-                    metric_bold, parent->letter_spacing_fixed,
-                    parent->text_transform,
-                    !computed_style_kerning_none(parent), &word_fixed))
-                word_fixed = layout_text_measure(
-                    context->reuse, face, metric_family, text + at, end - at,
-                    computed_style_font_size_fixed(parent),
-                    synthetic_bold, metric_bold, parent->font_scale,
-                    parent->letter_spacing_fixed, parent->text_transform,
-                    !computed_style_kerning_none(parent));
-            if (pair_intrinsics) {
-                int minimum_word = 0;
-                for (size_t segment_at = at; segment_at < end;) {
-                    bool discard = false;
-                    size_t segment_length = utf8_line_segment_length(
-                        text + segment_at, end - segment_at,
-                        computed_style_word_break(parent)
-                            == WORD_BREAK_KEEP_ALL,
-                        computed_style_hyphens_none(parent),
-                        &discard);
-                    if (segment_length == 0) break;
-                    int segment_width = discard ? 0 : measured_flow_text_width(
-                        face, metric_family, text + segment_at,
-                        segment_length,
-                        computed_style_font_size_fixed(parent),
-                        synthetic_bold, metric_bold, parent->font_scale,
-                        parent->letter_spacing_fixed,
-                        parent->text_transform == TEXT_TRANSFORM_CAPITALIZE
-                            && segment_at != at ? TEXT_TRANSFORM_NONE
-                            : parent->text_transform,
-                        !computed_style_kerning_none(parent));
-                    int shaped_fixed = 0;
-                    if (!discard && layout_bidi_intrinsic_shaped_width(
-                            &shaping, segment_at, segment_at + segment_length,
-                            face, metric_family,
-                            computed_style_font_size_fixed(parent),
-                            synthetic_bold, metric_bold,
-                            parent->letter_spacing_fixed,
-                            parent->text_transform,
-                            !computed_style_kerning_none(parent),
-                            &shaped_fixed))
-                        segment_width = layout_fixed_ceil(shaped_fixed);
-                    if (break_for_minimum && !discard) {
-                        segment_width = 0;
-                        size_t segment_end = segment_at + segment_length;
-                        for (size_t character_at = segment_at;
-                             character_at < segment_end;) {
-                            size_t character_length = utf8_character_length(
-                                text + character_at,
-                                segment_end - character_at);
-                            if (character_length == 0) break;
-                            int character_width = measured_flow_text_width(
-                                face, metric_family, text + character_at,
-                                character_length,
-                                computed_style_font_size_fixed(parent),
-                                synthetic_bold, metric_bold,
-                                parent->font_scale, 0,
-                                parent->text_transform == TEXT_TRANSFORM_CAPITALIZE
-                                    && character_at != at ? TEXT_TRANSFORM_NONE
-                                    : parent->text_transform,
-                                !computed_style_kerning_none(parent));
-                            if (character_width > segment_width) {
-                                segment_width = character_width;
-                            }
-                            character_at += character_length;
-                        }
-                    }
-                    if (segment_width > minimum_word) {
-                        minimum_word = segment_width;
-                    }
-                    segment_at += segment_length;
-                }
-                if (minimum_word > minimum_width) {
-                    minimum_width = minimum_word;
-                }
-            }
-            int space_fixed = font_text_width_for_family_at_size_fixed(
-                face, metric_family, " ", 1,
-                computed_style_font_size_fixed(parent), synthetic_bold,
-                metric_bold);
-            if (space_fixed < 0) {
-                space_fixed = 6 * parent->font_scale * 64;
-            }
-            space_fixed = layout_fixed_add(
-                space_fixed,
-                layout_fixed_from_integer(parent->word_spacing));
-            if (space_fixed < 0) space_fixed = 0;
-            width_fixed = layout_fixed_add(
-                width_fixed,
-                layout_fixed_add(
-                    has_word
-                        ? layout_fixed_add(
-                              space_fixed,
-                              parent->letter_spacing_fixed * 2)
-                        : 0,
-                    word_fixed));
-            has_word = true;
-            if (width_fixed >= limit_fixed) {
-                layout_bidi_intrinsic_shaping_end(&shaping);
-                return limit;
-            }
-            at = end;
-        }
-        layout_bidi_intrinsic_shaping_end(&shaping);
-        int maximum_width = layout_fixed_ceil(width_fixed);
-        if (pair_intrinsics) {
-            if (parent->white_space_mode == WHITE_SPACE_NOWRAP
-                || parent->white_space_mode == WHITE_SPACE_PRE) {
-                minimum_width = maximum_width;
-            }
-            if (minimum_width > limit) minimum_width = limit;
-            intrinsic_cache_put(
-                context, node, limit, INTRINSIC_CACHE_MINIMUM,
-                false, minimum_width);
-            context->intrinsic_paired_text_measurements++;
-        }
-        return maximum_width;
+        return intrinsic_string_max_width(
+            context, node, text, length, parent, limit);
     }
     if (node->type != LXB_DOM_NODE_TYPE_ELEMENT) return 0;
     if (layout_node_is_hidden_input(node)) return 0;
@@ -903,6 +943,15 @@ static int intrinsic_text_width_impl(LayoutContext *context,
             return constrain_intrinsic_outer_width(
                 context, node, parent, &style, limit, width);
         }
+    }
+    size_t alt_length = 0;
+    const char *alt = intrinsic_image_alt_text(node, &style, &alt_length);
+    if (alt != NULL) {
+        /* The alt text flows on the parent's line, outside the image's
+           own box edges (layout_inline.c). */
+        ComputedStyle alt_style = layout_alt_text_flow_style(&style);
+        return intrinsic_string_max_width(
+            context, NULL, alt, alt_length, &alt_style, limit);
     }
     int control_width = layout_control_default_width(node);
     if (control_width > 0
@@ -1248,6 +1297,98 @@ int intrinsic_min_text_width_internal(LayoutContext *context,
     return width;
 }
 
+/* The min-content width of one run of wrappable text in `parent`'s font:
+   its widest unbreakable segment. */
+static int intrinsic_string_min_width(LayoutContext *context,
+                                      const char *text, size_t length,
+                                      const ComputedStyle *parent, int limit)
+{
+    const FontFace *face = font_context_face_at_weight(
+        context->fonts, context->web_fonts, parent->font_family,
+        parent->font_italic, style_uses_bold_face(parent), computed_style_font_weight(parent));
+    bool metric_bold = style_uses_bold_face(parent);
+    FontFamily metric_family = font_context_metric_family(
+        context->web_fonts, parent->font_family, face);
+    bool synthetic_bold = style_uses_synthetic_weight(
+        context->fonts, context->web_fonts, parent, face);
+    bool break_for_minimum = computed_style_word_break(parent)
+                                 == WORD_BREAK_ALL
+        || computed_style_overflow_wrap(parent)
+               == OVERFLOW_WRAP_ANYWHERE;
+    int widest = 0;
+    LayoutBidiIntrinsicShaping shaping;
+    layout_bidi_intrinsic_shaping_begin(&shaping, context, text, length);
+    for (size_t at = 0; at < length;) {
+        while (at < length && isspace((unsigned char) text[at])) at++;
+        size_t end = at;
+        while (end < length && !isspace((unsigned char) text[end])) end++;
+        if (end == at) break;
+        int word = 0;
+        for (size_t segment_at = at; segment_at < end;) {
+            bool discard = false;
+            size_t segment_length = utf8_line_segment_length(
+                text + segment_at, end - segment_at,
+                computed_style_word_break(parent)
+                    == WORD_BREAK_KEEP_ALL,
+                computed_style_hyphens_none(parent),
+                &discard);
+            if (segment_length == 0) break;
+            int segment_width = discard ? 0 : measured_flow_text_width(
+                face, metric_family, text + segment_at, segment_length,
+                computed_style_font_size_fixed(parent),
+                synthetic_bold, metric_bold, parent->font_scale,
+                parent->letter_spacing_fixed,
+                parent->text_transform == TEXT_TRANSFORM_CAPITALIZE
+                    && segment_at != at ? TEXT_TRANSFORM_NONE
+                    : parent->text_transform,
+                !computed_style_kerning_none(parent));
+            int shaped_fixed = 0;
+            if (!discard && layout_bidi_intrinsic_shaped_width(
+                    &shaping, segment_at, segment_at + segment_length,
+                    face, metric_family,
+                    computed_style_font_size_fixed(parent),
+                    synthetic_bold, metric_bold,
+                    parent->letter_spacing_fixed, parent->text_transform,
+                    !computed_style_kerning_none(parent), &shaped_fixed))
+                segment_width = layout_fixed_ceil(shaped_fixed);
+            if (break_for_minimum && !discard) {
+                /* anywhere adds opportunities inside each ordinary
+                   Unicode line-breaking segment. */
+                segment_width = 0;
+                size_t segment_end = segment_at + segment_length;
+                for (size_t character_at = segment_at;
+                     character_at < segment_end;) {
+                    size_t character_length = utf8_character_length(
+                        text + character_at,
+                        segment_end - character_at);
+                    if (character_length == 0) break;
+                    int character_width = measured_flow_text_width(
+                        face, metric_family, text + character_at,
+                        character_length,
+                        computed_style_font_size_fixed(parent),
+                        synthetic_bold, metric_bold,
+                        parent->font_scale, 0,
+                        parent->text_transform == TEXT_TRANSFORM_CAPITALIZE
+                            && character_at != at ? TEXT_TRANSFORM_NONE
+                            : parent->text_transform,
+                        !computed_style_kerning_none(parent));
+                    if (character_width > segment_width) {
+                        segment_width = character_width;
+                    }
+                    character_at += character_length;
+                }
+            }
+            if (segment_width > word) word = segment_width;
+            segment_at += segment_length;
+        }
+        if (word > widest) widest = word;
+        if (widest >= limit) break;
+        at = end;
+    }
+    layout_bidi_intrinsic_shaping_end(&shaping);
+    return widest >= limit ? limit : widest;
+}
+
 static int intrinsic_min_text_width_impl(LayoutContext *context,
                                          lxb_dom_node_t *node,
                                          const ComputedStyle *parent,
@@ -1265,90 +1406,8 @@ static int intrinsic_min_text_width_impl(LayoutContext *context,
             || parent->white_space_mode == WHITE_SPACE_PRE) {
             return intrinsic_text_width(context, node, parent, limit);
         }
-        const FontFace *face = font_context_face_at_weight(
-            context->fonts, context->web_fonts, parent->font_family,
-            parent->font_italic, style_uses_bold_face(parent), computed_style_font_weight(parent));
-        bool metric_bold = style_uses_bold_face(parent);
-        FontFamily metric_family = font_context_metric_family(
-            context->web_fonts, parent->font_family, face);
-        bool synthetic_bold = style_uses_synthetic_weight(
-            context->fonts, context->web_fonts, parent, face);
-        bool break_for_minimum = computed_style_word_break(parent)
-                                     == WORD_BREAK_ALL
-            || computed_style_overflow_wrap(parent)
-                   == OVERFLOW_WRAP_ANYWHERE;
-        int widest = 0;
-        LayoutBidiIntrinsicShaping shaping;
-        layout_bidi_intrinsic_shaping_begin(&shaping, context, text, length);
-        for (size_t at = 0; at < length;) {
-            while (at < length && isspace((unsigned char) text[at])) at++;
-            size_t end = at;
-            while (end < length && !isspace((unsigned char) text[end])) end++;
-            if (end == at) break;
-            int word = 0;
-            for (size_t segment_at = at; segment_at < end;) {
-                bool discard = false;
-                size_t segment_length = utf8_line_segment_length(
-                    text + segment_at, end - segment_at,
-                    computed_style_word_break(parent)
-                        == WORD_BREAK_KEEP_ALL,
-                    computed_style_hyphens_none(parent),
-                    &discard);
-                if (segment_length == 0) break;
-                int segment_width = discard ? 0 : measured_flow_text_width(
-                    face, metric_family, text + segment_at, segment_length,
-                    computed_style_font_size_fixed(parent),
-                    synthetic_bold, metric_bold, parent->font_scale,
-                    parent->letter_spacing_fixed,
-                    parent->text_transform == TEXT_TRANSFORM_CAPITALIZE
-                        && segment_at != at ? TEXT_TRANSFORM_NONE
-                        : parent->text_transform,
-                    !computed_style_kerning_none(parent));
-                int shaped_fixed = 0;
-                if (!discard && layout_bidi_intrinsic_shaped_width(
-                        &shaping, segment_at, segment_at + segment_length,
-                        face, metric_family,
-                        computed_style_font_size_fixed(parent),
-                        synthetic_bold, metric_bold,
-                        parent->letter_spacing_fixed, parent->text_transform,
-                        !computed_style_kerning_none(parent), &shaped_fixed))
-                    segment_width = layout_fixed_ceil(shaped_fixed);
-                if (break_for_minimum && !discard) {
-                    /* anywhere adds opportunities inside each ordinary
-                       Unicode line-breaking segment. */
-                    segment_width = 0;
-                    size_t segment_end = segment_at + segment_length;
-                    for (size_t character_at = segment_at;
-                         character_at < segment_end;) {
-                        size_t character_length = utf8_character_length(
-                            text + character_at,
-                            segment_end - character_at);
-                        if (character_length == 0) break;
-                        int character_width = measured_flow_text_width(
-                            face, metric_family, text + character_at,
-                            character_length,
-                            computed_style_font_size_fixed(parent),
-                            synthetic_bold, metric_bold,
-                            parent->font_scale, 0,
-                            parent->text_transform == TEXT_TRANSFORM_CAPITALIZE
-                                && character_at != at ? TEXT_TRANSFORM_NONE
-                                : parent->text_transform,
-                            !computed_style_kerning_none(parent));
-                        if (character_width > segment_width) {
-                            segment_width = character_width;
-                        }
-                        character_at += character_length;
-                    }
-                }
-                if (segment_width > word) word = segment_width;
-                segment_at += segment_length;
-            }
-            if (word > widest) widest = word;
-            if (widest >= limit) break;
-            at = end;
-        }
-        layout_bidi_intrinsic_shaping_end(&shaping);
-        return widest >= limit ? limit : widest;
+        return intrinsic_string_min_width(context, text, length, parent,
+                                          limit);
     }
     if (node->type != LXB_DOM_NODE_TYPE_ELEMENT) return 0;
     if (layout_node_is_hidden_input(node)) return 0;
@@ -1399,6 +1458,17 @@ static int intrinsic_min_text_width_impl(LayoutContext *context,
             return constrain_intrinsic_outer_width(
                 context, node, parent, &style, limit, width);
         }
+    }
+    size_t alt_length = 0;
+    const char *alt = intrinsic_image_alt_text(node, &style, &alt_length);
+    if (alt != NULL) {
+        ComputedStyle alt_style = layout_alt_text_flow_style(&style);
+        if (alt_style.white_space_mode == WHITE_SPACE_NOWRAP
+            || alt_style.white_space_mode == WHITE_SPACE_PRE)
+            return intrinsic_string_max_width(
+                context, NULL, alt, alt_length, &alt_style, limit);
+        return intrinsic_string_min_width(
+            context, alt, alt_length, &alt_style, limit);
     }
     int control_width = layout_control_default_width(node);
     if (control_width > 0

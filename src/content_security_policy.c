@@ -297,7 +297,7 @@ static const TilefinchUrl *url_match_target(UrlMatch *match)
 {
     if (match->target_state == 0) {
         match->target_state =
-            tilefinch_url_parse(match->url, &match->target) ? 1 : 2;
+            tilefinch_url_parse_long(match->url, &match->target) ? 1 : 2;
     }
     return match->target_state == 1 ? &match->target : NULL;
 }

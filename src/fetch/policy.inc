@@ -160,6 +160,24 @@ static bool fetch_destination_is_passive(const FetchRequest *request)
             || strcasecmp(destination, "media") == 0);
 }
 
+/* A document load, top level or in a frame: the requests whose redirect
+   chain may pass through an address up to TILEFINCH_URL_LONG_LIMIT - 1
+   bytes (fetch_hop_advance). */
+static bool fetch_request_is_navigation(const FetchRequest *request)
+{
+    if (request == NULL) return false;
+    /* A zeroed context reads as a navigation of a document: only the
+       explicit marks count. */
+    const TilefinchRequestContext *page = request->page_context;
+    if (page != NULL
+        && (page->top_level_navigation
+            || (page->mode == TILEFINCH_REQUEST_MODE_NAVIGATE
+                && page->destination == TILEFINCH_DESTINATION_FRAME)))
+        return true;
+    return request->sec_fetch_mode != NULL
+        && strcasecmp(request->sec_fetch_mode, "navigate") == 0;
+}
+
 static bool fetch_request_is_top_level_navigation(const FetchRequest *request)
 {
     return request != NULL && request->sec_fetch_dest != NULL
@@ -198,7 +216,7 @@ static bool fetch_request_is_captive_portal_navigation(
 static bool fetch_url_names_local_network(const char *url)
 {
     TilefinchUrl parsed;
-    if (url == NULL || !tilefinch_url_parse(url, &parsed)) return false;
+    if (url == NULL || !tilefinch_url_parse_long(url, &parsed)) return false;
     const char *host = url + parsed.host_offset;
     size_t length = parsed.host_length;
     if (parsed.ipv6_literal) {
@@ -303,19 +321,24 @@ static bool fetch_request_mixed_override(
 /* Apply HSTS and HTTPS-first before the request target is admitted. Passive
    mixed content is auto-upgraded once and never falls back to HTTP. Active
    mixed content remains HTTP here and is rejected below. */
-static bool fetch_request_prepare_security_url_with_session(
+/* `upgraded` is scratch of `capacity` bytes, as `output` is. `long_hop`: a
+   navigation's redirect hop, whose address may be up to
+   TILEFINCH_URL_LONG_LIMIT - 1 bytes. */
+static bool fetch_request_prepare_security_url_sized(
     const FetchRequest *request, BrowserSession *security_session,
     const char *url,
     bool upgrade_initial_insecure_request,
-    char output[TILEFINCH_URL_SERIALIZED_LIMIT])
+    char *output, char *upgraded, size_t capacity, bool long_hop)
 {
-    char upgraded[TILEFINCH_URL_SERIALIZED_LIMIT];
-    if (url == NULL || output == NULL) return false;
-    if (!browser_session_hsts_upgrade_url(
-            security_session,
-            url, upgraded, sizeof(upgraded))) return false;
+    if (url == NULL || output == NULL || upgraded == NULL) return false;
+    if (!(long_hop
+              ? browser_session_hsts_upgrade_url_long(
+                    security_session, url, upgraded, capacity)
+              : browser_session_hsts_upgrade_url(
+                    security_session, url, upgraded, capacity)))
+        return false;
     TilefinchUrl target;
-    if (!tilefinch_url_parse(upgraded, &target)) return false;
+    if (!tilefinch_url_parse_long(upgraded, &target)) return false;
     bool ordinary_navigation = fetch_request_is_top_level_navigation(request)
         && !tilefinch_url_potentially_trustworthy(upgraded)
         /* Explicit LAN navigation is a supported escape hatch. Do not turn
@@ -337,11 +360,24 @@ static bool fetch_request_prepare_security_url_with_session(
     if (target.scheme == TILEFINCH_URL_SCHEME_HTTP
         && upgrade_initial_insecure_request
         && (ordinary_navigation || mixed_passive)) {
-        return tilefinch_url_upgrade_to_https(
-            upgraded, output, TILEFINCH_URL_SERIALIZED_LIMIT);
+        return long_hop
+            ? tilefinch_url_upgrade_to_https_long(upgraded, output, capacity)
+            : tilefinch_url_upgrade_to_https(upgraded, output, capacity);
     }
-    return tilefinch_url_normalize(
-        upgraded, output, TILEFINCH_URL_SERIALIZED_LIMIT);
+    return long_hop ? tilefinch_url_normalize_long(upgraded, output, capacity)
+                    : tilefinch_url_normalize(upgraded, output, capacity);
+}
+
+static bool fetch_request_prepare_security_url_with_session(
+    const FetchRequest *request, BrowserSession *security_session,
+    const char *url,
+    bool upgrade_initial_insecure_request,
+    char output[TILEFINCH_URL_SERIALIZED_LIMIT])
+{
+    char upgraded[TILEFINCH_URL_SERIALIZED_LIMIT];
+    return fetch_request_prepare_security_url_sized(
+        request, security_session, url, upgrade_initial_insecure_request,
+        output, upgraded, TILEFINCH_URL_SERIALIZED_LIMIT, false);
 }
 
 static bool fetch_request_prepare_security_url(
@@ -405,7 +441,7 @@ static bool fetch_request_target_allowed_for(
     TilefinchUrl initiator;
     TilefinchUrl target;
     if (!tilefinch_url_parse(initiator_url, &initiator)
-        || !tilefinch_url_parse(target_url, &target)) return false;
+        || !tilefinch_url_parse_long(target_url, &target)) return false;
     if (initiator.scheme != TILEFINCH_URL_SCHEME_HTTPS
         || target.scheme != TILEFINCH_URL_SCHEME_HTTP
         || tilefinch_url_potentially_trustworthy(target_url)) {
@@ -896,6 +932,10 @@ bool fetch_origin_blocked(const char *url)
 {
     if (fetch_blocked_origin_count == 0 || url == NULL) return false;
     char origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
+    /* An address that does not parse answers "not blocked" here (and
+       below). Unreachable today: every caller passes a hop the hop machine
+       has already normalized, which parses. A new caller with raw input
+       must refuse what does not parse first. */
     if (!tilefinch_url_origin(url, origin, sizeof(origin))) return false;
     const char *host = strstr(origin, "://");
     host = host == NULL ? origin : host + 3;
@@ -911,7 +951,8 @@ bool fetch_origin_blocked(const char *url)
                                    entry_host_length)) continue;
         if (path == NULL) return true;
         if (!have_path) {
-            if (!tilefinch_url_parse(url, &parsed)) return false;
+            /* Fails open, as above: the address parsed for its origin. */
+            if (!tilefinch_url_parse_long(url, &parsed)) return false;
             have_path = true;
         }
         size_t prefix_length = strlen(path);

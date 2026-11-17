@@ -109,8 +109,11 @@ const char *psp_ui_action_name(PspUiAction action)
         case PSP_UI_ACTION_HEAVY_RUN_ALWAYS: return "heavy-run-always";
         case PSP_UI_ACTION_HEAVY_CANCEL: return "heavy-cancel";
         case PSP_UI_ACTION_HEAVY_STOP_SCRIPTS: return "heavy-stop-scripts";
+        case PSP_UI_ACTION_HEAVY_FRAME_START: return "heavy-frame-start";
+        case PSP_UI_ACTION_HEAVY_FRAME_NOT_NOW: return "heavy-frame-not-now";
         case PSP_UI_ACTION_SCRIPTS_OFF_ACCEPT: return "scripts-off-accept";
         case PSP_UI_ACTION_SCRIPTS_OFF_DECLINE: return "scripts-off-decline";
+        case PSP_UI_ACTION_TRY_FULL_PAGE: return "try-full-page";
         case PSP_UI_ACTION_EXIT: return "exit";
     }
     return "unknown";

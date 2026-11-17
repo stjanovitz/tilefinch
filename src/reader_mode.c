@@ -156,11 +156,25 @@ typedef struct {
     uint32_t visible_text_bytes;
     uint16_t retained_forms;
     uint16_t retained_controls;
+    /* Basic only: visible form controls the view leaves out, and those it
+       keeps (selects, text areas and inputs other than hidden ones, the
+       kinds dropped_controls counts). */
+    uint16_t dropped_controls;
+    uint16_t kept_visible_controls;
     uint16_t mapped_anchors;
     bool truncated;
     bool tail_mode;
     bool basic_mode;
     bool bounded_out;
+    /* Basic only: inline content (text, an image or a control) sits on the
+       current line since the last block boundary, and a flattened block
+       wrapper (div and its kind) ended on such a line. Unstyled HTML lays
+       those wrappers out as blocks; the view keeps their line breaks so a
+       story card's label, headline and summary do not run together. */
+    bool line_open;
+    bool break_pending;
+    /* Basic only: emitted anchors currently open around the walk. */
+    uint16_t link_depth;
     lxb_dom_node_t *promoted[3];
     lxb_dom_node_t *reading_parts[3];
     lxb_dom_node_t *reading_root;
@@ -618,9 +632,30 @@ static bool reader_collapsed_disclosure(lxb_dom_node_t *node)
     return false;
 }
 
+static bool reader_hidden_attributes(lxb_dom_node_t *node);
+
 static bool reader_hidden_element(lxb_dom_node_t *node)
 {
     if (reader_tag_classes(node) & READER_TAG_HIDDEN) return true;
+    return reader_hidden_attributes(node);
+}
+
+/* A document parsed with scripting disabled (a script-free load, such as
+   Basic view by default) has <noscript> content parsed as markup and
+   rendered, as in any browser with scripts off: often the page's only
+   full-size images. Reader and Basic view keep it there; everywhere else
+   it stays hidden, as the page itself hides it. */
+static bool reader_hidden_element_in(const PocDocument *document,
+                                     lxb_dom_node_t *node)
+{
+    if (document != NULL && document->noscript_rendered
+        && document_node_is_tag(node, LXB_TAG_NOSCRIPT))
+        return reader_hidden_attributes(node);
+    return reader_hidden_element(node);
+}
+
+static bool reader_hidden_attributes(lxb_dom_node_t *node)
+{
     size_t length = 0;
     if (reader_has_attribute(node, "hidden")
         && !reader_collapsed_disclosure(node)) return true;
@@ -963,6 +998,20 @@ static bool reader_extract_append(ReaderExtractBuffer *output,
     return true;
 }
 
+_Static_assert(READER_EXTRACT_NODE_CEILING == READER_EXTRACT_NODE_CEILING_PUBLIC,
+               "extracted-view node ceiling diverged");
+
+size_t reader_extract_node_bound(const Budget *budget)
+{
+    size_t remaining = budget == NULL ? 0u : budget_remaining(budget);
+    size_t room = remaining > READER_EXTRACT_RESERVE_BYTES
+        ? remaining - READER_EXTRACT_RESERVE_BYTES : 0u;
+    size_t extra = room / READER_EXTRACT_NODE_COST;
+    if (extra > READER_EXTRACT_NODE_CEILING - READER_EXTRACT_NODE_FLOOR)
+        extra = READER_EXTRACT_NODE_CEILING - READER_EXTRACT_NODE_FLOOR;
+    return READER_EXTRACT_NODE_FLOOR + extra;
+}
+
 /* Fix one preparation's emitted bounds from the budget's free room and
    allocate the initial markup buffer. */
 static bool reader_extract_begin(ReaderExtractBuffer *output,
@@ -975,13 +1024,7 @@ static bool reader_extract_begin(ReaderExtractBuffer *output,
         .next_node_cooperate_at = READER_NODE_WORK_SLICE,
         .basic_mode = basic_mode
     };
-    size_t remaining = budget_remaining(document->budget);
-    size_t room = remaining > READER_EXTRACT_RESERVE_BYTES
-        ? remaining - READER_EXTRACT_RESERVE_BYTES : 0u;
-    size_t extra = room / READER_EXTRACT_NODE_COST;
-    if (extra > READER_EXTRACT_NODE_CEILING - READER_EXTRACT_NODE_FLOOR)
-        extra = READER_EXTRACT_NODE_CEILING - READER_EXTRACT_NODE_FLOOR;
-    output->node_limit = READER_EXTRACT_NODE_FLOOR + extra;
+    output->node_limit = reader_extract_node_bound(document->budget);
     size_t bytes = output->node_limit * READER_EXTRACT_BYTES_PER_NODE;
     if (bytes < READER_EXTRACT_BYTE_FLOOR) bytes = READER_EXTRACT_BYTE_FLOOR;
     if (bytes > READER_EXTRACT_BYTE_CEILING)
@@ -1499,6 +1542,44 @@ static bool reader_extract_separator(ReaderExtractBuffer *output)
     return reader_extract_append(output, " ", 1u);
 }
 
+/* Basic view's line model: tags that start and end a line of their own. */
+static bool reader_basic_block_tag(const char *tag)
+{
+    static const char *const tags[] = {
+        "p", "div", "li", "ul", "ol", "dl", "dt", "dd", "h1", "h2", "h3",
+        "h4", "h5", "h6", "header", "footer", "section", "article", "aside",
+        "main", "nav", "details", "summary", "table", "tr", "td", "th",
+        "thead", "tbody", "tfoot", "caption", "blockquote", "figure",
+        "figcaption", "pre", "hr", "br", "form", "fieldset", "legend",
+        "address", "hgroup", "center", "dialog", "menu"
+    };
+    if (tag == NULL) return false;
+    for (size_t i = 0; i < sizeof(tags) / sizeof(tags[0]); i++)
+        if (strcmp(tag, tags[i]) == 0) return true;
+    return false;
+}
+
+/* End Basic view's current line with a <br> when inline content is on it.
+   A full node bound degrades to the ordinary word separator. */
+static bool reader_basic_line_break(ReaderExtractBuffer *output)
+{
+    output->break_pending = false;
+    if (!output->line_open) return true;
+    if (output->nodes >= output->node_limit)
+        return reader_extract_separator(output);
+    if (!reader_extract_literal(output, "<br>")) return false;
+    output->nodes++;
+    output->line_open = false;
+    return true;
+}
+
+static bool reader_text_has_content(const char *text, size_t length)
+{
+    for (size_t i = 0; i < length; i++)
+        if (!isspace((unsigned char) text[i])) return true;
+    return false;
+}
+
 static bool reader_flattened_block_wrapper(lxb_dom_node_t *node)
 {
     return document_node_is_tag(node, LXB_TAG_ADDRESS) || document_node_is_tag(node, LXB_TAG_CENTER)
@@ -1672,6 +1753,57 @@ static bool reader_image_style_hidden(ReaderExtractBuffer *output,
     return hidden || (has_parent && style.visibility_hidden);
 }
 
+/* The controls Basic view counts as dropped when it leaves them out:
+   selects, text areas and inputs other than hidden ones. */
+static bool reader_basic_visible_control(lxb_dom_node_t *node)
+{
+    return document_node_is_tag(node, LXB_TAG_SELECT)
+        || document_node_is_tag(node, LXB_TAG_TEXTAREA)
+        || (document_node_is_tag(node, LXB_TAG_INPUT)
+            && !reader_attribute_equals_ci_trimmed(node, "type", "hidden"));
+}
+
+/* The visible controls under ROOT, for a Basic view its bound cut short:
+   the walk never reached those after the cut, and a form it withdrew took
+   its controls with it. Hidden subtrees are skipped as the walk skips
+   them; a select's or text area's contents are not searched. Bounded and
+   cooperative like the walk; *BOUNDED says it stopped early. */
+static uint32_t reader_basic_visible_controls(lxb_dom_node_t *root,
+                                              bool *bounded)
+{
+    uint32_t count = 0;
+    size_t visited = 0, next_cooperate_at = READER_NODE_WORK_SLICE;
+    lxb_dom_node_t *node = root == NULL ? NULL : root->first_child;
+    while (node != NULL) {
+        if (++visited > 4u * READER_BASIC_VISIT_LIMIT) {
+            *bounded = true;
+            break;
+        }
+        if (visited >= next_cooperate_at) {
+            if (!tilefinch_platform_cooperate("reader-basic-controls",
+                                              visited)) {
+                *bounded = true;
+                break;
+            }
+            next_cooperate_at += READER_NODE_WORK_SLICE;
+        }
+        bool descend = false;
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && !reader_hidden_element(node)) {
+            if (reader_basic_visible_control(node)) count++;
+            else descend = !document_node_is_tag(node, LXB_TAG_SELECT)
+                && !document_node_is_tag(node, LXB_TAG_TEXTAREA);
+        }
+        if (descend && node->first_child != NULL) {
+            node = node->first_child;
+            continue;
+        }
+        while (node != root && node->next == NULL) node = node->parent;
+        node = node == root ? NULL : node->next;
+    }
+    return count;
+}
+
 static bool reader_extract_node(ReaderExtractBuffer *output,
                                 lxb_dom_node_t *node, size_t depth,
                                 bool in_admitted_form,
@@ -1709,8 +1841,22 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
         size_t checkpoint = output->length;
         if (text == NULL) return true;
         bool meaningful = false;
+        bool text_line_open = output->line_open;
+        bool text_break_pending = output->break_pending;
+        size_t text_nodes = output->nodes;
+        if (output->basic_mode && output->break_pending
+            && reader_text_has_content(text, length)
+            && !reader_basic_line_break(output)) {
+            if (!output->truncated) return false;
+            reader_extract_rewind(output, checkpoint);
+            output->nodes = text_nodes;
+            output->line_open = text_line_open;
+            output->break_pending = text_break_pending;
+            return true;
+        }
         if (reader_extract_escaped(
                 output, text, length, false, &meaningful)) {
+            if (meaningful && output->basic_mode) output->line_open = true;
             if (meaningful) {
                 output->visible_text_bytes = reader_add_u32(
                     output->visible_text_bytes,
@@ -1721,10 +1867,13 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
         }
         if (!output->truncated) return false;
         reader_extract_rewind(output, checkpoint);
+        output->nodes = text_nodes;
+        output->line_open = text_line_open;
+        output->break_pending = text_break_pending;
         return true;
     }
     if (node->type != LXB_DOM_NODE_TYPE_ELEMENT
-        || reader_hidden_element(node)
+        || reader_hidden_element_in(output->document, node)
         || reader_engine_media_marker(output->document, node)
         || (!output->basic_mode
             && reader_excluded_region(output->document, node)))
@@ -1742,6 +1891,7 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
        bound cuts through can be withdrawn whole (see below). */
     const uint16_t forms_checkpoint = output->retained_forms;
     const uint16_t controls_checkpoint = output->retained_controls;
+    const uint16_t kept_visible_checkpoint = output->kept_visible_controls;
     bool admitted_form = in_admitted_form;
     if (document_node_is_tag(node, LXB_TAG_FORM)) {
         admitted_form = false;
@@ -1767,7 +1917,11 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
     /* An unretained chooser is not prose. Flattening its option labels can
        put hundreds of hidden choices ahead of the page's actual content.
        Keep ordinary button text, but omit unusable select subtrees whole. */
-    if (document_node_is_tag(node, LXB_TAG_SELECT) && !basic_control_safe) return true;
+    if (document_node_is_tag(node, LXB_TAG_SELECT) && !basic_control_safe) {
+        if (output->basic_mode && output->dropped_controls < UINT16_MAX)
+            output->dropped_controls++;
+        return true;
+    }
     bool counted_control = basic_control_safe && output->basic_mode
         && admitted_form
         && (document_node_is_tag(node, LXB_TAG_INPUT)
@@ -1787,6 +1941,14 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
         ? reader_extract_tag(
               node, output->basic_mode, admitted_form, basic_control_safe)
         : NULL;
+    if (output->basic_mode && reader_basic_visible_control(node)) {
+        if (tag == NULL) {
+            if (output->dropped_controls < UINT16_MAX)
+                output->dropped_controls++;
+        } else if (output->kept_visible_controls < UINT16_MAX) {
+            output->kept_visible_controls++;
+        }
+    }
     if (output->basic_mode && document_node_is_tag(node, LXB_TAG_TABLE)) {
         bool cancelled = false;
         in_layout_table = reader_layout_table(node, &cancelled);
@@ -1819,6 +1981,12 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
            surrounding prose remain; omit the broken visual entirely. */
         if (image_source_is_placeholder(image_source, image_source_length)) tag = NULL;
     }
+    /* A paragraph inside a link (a card or menu item wrapping its text in
+       <p>) would split the link around a block. Basic view flattens it like
+       a div: the link stays one inline run and keeps its line breaks. */
+    bool link_paragraph = output->basic_mode && tag != NULL
+        && output->link_depth != 0u && strcmp(tag, "p") == 0;
+    if (link_paragraph) tag = NULL;
     bool emitted = tag != NULL;
     size_t flattened_id_length = 0;
     const char *flattened_id = emitted ? NULL
@@ -1829,7 +1997,8 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
     if (flattened_id != NULL
         && flattened_id_length > READER_ANCHOR_VALUE_LIMIT)
         output->bounded_out = true;
-    bool separated_wrapper = !emitted && reader_flattened_block_wrapper(node);
+    bool separated_wrapper = !emitted
+        && (link_paragraph || reader_flattened_block_wrapper(node));
     size_t node_cost = (emitted || marker_emitted ? 1u : 0u)
         + (folded_navigation ? 2u : 0u);
     if (node_cost > output->node_limit - output->nodes) {
@@ -1843,13 +2012,33 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
     size_t checkpoint = output->length;
     size_t nodes_checkpoint = output->nodes;
     uint16_t anchors_checkpoint = output->mapped_anchors;
+    bool line_open_checkpoint = output->line_open;
+    bool break_pending_checkpoint = output->break_pending;
+    bool basic_lines = output->basic_mode && !in_admitted_form;
+    bool block_tag = emitted && reader_basic_block_tag(tag);
+    if (basic_lines && emitted) {
+        if (block_tag) {
+            output->line_open = false;
+            output->break_pending = false;
+        } else if (output->break_pending
+                   && !reader_basic_line_break(output)) {
+            goto append_failed;
+        }
+    }
+    if (folded_navigation && output->basic_mode) {
+        output->line_open = false;
+        output->break_pending = false;
+    }
     /* Independent adjacent links must remain separate after their layout
        wrappers disappear. Do not insert spaces between ordinary inline
        spans: authors also use those to split a single word. */
     if (emitted && strcmp(tag, "a") == 0 && reader_previous_ends_link(node)
         && !reader_extract_separator(output)) goto append_failed;
-    if (separated_wrapper && !reader_extract_separator(output))
+    if (separated_wrapper && basic_lines && output->line_open) {
+        if (!reader_basic_line_break(output)) goto append_failed;
+    } else if (separated_wrapper && !reader_extract_separator(output)) {
         goto append_failed;
+    }
     if (layout_cell && !reader_extract_separator(output)) goto append_failed;
     if (folded_navigation) {
         size_t label_length = 0;
@@ -2033,6 +2222,8 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
         if (!reader_extract_append(output, ">", 1u)) goto append_failed;
         output->nodes++;
     }
+    bool link_opened = output->basic_mode && emitted && strcmp(tag, "a") == 0;
+    if (link_opened) output->link_depth++;
     bool meaningful = emitted
         && (strcmp(tag, "img") == 0 || strcmp(tag, "video") == 0
             || strcmp(tag, "audio") == 0 || strcmp(tag, "form") == 0
@@ -2089,6 +2280,13 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
             meaningful = meaningful || child_meaningful;
         }
     }
+    if (link_opened) output->link_depth--;
+    /* Replaced content and controls are inline content of the line. */
+    if (basic_lines && emitted && !block_tag
+        && (strcmp(tag, "img") == 0 || strcmp(tag, "video") == 0
+            || strcmp(tag, "audio") == 0 || strcmp(tag, "input") == 0
+            || strcmp(tag, "select") == 0 || strcmp(tag, "textarea") == 0
+            || strcmp(tag, "button") == 0)) output->line_open = true;
     if (output->truncated && emitted && strcmp(tag, "form") == 0) {
         /* A shortened Basic view may end mid-page, but never mid-form: a
            form missing the controls after the cut would submit a different
@@ -2098,6 +2296,9 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
         output->mapped_anchors = anchors_checkpoint;
         output->retained_forms = forms_checkpoint;
         output->retained_controls = controls_checkpoint;
+        output->kept_visible_controls = kept_visible_checkpoint;
+        output->line_open = line_open_checkpoint;
+        output->break_pending = break_pending_checkpoint;
         return true;
     }
     if (emitted && strcmp(tag, "img") != 0 && strcmp(tag, "source") != 0
@@ -2113,12 +2314,18 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
         }
         output->tail_mode = previous_tail_mode;
     }
+    if (block_tag && output->basic_mode) {
+        output->line_open = false;
+        output->break_pending = false;
+    }
     if (folded_navigation) {
         bool previous_tail_mode = output->tail_mode;
         if (output->truncated) output->tail_mode = true;
         bool closed = reader_extract_literal(output, "</details>");
         output->tail_mode = previous_tail_mode;
         if (!closed) return false;
+        output->line_open = false;
+        output->break_pending = false;
     }
     if (!output->truncated && emitted && !meaningful
         && !retained_anchor_identity
@@ -2126,10 +2333,14 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
         reader_extract_rewind(output, checkpoint);
         output->nodes = nodes_checkpoint;
         output->mapped_anchors = anchors_checkpoint;
+        output->line_open = line_open_checkpoint;
+        output->break_pending = break_pending_checkpoint;
         return true;
     }
     if (!output->truncated && separated_wrapper
         && !reader_extract_separator(output)) goto append_failed;
+    if (separated_wrapper && basic_lines && meaningful && output->line_open)
+        output->break_pending = true;
     if (meaningful_content != NULL) *meaningful_content = meaningful;
     return true;
 
@@ -2138,6 +2349,8 @@ append_failed:
     reader_extract_rewind(output, checkpoint);
     output->nodes = nodes_checkpoint;
     output->mapped_anchors = anchors_checkpoint;
+    output->line_open = line_open_checkpoint;
+    output->break_pending = break_pending_checkpoint;
     return true;
 }
 
@@ -3057,7 +3270,7 @@ static bool reader_document_prepare_internal(
                 okay = false;
                 break;
             }
-            bool hidden = reader_hidden_element(node);
+            bool hidden = reader_hidden_element_in(document, node);
             bool style_hidden = false;
             if (style_stack != NULL) {
                 const ComputedStyle *parent_style = depth == 0
@@ -3518,6 +3731,21 @@ static bool reader_document_prepare_basic_internal(
         meaningful = meaningful || child_meaningful;
     }
     reader_image_style_chain_release(&output);
+    /* A view the bound cut short leaves out the controls after the cut,
+       and those of a form it withdrew (reader_extract_node): count them as
+       dropped too, so a caller that needs every control
+       (psp_basic_default_presentable) is not shown a view without them. */
+    if (okay && output.truncated) {
+        bool controls_bounded = false;
+        uint32_t visible = reader_basic_visible_controls(body,
+                                                         &controls_bounded);
+        if (visible > output.kept_visible_controls) {
+            uint32_t missing = visible - output.kept_visible_controls;
+            if (missing > output.dropped_controls)
+                output.dropped_controls = missing > UINT16_MAX
+                    ? UINT16_MAX : (uint16_t) missing;
+        }
+    }
     /* Complete admission refuses any omitted action (form, control,
        select option or anchor: bounded_out), but a view shortened by its
        emitted node or byte bound is a balanced, honestly labeled prefix and
@@ -3542,6 +3770,7 @@ static bool reader_document_prepare_basic_internal(
     analysis->extracted_nodes = output.nodes > UINT16_MAX
         ? UINT16_MAX : (uint16_t) output.nodes;
     analysis->retained_forms = output.retained_forms;
+    analysis->dropped_controls = output.dropped_controls;
     analysis->mapped_anchors = output.mapped_anchors;
     analysis->bounded_out = output.bounded_out
         || (output.truncated && !require_complete);

@@ -2625,6 +2625,25 @@ typedef struct {
     uint64_t selector_attribute_generation;
     bool selector_attribute_names_ready;
     bool selector_attribute_names_opaque;
+    /* Whether any declaration reads an attribute through attr() (generated
+       content, or a var()-dependent declaration naming attr()), found on the
+       first stylesheet_declarations_read_attribute() query for this build
+       generation and declaration count. */
+    uint64_t attribute_reader_generation;
+    size_t attribute_reader_declarations;
+    bool attribute_readers_ready;
+    bool attribute_readers_present;
+    /* stylesheet_attribute_selectors_subject_only() answers for the last
+       few attribute names, valid for one build generation and rule counts. */
+    uint64_t subject_attribute_generation;
+    size_t subject_attribute_rules;
+    size_t subject_attribute_custom_rules;
+    struct {
+        char name[23];
+        bool subject_only;
+    } subject_attribute_memo[6];
+    uint8_t subject_attribute_memo_count;
+    uint8_t subject_attribute_memo_next;
     bool document_rules_deferred;
     const DocumentRegisteredProperty *api_registrations;
     bool rule_batch_active;
@@ -3103,6 +3122,26 @@ bool style_focus_change_is_outline_only(
    set cached per sheet generation, so each query is a binary search. */
 bool stylesheet_selectors_reference_attribute_prefix(
     const Stylesheet *sheet, const char *name, size_t name_length);
+/* Whether some declaration may read attribute `name` through attr(): a
+   generated-content attr() naming it, or any var()-dependent declaration
+   naming attr() (its final name is known only at match time). True without
+   a sheet. A sheet with no attr() at all answers from a flag cached per
+   build generation and declaration count. */
+bool stylesheet_declarations_read_attribute(
+    const Stylesheet *sheet, const char *name, size_t name_length);
+/* Whether every selector test of attribute `name` (exact, ASCII case
+   folded) sits at the top level of a rule's subject compound: outside
+   :is()/:not()/:has()/:nth-*(of), with no combinator after it and no
+   pseudo-element, and in no custom-property rule. Then changing that
+   attribute on an element can change only that element's own computed
+   style. False for anything the scan cannot parse (escapes, namespaces)
+   and without a sheet. */
+bool stylesheet_attribute_selectors_subject_only(
+    const Stylesheet *sheet, const char *name, size_t name_length);
+/* Whether two resolved styles are the same computed values (paint stacks
+   compared by content, not by interned slot). */
+bool computed_style_same(const Stylesheet *sheet, const ComputedStyle *left,
+                         const ComputedStyle *right);
 /* Two bits of a 64-bit set for one custom-property name (ASCII case
    folded, so a journal's lowercased name finds the author's spelling). A
    set that lacks either bit of a name never read it. */

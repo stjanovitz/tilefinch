@@ -1,6 +1,6 @@
 # Private account lab
 
-Two host tools let a maintainer sign the interactive lab into a dedicated,
+Three host tools let a maintainer sign the interactive lab into a dedicated,
 disposable test account without putting account values in chat, command
 scripts, shell arguments or captures. Use them only with such an account,
 never a main account. Build the release host lab first.
@@ -21,6 +21,35 @@ never a main account. Build the release host lab first.
   copies, and OS swap and image-viewer caches are outside the tools'
   protection. After testing, sign out or revoke the test session from the
   account's security settings.
+
+## Quick sign-in test
+
+```sh
+scripts/try-signin.py            # YouTube sign-in, the PSP's journey
+scripts/try-signin.py --google   # plain Google sign-in
+```
+
+One command for checking a sign-in fix. It rebuilds the release host lab if
+sources changed, opens the sign-in page in the private lab, asks for the
+email (shown as typed) and the password (hidden) in macOS dialogs, and submits each once. It then
+lets redirects and the landing page finish and saves the sign-in diagnostics
+report: the same counts and fixed classes as the PSP's Diagnostic QR
+([DIAGNOSTIC_QR.md](../DIAGNOSTIC_QR.md)), with the commit, the class of the
+final origin (`accounts`, `youtube` or `other`, so a third-party identity
+provider is not named) and the step names. Reports go to
+`.private-investigations/signin-tests/`, one folder per run. No URL path,
+form value or cookie value is written.
+
+A short menu follows:
+- `b` lists the page's buttons (Continue, Not now, ...) and presses the one you pick; after the password this list comes up by itself while the page is still on Google. Only buttons you could reach on the PSP are listed (shown, enabled, on the page and not clipped away), with control characters removed. The lab writes the labels to an owner-only file in the run's private folder; the script reads and deletes it at once and shows the labels only in the terminal, never in a report;
+- `v` views the page with form contents blanked;
+- `w` waits longer, for example after approving a phone prompt, and saves a
+  new report;
+- `y` opens the YouTube feed and saves a report;
+- `q` quits and discards the cookies.
+
+Nothing is retried. Verification codes are not handled: use the console
+below for those.
 
 ## Interactive launcher
 

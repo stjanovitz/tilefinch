@@ -4649,6 +4649,10 @@ JS_RT_GUARDED_NATIVE(, js_dom_set_attribute)(JSContext *context,
         && (!old_present || old_value == NULL
             || bridge_style_text_is_geometry(
                    (const char *) old_value, old_value_length));
+    JsRtGeometryAttributeWrite geometry_write;
+    bool preserve_geometry = !unchanged_selector_identity
+        && js_rt_geometry_attribute_write_begin(
+               bridge, node, name, name_length, &geometry_write);
     document_style_quiet_begin();
     lxb_dom_attr_t *attribute = lxb_dom_element_set_attribute(
         lxb_dom_interface_element(node), (const lxb_char_t *) name,
@@ -4672,6 +4676,8 @@ JS_RT_GUARDED_NATIVE(, js_dom_set_attribute)(JSContext *context,
                 name, name_length, relational_selector_sensitive,
                 changed_tokens_exact ? changed_tokens : NULL,
                 changed_token_count);
+            if (preserve_geometry)
+                js_rt_geometry_attribute_write_end(bridge, &geometry_write);
         }
         ScriptElementState *state = js_rt_script_element_state_find(bridge, node);
         if (async_attribute && state != NULL && state->programmatic
@@ -4836,6 +4842,10 @@ JS_RT_GUARDED_NATIVE(, js_dom_remove_attribute)(JSContext *context,
         script_element_state_pin_parser_started(
             bridge, node, name, name_length);
     }
+    JsRtGeometryAttributeWrite geometry_write;
+    bool preserve_geometry = existed
+        && js_rt_geometry_attribute_write_begin(
+               bridge, node, name, name_length, &geometry_write);
     document_style_quiet_begin();
     lxb_status_t status = lxb_dom_element_remove_attribute(
         lxb_dom_interface_element(node), (const lxb_char_t *) name,
@@ -4848,6 +4858,8 @@ JS_RT_GUARDED_NATIVE(, js_dom_remove_attribute)(JSContext *context,
             name, name_length, relational_selector_sensitive,
             changed_tokens_exact ? changed_tokens : NULL,
             changed_token_count);
+        if (preserve_geometry)
+            js_rt_geometry_attribute_write_end(bridge, &geometry_write);
         if (node->local_name == LXB_TAG_IMG
             && (bridge_mutation_name_equal(name, name_length, "src")
                 || bridge_mutation_name_equal(name, name_length, "srcset")

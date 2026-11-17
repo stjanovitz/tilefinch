@@ -5,7 +5,18 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* What an address fits, terminator included: every URL buffer, the parser
+   and every function below that writes an address keep this bound. */
 #define TILEFINCH_URL_SERIALIZED_LIMIT 2048
+/* What an intermediate hop of a navigation's redirect chain may be. Sign-in
+   hand-overs put one-time tokens of several kilobytes in a Location. Only
+   the fetch hop machine holds such an address, in a budget-owned string
+   built with the _long writers below; the rules a hop must pass read it
+   with tilefinch_url_parse_long, and the checks that answer with an origin
+   or a yes/no (origin, same-origin, site, downgrade, trustworthy) accept
+   it. Everything else keeps TILEFINCH_URL_SERIALIZED_LIMIT: the document a
+   chain ends on must fit it. */
+#define TILEFINCH_URL_LONG_LIMIT 8192
 #define TILEFINCH_ORIGIN_SERIALIZED_LIMIT 320
 
 typedef enum {
@@ -40,6 +51,10 @@ typedef struct {
 } TilefinchUrl;
 
 bool tilefinch_url_parse(const char *value, TilefinchUrl *url);
+/* The same view of an address up to TILEFINCH_URL_LONG_LIMIT - 1 bytes, for
+   code a redirect hop's address passes through. A caller reads the view in
+   place; one that copies it bounds the copy itself. */
+bool tilefinch_url_parse_long(const char *value, TilefinchUrl *url);
 bool tilefinch_url_is_secure(const TilefinchUrl *url);
 /* Secure-context transport gate used for fingerprinting-sensitive browser
    metadata. HTTPS is trustworthy; HTTP is accepted only for localhost and
@@ -56,10 +71,22 @@ bool tilefinch_url_request_key(const char *value, char *output,
                             size_t output_size);
 bool tilefinch_url_resolve(const char *base, const char *reference,
                         char *output, size_t output_size);
+/* The same three writers for a redirect hop: an input or a result may be up
+   to TILEFINCH_URL_LONG_LIMIT - 1 bytes. The plain writers refuse any input
+   of TILEFINCH_URL_SERIALIZED_LIMIT bytes or more, whatever the output
+   buffer holds. */
+bool tilefinch_url_normalize_long(const char *value, char *output,
+                                  size_t output_size);
+bool tilefinch_url_request_key_long(const char *value, char *output,
+                                    size_t output_size);
+bool tilefinch_url_resolve_long(const char *base, const char *reference,
+                                char *output, size_t output_size);
 /* Rewrites an absolute HTTP URL to HTTPS without a downgrade fallback.
    An explicit :80 is mapped to :443; other explicit ports are retained. */
 bool tilefinch_url_upgrade_to_https(const char *value, char *output,
                                     size_t output_size);
+bool tilefinch_url_upgrade_to_https_long(const char *value, char *output,
+                                         size_t output_size);
 
 /* Schemeful site identity: scheme plus the PSL-derived registrable domain.
    Ports do not split a site. IP literals, single-label hosts, and inputs with

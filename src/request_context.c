@@ -60,7 +60,8 @@ static bool request_context_parse(const TilefinchRequestContext *context,
         || (unsigned) context->mode > TILEFINCH_REQUEST_MODE_NO_CORS
         || (unsigned) context->credentials > TILEFINCH_CREDENTIALS_INCLUDE
         || !request_destination_valid(context->destination)
-        || !tilefinch_url_parse(context->target_url, target)
+        /* The target may be a redirect chain's long hop. */
+        || !tilefinch_url_parse_long(context->target_url, target)
         || (context->initiator_url != NULL
             && !tilefinch_url_parse(context->initiator_url, initiator))
         || (top_url != NULL && top_url != context->initiator_url

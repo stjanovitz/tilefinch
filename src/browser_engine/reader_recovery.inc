@@ -276,6 +276,25 @@ bool browser_engine_analyze_reader(
         &engine->navigation.page.stylesheet, analysis);
 }
 
+/* A fresh Basic view came out shortened by its memory-scaled bound while
+   the page's live scripts hold at least 1 MiB of heap (another 1,024 nodes
+   once freed). */
+#define BROWSER_BASIC_RECLAIM_MIN_HEAP (1024u * 1024u)
+static bool browser_engine_basic_view_reclaim_due(
+    const BrowserEngine *engine, const ReaderDocumentAnalysis *prepared)
+{
+    const NavigationPage *page = &engine->navigation.page;
+    if (!prepared->extraction_truncated || prepared->kind != READER_PAGE_BASIC
+        || page->runtime == NULL
+        || reader_extract_node_bound(page->document.budget)
+               >= READER_EXTRACT_NODE_CEILING_PUBLIC) return false;
+    size_t held = script_runtime_heap_used(page->runtime);
+    for (size_t frame = 0; frame < page->frame_count; frame++)
+        if (page->frames[frame].runtime != NULL)
+            held += script_runtime_heap_used(page->frames[frame].runtime);
+    return held >= BROWSER_BASIC_RECLAIM_MIN_HEAP;
+}
+
 bool browser_engine_prepare_basic_view(
     BrowserEngine *engine, ReaderDocumentAnalysis *analysis)
 {
@@ -306,6 +325,7 @@ bool browser_engine_prepare_basic_view(
         return false;
     }
     ReaderDocumentAnalysis prepared = {0};
+    bool scripts_stopped = false;
     if (!reader_document_prepare_basic_complete_with_layout(
             &engine->navigation.page.document,
             &engine->navigation.page.stylesheet,
@@ -314,7 +334,38 @@ bool browser_engine_prepare_basic_view(
         if (analysis != NULL) *analysis = prepared;
         return false;
     }
-    if (analysis != NULL) *analysis = prepared;
+    if (browser_engine_basic_view_reclaim_due(engine, &prepared)) {
+        /* Shown, this view retires the page's scripts anyway; their heap is
+           what shortened it. Stop them first (as Stop page scripts does)
+           and prepare again with the room they held, so a script-heavy
+           page's view is not cut at the floor. Nothing was presented yet,
+           and the raw page stays usable if the second preparation fails. */
+        if (reader_document_discard_prepared_view(
+                &engine->navigation.page.document, READER_PAGE_BASIC)
+            && browser_engine_stop_page_scripts(engine)) {
+            prepared = (ReaderDocumentAnalysis) {0};
+            if (!reader_document_prepare_basic_complete_with_layout(
+                    &engine->navigation.page.document,
+                    &engine->navigation.page.stylesheet,
+                    &engine->navigation.page.layout, &prepared)) {
+                if (analysis != NULL) {
+                    *analysis = prepared;
+                    analysis->scripts_stopped = true;
+                }
+                return false;
+            }
+            scripts_stopped = true;
+        } else {
+            if (analysis != NULL) *analysis = (ReaderDocumentAnalysis) {
+                .prepared = true, .bounded_out = true
+            };
+            return false;
+        }
+    }
+    if (analysis != NULL) {
+        *analysis = prepared;
+        analysis->scripts_stopped = scripts_stopped;
+    }
     /* A Basic view shortened by its emit bound is admitted (and labeled);
        an omitted action is not. */
     if (prepared.kind != READER_PAGE_BASIC || prepared.bounded_out)

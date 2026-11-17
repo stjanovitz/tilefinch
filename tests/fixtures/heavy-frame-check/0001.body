@@ -1,0 +1,1 @@
+<!doctype html><html><head><title>Check</title><script defer src="/check/check.js"></script></head><body><p>Verification required.</p><script>parent.postMessage("cookie:"+document.cookie,"*");document.cookie="seen=script;path=/";document.querySelector("script[src]").onerror=function(){parent.postMessage("check-refused","*")}</script></body></html>

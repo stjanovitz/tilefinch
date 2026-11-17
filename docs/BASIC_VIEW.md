@@ -41,8 +41,13 @@ Navigation and site-banner landmarks (`nav`, `role="navigation"` or
 page's `aria-label` when supplied. Their links remain available without
 JavaScript, while the main content and search form no longer sit behind
 several screens of menu links. Ordinary inline word fragments stay joined;
-adjacent independent links get a word boundary. A select that is not kept is
-omitted rather than printing its entire option list.
+adjacent independent links get a word boundary. Generic block wrappers such
+as `div` are dropped but still end a line when text sits on either side, as
+unstyled HTML would show them, so a story card's label, headline and summary
+stay on separate lines instead of running into one paragraph; a paragraph
+inside a link is flattened the same way, so a menu item stays on its
+bullet's line. A select that is not kept is omitted rather than printing its
+entire option list.
 
 Tables used to arrange navigation or page columns become ordinary stacked
 blocks, instead of squeezing stories into narrow equal-width cells. Tables
@@ -62,6 +67,11 @@ disclosures; hidden prose remains recoverable. Meaningful embedded images
 remain visible. Lazy images use the same source selection and resource
 permissions as the full page, including after a view switch; the browser
 never guesses an alternative image URL.
+On a page loaded without its scripts (such as a site that opens in Basic
+view by default), the content a page provides in `<noscript>` for browsers
+without JavaScript is shown by the page and kept by Basic view, often the
+only full-size pictures of a lazy-loading front page. On a page that ran
+scripts, `<noscript>` content stays hidden in both, as in any browser.
 
 Basic view does not infer behavior from button text, classes, test IDs or
 click-handler-shaped markup. `POST` forms, buttons outside a form, disabled
@@ -91,6 +101,12 @@ content, and the limit grows with the memory the page has left:
 
 Long articles get the larger view only when there is free memory for it;
 pages without that headroom get the same smaller, explicitly shortened view.
+When you ask for Basic view on a page whose running scripts hold that
+memory, and the view comes out shortened because of it, Tilefinch stops the
+page's scripts first (Basic view stops them when it is shown anyway) and
+prepares the view again with the memory they held. On the 0.1.51 census
+pages this took npr.org's front page from 512 to about 2,200 nodes, and
+Wikipedia's long article to its whole length.
 
 Both limits are fixed when preparation starts, so the same page and memory
 state always give the same view. Preparation stops walking the source as
@@ -179,6 +195,66 @@ Basic view where it can help (not under Off):
   site's JavaScript setting for later loads. Network, TLS, HTTP-error and
   cancelled loads do not offer it.
 
+## Opening in Basic view by default
+
+Under **Automatic**, a site whose page's scripts ran out of memory on an
+earlier visit opens in Basic view from then on. Tilefinch remembers such a
+site by name only (the last 8, while **URL history** is on; see the
+[user guide](USER_GUIDE.md#heavy-pages)). The next load of any of its pages
+runs with page JavaScript off, so it needs a fraction of the memory and
+time, and its commit is shown in Basic view under the note "Basic view:
+scripts ran out of memory last time" with **X Try full page  O Keep Basic
+view**. **Menu → Page tools → Try full page** (right after **Basic view**,
+only on such a page) does the same as Cross after the note is gone.
+
+Only a GET navigation opens this way: a form's POST result is the server's
+answer to it, and neither **Try full page** nor the reload below could repeat
+it, so a POST loads as the site's JavaScript setting says. A site set to
+always open in Reader (**Menu → Page tools → Site information → Permissions
+& controls → Always Reader**) opens in Reader instead. The note takes Cross and Circle only the first time
+a site opens this way in a session; its later pages show the same note as a
+plain status (a press then belongs to the page), and Page tools keeps **Try
+full page**. A page shown afterwards by another route (an offline page, a
+native page, a restored tab) does not offer it.
+
+Basic view is used only when it keeps the script-free page. The page loads
+again at once with its scripts when:
+
+- Basic view would leave out a visible form control (a currency converter's
+  amount box in a form it cannot keep, a POST form), including the fields of
+  a form the view's size bound cut short or withdrew;
+- the page has almost nothing to read without scripts (fewer than 512 bytes
+  of text: an app shell that says to enable JavaScript);
+- a redirect took the load to another site that has no note of its own.
+
+The requested site then keeps the **Load without scripts?** offer instead,
+for the rest of the session and, while **URL history** is on, for later
+sessions too (the profile remembers the last 8 such sites by name; turning
+URL history off, **Menu → Page tools → Site information → Reset
+permissions** and forgetting a history address forget them).
+
+**Try full page** reloads that address once with scripts on. When that full
+page loads, the site's note is forgotten and its pages open normally again;
+if its scripts run out of memory again, the note returns and the next visit
+opens in Basic view again. A redirect within the site, or to another noted
+site, is presented the same way: the load ran without scripts, wherever it
+ended. Going to another page before the full page loads drops the request.
+The site's JavaScript setting is not changed; the load that opened in Basic
+view only ran without scripts, and the next load follows the setting again,
+including after a load that could not start or failed.
+
+The signal is the site's own earlier failure, measured on this PSP, not a
+guess from the page's size or its name. On the 55-page census replay of
+0.1.51, scripts stopped at their memory limit on four pages: three judged
+partial (a BBC article, BBC Sport and weather.com), which open in Basic
+view, and xe.com's converter, judged working, whose amount fields Basic view
+would drop, so it keeps loading in full. **Ask** and **Off** keep the older
+**Load without scripts?** offer instead (user guide, "Heavy pages"). Every
+page load the browser starts is covered, including the page shown at
+startup (the restored last page or a custom homepage) and a tab switch that
+reloads its page; a URL given on the command line and the trace and
+validation boots are not.
+
 ## Switching and fragments
 
 Switching between the original page and Basic view keeps your place at the
@@ -214,6 +290,11 @@ controls.
   retire the current page's author realms. This prevents delayed scripts
   from rewriting the trusted-looking Basic links or forms, while a failed
   presentation leaves the original page and its JavaScript realm untouched.
+  The one exception is a requested view shortened by its memory bound while
+  the page's realms hold at least 1 MiB of heap: the first extraction is
+  discarded before anything is presented, the realms are retired as by Stop
+  page scripts (not recorded as a memory stop), and the view is prepared
+  again. A failure after that leaves the raw page, without its scripts.
   The configured JavaScript policy is unchanged for the next navigation.
 - Admission builds one temporary extraction and commits that same buffer
   only after the limit checks pass. A failed DOM refresh removes the clone

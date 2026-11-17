@@ -137,6 +137,14 @@ typedef struct {
        realm_refusals_seen is the realm's allocation-refusal count when it
        was last checked. */
     bool realm_memory_stopped;
+    /* A big script waits for the page's answer. With no earlier scripts the
+       realm/document are discarded and loaded again from heavy_response;
+       otherwise the live realm/document resume in place, skipping scripts
+       already completed. The bools stay together and the rest is 8 bytes,
+       so the optional field below still lands in the PSP tail padding. */
+    bool heavy_held;
+    size_t heavy_held_bytes;
+    FetchResult *heavy_response;
     size_t realm_refusals_seen;
 #if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
     /* frame_lite lazy_realm (include/tilefinch/frame_lite.h): committed
@@ -419,6 +427,10 @@ typedef struct {
     int deferred_image_rank_scroll_y;
     bool deferred_image_rank_valid;
     size_t deferred_image_eligible_end;
+    /* The page realm was retired while the queue held its weak node handles:
+       the queue's next turn takes the plan again from the document
+       (navigation_replan_retired_document_images). */
+    bool deferred_images_replan;
     /* Once an admission bound has refused an image, images in and around the
        viewport are found again from the laid-out page after each adopted
        layout and each half-viewport scrolled, and the entries farthest from
@@ -1133,6 +1145,8 @@ struct NavigationSession {
     bool last_tls_verify_result_available;
     bool last_tls_verification_failed;
     bool last_transport_timed_out;
+    /* The last load's redirect chain, as its transport left it. */
+    FetchChainFacts last_chain;
     /* The document's body crossed the load's maximum_bytes. */
     bool last_response_limit_exceeded;
     /* The document's response headers arrived (last_http_status is set
@@ -1493,6 +1507,37 @@ void navigation_set_stream_delivery(
     size_t irregular_max_chunk_bytes, size_t stall_every_chunks,
     size_t cancel_after_bytes, size_t truncate_after_bytes);
 bool navigation_collect_frame_capability_trace(NavigationSession *session);
+/* The page's own heavy-script state (script_runtime_heavy_state): the
+   top-level realm's scripts only. Its frames' are navigation_heavy_frames. */
+bool navigation_heavy_state(NavigationSession *session,
+                            ScriptHeavyState *state);
+/* The page's child frames' big scripts (script_runtime_heavy_frame_begin):
+   those waiting for the page's frame answer (held loads included), those
+   refused, and the address of the first frame with one waiting. False
+   without a committed page; without a live top-level realm only the kept
+   responses are counted. */
+typedef struct {
+    size_t waiting_scripts;
+    size_t waiting_bytes;
+    size_t refused_scripts;
+    /* Frames keeping their response for the frame answer, and its bytes
+       (NAVIGATION_HEAVY_FRAME_KEEP_BYTES bounds each). */
+    size_t kept_responses;
+    size_t kept_bytes;
+    /* The frame question is open: the ASK policy, not yet answered. */
+    bool asks;
+    char url[NAVIGATION_URL_LIMIT];
+} NavigationHeavyFrames;
+bool navigation_heavy_frames(NavigationSession *session,
+                             NavigationHeavyFrames *frames);
+/* Answers the page's own waiting scripts (the top-level realm); its
+   frames keep their own question. False when nothing was waiting. */
+bool navigation_answer_heavy(NavigationSession *session, bool run);
+/* Answers the page's frames for this page load: every frame realm, frames
+   whose load waits (they load again on the next turn) and frames created
+   later; the page's own scripts keep their own question. False when
+   nothing was waiting. */
+bool navigation_answer_heavy_frames(NavigationSession *session, bool run);
 bool navigation_collect_page_capability_trace(NavigationSession *session);
 uint64_t navigation_begin(NavigationSession *session);
 void navigation_cancel(NavigationSession *session, uint64_t generation);
@@ -1525,6 +1570,18 @@ bool navigation_load_request(NavigationSession *session,
                              int viewport_width, const FontSet *fonts,
                              const ImageResources *images,
                              bool record_history);
+/* The same, for a caller that can open a site adapter's page. A chain that
+   lands on an address a site adapter handles (a sign-in that ends on
+   YouTube) is not parsed: the load is dropped at that response's headers
+   and the address to open instead (navigation_load_adapter_redirect) is
+   copied to `adapter_redirect`, which is otherwise left empty. The call
+   then returns false with nothing committed. */
+bool navigation_load_request_handoff(
+    NavigationSession *session, uint64_t generation, const char *url,
+    const char *method, const char *body, size_t body_length,
+    const char *content_type, size_t maximum_bytes, long timeout_ms,
+    int viewport_width, const FontSet *fonts, const ImageResources *images,
+    bool record_history, char *adapter_redirect, size_t redirect_capacity);
 NavigationLoad *navigation_load_begin_url(
     NavigationSession *session, uint64_t generation, const char *url,
     size_t maximum_bytes, long timeout_ms, int viewport_width,
@@ -1546,6 +1603,13 @@ NavigationLoadStatus navigation_load_pump(
 NavigationLoadStatus navigation_load_status(const NavigationLoad *load);
 /* Headers were accepted but no service HTML was parsed or executed. */
 const char *navigation_load_adapter_redirect(const NavigationLoad *load);
+/* The redirect chain the load followed and the status of the last response
+   it saw, read before a load handed over to a site adapter
+   (navigation_load_adapter_redirect) is destroyed: the session's last_chain
+   is filled only when a load's response is taken, and the next load clears
+   it. */
+bool navigation_load_chain_facts(const NavigationLoad *load,
+                                 FetchChainFacts *chain, long *http_status);
 /* A top-level GET's attachment stops before parsing or publishing its body. */
 const char *navigation_load_download_filename(const NavigationLoad *load);
 bool navigation_load_no_content(const NavigationLoad *load);
@@ -1581,12 +1645,16 @@ const NavigationEntry *navigation_current(const NavigationSession *session);
 /* A committed top-level document that is a bot-protection wall: a refusal
    status with a vendor signature in its headers or title, or a refusal
    status on a page that renders nothing because its script was refused
-   (vendor empty). The frontend tells the reader the site may not work. */
+   (vendor empty). The frontend tells the reader the site may not work.
+   paints_nothing: the committed layout draws no text or image. A silent
+   challenge (AWS WAF's) leaves its page blank while it works, and for good
+   when it cannot finish, so the frontend keeps its notice up meanwhile. */
 typedef struct {
     long status;
     char vendor[TILEFINCH_BOT_WALL_VENDOR_LIMIT];
     char site[TILEFINCH_BOT_WALL_SITE_LIMIT];
     bool blank_after_refused_script;
+    bool paints_nothing;
 } NavigationBotWall;
 bool navigation_bot_wall(const NavigationSession *session,
                          NavigationBotWall *wall);

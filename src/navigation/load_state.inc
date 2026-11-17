@@ -1342,6 +1342,7 @@ NavigationLoadStatus navigation_load_pump(
     session->last_tls_verification_failed =
         load->response.tls_verification_failed;
     session->last_transport_timed_out = load->response.timed_out;
+    session->last_chain = load->response.chain;
     session->last_response_limit_exceeded =
         load->response.response_limit_exceeded;
     session->last_tls12_compatibility_retry =
@@ -2211,6 +2212,38 @@ void navigation_load_destroy(NavigationLoad *load)
     budget_free(budget, load);
 }
 
+bool navigation_load_request_handoff(
+    NavigationSession *session, uint64_t generation, const char *url,
+    const char *method, const char *body, size_t body_length,
+    const char *content_type, size_t maximum_bytes, long timeout_ms,
+    int viewport_width, const FontSet *fonts, const ImageResources *images,
+    bool record_history, char *adapter_redirect, size_t redirect_capacity)
+{
+    if (adapter_redirect != NULL && redirect_capacity != 0)
+        adapter_redirect[0] = '\0';
+    NavigationLoad *load = navigation_load_begin_request(
+        session, generation, url, method, body, body_length, content_type,
+        maximum_bytes, timeout_ms, viewport_width, fonts, images,
+        record_history);
+    if (load == NULL) return false;
+    while (navigation_load_status(load) == NAVIGATION_LOAD_PENDING) {
+        (void) navigation_load_pump(load, NULL);
+    }
+    const char *redirect = navigation_load_adapter_redirect(load);
+    if (redirect != NULL && adapter_redirect != NULL) {
+        if (strlen(redirect) < redirect_capacity)
+            memcpy(adapter_redirect, redirect, strlen(redirect) + 1u);
+        else
+            snprintf(session->last_error, sizeof(session->last_error), "%s",
+                     "site adapter address does not fit the hand-over");
+    }
+    bool success = redirect == NULL
+        && navigation_load_status(load) == NAVIGATION_LOAD_READY_TO_FINISH
+        && navigation_load_finish(load, NULL);
+    navigation_load_destroy(load);
+    return success;
+}
+
 bool navigation_load_request(NavigationSession *session,
                              uint64_t generation, const char *url,
                              const char *method, const char *body,
@@ -2220,19 +2253,22 @@ bool navigation_load_request(NavigationSession *session,
                              const ImageResources *images,
                              bool record_history)
 {
-    NavigationLoad *load = navigation_load_begin_request(
+    return navigation_load_request_handoff(
         session, generation, url, method, body, body_length, content_type,
         maximum_bytes, timeout_ms, viewport_width, fonts, images,
-        record_history);
-    if (load == NULL) return false;
-    while (navigation_load_status(load) == NAVIGATION_LOAD_PENDING) {
-        (void) navigation_load_pump(load, NULL);
-    }
-    bool success = navigation_load_status(load)
-                       == NAVIGATION_LOAD_READY_TO_FINISH
-        && navigation_load_finish(load, NULL);
-    navigation_load_destroy(load);
-    return success;
+        record_history, NULL, 0);
+}
+
+bool navigation_load_chain_facts(const NavigationLoad *load,
+                                 FetchChainFacts *chain, long *http_status)
+{
+    if (load == NULL || chain == NULL || http_status == NULL) return false;
+    if (load->request_id != 0)
+        return fetch_scheduler_request_chain(
+            load->scheduler, load->request_id, chain, http_status);
+    *chain = load->response.chain;
+    *http_status = load->response.status_code;
+    return true;
 }
 
 const char *navigation_load_adapter_redirect(const NavigationLoad *load)

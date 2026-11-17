@@ -24,7 +24,7 @@ Use `--skip-js` to measure HTML/CSS/layout/rendering independently when a real p
 
 `--challenge-diagnostic` is an explicitly diagnostic navigation policy. It retains an HTTP error page, records `cf-mitigated`, `Accept-CH`, `Critical-CH`, and server headers, runs only the page's initially present inline scripts, and reports external script URLs inserted into the DOM. It does not claim the error page is the requested site and does not fabricate or submit a challenge result.
 
-The interactive lab's closing summary reports `bot-wall detected=yes site=... vendor=... status=...` when the committed top-level document is a bot-protection wall: a refusal status (403, 405, 429 or 503, or one vendor's 202) with a known vendor signature in its headers or title (the table is in `src/bot_wall.c`), or a refusal-status page that paints nothing after its script was refused. The PSP chrome raises the same two-line notice ("<site> blocked Tilefinch / Bot protection: this site may not work") instead of leaving a silent blank page. Detection is generic, reads only the response and the committed page, and never attempts the challenge.
+The interactive lab's closing summary reports `bot-wall detected=yes site=... vendor=... status=...` when the committed top-level document is a bot-protection wall: a refusal status (403, 405, 429 or 503, or one vendor's 202) with a known vendor signature in its headers or title (the table is in `src/bot_wall.c`), or a refusal-status page that paints nothing after its script was refused. The PSP chrome raises the same two-line notice ("<site> blocked Tilefinch / Bot protection: this site may not work") instead of leaving a silent blank page. `paints=nothing` means the committed layout draws no text or image, as on an AWS WAF silent challenge, which stays blank while it works and for good when it cannot finish; the PSP then keeps the notice up for as long as the page stays blank and no other status takes its place. Detection is generic, reads only the response and the committed page, and never attempts the challenge.
 
 The interactive lab can make a legitimate managed-challenge attempt with `--url ... --fetch-scripts`. It retains secure/HttpOnly response cookies, retries a safe GET once when `Critical-CH` requests truthful PSP client hints, and sends only the named high-entropy hints to the origin that requested them. A cross-origin retry redirect suppresses those hints for the rest of that redirect chain while truthful low-entropy hints continue normally. The lab loads scripts inserted by the bootstrap under normal quotas and reports challenge/network/clearance state without cookie values. It never copies clearance from another browser. The lab sends the same User-Agent and per-site identity exceptions as the PSP (`src/site_identity.c`).
 
@@ -470,8 +470,14 @@ the engine raised its "Google refused sign-in" notice since the last report.
 Lab form submissions feed the same counters as the PSP's.
 `--heavy-policy run|ask|refuse` sets the heavy-page policy (run by default,
 so a lab run never waits); with `ask`, `heavy-answer run` or
-`heavy-answer stop` answers the scripts that wait, and `stop-scripts`
-retires the page's realms as the PSP's Stop page scripts does.
+`heavy-answer stop` answers the page's own scripts that wait (its
+`heavy-page` line in `script-report`), and `heavy-frame-answer run` or
+`heavy-frame-answer stop` answers its child frames' (the `heavy-frames`
+line, printed for a page with frames, counts a frame whose load waits as
+one waiting script, and `kept=` the frame responses held for that answer
+and their bytes). Neither answer changes the other.
+`stop-scripts` retires the page's realms as the PSP's Stop page scripts
+does.
 `memory-report [PHASE]` prints the memory make-up lines the PSP validation
 log carries at pre-interaction and controlled-exit (budget at peak, the
 JavaScript, DOM, resource, session and render splits, and one

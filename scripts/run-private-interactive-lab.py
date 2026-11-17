@@ -280,6 +280,44 @@ def wait_for_account_field(session, kind, *, timeout=30, cancelled=lambda: False
     return None
 
 
+# A page goes on preparing after its form is on screen. Google's sign-in
+# loads its anti-bot check in a hidden frame once the page has loaded, and a
+# form sent before that frame is ready carries the page's placeholder
+# ("FNL~", a failure code) instead of a token, which Google answers with
+# extra verification. A person reading the page and typing on a PSP takes
+# far longer than that; this driver must not be faster than the page.
+SETTLE_MINIMUM_ROUNDS = 16
+SETTLE_QUIET_ROUNDS = 6
+SETTLE_MAXIMUM_ROUNDS = 64
+
+
+def settle_before_entry(session, *, cancelled=lambda: False):
+    """Advance the page until it has been quiet for a while.
+
+    Each round pumps normal browser work and waits a quarter of a second
+    (about six seconds in all at least, with real-time pacing). Quiet means
+    the page's pending tasks, requests and handler calls stopped changing.
+    Returns the last status, or None when the page left the account origin.
+    """
+    previous = None
+    quiet = 0
+    values = None
+    for round_number in range(SETTLE_MAXIMUM_ROUNDS):
+        if cancelled():
+            break
+        values = session.send(b"pump 8 16\n")
+        if values[7] != "https://accounts.google.com":
+            return None
+        activity = (values[1], values[6], tuple(values[9:16]))
+        quiet = quiet + 1 if activity == previous else 0
+        previous = activity
+        if (round_number + 1 >= SETTLE_MINIMUM_ROUNDS
+                and quiet >= SETTLE_QUIET_ROUNDS):
+            break
+        time.sleep(0.25)
+    return values
+
+
 def guided_signin(session, values, *, input_value=local_account_input,
                   progress=lambda phase: None, before_password=lambda: None,
                   cancelled=lambda: False):
@@ -350,7 +388,18 @@ def guided_signin(session, values, *, input_value=local_account_input,
                   if rejected else
                   "Paused: the password page did not appear. Use view for any error or verification.")
             return session.send(b"status\n")
-        print("Password page found. Submitting once…", flush=True)
+        print("Password page found. Letting it finish loading…", flush=True)
+        # The field is on screen before the page is ready for an answer
+        # (see settle_before_entry). Wait, then make sure it is still the
+        # focused, editable password field.
+        if (settle_before_entry(session, cancelled=cancelled) is None
+                or wait_for_account_field(session, "password",
+                                          cancelled=cancelled) is None):
+            progress("password_unavailable")
+            print("Paused: the password page changed while it loaded. "
+                  "Nothing submitted.")
+            return session.send(b"status\n")
+        print("Submitting once…", flush=True)
         if cancelled():
             return session.send(b"status\n")
         # Latch before filling: an author input handler might itself submit.

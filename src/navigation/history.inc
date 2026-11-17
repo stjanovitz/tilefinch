@@ -87,11 +87,14 @@ bool navigation_bot_wall(const NavigationSession *session,
               status, entry == NULL ? NULL : entry->title);
     bool refused_script = session->script_skipped_quota != 0
         || session->page.script_result.dynamic_scripts_quota_rejected != 0;
-    bool blank = vendor == NULL && status >= 400 && refused_script
-        && !navigation_layout_paints_content(&session->page.layout);
+    if (vendor == NULL && (status < 400 || !refused_script)) return false;
+    bool paints_nothing =
+        !navigation_layout_paints_content(&session->page.layout);
+    bool blank = vendor == NULL && paints_nothing;
     if (vendor == NULL && !blank) return false;
     wall->status = status;
     wall->blank_after_refused_script = blank;
+    wall->paints_nothing = paints_nothing;
     if (vendor != NULL) {
         snprintf(wall->vendor, sizeof(wall->vendor), "%s", vendor);
     }

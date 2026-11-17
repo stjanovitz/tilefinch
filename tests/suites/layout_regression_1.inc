@@ -111,6 +111,8 @@
     CHECK(test_width_only_failed_image_in_flex_shows_alt(&budget) == 0);
     puts("test: unloaded ratio images reserve their box; alt never overlaps");
     CHECK(test_unloaded_image_reserves_ratio_box(&budget) == 0);
+    puts("test: unloaded image alt text sizes its flex and float container");
+    CHECK(test_unloaded_image_alt_sizes_its_container(&budget) == 0);
 
     puts("test: resumable authoritative layout is exact and transactional");
     CHECK(test_resumable_authoritative_layout(&budget) == 0);

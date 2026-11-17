@@ -1149,6 +1149,64 @@ static int test_unloaded_image_reserves_ratio_box(Budget *budget)
     return 0;
 }
 
+/* gitlab's project badges: <a><img alt="Project badge"></a> items in a
+   wrapping flex row. An unloaded image without a definite box lays out as
+   its alt text, but its intrinsic widths were zero, so every link shrank
+   to nothing and the alt texts overprinted one another. The image now
+   contributes its alt text's widths: each link is as wide as its text and
+   the links sit side by side. A shrink-to-fit float sizes the same way. */
+static int test_unloaded_image_alt_sizes_its_container(Budget *budget)
+{
+    static const char page[] =
+        "<!doctype html><style>body{margin:0;font:12px sans-serif}"
+        ".badges{display:flex;flex-wrap:wrap;gap:8px}"
+        ".badges a{line-height:1}#float{float:left}"
+        "</style><body><div class=badges>"
+        "<a id=b1 href=/1><img src=/1.svg alt='Project badge'></a>"
+        "<a id=b2 href=/2><img src=/2.svg alt='Project badge'></a>"
+        "<a id=b3 href=/3><img src=/3.svg alt='Project badge'></a></div>"
+        "<div id=float><img src=/4.svg alt='Project badge'></div>"
+        "</body>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, budget, page, sizeof(page) - 1, 19)
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && layout_build(&layout, budget, &document, &sheet,
+                          NULL, NULL, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    const char *ids[] = {"b1", "b2", "b3"};
+    int right = INT_MIN;
+    for (size_t i = 0; i < 3; i++) {
+        const LayoutNodeBox *box = layout_box_for_node(
+            &layout, find_id(root, ids[i]));
+        CHECK(box != NULL && box->width >= 60 && box->y == 0);
+        CHECK(box->x >= right + (i == 0 ? 0 : 8));
+        right = box->x + box->width;
+    }
+    const LayoutNodeBox *wrapper = layout_box_for_node(
+        &layout, find_id(root, "float"));
+    CHECK(wrapper != NULL && wrapper->width >= 60 && wrapper->height < 24);
+    /* One line per alt text: no word wrapped onto a second line. */
+    size_t lines = 0;
+    int previous_y = INT_MIN;
+    for (size_t i = 0; i < layout.count; i++) {
+        const DrawCommand *command = &layout.commands[i];
+        if (command->type != DRAW_TEXT || command->text_length == 0
+            || memcmp(command->text, "badge", 5) != 0) continue;
+        CHECK(previous_y == INT_MIN || command->y == previous_y
+              || lines == 3);
+        previous_y = command->y;
+        lines++;
+    }
+    CHECK(lines == 4);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
 static bool layout_command_equivalent(const DrawCommand *left,
                                       const DrawCommand *right)
 {

@@ -351,6 +351,12 @@ static JSValue runtime_diagnostic_json_parse(JSContext *context,
     return result;
 }
 
+static bool runtime_install_private_json_observer(ScriptRuntime *runtime);
+
+/* Installing a classifier is what puts the JSON.parse observer on the
+   page: it feeds the classifier, and it replaces a function the page can
+   compare against its own copy. A private session without a classifier
+   (the sign-in test) leaves JSON.parse the page's own, as on the PSP. */
 bool script_runtime_private_outcome_classifier(
     ScriptRuntime *runtime, const char *source, size_t length)
 {
@@ -361,6 +367,10 @@ bool script_runtime_private_outcome_classifier(
         "<private-outcome-classifier>", JS_EVAL_TYPE_GLOBAL);
     bool ok = !JS_IsException(classifier)
         && JS_IsFunction(runtime->context, classifier) && !JS_IsProxy(classifier);
+    if (ok && !runtime->xhr_diagnostics->json_parse_observer_installed) {
+        ok = runtime_install_private_json_observer(runtime);
+        runtime->xhr_diagnostics->json_parse_observer_installed = ok;
+    }
     if (ok) {
         JS_FreeValue(runtime->context, runtime->private_outcome_classifier);
         runtime->private_outcome_classifier = classifier;
@@ -462,10 +472,6 @@ bool script_runtime_xhr_diagnostics(
             JS_FreeValue(runtime->context, installed);
         }
         JS_FreeValue(runtime->context, recorder);
-        if (ok) {
-            ok = runtime_install_private_json_observer(runtime);
-            runtime->xhr_diagnostics->json_parse_observer_installed = ok;
-        }
         if (!ok) {
             budget_free(runtime->budget, runtime->xhr_diagnostics);
             runtime->xhr_diagnostics = NULL;

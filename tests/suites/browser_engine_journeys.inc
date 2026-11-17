@@ -208,6 +208,87 @@ teardown:
     return 0;
 }
 
+/* A page whose scripts stop after it was shown (a realm out of memory, or
+   stopped for Basic view) keeps its DOM, and the ordinary <img> elements
+   waiting in the post-commit queue still load. The queue held the realm's
+   weak node handles; once the realm was gone every target read as removed and
+   the queue ended without a single request (bbc.co.uk articles: every photo
+   left as alt text). A body put back over the queued nodes is planned too. */
+int test_retired_realm_keeps_image_queue(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = true;
+    config.resources.web_fonts_enabled = false;
+    config.resources.maximum_images = 12;
+    char error[256] = {0};
+    for (unsigned variant = 0; variant < 2; variant++) {
+        BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+        CHECK(engine != NULL && fetch_trace_replay_begin(
+            TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-interactive-images",
+            error, sizeof(error)));
+        CHECK(browser_engine_load_url(engine, "https://interactive-images.test/page", true));
+        NavigationSession *nav = browser_engine_navigation(engine);
+        CHECK(nav->page.loaded && nav->page.image_continuation_pending
+            && nav->page.deferred_image_count == 3u
+            && nav->page.deferred_image_targets[0].weak_handle != 0
+            && nav->page.runtime != NULL);
+        lxb_dom_node_t *root = lxb_dom_interface_node(nav->page.document.html);
+        if (variant == 1) {
+            /* The realm replaces the body before it stops: the queued nodes
+               are gone and the images to load are the new body's. */
+            CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+                "document.getElementById('first').innerHTML="
+                "'<img id=hero src=/hero.svg>'",
+                "<retired-realm-rewrite>", &nav->page.script_result));
+            CHECK(navigation_relayout(nav));
+            root = lxb_dom_interface_node(nav->page.document.html);
+        }
+        lxb_dom_node_t *hero = test_reader_find_id(root, "hero");
+        lxb_dom_node_t *tail = test_reader_find_id(root, "tail");
+        /* The relayout after a rewrite may already have found the new hero;
+           the untouched tail waits in the queue either way. */
+        CHECK(hero != NULL && tail != NULL
+            && (variant == 1
+                || images_find_node(&nav->page.images, hero) == NULL)
+            && images_find_node(&nav->page.images, tail) == NULL);
+        size_t attempted = nav->page.images.stats.attempted;
+        navigation_record_script_stop(nav, NAVIGATION_SCRIPT_STOP_MEMORY);
+        navigation_retire_current_page_scripts(nav);
+        CHECK(nav->page.runtime == NULL && nav->page.loaded);
+        for (unsigned pump = 0; nav->page.image_continuation_pending && pump < 512; pump++) {
+            bool changed = false;
+            (void) browser_engine_run_deferred_image_work(engine, &changed);
+            CHECK(nav->page.loaded);
+        }
+        if (!image_resource_available(images_find_node(&nav->page.images, hero))
+            || !image_resource_available(images_find_node(&nav->page.images, tail)))
+            fprintf(stderr, "retired realm images variant=%u pending=%d "
+                "cursor=%zu/%zu attempted=%zu->%zu loaded=%zu\n", variant,
+                nav->page.image_continuation_pending,
+                nav->page.deferred_image_cursor, nav->page.deferred_image_count,
+                attempted, nav->page.images.stats.attempted,
+                nav->page.images.stats.loaded);
+        CHECK(!nav->page.image_continuation_pending
+            && image_resource_available(images_find_node(&nav->page.images, hero))
+            && image_resource_available(images_find_node(&nav->page.images, tail))
+            && browser_engine_render_frame(engine, NULL)
+            && browser_engine_last_error(engine)[0] == '\0');
+        fetch_trace_end();
+        CHECK(browser_engine_shutdown(engine));
+        BrowserEngineMetrics metrics = {0};
+        CHECK(browser_engine_metrics(engine, &metrics)
+            && metrics.budget_current == 0 && metrics.budget_active_allocations == 0);
+        browser_engine_destroy(engine);
+    }
+    return 0;
+}
+
 typedef struct {
     size_t calls;
     size_t metadata_checkpoints;
@@ -2109,6 +2190,73 @@ static int deferred_image_pair_case(const char *url, unsigned collect_delay,
     *frame = frame_checksum(pixels, count);
     fetch_trace_end();
     CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* steam (Portal 2 capsule and masthead logo) and weather.gov (agency
+   banners): an image with no declared size has no layout box until its
+   pixels arrive. The post-commit queue ranked such images after every
+   sized image below the screen, so a page's on-screen masthead loaded
+   last. They are placed by their alt text, or by their nearest boxed
+   ancestor, and load first; they still stay off the commit path. */
+int test_deferred_unsized_visible_images_load_first(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = true;
+    config.resources.web_fonts_enabled = false;
+    config.resources.maximum_images = 12;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL && fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-interactive-image-unsized",
+        error, sizeof(error)));
+    CHECK(browser_engine_load_url(engine, "https://interactive-images.test/page", true));
+    NavigationSession *nav = browser_engine_navigation(engine);
+    lxb_dom_node_t *root = lxb_dom_interface_node(nav->page.document.html);
+    lxb_dom_node_t *logo = test_reader_find_id(root, "logo");
+    lxb_dom_node_t *icon = test_reader_find_id(root, "icon");
+    lxb_dom_node_t *far = test_reader_find_id(root, "far");
+    lxb_dom_node_t *further = test_reader_find_id(root, "further");
+    CHECK(logo != NULL && icon != NULL && far != NULL && further != NULL);
+    /* The queue still keeps every <img> off the commit path. */
+    CHECK(nav->page.loaded && nav->page.runtime != NULL
+        && nav->page.image_continuation_pending
+        && nav->page.deferred_image_count == 4u
+        && images_find_node(&nav->page.images, logo) == NULL
+        && layout_box_for_node(&nav->page.layout, logo) == NULL
+        && layout_box_for_node(&nav->page.layout, far) != NULL
+        && browser_engine_render_frame(engine, NULL));
+    CHECK(navigation_run_deferred_image_work(nav));
+    CHECK(nav->page.deferred_image_targets != NULL
+        && nav->page.deferred_image_targets[0].node == logo
+        && nav->page.deferred_image_targets[1].node == icon
+        && nav->page.deferred_image_batch_count == 2u);
+    bool far_before_logo = false;
+    for (unsigned pump = 0; nav->page.image_continuation_pending && pump < 512; pump++) {
+        bool changed = false;
+        (void) browser_engine_run_deferred_image_work(engine, &changed);
+        CHECK(nav->page.loaded && browser_engine_last_error(engine)[0] == '\0');
+        if (!image_resource_available(images_find_node(&nav->page.images, logo))
+            && image_resource_available(images_find_node(&nav->page.images, far)))
+            far_before_logo = true;
+    }
+    CHECK(!far_before_logo && !nav->page.image_continuation_pending
+        && image_resource_available(images_find_node(&nav->page.images, logo))
+        && image_resource_available(images_find_node(&nav->page.images, icon))
+        && image_resource_available(images_find_node(&nav->page.images, far))
+        && browser_engine_render_frame(engine, NULL));
+    fetch_trace_end();
+    CHECK(browser_engine_shutdown(engine));
+    BrowserEngineMetrics metrics = {0};
+    CHECK(browser_engine_metrics(engine, &metrics)
+        && metrics.budget_current == 0 && metrics.budget_active_allocations == 0);
     browser_engine_destroy(engine);
     return 0;
 }

@@ -70,6 +70,43 @@ static bool compile_abort_cooperate(void *context, const char *phase,
     }                                                                        \
 } while (0)
 
+/* A frame may be rebuilt only before its first script completes. Later
+   scripts still prompt, but the child must resume in place. */
+static int test_heavy_frame_does_not_replay_prior_scripts(void)
+{
+    ScriptRuntime top = {0};
+    top.bridge.heavy.policy = SCRIPT_HEAVY_POLICY_ASK;
+    ScriptRuntime first_heavy = {0};
+    script_runtime_heavy_frame_begin(&first_heavy, &top, true);
+    CHECK(script_runtime_heavy_frame_verdict(
+        &first_heavy, SCRIPT_HEAVY_UNIT_BYTES)
+        == SCRIPT_HEAVY_FRAME_HOLD);
+    CHECK(script_runtime_heavy_frame_replay_safe(&first_heavy));
+    Budget budget;
+    budget_init(&budget, 4096);
+    ScriptRuntime after_inline = {0};
+    after_inline.budget = &budget;
+    script_runtime_heavy_frame_begin(&after_inline, &top, true);
+    script_runtime_frame_script_completed(&after_inline, 42);
+    CHECK(script_runtime_frame_script_was_completed(&after_inline, 42));
+    CHECK(after_inline.bridge.heavy.frame_completed_count == 1);
+    script_runtime_frame_script_completed(&after_inline, 42);
+    CHECK(after_inline.bridge.heavy.frame_completed_count == 1);
+    CHECK(!script_runtime_heavy_frame_replay_safe(&after_inline));
+    CHECK(script_runtime_heavy_frame_verdict(
+        &after_inline, SCRIPT_HEAVY_UNIT_BYTES)
+        == SCRIPT_HEAVY_FRAME_HOLD);
+    after_inline.bridge.script_quota_count = 2;
+    after_inline.bridge.script_quota_bytes = SCRIPT_HEAVY_UNIT_BYTES;
+    CHECK(script_runtime_heavy_frame_rollback_quota(
+        &after_inline, 1, SCRIPT_HEAVY_UNIT_BYTES));
+    CHECK(after_inline.bridge.script_quota_count == 1);
+    CHECK(after_inline.bridge.script_quota_bytes == 0);
+    budget_free(&budget, after_inline.bridge.heavy.frame_completed_scripts);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
 typedef struct {
     uint64_t now_ns;
     size_t calls;
@@ -9491,6 +9528,9 @@ static int test_indexeddb_close_pending_upgrade(void)
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--heavy-frame-once-only") == 0)
+        return test_heavy_frame_does_not_replay_prior_scripts();
+    CHECK(test_heavy_frame_does_not_replay_prior_scripts() == 0);
     if (argc == 2 && strcmp(argv[1], "--idb-close-only") == 0)
         return test_indexeddb_close_pending_upgrade();
     CHECK(test_indexeddb_close_pending_upgrade() == 0);

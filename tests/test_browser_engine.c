@@ -12,6 +12,7 @@
 #include "tilefinch/user_agent.h"
 #include "tilefinch/youtube_lite.h"
 #include "tilefinch/youtube_resolver.h"
+#include "tilefinch/psp_basic_fallback.h"
 #include "tilefinch/psp_ui.h"
 #include "tilefinch/psp_ui_settings.h"
 #include "tilefinch/psp_input_page_media.h"
@@ -485,7 +486,8 @@ int main(int argc, char **argv)
         return test_geometry_refusal_not_retried_read_by_read()
             || test_geometry_refusal_gives_up_reuse_cache();
     if (argc == 2 && strcmp(argv[1], "--image-pair-only") == 0)
-        return test_deferred_image_pair_shares_one_flow()
+        return test_deferred_unsized_visible_images_load_first()
+            || test_deferred_image_pair_shares_one_flow()
             || test_relayout_image_load_while_deferred_decode_held()
             || test_given_up_deferred_batch_keeps_script_images()
             || test_filtered_page_fixed_images_publish_by_paint()
@@ -498,6 +500,11 @@ int main(int argc, char **argv)
         return test_computed_style_tracks_container_geometry();
     if (argc == 2 && strcmp(argv[1], "--opacity-geometry-only") == 0)
         return test_opacity_geometry_snapshot_reuse();
+    if (argc == 2 && strcmp(argv[1], "--attribute-geometry-only") == 0)
+        return test_inert_attribute_geometry_snapshot_reuse()
+            || test_generated_expression_attribute_invalidates_geometry();
+    if (argc == 2 && strcmp(argv[1], "--head-probe-only") == 0)
+        return test_head_probe_style_read_skips_container_layout();
     if (argc == 2 && strcmp(argv[1], "--css-transitions-only") == 0) {
         /* Every test runs, so one failure does not hide another. */
         int failed = test_css_transition_lifecycle();
@@ -534,6 +541,8 @@ int main(int argc, char **argv)
         return test_parser_blocking_script_beside_stuck_loads();
     if (argc == 2 && strcmp(argv[1], "--deferred-startup-only") == 0)
         return test_deferred_startup_journey();
+    if (argc == 2 && strcmp(argv[1], "--retired-realm-images-only") == 0)
+        return test_retired_realm_keeps_image_queue();
     if (argc == 2 && strcmp(argv[1], "--image-admission-only") == 0)
         return test_deferred_image_admission_yields_to_input();
     if (argc == 2 && strcmp(argv[1], "--cooperate-boundary-only") == 0)
@@ -552,7 +561,11 @@ int main(int argc, char **argv)
     if (argc == 2 && strcmp(argv[1], "--google-identity-only") == 0)
         return test_google_search_compatibility_adapter()
             || test_google_search_identity()
-            || test_google_accounts_identity();
+            || test_google_accounts_identity()
+            || test_accounts_password_redirect_chain()
+            || test_long_redirect_hop_chain()
+            || test_handoff_chain_facts()
+            || test_worker_path_response_cookies();
     if (argc == 2 && strcmp(argv[1], "--provider-navigation-only") == 0) {
         return test_cooperative_site_adapter_navigation();
     }
@@ -608,12 +621,14 @@ int main(int argc, char **argv)
     CHECK(test_script_free_browsing_journey() == 0);
     CHECK(test_background_interruption_journey() == 0);
     CHECK(test_deferred_startup_journey() == 0);
+    CHECK(test_retired_realm_keeps_image_queue() == 0);
     CHECK(test_deferred_image_admission_yields_to_input() == 0);
     CHECK(test_cooperate_boundary_dispatch() == 0);
     CHECK(test_cooperate_boundary_phase_names() == 0);
     CHECK(test_cooperate_boundaries_reach_frontend() == 0);
     CHECK(test_raster_decode_checkpoints_borrow_render_shell() == 0);
     CHECK(test_deferred_image_publication_survives_rebuild() == 0);
+    CHECK(test_deferred_unsized_visible_images_load_first() == 0);
     CHECK(test_deferred_image_pair_shares_one_flow() == 0);
     CHECK(test_relayout_image_load_while_deferred_decode_held() == 0);
     CHECK(test_given_up_deferred_batch_keeps_script_images() == 0);
@@ -656,6 +671,9 @@ int main(int argc, char **argv)
     CHECK(test_computed_style_resolved_values() == 0);
     CHECK(test_computed_style_tracks_container_geometry() == 0);
     CHECK(test_opacity_geometry_snapshot_reuse() == 0);
+    CHECK(test_inert_attribute_geometry_snapshot_reuse() == 0);
+    CHECK(test_generated_expression_attribute_invalidates_geometry() == 0);
+    CHECK(test_head_probe_style_read_skips_container_layout() == 0);
     CHECK(test_inline_style_mutations_skip_stylesheet_rebuild() == 0);
     CHECK(test_transition_clock_bounded() == 0);
     CHECK(test_transition_eviction_inline_once() == 0);
@@ -726,6 +744,10 @@ int main(int argc, char **argv)
     CHECK(test_google_search_compatibility_adapter() == 0);
     CHECK(test_google_search_identity() == 0);
     CHECK(test_google_accounts_identity() == 0);
+    CHECK(test_accounts_password_redirect_chain() == 0);
+    CHECK(test_long_redirect_hop_chain() == 0);
+    CHECK(test_handoff_chain_facts() == 0);
+    CHECK(test_worker_path_response_cookies() == 0);
     CHECK(test_reader_presentation_adapter() == 0);
     CHECK(test_reader_switch_reuses_page_stylesheet_responses() == 0);
     CHECK(test_blank_reader_frontend_recovery() == 0);
@@ -736,6 +758,7 @@ int main(int argc, char **argv)
     CHECK(test_basic_view_recovery_live_realm_oom() == 0);
     CHECK(test_basic_view_recovery_compile_refusal() == 0);
     CHECK(test_basic_view_recovery_large_and_hidden_pages() == 0);
+    CHECK(test_basic_view_reclaims_script_heap() == 0);
     CHECK(test_basic_view_native_root_provenance() == 0);
     CHECK(test_basic_view_handle_capacity_is_transactional() == 0);
     CHECK(test_basic_view_bypasses_author_delegated_actions() == 0);

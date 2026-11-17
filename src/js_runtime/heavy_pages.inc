@@ -195,7 +195,149 @@ bool script_runtime_answer_heavy(ScriptRuntime *runtime, bool run)
         && !bridge->heavy.answered;
     bridge->heavy.answered = true;
     bridge->heavy.allowed = run;
+    if (bridge->heavy.frame_gate) {
+        bridge->heavy.frame_held = false;
+        bridge->heavy.frame_held_bytes = 0;
+    }
     return waiting;
+}
+
+bool script_runtime_heavy_frames_ask(const ScriptRuntime *top)
+{
+    return top != NULL
+        && top->bridge.heavy.policy == SCRIPT_HEAVY_POLICY_ASK
+        && !top->bridge.heavy.frames_answered;
+}
+
+void script_runtime_answer_heavy_frames(ScriptRuntime *top, bool run)
+{
+    if (top == NULL) return;
+    top->bridge.heavy.frames_answered = true;
+    top->bridge.heavy.frames_allowed = run;
+}
+
+void script_runtime_heavy_frame_begin(ScriptRuntime *frame,
+                                      const ScriptRuntime *top,
+                                      bool can_hold)
+{
+    if (frame == NULL) return;
+    DomBridge *bridge = &frame->bridge;
+    bridge->heavy.frame_gate = true;
+    bridge->heavy.frame_can_hold = can_hold;
+    if (top == NULL) return;
+    /* The page's answer for its frames, never its own. */
+    bridge->heavy.policy = top->bridge.heavy.policy;
+    bridge->heavy.answered = top->bridge.heavy.frames_answered;
+    bridge->heavy.allowed = top->bridge.heavy.frames_allowed;
+}
+
+ScriptHeavyFrameVerdict script_runtime_heavy_frame_verdict(
+    ScriptRuntime *runtime, size_t bytes)
+{
+    if (runtime == NULL) return SCRIPT_HEAVY_FRAME_RUN;
+    DomBridge *bridge = &runtime->bridge;
+    if (!bridge->heavy.frame_gate || bytes < SCRIPT_HEAVY_UNIT_BYTES
+        || bridge->heavy.policy == SCRIPT_HEAVY_POLICY_RUN
+        || (bridge->heavy.answered && bridge->heavy.allowed))
+        return SCRIPT_HEAVY_FRAME_RUN;
+    if (bridge->heavy.answered
+        || bridge->heavy.policy == SCRIPT_HEAVY_POLICY_REFUSE) {
+        bridge->heavy.answered = true;
+        bridge->heavy.allowed = false;
+        bridge->heavy.refused_scripts++;
+        return SCRIPT_HEAVY_FRAME_REFUSE;
+    }
+    /* No kept response or completed-script record: continuing is safer
+       than rebuilding a realm and repeating external effects. */
+    if (!bridge->heavy.frame_can_hold) return SCRIPT_HEAVY_FRAME_RUN;
+    bridge->heavy.frame_held = true;
+    bridge->heavy.frame_held_bytes = bytes;
+    return SCRIPT_HEAVY_FRAME_HOLD;
+}
+
+bool script_runtime_heavy_frame_replay_safe(const ScriptRuntime *runtime)
+{
+    return runtime != NULL
+        && runtime->bridge.heavy.frame_completed_count == 0;
+}
+
+bool script_runtime_heavy_frame_rollback_quota(ScriptRuntime *runtime,
+                                               size_t slots, size_t bytes)
+{
+    if (runtime == NULL) return false;
+    DomBridge *bridge = &runtime->bridge;
+    if (!bridge->heavy.frame_gate || !bridge->heavy.frame_held
+        || slots > bridge->script_quota_count
+        || bytes > bridge->script_quota_bytes) {
+        bridge->heavy.frame_held = false;
+        bridge->heavy.frame_held_bytes = 0;
+        bridge->heavy.frame_can_hold = false;
+        return false;
+    }
+    bridge->script_quota_count -= slots;
+    bridge->script_quota_bytes -= bytes;
+    return true;
+}
+
+bool script_runtime_frame_script_was_completed(const ScriptRuntime *runtime,
+                                               long handle)
+{
+    if (runtime == NULL || handle == 0) return false;
+    const DomBridge *bridge = &runtime->bridge;
+    for (size_t i = 0; i < bridge->heavy.frame_completed_count; i++) {
+        if (bridge->heavy.frame_completed_scripts[i] == handle) return true;
+    }
+    return false;
+}
+
+void script_runtime_frame_script_completed(ScriptRuntime *runtime,
+                                           long handle)
+{
+    if (runtime == NULL || handle == 0
+        || !runtime->bridge.heavy.frame_gate
+        || !runtime->bridge.heavy.frame_can_hold
+        || runtime->bridge.heavy.policy != SCRIPT_HEAVY_POLICY_ASK
+        || runtime->bridge.heavy.answered) return;
+    DomBridge *bridge = &runtime->bridge;
+    if (script_runtime_frame_script_was_completed(runtime, handle)) return;
+    enum { FRAME_COMPLETED_LIMIT = 256 };
+    if (bridge->heavy.frame_completed_scripts == NULL) {
+        bridge->heavy.frame_completed_scripts = budget_malloc(
+            runtime->budget, FRAME_COMPLETED_LIMIT * sizeof(long));
+        if (bridge->heavy.frame_completed_scripts == NULL) {
+            bridge->heavy.frame_can_hold = false;
+            return;
+        }
+    }
+    if (bridge->heavy.frame_completed_count == FRAME_COMPLETED_LIMIT) {
+        bridge->heavy.frame_can_hold = false;
+        return;
+    }
+    bridge->heavy.frame_completed_scripts[
+        bridge->heavy.frame_completed_count++] = handle;
+}
+
+void script_runtime_heavy_frame_counts(const ScriptRuntime *runtime,
+                                       size_t *waiting_scripts,
+                                       size_t *waiting_bytes,
+                                       size_t *refused_scripts)
+{
+    bool waiting = runtime != NULL
+        && runtime->bridge.heavy.waiting_scripts != 0
+        && !runtime->bridge.heavy.answered;
+    *waiting_scripts = waiting ? runtime->bridge.heavy.waiting_scripts : 0;
+    *waiting_bytes = waiting ? runtime->bridge.heavy.waiting_bytes : 0;
+    *refused_scripts = runtime == NULL ? 0
+        : runtime->bridge.heavy.refused_scripts;
+}
+
+bool script_runtime_heavy_frame_held(const ScriptRuntime *runtime,
+                                     size_t *bytes)
+{
+    bool held = runtime != NULL && runtime->bridge.heavy.frame_held;
+    if (bytes != NULL)
+        *bytes = held ? runtime->bridge.heavy.frame_held_bytes : 0;
+    return held;
 }
 
 /* Called for a READY dynamic script before it runs. True holds it (it stays
@@ -229,10 +371,14 @@ bool js_rt_heavy_gate_holds(ScriptRuntime *runtime, ScriptDynamicTask *task)
         bridge->heavy.refused_scripts++;
         release = true;
     } else {
-        ScriptHeavyState state;
-        heavy_measure(runtime, &state);
-        bool ask = state.page_class == SCRIPT_HEAVY_CLASS_OVER
-            || state.page_class == SCRIPT_HEAVY_CLASS_SHELL;
+        /* A child frame's big script is asked about by its size alone. */
+        bool ask = bridge->heavy.frame_gate;
+        if (!ask) {
+            ScriptHeavyState state;
+            heavy_measure(runtime, &state);
+            ask = state.page_class == SCRIPT_HEAVY_CLASS_OVER
+                || state.page_class == SCRIPT_HEAVY_CLASS_SHELL;
+        }
         if (!ask) {
             release = true;
         } else if (bridge->heavy.policy == SCRIPT_HEAVY_POLICY_REFUSE) {

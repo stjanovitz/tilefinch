@@ -1,5 +1,8 @@
 include(ExternalProject)
 
+set(TILEFINCH_MBEDTLS_CLIENT_SAFETY_PATCH
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/mbedtls-3.6.7-client-safety.patch")
+
 set(TILEFINCH_PSP_TRANSPORT_MODE "OWNED" CACHE STRING
     "PSP live-network transport: OWNED or LEGACY")
 set_property(CACHE TILEFINCH_PSP_TRANSPORT_MODE PROPERTY STRINGS OWNED LEGACY)
@@ -127,6 +130,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${_transport_mbedtls_config}"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/mbedtls-3.6.6-psp.patch"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/mbedtls-3.6.6-psp-bnmul.patch"
+    "${TILEFINCH_MBEDTLS_CLIENT_SAFETY_PATCH}"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/curl-8.22.0-psp.patch"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/curl-8.22.0-http2-upload-lifetime.patch")
 
@@ -185,6 +189,12 @@ ExternalProject_Add(tilefinch_psp_mbedtls
         "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/mbedtls-3.6.6-psp-bnmul.patch"
         "-DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply_patch.cmake"
+        COMMAND
+        "${CMAKE_COMMAND}"
+        "-DPATCH_SOURCE_DIR=<SOURCE_DIR>"
+        "-DPATCH_FILE=${TILEFINCH_MBEDTLS_CLIENT_SAFETY_PATCH}"
+        "-DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply_patch.cmake"
     CMAKE_ARGS
         "-DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}"
         "-DCMAKE_INSTALL_PREFIX=${_transport_prefix}"
@@ -203,6 +213,13 @@ ExternalProject_Add_Step(tilefinch_psp_mbedtls user-config
     COMMAND "${CMAKE_COMMAND}" -E true
     DEPENDS "${_transport_mbedtls_config}"
     DEPENDERS configure)
+ExternalProject_Add_Step(tilefinch_psp_mbedtls patch-files
+    COMMAND "${CMAKE_COMMAND}" -E true
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/patches/mbedtls-3.6.6-psp.patch"
+        "${CMAKE_CURRENT_SOURCE_DIR}/patches/mbedtls-3.6.6-psp-bnmul.patch"
+        "${TILEFINCH_MBEDTLS_CLIENT_SAFETY_PATCH}"
+    DEPENDERS download
+    INDEPENDENT TRUE)
 
 set(_nghttp2_dependency "")
 set(_nghttp2_library "")

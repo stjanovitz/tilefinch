@@ -3634,9 +3634,11 @@ int main(int argc, char **argv)
                 if (*at == '\n') *at = '|';
             }
             printf("bot-wall detected=yes site=\"%s\" vendor=\"%s\" "
-                   "status=%ld blank-refused-script=%s notice=\"%s\"\n",
+                   "status=%ld blank-refused-script=%s paints=%s "
+                   "notice=\"%s\"\n",
                    bot_wall.site, bot_wall.vendor, bot_wall.status,
                    bot_wall.blank_after_refused_script ? "yes" : "no",
+                   bot_wall.paints_nothing ? "nothing" : "content",
                    notice);
         } else {
             printf("bot-wall detected=no\n");

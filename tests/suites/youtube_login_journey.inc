@@ -205,7 +205,7 @@ static int test_youtube_login_report_trail(void)
     CHECK(!browser_engine_navigation_pending(engine) && nav->page.loaded);
     CHECK(browser_engine_render_frame(engine, NULL));
     CHECK(browser_engine_youtube_signin_report(engine, report, sizeof(report)));
-    CHECK(strstr(report, "diagnostics v4") && strstr(report, "script-stop=0 ")
+    CHECK(strstr(report, "diagnostics v5") && strstr(report, "script-stop=0 ")
         && strstr(report, "text-present=0") && strstr(report, "auth-navigations=1")
         && strstr(report, "form-posts=0") && !strstr(report, "budget-limit-kib=0 "));
 
@@ -686,7 +686,9 @@ static int test_youtube_login_journey(void)
     BrowserConfig config; browser_config_init(&config, &device);
     config.memory_limit = 16u * MIB; config.resources.web_fonts_enabled = false;
     char error[256] = {0};
-    for (unsigned lane = 0; lane < 3u; lane++) {
+    /* Lane 3 is the lab's synchronous submission: the chain lands on
+       YouTube, whose native page opens, as on the job path (lane 0). */
+    for (unsigned lane = 0; lane < 4u; lane++) {
         CHECK(fetch_trace_replay_begin(fixture, error, sizeof(error)));
         BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error)); CHECK(engine);
         CHECK(browser_engine_set_javascript_enabled(engine, false));
@@ -709,6 +711,18 @@ static int test_youtube_login_journey(void)
         CHECK(browser_engine_set_javascript_enabled(engine, true));
         if (lane == 2u) {
             CHECK(browser_engine_load_url(engine, "https://accounts.google.com/tilefinch-test-signin", false));
+        } else if (lane == 3u) {
+            browser_engine_set_youtube_signin_diagnostics(engine, true);
+            bool handed = browser_engine_execute_action(
+                engine, &action, config.maximum_document_bytes, config.navigation_timeout_ms);
+            if (!handed) fprintf(stderr, "synchronous sign-in hand-over: %s\n", browser_engine_last_error(engine));
+            CHECK(handed);
+            char report[2560];
+            CHECK(browser_engine_youtube_signin_report(engine, report, sizeof(report))
+                /* Sent, landed, and no failure read into the hand-over. */
+                && strstr(report, " post-outcome=2 ") != NULL
+                && strstr(report, "\npost-chain=0,") != NULL
+                && nav->last_chain.failure == FETCH_CHAIN_FAILURE_NONE);
         } else CHECK(browser_engine_begin_navigation_action(engine, &action, config.maximum_document_bytes, config.navigation_timeout_ms));
         if (lane == 1u) {
             browser_engine_cancel_navigation(engine, "login cancelled");

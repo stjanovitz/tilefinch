@@ -410,6 +410,12 @@ bool browser_profile_heavy_site_allowed(const BrowserProfile *profile,
    Only the site is kept, as for the other per-site settings. */
 bool browser_profile_site_script_memory_stopped(
     const BrowserProfile *profile, const char *url);
+/* Whether this URL's site loads in full rather than in Basic view by
+   default: its script-free page had controls Basic view would leave out
+   (docs/BASIC_VIEW.md). Kept, like the script-memory notes, only while URL
+   history is on. */
+bool browser_profile_site_loads_in_full(const BrowserProfile *profile,
+                                        const char *url);
 BrowserBasicFallbackMode browser_profile_basic_fallback_mode(
     const BrowserProfile *profile);
 bool browser_profile_update_check_enabled(const BrowserProfile *profile);
@@ -569,6 +575,12 @@ bool browser_profile_set_heavy_site_allowed(
    forgets its site's note. */
 bool browser_profile_set_site_script_memory_stopped(
     BrowserProfile *profile, const char *url, bool stopped);
+/* Remembers (or forgets) that this URL's site loads in full, with the
+   same limit and history rules as the script-memory notes; Reset site
+   settings and forgetting a history address forget it too. True when the
+   list changed. */
+bool browser_profile_set_site_loads_in_full(
+    BrowserProfile *profile, const char *url, bool full);
 void browser_profile_set_reader_auto_mode(
     BrowserProfile *profile, bool enabled);
 void browser_profile_set_update_check_enabled(

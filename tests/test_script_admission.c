@@ -29,6 +29,21 @@ static void test_compile_model(void)
     CHECK(script_admission_compile_peak(SIZE_MAX) == SIZE_MAX);
     CHECK(script_admission_compile_peak(SIZE_MAX / 2u + 1u) == SIZE_MAX);
     CHECK(script_admission_compile_floor(SIZE_MAX) == SIZE_MAX);
+    /* Units of 1 MiB or more must also be able to obtain 4 times their
+       source before they compile: cnn.com's 2.3 MB inline bundle and
+       ign.com's 1.4 MB _app chunk had 3.4 and at most 3.75 times
+       obtainable and ran out of heap mid-compile; reuters' 2.5 MB chunk
+       had 4.2 and compiled. Below the threshold only the floor applies. */
+    CHECK(script_admission_large_unit_heap(SCRIPT_ADMISSION_LARGE_UNIT_BYTES
+                                           - 1u) == 0);
+    CHECK(script_admission_large_unit_heap(1u * MIB) == 4u * MIB);
+    CHECK(script_admission_large_unit_heap(2306610u) > 2306610u * 34u / 10u);
+    CHECK(script_admission_large_unit_heap(1382186u)
+          > 1382186u * 375u / 100u);
+    CHECK(script_admission_large_unit_heap(2472675u) < 2472675u * 42u / 10u);
+    CHECK(script_admission_large_unit_heap(1945591u) < 1945591u * 43u / 10u);
+    CHECK(script_admission_large_unit_heap(SIZE_MAX) == SIZE_MAX);
+    CHECK(script_admission_large_unit_heap(SIZE_MAX / 4u + 1u) == SIZE_MAX);
     /* The PSP app's per-script ceiling holds m.vk.com's 3.0 MiB
        application chunk. */
     CHECK((size_t) BROWSER_PSP_APP_SCRIPT_FILE_KB * KIB >= 3182206u);

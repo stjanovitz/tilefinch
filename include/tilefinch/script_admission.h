@@ -114,6 +114,34 @@ size_t script_admission_compile_peak(size_t unit_bytes);
 #define SCRIPT_ADMISSION_FLOOR_MINIMUM_UNIT_BYTES (64u * 1024u)
 size_t script_admission_compile_floor(size_t unit_bytes);
 
+/* The heap a unit of at least SCRIPT_ADMISSION_LARGE_UNIT_BYTES must be
+   able to obtain now (script_runtime_heap_obtainable: the heap it can
+   actually reach, no text counted as in it) before it compiles: 4 times
+   its source; 0 below the threshold, where the floor alone decides.
+   Above 1 MiB a failed compile is expensive (4.3 ms/KiB on the PSP: 6 s
+   for 1.4 MB, 10 s for 2.3 MB) and the floor is far too low to stop one.
+   On the 0.1.51 census (2026-11-16, host lab, text in the function-source
+   store) whole-file compiles of 1 MiB or more fell into two groups:
+   - five compiled (craigslist 1.0 MB, npr-home's Stripe 1.1 MB, gitlab
+     1.5 MB, substack 1.9 MB, reuters 2.5 MB) at a heap peak of 0.6-1.1
+     times their source, with 4.2-16.3 times their source obtainable;
+   - two ran out of heap mid-compile after 100 and 150 ms of host compile
+     (ign's 1.4 MB _app chunk, cnn.com's 2.3 MB inline bundle): they need
+     6.9-7.6 times their source of heap (10.5 and 15.8 MB) and had 3.3-3.75
+     and 3.4 times obtainable.
+   tilefinch-js-bench --only compile_peak (text in the heap) splits the
+   corpus's eleven units of 1 MiB or more the same way: 1.06-2.24 times or
+   9.0-10.6 times. Copying the unit's own text into the store takes about
+   1 times its source out of the Budget that backs the heap, so the first
+   group needs about 2 times obtainable and the second about 8; 4 is the
+   geometric middle. The cost: a first-group unit with between about 2 and
+   4 times its source obtainable is refused although it would have
+   compiled. No census page had one; the closest, reuters' chunk, had
+   4.2. */
+#define SCRIPT_ADMISSION_LARGE_UNIT_BYTES (1024u * 1024u)
+#define SCRIPT_ADMISSION_LARGE_UNIT_HEAP_MULTIPLIER 4u
+size_t script_admission_large_unit_heap(size_t unit_bytes);
+
 /* PSP milliseconds to restore `bytes` of source from a bytecode-cache hit
    (about 50 ms per MiB). */
 uint32_t script_admission_restore_ms(size_t bytes);
@@ -161,6 +189,16 @@ typedef enum {
 /* A dynamic script at least this large is weighed (and, when the user is
    asked, waits for the answer); smaller ones always run. */
 #define SCRIPT_HEAVY_UNIT_BYTES (256u * 1024u)
+/* In a child frame, a classic or dynamic script of at least
+   SCRIPT_HEAVY_UNIT_BYTES is asked about by itself, without the page's
+   SCRIPT_HEAVY_START_MS estimate or shell test: such a script is an
+   embedded app or a bot check, not the page the reader opened, and its
+   frame's text says nothing about it. The model also underrates these
+   scripts: DataDome's 580 KiB captcha script (etsy, nytimes) is a 5.7 s
+   start by script_admission_start_ms(), but its first run alone takes
+   361 ms in the host lab, about 36 s on the PSP at the measured host to
+   device factor of about 100, and its frames have 550 to 670 bytes of
+   text. */
 /* 15 s of device script time: about 1.5 MiB of fresh script. The page's
    own layout and image work comes on top (on xe.com and weather.com about
    as much again as the scripts), so a page this heavy takes at least

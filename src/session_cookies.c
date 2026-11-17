@@ -339,7 +339,8 @@ typedef struct {
 static bool parse_cookie_url(const char *url, CookieURL *parsed)
 {
     TilefinchUrl view;
-    if (url == NULL || parsed == NULL || !tilefinch_url_parse(url, &view))
+    if (url == NULL || parsed == NULL
+        || !tilefinch_url_parse_long(url, &view))
         return false;
     parsed->secure = tilefinch_url_is_secure(&view);
     size_t host_length = view.host_length;

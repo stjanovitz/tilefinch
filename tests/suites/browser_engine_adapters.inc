@@ -2169,6 +2169,8 @@ typedef struct {
     const char *body;
     bool failed;
     const char *method;
+    /* The response's Accept-CH value; NULL: none. */
+    const char *accept_ch;
 } GoogleIdentityRecord;
 
 static bool write_google_identity_replay(
@@ -2194,7 +2196,7 @@ static bool write_google_identity_replay(
             "transport-timeout=0\nerror=%s\nstatus=%ld\nlength=%zu\n"
             "redirect-origin-tainted=0\n"
             "effective-url=%s\ncontent-type=%s\netag=\nlast-modified=\n"
-            "cf-mitigated=\naccept-ch=\ncritical-ch=\nserver=gws\n"
+            "cf-mitigated=\naccept-ch=%s\ncritical-ch=\nserver=gws\n"
             "cf-ray=\nset-cookie-count=0\n",
             record->method == NULL ? "GET" : record->method,
             record->url, record->failed ? 0 : 1,
@@ -2202,7 +2204,8 @@ static bool write_google_identity_replay(
             record->status, record->failed ? 0u : length,
             record->effective_url == NULL ? record->url
                                           : record->effective_url,
-            record->content_type) > 0;
+            record->content_type,
+            record->accept_ch == NULL ? "" : record->accept_ch) > 0;
         ok = meta != NULL && fclose(meta) == 0 && ok;
     }
     snprintf(path, sizeof(path), "%s/trace.meta", directory);
@@ -3069,7 +3072,7 @@ static int test_google_accounts_identity(void)
           && browser_engine_take_youtube_login_events(engine) == 0u
           && browser_engine_youtube_signin_report(engine, report,
                                                   sizeof(report))
-          && strstr(report, "diagnostics v4\n") != NULL
+          && strstr(report, "diagnostics v5\n") != NULL
           && strstr(report, "\naccounts-refusals=1 refusal-class=3 "
                             "refusal-reason=0\n") != NULL);
 
@@ -3176,6 +3179,818 @@ static int test_google_accounts_identity(void)
     browser_engine_destroy(engine);
     remove_google_identity_replay(replay, record_count);
     site_identity_reset();
+    return 0;
+}
+
+/* The redirect after the password form (issue 7, 0.1.51). The account site
+   asks for client hints, so the password POST carries them; its redirect
+   leaves for another origin, where the hints may not follow. The PSP worker
+   refused that hop's request (hint names without the permission to send
+   them), the hop waited out the whole request deadline and the load ended as
+   "The site took too long to answer" with no HTTP status. The hop now runs,
+   and the sign-in report says where a chain ended. */
+static int test_accounts_password_redirect_chain(void)
+{
+    site_identity_reset();
+    static const char password[] =
+        "https://accounts.google.com/v3/signin/challenge/pwd?flowName=Chain";
+    static const char password_post[] =
+        "https://accounts.google.com/v3/signin/challenge/pwd"
+        "?flowName=Chain&TL=synthetic";
+    static const char set_sid[] =
+        "https://accounts.youtube.com/accounts/SetSID?ssdc=1&sidt=synthetic";
+    static const char refused_post[] =
+        "https://accounts.google.com/v3/signin/challenge/pwd"
+        "?flowName=Refused&TL=synthetic";
+    static const char refused_step[] =
+        "https://accounts.youtube.com/accounts/SetSID?ssdc=1&step=2";
+    /* The worker refuses the hop after the redirect for good. */
+    static const char unsupported_post[] =
+        "https://accounts.google.com/v3/signin/challenge/pwd"
+        "?flowName=Unsupported&TL=synthetic";
+    static const char unsupported_step[] =
+        "https://accounts.youtube.com/accounts/SetSID?ssdc=1&step=3";
+    /* A redirect with cookies to a hop that never answers, on a host too
+       long for the report to keep. */
+    static const char unanswered_post[] =
+        "https://accounts.google.com/v3/signin/challenge/pwd"
+        "?flowName=Unanswered&TL=synthetic";
+    static const char unanswered_step[] =
+        "https://a-long-landing-host-name-for-the-sign-in-report"
+        ".example.test/landed";
+    static const char password_page[] =
+        "<!doctype html><title>Password probe</title><p>Welcome</p>";
+    static const char landed_page[] =
+        "<!doctype html><title>Signed in probe</title><p>handoff</p>";
+    static const char hints[] = "Sec-CH-UA-Arch, Sec-CH-UA-Model";
+    const GoogleIdentityRecord records[] = {
+        {.url = password, .status = 200, .content_type = "text/html",
+         .body = password_page, .accept_ch = hints},
+        {.url = password_post, .method = "POST", .effective_url = set_sid,
+         .status = 200, .content_type = "text/html", .body = landed_page},
+        {.url = set_sid, .status = 200, .content_type = "text/html",
+         .body = landed_page},
+        /* A chain whose second redirect leaves HTTPS: refused. */
+        {.url = refused_post, .method = "POST",
+         .effective_url = refused_step, .status = 200,
+         .content_type = "text/html", .body = landed_page},
+        {.url = refused_step,
+         .effective_url = "http://plain.example.test/landed",
+         .status = 200, .content_type = "text/html", .body = landed_page},
+        {.url = unsupported_post, .method = "POST",
+         .effective_url = unsupported_step, .status = 200,
+         .content_type = "text/html", .body = landed_page},
+        {.url = unsupported_step, .status = 200, .content_type = "text/html",
+         .body = landed_page},
+        {.url = unanswered_post, .method = "POST",
+         .effective_url = unanswered_step, .status = 200,
+         .content_type = "text/html", .body = landed_page},
+        {.url = unanswered_step, .status = 0, .content_type = "",
+         .body = "", .failed = true}
+    };
+    size_t record_count = sizeof(records) / sizeof(records[0]);
+    char replay[128];
+    char error[256] = {0};
+    CHECK(write_google_identity_replay(replay, records, record_count)
+          && fetch_trace_replay_begin_response_keyed(
+                 replay, error, sizeof(error)));
+    TilefinchTestFaults *faults = tilefinch_test_faults();
+    faults->replay_lane_runs_page_hops = true;
+
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.tile_capacity = 0u;
+    config.javascript.enabled = false;
+    config.javascript.document_scripts_enabled = false;
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    browser_engine_set_youtube_signin_diagnostics(engine, true);
+
+    /* The password page: the account site's Accept-CH is remembered. */
+    CHECK(browser_engine_begin_navigation_url(engine, password, 1u * MIB,
+                                              1000, true)
+          && google_identity_pump(engine) == BROWSER_NAVIGATION_JOB_SUCCEEDED
+          && strcmp(navigation->page.document.title, "Password probe") == 0);
+
+    ControllerAction submit = {0};
+    submit.type = CONTROLLER_ACTION_FORM_SUBMIT;
+    snprintf(submit.url, sizeof(submit.url), "%s", password_post);
+    snprintf(submit.method, sizeof(submit.method), "POST");
+    snprintf(submit.content_type, sizeof(submit.content_type),
+             "application/x-www-form-urlencoded");
+    static const char submit_body[] =
+        "identifier=someone%40example.test&Passwd=synthetic"
+        "&bgresponse=!synthetic&at=1";
+    submit.body_length = sizeof(submit_body) - 1u;
+    memcpy(submit.body, submit_body, submit.body_length);
+    const long timeout_ms = 1500;
+    CHECK(browser_engine_begin_navigation_action(engine, &submit, 1u * MIB,
+                                                 timeout_ms));
+    uint64_t started_us = tilefinch_platform_monotonic_time_us();
+    BrowserNavigationJobStatus status = BROWSER_NAVIGATION_JOB_PENDING;
+    while (status == BROWSER_NAVIGATION_JOB_PENDING
+           && tilefinch_platform_monotonic_time_us() - started_us
+                  < UINT64_C(6000000))
+        status = browser_engine_pump_navigation(engine, NULL);
+    uint64_t elapsed_us = tilefinch_platform_monotonic_time_us() - started_us;
+    char report[2560];
+    bool reported = browser_engine_youtube_signin_report(
+        engine, report, sizeof(report));
+    if (status != BROWSER_NAVIGATION_JOB_SUCCEEDED)
+        fprintf(stderr, "password chain status=%d code=%s after %llu ms "
+                        "error=%s\n", (int) status,
+                tilefinch_diagnostic_code_name(
+                    browser_engine_navigation_failure_code(engine)),
+                (unsigned long long) (elapsed_us / 1000u),
+                browser_engine_last_error(engine));
+    CHECK(status == BROWSER_NAVIGATION_JOB_SUCCEEDED
+          /* Not by waiting out the deadline. */
+          && elapsed_us < (uint64_t) timeout_ms * 1000u
+          && strcmp(navigation->page.document_url, set_sid) == 0
+          && strcmp(navigation->page.document.title, "Signed in probe") == 0);
+    CHECK(reported && strstr(report, "diagnostics v5\n") != NULL
+          && strstr(report, "form-posts=1 token-kind=4 token-length=10 "
+                            "post-target=2 post-outcome=2 ") != NULL
+          /* No failure, one redirect followed, no failing hop or limit. */
+          && strstr(report, "\npost-chain=0,1,0,0,0,") != NULL
+          && strstr(report, ",1500\n") != NULL
+          && strstr(report, "Passwd") == NULL
+          && strstr(report, "synthetic") == NULL
+          && strstr(report, "youtube.com") == NULL);
+
+    /* A chain a redirect rule ends fails at once with that rule's own
+       reason, never as a timeout, and the report names the hop, its host
+       class and the rule. The form is posted once. */
+    CHECK(browser_engine_begin_navigation_url(engine, password, 1u * MIB,
+                                              1000, true)
+          && google_identity_pump(engine) == BROWSER_NAVIGATION_JOB_SUCCEEDED);
+    accounts_identity_clear_requests();
+    snprintf(submit.url, sizeof(submit.url), "%s", refused_post);
+    CHECK(browser_engine_begin_navigation_action(engine, &submit, 1u * MIB,
+                                                 timeout_ms));
+    started_us = tilefinch_platform_monotonic_time_us();
+    status = BROWSER_NAVIGATION_JOB_PENDING;
+    while (status == BROWSER_NAVIGATION_JOB_PENDING
+           && tilefinch_platform_monotonic_time_us() - started_us
+                  < UINT64_C(6000000))
+        status = browser_engine_pump_navigation(engine, NULL);
+    elapsed_us = tilefinch_platform_monotonic_time_us() - started_us;
+    const char *agents[4];
+    unsigned posts = accounts_identity_requests(refused_post, agents);
+    reported = browser_engine_youtube_signin_report(engine, report,
+                                                    sizeof(report));
+    if (status != BROWSER_NAVIGATION_JOB_FAILED || posts != 1u)
+        fprintf(stderr, "refused chain status=%d posts=%u error=%s\n%s",
+                (int) status, posts, browser_engine_last_error(engine),
+                reported ? report : "");
+    CHECK(status == BROWSER_NAVIGATION_JOB_FAILED && posts == 1u
+          && elapsed_us < (uint64_t) timeout_ms * 1000u
+          && browser_engine_navigation_failure_code(engine)
+                 == TILEFINCH_DIAGNOSTIC_INTERNAL_FAILED
+          && strcmp(navigation->page.document_url, password) == 0);
+    CHECK(reported
+          /* The status is the refused redirect's own. */
+          && strstr(report, "post-target=2 post-outcome=3 "
+                            "post-http-status=302 post-landing=2\n") != NULL
+          /* Class 7: a redirect rule. One redirect was followed; the
+             response that ended the chain came from hop 1 (the POST is hop
+             0), on accounts.youtube.com (host class 3); limit 4: a target
+             the redirect rules refuse. */
+          && strstr(report, "\npost-chain=7,1,1,3,4,") != NULL
+          && strstr(report, ",1500\n") != NULL);
+
+    /* A hop the worker can never carry fails at once, never by waiting out
+       the deadline, and it is not a network failure: the page reads
+       "Something went wrong", not "Check Wi-Fi". */
+    faults->replay_lane_unsupported_url = unsupported_step;
+    unsigned chain[12] = {0};
+    CHECK(browser_engine_begin_navigation_url(engine, password, 1u * MIB,
+                                              1000, true)
+          && google_identity_pump(engine) == BROWSER_NAVIGATION_JOB_SUCCEEDED);
+    accounts_identity_clear_requests();
+    snprintf(submit.url, sizeof(submit.url), "%s", unsupported_post);
+    CHECK(browser_engine_begin_navigation_action(engine, &submit, 1u * MIB,
+                                                 timeout_ms));
+    started_us = tilefinch_platform_monotonic_time_us();
+    status = BROWSER_NAVIGATION_JOB_PENDING;
+    while (status == BROWSER_NAVIGATION_JOB_PENDING
+           && tilefinch_platform_monotonic_time_us() - started_us
+                  < UINT64_C(6000000))
+        status = browser_engine_pump_navigation(engine, NULL);
+    elapsed_us = tilefinch_platform_monotonic_time_us() - started_us;
+    faults->replay_lane_unsupported_url = NULL;
+    posts = accounts_identity_requests(unsupported_post, agents);
+    reported = browser_engine_youtube_signin_report(engine, report,
+                                                    sizeof(report));
+    const char *line = reported ? strstr(report, "\npost-chain=") : NULL;
+    bool parsed = line != NULL && sscanf(
+        line, "\npost-chain=%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u",
+        &chain[0], &chain[1], &chain[2], &chain[3], &chain[4], &chain[5],
+        &chain[6], &chain[7], &chain[8], &chain[9], &chain[10],
+        &chain[11]) == 12;
+    if (status != BROWSER_NAVIGATION_JOB_FAILED || posts != 1u
+        || browser_engine_navigation_failure_code(engine)
+               != TILEFINCH_DIAGNOSTIC_INTERNAL_FAILED)
+        fprintf(stderr, "unsupported hop status=%d posts=%u code=%s after "
+                        "%llu ms error=%s\n%s", (int) status, posts,
+                tilefinch_diagnostic_code_name(
+                    browser_engine_navigation_failure_code(engine)),
+                (unsigned long long) (elapsed_us / 1000u),
+                browser_engine_last_error(engine), reported ? report : "");
+    CHECK(status == BROWSER_NAVIGATION_JOB_FAILED && posts == 1u
+          && elapsed_us < (uint64_t) timeout_ms * 1000u / 2u
+          && browser_engine_navigation_failure_code(engine)
+                 == TILEFINCH_DIAGNOSTIC_INTERNAL_FAILED);
+    /* Class 7, limit 6 (a request the transport cannot carry), on hop 1 at
+       accounts.youtube.com, which never answered. */
+    CHECK(parsed && strstr(report, "post-http-status=0 ") != NULL
+          && chain[0] == 7u && chain[1] == 1u && chain[2] == 1u
+          && chain[3] == 3u && chain[4] == 6u && chain[5] == 0u
+          && chain[6] == 0u && chain[9] == 0u && chain[11] == 1500u);
+
+    /* A redirect that set cookies, then a hop that never answered: that
+       hop's numbers are zero, not the redirect's, and a host too long to
+       keep reads as any other host (class 5). */
+    faults->replay_lane_redirect_cookies = 3u;
+    CHECK(browser_engine_begin_navigation_url(engine, password, 1u * MIB,
+                                              1000, true)
+          && google_identity_pump(engine) == BROWSER_NAVIGATION_JOB_SUCCEEDED);
+    snprintf(submit.url, sizeof(submit.url), "%s", unanswered_post);
+    CHECK(browser_engine_begin_navigation_action(engine, &submit, 1u * MIB,
+                                                 timeout_ms));
+    started_us = tilefinch_platform_monotonic_time_us();
+    status = BROWSER_NAVIGATION_JOB_PENDING;
+    while (status == BROWSER_NAVIGATION_JOB_PENDING
+           && tilefinch_platform_monotonic_time_us() - started_us
+                  < UINT64_C(6000000))
+        status = browser_engine_pump_navigation(engine, NULL);
+    faults->replay_lane_redirect_cookies = 0u;
+    reported = browser_engine_youtube_signin_report(engine, report,
+                                                    sizeof(report));
+    line = reported ? strstr(report, "\npost-chain=") : NULL;
+    parsed = line != NULL && sscanf(
+        line, "\npost-chain=%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u",
+        &chain[0], &chain[1], &chain[2], &chain[3], &chain[4], &chain[5],
+        &chain[6], &chain[7], &chain[8], &chain[9], &chain[10],
+        &chain[11]) == 12;
+    if (!parsed || chain[3] != 5u || chain[5] != 0u || chain[6] != 0u)
+        fprintf(stderr, "unanswered hop status=%d error=%s\n%s",
+                (int) status, browser_engine_last_error(engine),
+                reported ? report : "");
+    CHECK(status == BROWSER_NAVIGATION_JOB_FAILED && parsed
+          && chain[0] != 0u && chain[0] != 7u
+          && chain[1] == 1u && chain[2] == 1u && chain[3] == 5u
+          /* The hop's own header bytes, Set-Cookie fields and first byte. */
+          && chain[5] == 0u && chain[6] == 0u && chain[9] == 0u
+          /* The chain's: the redirect's three cookies. */
+          && chain[7] > 0u && chain[8] == 3u);
+
+    /* A redirect whose cookies would take the chain past the transport's
+       capacity is not followed with some of them dropped: the chain ends
+       there, on the redirect's own hop, under the cookie rule. */
+    faults->replay_lane_redirect_cookies = FETCH_RESPONSE_COOKIE_CAPACITY + 1u;
+    CHECK(browser_engine_begin_navigation_url(engine, password, 1u * MIB,
+                                              1000, true)
+          && google_identity_pump(engine) == BROWSER_NAVIGATION_JOB_SUCCEEDED);
+    accounts_identity_clear_requests();
+    CHECK(browser_engine_begin_navigation_action(engine, &submit, 1u * MIB,
+                                                 timeout_ms));
+    started_us = tilefinch_platform_monotonic_time_us();
+    status = BROWSER_NAVIGATION_JOB_PENDING;
+    while (status == BROWSER_NAVIGATION_JOB_PENDING
+           && tilefinch_platform_monotonic_time_us() - started_us
+                  < UINT64_C(6000000))
+        status = browser_engine_pump_navigation(engine, NULL);
+    faults->replay_lane_redirect_cookies = 0u;
+    reported = browser_engine_youtube_signin_report(engine, report,
+                                                    sizeof(report));
+    line = reported ? strstr(report, "\npost-chain=") : NULL;
+    parsed = line != NULL && sscanf(
+        line, "\npost-chain=%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u",
+        &chain[0], &chain[1], &chain[2], &chain[3], &chain[4], &chain[5],
+        &chain[6], &chain[7], &chain[8], &chain[9], &chain[10],
+        &chain[11]) == 12;
+    if (!parsed || chain[0] != 7u || chain[4] != 5u)
+        fprintf(stderr, "cookie overflow status=%d error=%s\n%s",
+                (int) status, browser_engine_last_error(engine),
+                reported ? report : "");
+    CHECK(status == BROWSER_NAVIGATION_JOB_FAILED && parsed
+          && accounts_identity_requests(unanswered_step, agents) == 0u
+          && chain[0] == 7u && chain[1] == 0u && chain[2] == 0u
+          && chain[3] == 1u && chain[4] == 5u
+          && chain[8] == FETCH_RESPONSE_COOKIE_CAPACITY);
+
+    fetch_trace_end();
+    faults->replay_lane_runs_page_hops = false;
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    remove_google_identity_replay(replay, record_count);
+    site_identity_reset();
+    return 0;
+}
+
+/* The Cookie header of the latest replayed request for url, copied to
+   `copy`, or NULL when the replay answered none. */
+static const char *worker_cookie_request(const char *url, char copy[192])
+{
+    TilefinchTestFaults *faults = tilefinch_test_faults();
+    size_t capacity = sizeof(faults->replayed_requests)
+        / sizeof(faults->replayed_requests[0]);
+    unsigned count = faults->replayed_request_count;
+    unsigned first = count > capacity ? count - (unsigned) capacity : 0u;
+    const char *cookie = NULL;
+    for (unsigned i = first; i < count; i++) {
+        size_t slot = i % capacity;
+        if (strcmp(faults->replayed_requests[slot].url, url) == 0)
+            cookie = faults->replayed_requests[slot].cookie;
+    }
+    if (cookie == NULL) return NULL;
+    snprintf(copy, 192, "%s", cookie);
+    return copy;
+}
+
+/* A sign-in hand-over's redirect to an address of several kilobytes (issue
+   7: after the password, Google answered 302 with a Location Tilefinch
+   refused as over 2,047 bytes, and the page stayed on the password form).
+   On the PSP's hop machine a navigation's chain passes through such an
+   address: the worker hands the Location over whole beside its header
+   snapshot, the hop is requested with the whole address, its cookies are
+   kept under its own host, and the chain lands. It may not end on one. */
+static int test_long_redirect_hop_chain(void)
+{
+    static const char form[] = "https://long-chain.example.test/form";
+    static const char submit_url[] =
+        "https://long-chain.example.test/submit?step=1";
+    static const char landed[] = "https://long-chain.example.test/landed";
+    /* One hop host per length, so each run's cookie is its own. */
+    static const char *const hop_after[] = {
+        "https://hop-a.long-chain.example.test/after",
+        "https://hop-b.long-chain.example.test/after",
+        "https://hop-c.long-chain.example.test/after"
+    };
+    static const char *const hop_prefixes[] = {
+        "https://hop-a.long-chain.example.test/setsid?ssdc=1&sidt=",
+        "https://hop-b.long-chain.example.test/setsid?ssdc=1&sidt=",
+        "https://hop-c.long-chain.example.test/setsid?ssdc=1&sidt="
+    };
+    const char *hop_prefix = hop_prefixes[0];
+    const size_t hop_prefix_length = strlen(hop_prefix);
+    static const char plain_body[] =
+        "<!doctype html><title>Long chain probe</title><p>probe</p>";
+    const GoogleIdentityRecord records[] = {
+        {.url = form, .status = 200, .content_type = "text/html",
+         .body = plain_body},
+        {.url = landed, .status = 200, .content_type = "text/html",
+         .body = "<!doctype html><title>Landed probe</title><p>landed</p>"},
+        {.url = hop_after[0], .status = 200, .content_type = "text/html",
+         .body = plain_body},
+        {.url = hop_after[1], .status = 200, .content_type = "text/html",
+         .body = plain_body},
+        {.url = hop_after[2], .status = 200, .content_type = "text/html",
+         .body = plain_body}
+    };
+    size_t record_count = sizeof(records) / sizeof(records[0]);
+    char replay[128];
+    char error[256] = {0};
+    CHECK(write_google_identity_replay(replay, records, record_count)
+          && fetch_trace_replay_begin_response_keyed(
+                 replay, error, sizeof(error)));
+    TilefinchTestFaults *faults = tilefinch_test_faults();
+    faults->replay_lane_runs_page_hops = true;
+
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.tile_capacity = 0u;
+    config.javascript.enabled = false;
+    config.javascript.document_scripts_enabled = false;
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+    NavigationSession *navigation = browser_engine_navigation(engine);
+
+    ControllerAction submit = {0};
+    submit.type = CONTROLLER_ACTION_FORM_SUBMIT;
+    snprintf(submit.url, sizeof(submit.url), "%s", submit_url);
+    snprintf(submit.method, sizeof(submit.method), "POST");
+    snprintf(submit.content_type, sizeof(submit.content_type),
+             "application/x-www-form-urlencoded");
+    static const char submit_body[] = "field=synthetic&at=1";
+    submit.body_length = sizeof(submit_body) - 1u;
+    memcpy(submit.body, submit_body, submit.body_length);
+    const long timeout_ms = 1500;
+    static char through[TILEFINCH_URL_LONG_LIMIT];
+    static const size_t lengths[] = {
+        3000u, 7000u, TILEFINCH_URL_LONG_LIMIT - 1u
+    };
+    char landed_copy[192], after_copy[192];
+    for (size_t at = 0; at < sizeof(lengths) / sizeof(lengths[0]); at++) {
+        size_t prefix_length = hop_prefix_length;
+        memcpy(through, hop_prefixes[at], prefix_length);
+        memset(through + prefix_length, 't', lengths[at] - prefix_length);
+        through[lengths[at]] = '\0';
+        CHECK(browser_engine_begin_navigation_url(engine, form, 1u * MIB,
+                                                  1000, true)
+              && google_identity_pump(engine)
+                     == BROWSER_NAVIGATION_JOB_SUCCEEDED);
+        accounts_identity_clear_requests();
+        faults->replay_lane_detour_from = submit_url;
+        faults->replay_lane_detour_through = through;
+        faults->replay_lane_detour_to = landed;
+        /* Each redirect sets "lane0=1" for its own host. */
+        faults->replay_lane_redirect_cookies = 1u;
+        CHECK(browser_engine_begin_navigation_action(engine, &submit,
+                                                     1u * MIB, timeout_ms));
+        uint64_t started_us = tilefinch_platform_monotonic_time_us();
+        BrowserNavigationJobStatus status = BROWSER_NAVIGATION_JOB_PENDING;
+        while (status == BROWSER_NAVIGATION_JOB_PENDING
+               && tilefinch_platform_monotonic_time_us() - started_us
+                      < UINT64_C(6000000))
+            status = browser_engine_pump_navigation(engine, NULL);
+        faults->replay_lane_redirect_cookies = 0u;
+        if (status != BROWSER_NAVIGATION_JOB_SUCCEEDED)
+            fprintf(stderr, "long hop (%zu bytes) status=%d code=%s "
+                            "limit=%u error=%s\n", lengths[at], (int) status,
+                    tilefinch_diagnostic_code_name(
+                        browser_engine_navigation_failure_code(engine)),
+                    (unsigned) navigation->last_chain.limit,
+                    browser_engine_last_error(engine));
+        CHECK(status == BROWSER_NAVIGATION_JOB_SUCCEEDED
+              && strcmp(navigation->page.document_url, landed) == 0
+              && strcmp(navigation->page.document.title, "Landed probe") == 0
+              && navigation->last_chain.redirects == 2u
+              && navigation->last_chain.limit == FETCH_CHAIN_LIMIT_NONE);
+        /* The landing request carried the first host's cookie; a later
+           page on the long hop's host gets the one that hop set (host-only
+           cookies: neither host sees the other's). */
+        const char *landed_cookie = worker_cookie_request(landed, landed_copy);
+        CHECK(landed_cookie != NULL
+              && strstr(landed_cookie, "lane0=1") != NULL);
+        CHECK(browser_engine_begin_navigation_url(engine, hop_after[at],
+                                                  1u * MIB, 1000, true)
+              && google_identity_pump(engine)
+                     == BROWSER_NAVIGATION_JOB_SUCCEEDED);
+        const char *after_cookie =
+            worker_cookie_request(hop_after[at], after_copy);
+        if (after_cookie == NULL || strstr(after_cookie, "lane0=1") == NULL)
+            fprintf(stderr, "long hop (%zu bytes) cookies: after=%s\n",
+                    lengths[at],
+                    after_cookie == NULL ? "(no request)" : after_cookie);
+        CHECK(after_cookie != NULL
+              && strstr(after_cookie, "lane0=1") != NULL);
+    }
+
+    /* A long hop on the account site still presents that site's identity
+       (a top-level navigation's hop takes its target's User-Agent). */
+    static char long_accounts[7000];
+    static const char accounts_prefix[] =
+        "https://accounts.google.com/CheckCookie?continue=";
+    memcpy(long_accounts, accounts_prefix, sizeof(accounts_prefix) - 1u);
+    memset(long_accounts + sizeof(accounts_prefix) - 1u, 't',
+           sizeof(long_accounts) - sizeof(accounts_prefix));
+    long_accounts[sizeof(long_accounts) - 1u] = '\0';
+    CHECK(site_identity_user_agent_override(long_accounts) != NULL
+          && site_identity_user_agent_override(long_accounts)
+                 == site_identity_user_agent_override(
+                        "https://accounts.google.com/ServiceLogin"));
+
+    /* A chain that ends on the long address fails under its own rule, at
+       once, and the page stays where it was. */
+    memcpy(through, hop_prefix, hop_prefix_length);
+    memset(through + hop_prefix_length, 't', 3000u - hop_prefix_length);
+    through[3000] = '\0';
+    CHECK(browser_engine_begin_navigation_url(engine, form, 1u * MIB,
+                                              1000, true)
+          && google_identity_pump(engine)
+                 == BROWSER_NAVIGATION_JOB_SUCCEEDED);
+    faults->replay_lane_detour_to = NULL;
+    CHECK(browser_engine_begin_navigation_action(engine, &submit, 1u * MIB,
+                                                 timeout_ms));
+    uint64_t started_us = tilefinch_platform_monotonic_time_us();
+    BrowserNavigationJobStatus status = BROWSER_NAVIGATION_JOB_PENDING;
+    while (status == BROWSER_NAVIGATION_JOB_PENDING
+           && tilefinch_platform_monotonic_time_us() - started_us
+                  < UINT64_C(6000000))
+        status = browser_engine_pump_navigation(engine, NULL);
+    uint64_t elapsed_us = tilefinch_platform_monotonic_time_us() - started_us;
+    if (status != BROWSER_NAVIGATION_JOB_FAILED
+        || navigation->last_chain.limit != FETCH_CHAIN_LIMIT_DOCUMENT_LENGTH)
+        fprintf(stderr, "long final address status=%d limit=%u error=%s\n",
+                (int) status, (unsigned) navigation->last_chain.limit,
+                browser_engine_last_error(engine));
+    CHECK(status == BROWSER_NAVIGATION_JOB_FAILED
+          && elapsed_us < (uint64_t) timeout_ms * 1000u / 2u
+          && navigation->last_chain.failure == FETCH_CHAIN_FAILURE_RULE
+          && navigation->last_chain.limit == FETCH_CHAIN_LIMIT_DOCUMENT_LENGTH
+          && navigation->last_chain.redirects == 1u
+          && browser_engine_navigation_failure_code(engine)
+                 == TILEFINCH_DIAGNOSTIC_INTERNAL_FAILED
+          && strcmp(navigation->page.document_url, form) == 0);
+
+    /* One byte past a hop's bound: the Location is refused, the hop never
+       made. */
+    static char oversize[TILEFINCH_URL_LONG_LIMIT + 1u];
+    memcpy(oversize, hop_prefix, hop_prefix_length);
+    memset(oversize + hop_prefix_length, 't',
+           TILEFINCH_URL_LONG_LIMIT - hop_prefix_length);
+    oversize[TILEFINCH_URL_LONG_LIMIT] = '\0';
+    faults->replay_lane_detour_through = oversize;
+    faults->replay_lane_detour_to = landed;
+    CHECK(browser_engine_begin_navigation_action(engine, &submit, 1u * MIB,
+                                                 timeout_ms));
+    status = BROWSER_NAVIGATION_JOB_PENDING;
+    started_us = tilefinch_platform_monotonic_time_us();
+    while (status == BROWSER_NAVIGATION_JOB_PENDING
+           && tilefinch_platform_monotonic_time_us() - started_us
+                  < UINT64_C(6000000))
+        status = browser_engine_pump_navigation(engine, NULL);
+    CHECK(status == BROWSER_NAVIGATION_JOB_FAILED
+          && navigation->last_chain.limit == FETCH_CHAIN_LIMIT_TARGET_LENGTH
+          && navigation->last_chain.redirects == 0u
+          && strcmp(navigation->page.document_url, form) == 0);
+
+    faults->replay_lane_detour_from = NULL;
+    faults->replay_lane_detour_through = NULL;
+    faults->replay_lane_detour_to = NULL;
+    fetch_trace_end();
+    faults->replay_lane_runs_page_hops = false;
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    remove_google_identity_replay(replay, record_count);
+    return 0;
+}
+
+/* The twelve post-chain= numbers of the sign-in report. */
+static bool handoff_report_chain(BrowserEngine *engine, unsigned long out[12],
+                                 long *post_http_status)
+{
+    static char report[2560];
+    if (!browser_engine_youtube_signin_report(engine, report, sizeof(report)))
+        return false;
+    const char *status = strstr(report, " post-http-status=");
+    const char *line = strstr(report, "\npost-chain=");
+    return status != NULL && line != NULL
+        && sscanf(status, " post-http-status=%ld", post_http_status) == 1
+        && sscanf(line, "\npost-chain=%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,"
+                        "%lu,%lu,%lu", &out[0], &out[1], &out[2], &out[3],
+                  &out[4], &out[5], &out[6], &out[7], &out[8], &out[9],
+                  &out[10], &out[11]) == 12;
+}
+
+/* A sign-in chain that lands on YouTube hands over to the native page: the
+   load is dropped at the YouTube response's headers and the adapter's page
+   opened instead. The sign-in trail still reports the chain the POST
+   followed, counted by the hop machine (two redirects, one cookie each,
+   through a long hop), not the zeros the adapter's load leaves in the
+   session, on the host lab's synchronous action and on the PSP's job. */
+static int test_handoff_chain_facts(void)
+{
+    static const char form[] =
+        "https://accounts.google.com/v3/signin/challenge/pwd?tf=form";
+    static const char submit_url[] =
+        "https://accounts.google.com/v3/signin/challenge/pwd?tf=submit";
+    static const char landed[] =
+        "https://www.youtube.com/signin?token=synthetic-chain";
+    static const char bootstrap[] =
+        "<script>ytcfg.set({\"INNERTUBE_API_KEY\":\"fixture-key\","
+        "\"INNERTUBE_CONTEXT_CLIENT_VERSION\":\"fixture-version\","
+        "\"INNERTUBE_CLIENT_NAME\":\"MWEB\",\"VISITOR_DATA\":\"fixture\","
+        "\"LOGGED_IN\":true});</script>";
+    const GoogleIdentityRecord records[] = {
+        {.url = form, .status = 200, .content_type = "text/html",
+         .body = "<!doctype html><title>Password</title><p>pwd</p>"},
+        {.url = landed, .status = 200, .content_type = "text/html",
+         .body = "<!doctype html><p>full YouTube</p>"},
+        {.url = "https://m.youtube.com/", .status = 200,
+         .content_type = "text/html", .body = bootstrap}
+    };
+    size_t record_count = sizeof(records) / sizeof(records[0]);
+    char replay[128];
+    char error[256] = {0};
+    CHECK(write_google_identity_replay(replay, records, record_count)
+          && fetch_trace_replay_begin_response_keyed(
+                 replay, error, sizeof(error)));
+    TilefinchTestFaults *faults = tilefinch_test_faults();
+    faults->replay_lane_runs_page_hops = true;
+
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.tile_capacity = 0u;
+    config.javascript.enabled = false;
+    config.javascript.document_scripts_enabled = false;
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+    browser_engine_set_youtube_signin_diagnostics(engine, true);
+    NavigationSession *navigation = browser_engine_navigation(engine);
+
+    ControllerAction submit = {0};
+    submit.type = CONTROLLER_ACTION_FORM_SUBMIT;
+    submit.navigation_source = CONTROLLER_NAVIGATION_USER;
+    snprintf(submit.url, sizeof(submit.url), "%s", submit_url);
+    snprintf(submit.method, sizeof(submit.method), "POST");
+    snprintf(submit.content_type, sizeof(submit.content_type),
+             "application/x-www-form-urlencoded");
+    static const char submit_body[] = "password=synthetic&bgresponse=x";
+    submit.body_length = sizeof(submit_body) - 1u;
+    memcpy(submit.body, submit_body, submit.body_length);
+    const long timeout_ms = 1500;
+    /* A long hop between the POST and YouTube, as Google's is. */
+    static char through[3000];
+    static const char through_prefix[] =
+        "https://accounts.google.com/CheckCookie?continue=";
+    memcpy(through, through_prefix, sizeof(through_prefix) - 1u);
+    memset(through + sizeof(through_prefix) - 1u, 't',
+           sizeof(through) - sizeof(through_prefix));
+    through[sizeof(through) - 1u] = '\0';
+    faults->replay_lane_detour_from = submit_url;
+    faults->replay_lane_detour_through = through;
+    faults->replay_lane_detour_to = landed;
+    for (unsigned lane = 0; lane < 2u; lane++) {
+        CHECK(browser_engine_begin_navigation_url(engine, form, 1u * MIB,
+                                                  1000, true)
+              && google_identity_pump(engine)
+                     == BROWSER_NAVIGATION_JOB_SUCCEEDED);
+        faults->replay_lane_redirect_cookies = 1u;
+        bool opened;
+        if (lane == 0u) {
+            /* The host lab's synchronous form submission. */
+            opened = browser_engine_execute_action(engine, &submit,
+                                                   1u * MIB, timeout_ms);
+        } else {
+            /* The PSP's navigation job. */
+            CHECK(browser_engine_begin_navigation_action(
+                engine, &submit, 1u * MIB, timeout_ms));
+            opened = google_identity_pump(engine)
+                         == BROWSER_NAVIGATION_JOB_SUCCEEDED;
+        }
+        faults->replay_lane_redirect_cookies = 0u;
+        unsigned long chain[12] = {0};
+        long post_status = -1;
+        bool reported = handoff_report_chain(engine, chain, &post_status);
+        if (!opened || !reported || chain[1] != 2u)
+            fprintf(stderr, "hand-over chain lane %u: opened=%d document=%s "
+                            "error=%s post-http-status=%ld post-chain=%lu,"
+                            "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
+                    lane, opened, navigation->page.document_url,
+                    browser_engine_last_error(engine), post_status,
+                    chain[0], chain[1], chain[2], chain[3], chain[4],
+                    chain[5], chain[6], chain[7], chain[8], chain[9],
+                    chain[10], chain[11]);
+        CHECK(opened && reported
+              && strcmp(navigation->page.document_url,
+                        "https://www.youtube.com/") == 0);
+        /* Finished (class 0, no failed hop, host or limit), two redirects
+           followed, the YouTube response's headers counted, one cookie per
+           redirect, and the times against the POST's deadline. */
+        CHECK(chain[0] == 0u && chain[1] == 2u && chain[2] == 0u
+              && chain[3] == 0u && chain[4] == 0u
+              && chain[5] > 0u && chain[6] == 0u && chain[7] >= chain[5]
+              && chain[8] == 2u && chain[9] > 0u && chain[10] <= chain[11]
+              && chain[11] == (unsigned long) timeout_ms
+              && post_status == 200);
+        /* The trail's copy is not written back: after the synchronous
+           hand-over the session keeps what the adapter's load left
+           (browser_engine.c reads it to classify that load's failures). */
+        CHECK(lane != 0u || navigation->last_chain.redirects == 0u);
+    }
+    faults->replay_lane_detour_from = NULL;
+    faults->replay_lane_detour_through = NULL;
+    faults->replay_lane_detour_to = NULL;
+    fetch_trace_end();
+    faults->replay_lane_runs_page_hops = false;
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    remove_google_identity_replay(replay, record_count);
+    return 0;
+}
+
+/* A worker-path page's own Set-Cookie fields reach the jar at its header
+   boundary, as on the browser-thread path: the page's stylesheet request
+   and the next page carry them, both for a page answered at once and for
+   the final response of a redirect chain. On the PSP the header take used
+   to hand over no cookies, and the navigation's commit at completion was
+   then skipped as already done. */
+static int test_worker_path_response_cookies(void)
+{
+    static const char page[] = "https://cookie-page.example.test/page";
+    static const char style[] = "https://cookie-page.example.test/style.css";
+    static const char page_after[] = "https://cookie-page.example.test/after";
+    static const char start[] = "https://cookie-chain.example.test/start";
+    static const char landed[] = "https://cookie-chain.example.test/landed";
+    static const char chain_after[] =
+        "https://cookie-chain.example.test/after";
+    static const char page_body[] =
+        "<!doctype html><title>Cookie page</title>"
+        "<link rel=stylesheet href=\"/style.css\"><p>page</p>";
+    static const char plain_body[] =
+        "<!doctype html><title>Cookie probe</title><p>probe</p>";
+    const GoogleIdentityRecord records[] = {
+        {.url = page, .status = 200, .content_type = "text/html",
+         .body = page_body},
+        {.url = style, .status = 200, .content_type = "text/css",
+         .body = "p{color:#123456}"},
+        {.url = page_after, .status = 200, .content_type = "text/html",
+         .body = plain_body},
+        {.url = start, .effective_url = landed, .status = 200,
+         .content_type = "text/html", .body = plain_body},
+        {.url = landed, .status = 200, .content_type = "text/html",
+         .body = plain_body},
+        {.url = chain_after, .status = 200, .content_type = "text/html",
+         .body = plain_body}
+    };
+    size_t record_count = sizeof(records) / sizeof(records[0]);
+    char replay[128];
+    char error[256] = {0};
+    CHECK(write_google_identity_replay(replay, records, record_count)
+          && fetch_trace_replay_begin_response_keyed(
+                 replay, error, sizeof(error)));
+    TilefinchTestFaults *faults = tilefinch_test_faults();
+    faults->replay_lane_runs_page_hops = true;
+
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.tile_capacity = 0u;
+    config.javascript.enabled = false;
+    config.javascript.document_scripts_enabled = false;
+    config.resources.enabled = true;
+    config.resources.web_fonts_enabled = false;
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+    NavigationSession *navigation = browser_engine_navigation(engine);
+
+    /* A page answered at once sets two cookies. */
+    accounts_identity_clear_requests();
+    faults->replay_lane_cookie_url = page;
+    faults->replay_lane_url_cookies = 2u;
+    CHECK(browser_engine_begin_navigation_url(engine, page, 1u * MIB,
+                                              1000, true)
+          && google_identity_pump(engine) == BROWSER_NAVIGATION_JOB_SUCCEEDED
+          && strcmp(navigation->page.document.title, "Cookie page") == 0);
+    char style_copy[192], after_copy[192], landed_copy[192];
+    const char *style_cookie = worker_cookie_request(style, style_copy);
+    CHECK(browser_engine_begin_navigation_url(engine, page_after, 1u * MIB,
+                                              1000, true)
+          && google_identity_pump(engine)
+                 == BROWSER_NAVIGATION_JOB_SUCCEEDED);
+    const char *after_cookie = worker_cookie_request(page_after, after_copy);
+    if (after_cookie == NULL || strstr(after_cookie, "page1=1") == NULL
+        || style_cookie == NULL || strstr(style_cookie, "page0=1") == NULL)
+        fprintf(stderr, "worker page cookies: style=%s after=%s\n",
+                style_cookie == NULL ? "(no request)" : style_cookie,
+                after_cookie == NULL ? "(no request)" : after_cookie);
+    /* The page's subresource went out after its cookies were set. */
+    CHECK(style_cookie != NULL && strstr(style_cookie, "page0=1") != NULL
+          && strstr(style_cookie, "page1=1") != NULL);
+    CHECK(after_cookie != NULL && strstr(after_cookie, "page0=1") != NULL
+          && strstr(after_cookie, "page1=1") != NULL);
+
+    /* A redirect with its own cookie to a page that sets two. */
+    accounts_identity_clear_requests();
+    faults->replay_lane_cookie_url = landed;
+    faults->replay_lane_redirect_cookies = 1u;
+    CHECK(browser_engine_begin_navigation_url(engine, start, 1u * MIB,
+                                              1000, true)
+          && google_identity_pump(engine) == BROWSER_NAVIGATION_JOB_SUCCEEDED
+          && strcmp(navigation->page.document_url, landed) == 0);
+    faults->replay_lane_redirect_cookies = 0u;
+    const char *landed_cookie = worker_cookie_request(landed, landed_copy);
+    CHECK(browser_engine_begin_navigation_url(engine, chain_after, 1u * MIB,
+                                              1000, true)
+          && google_identity_pump(engine)
+                 == BROWSER_NAVIGATION_JOB_SUCCEEDED);
+    after_cookie = worker_cookie_request(chain_after, after_copy);
+    if (after_cookie == NULL || strstr(after_cookie, "page1=1") == NULL)
+        fprintf(stderr, "worker chain cookies: landed=%s after=%s\n",
+                landed_cookie == NULL ? "(no request)" : landed_cookie,
+                after_cookie == NULL ? "(no request)" : after_cookie);
+    CHECK(landed_cookie != NULL && strstr(landed_cookie, "lane0=1") != NULL
+          && strstr(landed_cookie, "page0=1") == NULL);
+    CHECK(after_cookie != NULL && strstr(after_cookie, "lane0=1") != NULL
+          && strstr(after_cookie, "page0=1") != NULL
+          && strstr(after_cookie, "page1=1") != NULL);
+
+    faults->replay_lane_cookie_url = NULL;
+    faults->replay_lane_url_cookies = 0u;
+    fetch_trace_end();
+    faults->replay_lane_runs_page_hops = false;
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    remove_google_identity_replay(replay, record_count);
     return 0;
 }
 
@@ -5801,6 +6616,93 @@ static int test_basic_view_recovery_large_and_hidden_pages(void)
           && budget->current == 0u
           && budget_active_allocations(budget, NULL) == 0u);
     browser_engine_test_set_recovery_time_us(0u);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* A Basic view requested on a script-heavy page used to be cut at the
+   512-node floor because the page's live scripts held the memory its bound
+   scales with (npr.org and washingtonpost.com, 0.1.51 census). Basic view
+   retires those scripts when it is shown anyway, so a view shortened that
+   way stops them first and is prepared again with the room they held. */
+static int test_basic_view_reclaims_script_heap(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.tile_capacity = 0u;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.javascript.heap_limit = 10u * MIB;
+    config.javascript.maximum_scripts = 8u;
+    config.javascript.maximum_total_bytes = 64u * 1024u;
+    config.javascript.maximum_file_bytes = 32u * 1024u;
+    char error[128] = {0};
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+    enum { PARAGRAPHS = 2400 };
+    size_t capacity = 256u + PARAGRAPHS * 40u + 512u;
+    char *page = malloc(capacity);
+    CHECK(page != NULL);
+    size_t length = (size_t) snprintf(
+        page, capacity, "<!doctype html><body><h1>Front page</h1>");
+    for (unsigned i = 0; i < PARAGRAPHS; i++)
+        length += (size_t) snprintf(page + length, capacity - length,
+                                    "<p>Story summary %u.</p>", i);
+    length += (size_t) snprintf(
+        page + length, capacity - length,
+        "<script>window.keep = [];"
+        "for (let i = 0; i < 40; i++) {"
+        "  const block = new Array(8192);"
+        "  for (let j = 0; j < 8192; j++) block[j] = {i: i, j: j};"
+        "  window.keep.push(block);"
+        "}</script></body>");
+    CHECK(length < capacity
+          && browser_engine_commit_html(
+                 engine, "https://reclaim.example.test/", page, length, true));
+    free(page);
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    CHECK(navigation != NULL && navigation->page.runtime != NULL);
+    size_t held = script_runtime_heap_used(navigation->page.runtime);
+    size_t bound_before =
+        reader_extract_node_bound(navigation->page.document.budget);
+    if (held < 2u * MIB || bound_before >= PARAGRAPHS) {
+        fprintf(stderr, "reclaim setup: heap=%zu bound=%zu\n",
+                held, bound_before);
+        CHECK(false);
+    }
+    ReaderDocumentAnalysis analysis = {0};
+    CHECK(browser_engine_prepare_basic_view(engine, &analysis)
+          && analysis.kind == READER_PAGE_BASIC);
+    if (analysis.extraction_truncated
+        || analysis.extracted_nodes <= bound_before) {
+        fprintf(stderr, "reclaim: nodes=%u truncated=%d bound=%zu\n",
+                (unsigned) analysis.extracted_nodes,
+                (int) analysis.extraction_truncated, bound_before);
+        CHECK(false);
+    }
+    /* The scripts were stopped for the view, by the browser, not for
+       memory: no "ran out of memory" note follows the site. */
+    CHECK(navigation->page.runtime == NULL
+          && !browser_engine_page_scripts_stopped_for_memory(engine));
+    /* The caller is told, so the reader hears the scripts stopped
+       (psp_basic_view_toggle_status); a later preparation of the stored
+       view stopped nothing. */
+    CHECK(analysis.scripts_stopped);
+    CHECK(strcmp(psp_basic_view_toggle_status(true, &analysis),
+                 "BASIC VIEW ON\nPAGE SCRIPTS STOPPED") == 0);
+    ReaderDocumentAnalysis again = {0};
+    CHECK(browser_engine_prepare_basic_view(engine, &again)
+          && !again.scripts_stopped);
+    CHECK(strcmp(psp_basic_view_toggle_status(true, &again),
+                 "BASIC VIEW ON") == 0);
+    Budget *budget = browser_engine_budget(engine);
+    CHECK(budget != NULL && browser_engine_shutdown(engine)
+          && budget->current == 0u
+          && budget_active_allocations(budget, NULL) == 0u);
     browser_engine_destroy(engine);
     return 0;
 }

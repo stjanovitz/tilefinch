@@ -130,6 +130,7 @@ endif()
 
 add_library(tilefinch_psp_ui STATIC
     src/psp_basic_fallback.c
+    src/psp_heavy_notice.c
     src/psp_local_route.c
     src/psp_reader_policy.c
     src/psp_youtube_login_consent.c
@@ -757,7 +758,7 @@ if(PSP)
             # Ordinary: user-approved 9 KiB increase on 2026-11-16 for the
             # integrated runtime safety fixes and bootstrap interfaces.
             # Page-memory, download and cache limits are unchanged.
-            set(TILEFINCH_PSP_TEXT_LIMIT 5509216)
+            set(TILEFINCH_PSP_TEXT_LIMIT 5533792)
         endif()
         # Local size experiments only (an engine built at -O2 under PPSSPP,
         # for instance): a build directory that sets this is over the

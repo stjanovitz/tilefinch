@@ -31,11 +31,33 @@ cookie-notice sheet after the load, which costs a whole-sheet rebuild the
 PSP never does; `replay --user-css-before-load` sets it before the load, as
 the PSP app sets its presentation CSS before each navigation (same frames,
 one full rebuild fewer). Use it for timing, and compare runs only within
-one mode. The command script ticks the page for 150
-x 33 ms, renders the top and two scrolled screens, runs the `census` lab
-command (first-paint timebase, off-screen layout share, decoded vs. painted
-size of every image, Reader analysis), records a few page facts and prints
-the script heap report.
+one mode. The command script runs the page for 150 frames of 33 ms,
+renders the top and two scrolled screens, runs the `census` lab command
+(first-paint timebase, off-screen layout share, decoded vs. painted size of
+every image, Reader analysis), records a few page facts and prints the
+script heap report.
+
+Each of the 150 frames is a lab `pump` turn, one PSP loop frame: it advances
+the page runtime, then runs the engine's page-idle work and one unit of the
+post-commit image queue, as the PSP loop does after presenting a frame
+(`psp_deferred_image_after_present` in `src/psp_script_main.c`). The queue
+matters on every page that runs scripts: the commit leaves that page's
+parser `<img>` elements to it, nearest the screen first, so the frames show
+what a PSP shows after about that many frames. The PSP loop's frame-pump
+policy can skip the idle and image units in a frame (input, a pending
+render), so a pump turn is the most a PSP frame does, not the least. The
+lab's `image-queue queued=N batches=M pending=yes|no` line says what the
+queue still held when the summary was printed (`extract.py`:
+`images.queue_queued`, `queue_batches`, `queue_pending`).
+
+Runs before 2026-11-16 used the lab's `tick` instead, which advances only
+the page runtime: their frames never loaded the queued images, so their
+image counts on scripted pages are zero or near it (`batches=0`), and
+judging them needed an `--idle` pass. `--runtime-ticks` restores that loop
+for comparison with such runs; `run.json` records which one a run used
+(`ticks`). Compare runs only within one mode: pump turns also add the idle
+work's time, memory and relayouts to the visit. A capture uses the same
+frames, so it records the image responses the queue requests.
 
 There are five replay passes, each writing its own JSONL:
 
@@ -55,13 +77,12 @@ There are five replay passes, each writing its own JSONL:
   the existing in-memory bytecode caches already save. The reload follows
   the first load at once, so the first visit never runs its ticks: async and
   dynamic scripts load only on the second visit and cannot hit a cache.
-- `--revisit-ticked`: the first visit also runs the 150 ticks and up to 300
-  owner idle turns (`idle 300`), then the page URL is loaded again
+- `--revisit-ticked`: the first visit also runs the 150 frames and up to
+  300 owner idle turns (`idle 300`), then the page URL is loaded again
   (`go URL`) and measured. This is the closer model of a reader returning to
-  a page; it takes about twice as long. The idle turns matter: the lab's
-  `tick` advances only the page runtime, while the PSP loop also runs the
-  engine's idle work whenever the page is quiet, and classic bytecode is
-  stored there (a page left with stores still queued stores at most 256 KiB
+  a page; it takes about twice as long. The idle turns matter: the PSP loop
+  keeps running the engine's idle work whenever the page is quiet, past the
+  150 frames, and classic bytecode is stored there (a page left with stores still queued stores at most 256 KiB
   of them as it closes and drops the rest).
 - `--restart`: a browser restart between the visits. The first visit
   (with its ticks and idle turns) runs in its own lab process with a fresh
@@ -82,10 +103,10 @@ There are five replay passes, each writing its own JSONL:
   costs a rebuild, so this pass is never timed; `--repeat 1` is enough.
 
 `--idle N` adds up to N owner idle turns to the measured visit, after its
-ticks and before it is rendered (the lab's `idle` command, which stops at
-the first turn that leaves no work). The default pass runs none, so the
-idle work the PSP loop does between frames only appears in an `--idle`
-pass: background image and font continuations, display retargeting
+frames and before it is rendered (the lab's `idle` command, which stops at
+the first turn that leaves no work). The default pass runs none, so idle
+work the PSP loop keeps doing after the 150 frames only appears in an
+`--idle` pass: background image and font continuations, display retargeting
 (`images.retarget`: decoded rasters reduced to their painted size after
 layout, SVG markup rasterized again at it, counted in `rasters`) and the
 classic-bytecode stores (`js.bytecode_cache_idle_store_us`,

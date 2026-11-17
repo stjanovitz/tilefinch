@@ -8,6 +8,11 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.52 — 2026-11-16
+
+- More reliable YouTube sign-in, with clearer diagnostics when enabled.
+- Improved Basic view for heavy pages, keeping more text and pictures available when scripts run out of memory.
+
 ## 0.1.51 — 2026-11-16
 
 - Better compatibility with script-heavy pages, with faster loading and fewer pauses.

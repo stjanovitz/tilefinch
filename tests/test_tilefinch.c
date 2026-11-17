@@ -5679,6 +5679,70 @@ static bool test_stylesheet_transient_retry_cap(Budget *budget)
     return ok && budget->current == 0;
 }
 
+/* amazon.com links more stylesheets than the 32-entry page ledger holds.
+   A link whose URL found the ledger full had its failure recorded nowhere,
+   so every parser checkpoint rebuild fetched it again (the census replay
+   saw 8 failing AUI sheets requested 27 times each). A failure past the full
+   ledger now keeps the same attempt limit: once the ledger's own failures
+   are suppressed, rebuilds stop requesting the overflow URL too. */
+static bool test_stylesheet_failure_past_full_ledger_is_suppressed(
+    Budget *budget)
+{
+    enum { LINKS = STYLESHEET_DOCUMENT_RESOURCE_LIMIT * 2 + 8 };
+    char html[LINKS * 80 + 160];
+    int used = snprintf(html, sizeof(html), "<!doctype html>");
+    for (int i = 0; i < LINKS && used > 0 && (size_t) used < sizeof(html);
+         i++) {
+        used += snprintf(html + used, sizeof(html) - (size_t) used,
+                         "<link rel=stylesheet "
+                         "href=https://fixture.test/missing-%02d.css>", i);
+    }
+    if (used <= 0 || (size_t) used >= sizeof(html) - 112) return false;
+    used += snprintf(html + used, sizeof(html) - (size_t) used,
+                     "<link rel=preload as=style "
+                     "href=https://fixture.test/missing-71.css><body>many");
+    PocDocument document = {0};
+    Stylesheet stylesheet = {0};
+    StylesheetDocumentResources resources = {0};
+    ExternalStylesheetStats stats = {0};
+    FetchTraceReplayStats replay = {0};
+    char error[256] = {0};
+    bool ok = document_parse(&document, budget, html, (size_t) used, 17)
+        && fetch_trace_replay_begin(
+            TILEFINCH_TEST_SOURCE_DIR
+            "/fixtures/http-section-external-layout",
+            error, sizeof(error));
+    size_t requests_before_last = 0;
+    for (size_t pass = 0;
+         ok && pass <= STYLESHEET_TRANSIENT_ATTEMPT_LIMIT; pass++) {
+        stylesheet_destroy(&stylesheet);
+        if (pass == STYLESHEET_TRANSIENT_ATTEMPT_LIMIT) {
+            ok = fetch_trace_replay_stats(&replay);
+            requests_before_last = replay.request_count;
+        }
+        ok = ok && stylesheet_build(&stylesheet, budget, &document, 480)
+            && stylesheets_load_external_tracked(
+                &document, &stylesheet, budget, "https://fixture.test/page",
+                STYLESHEET_DOCUMENT_RESOURCE_LIMIT, 64 * 1024, 4096, 1000,
+                NULL, NULL, &resources, &stats)
+            && stats.loaded == 0;
+    }
+    ok = ok && resources.count == STYLESHEET_DOCUMENT_RESOURCE_LIMIT
+        && fetch_trace_replay_stats(&replay)
+        && replay.request_count == requests_before_last
+        && replay.request_count >= LINKS;
+    if (!ok) {
+        fprintf(stderr, "stylesheet ledger overflow: requests=%zu/%zu "
+                "ledger=%zu %s\n", replay.request_count,
+                requests_before_last, resources.count, error);
+    }
+    fetch_trace_end();
+    stylesheet_document_resources_destroy(&resources);
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
+    return ok && budget->current == 0;
+}
+
 static bool test_script_shared_cache_lifetimes(Budget *budget)
 {
     static const unsigned char classic[] =
@@ -8969,6 +9033,16 @@ static void tilefinch_test_usage(const char *program)
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
+
+    if (argc == 2
+        && strcmp(argv[1], "--stylesheet-overflow-preload-only") == 0) {
+        Budget budget;
+        budget_init(&budget, 32u * 1024u * 1024u);
+        if (!budget_install_lexbor(&budget)) return 1;
+        bool ok = test_stylesheet_failure_past_full_ledger_is_suppressed(
+            &budget);
+        return !ok || !budget_uninstall_lexbor(&budget);
+    }
 
     const char *filter = NULL;
     bool list = false;

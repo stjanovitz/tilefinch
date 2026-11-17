@@ -868,6 +868,10 @@ static TILEFINCH_OUT_OF_LINE void psp_navigation_present_failure(
 {
     if (process == NULL || browser == NULL || views == NULL
         || views->navigation == NULL || interactive == NULL) return;
+    /* A load opened in Basic view by default ran without page JavaScript
+       and ended without a commit: the site's policy again. */
+    psp_basic_default_abandon(psp_app_basic_default(), browser->profile,
+                              browser->engine);
     char media_audio_url[NAVIGATION_URL_LIMIT];
     if (browser_engine_take_media_audio_offer(
             browser->engine, media_audio_url, sizeof(media_audio_url))) {
@@ -1188,10 +1192,12 @@ static TILEFINCH_OUT_OF_LINE void psp_apply_reader_after_navigation_dirty(
                 && psp_app_set_basic_view(app, loaded_url, true, page_dirty);
             psp_ui_show_status(
                 ui, shown ? "BASIC VIEW ON" : "BASIC VIEW UNAVAILABLE", 180);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
             printf("tilefinch-basic-recovery: reload=%s nodes=%u "
                    "truncated=%d\n", shown ? "yes" : "no",
                    (unsigned) reload_analysis.extracted_nodes,
                    (int) reload_analysis.extraction_truncated);
+#endif
             return;
         }
     }
@@ -1251,11 +1257,13 @@ static TILEFINCH_OUT_OF_LINE void psp_apply_reader_after_navigation_dirty(
                 app, loaded_url, &analysis);
             return;
         }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
         printf("tilefinch-basic-recovery: available=yes forms=%u "
                "anchors=%u truncated=%d\n",
                (unsigned) analysis.retained_forms,
                (unsigned) analysis.mapped_anchors,
                (int) analysis.extraction_truncated);
+#endif
         return;
     case PSP_BASIC_FALLBACK_ASK:
         app->interactive->blank_reader_recovery_pending = false;
@@ -1270,10 +1278,13 @@ static TILEFINCH_OUT_OF_LINE void psp_apply_reader_after_navigation_dirty(
                 psp_basic_fallback_failure_actions(
                     fallback, true, ui->basic_mode, false),
                 false);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
             printf("tilefinch-basic-recovery: available=yes prompt=ask\n");
+#endif
         }
         return;
     case PSP_BASIC_FALLBACK_UNAVAILABLE:
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
         printf("tilefinch-basic-recovery: available=no prepared=%d "
                "visited=%u nodes=%u bytes=%u forms=%u anchors=%u "
                "truncated=%d bounded=%d\n",
@@ -1284,6 +1295,7 @@ static TILEFINCH_OUT_OF_LINE void psp_apply_reader_after_navigation_dirty(
                (unsigned) analysis.mapped_anchors,
                (int) analysis.extraction_truncated,
                (int) analysis.bounded_out);
+#endif
         break;
     case PSP_BASIC_FALLBACK_KEEP_PAGE:
     default:
@@ -1384,9 +1396,89 @@ static TILEFINCH_OUT_OF_LINE void psp_apply_reader_after_navigation_dirty(
     if (page_dirty != NULL) *page_dirty = true;
 }
 
-static TILEFINCH_OUT_OF_LINE void psp_apply_reader_after_navigation(
-    PspApp *app, PspAppFrameState *frame)
+/* A commit, through the Basic-by-default state (psp_basic_fallback.h):
+   true when it was presented in Basic view by default, or reloaded with
+   scripts because Basic view would not keep the page, and the ordinary
+   commit handling is skipped. *NOTICE is the notice the commit's status
+   shows (psp_ui_show_commit_status). */
+static TILEFINCH_OUT_OF_LINE bool psp_basic_default_after_commit(
+    PspApp *app, PspAppFrameState *frame, PspUiCommitNotice *notice)
 {
+    bool *page_dirty = frame == NULL ? NULL : &frame->page_dirty;
+    BrowserEngine *engine = app->browser->engine;
+    BrowserProfile *profile = app->browser->profile;
+    PspUiState *ui = &app->process->presentation.ui;
+    PspBasicDefault *state = psp_app_basic_default();
+    *notice = PSP_UI_COMMIT_NOTICE_NONE;
+    ui->basic_default_page = 0u;
+    char loaded_entry_buffer[NAVIGATION_URL_LIMIT];
+    const char *loaded_entry_url = psp_app_current_url(
+        engine, loaded_entry_buffer, sizeof(loaded_entry_buffer));
+    const char *loaded_url = loaded_entry_url == NULL
+        ? ui->url : loaded_entry_url;
+    bool profile_changed = false;
+    PspBasicDefaultCommit commit = psp_basic_default_commit(
+        state, profile, loaded_url, &profile_changed);
+    if (profile_changed)
+        psp_profile_store_mark_dirty(&app->browser->profile_store,
+                                     psp_time_us(NULL));
+    if (commit != PSP_BASIC_DEFAULT_COMMIT_BASIC) return false;
+    /* The load ran without page JavaScript: later loads follow the site's
+       policy again (each navigation start sets it). */
+    (void) browser_engine_set_javascript_enabled(
+        engine, browser_profile_javascript_allowed_for_url(profile,
+                                                           loaded_url));
+    /* An explicit Reader request, or the site's "always Reader" choice,
+       wins, as it does over the fallback. */
+    if (psp_basic_default_reader_wins(profile, loaded_url, ui->reader_mode))
+        return false;
+    app->interactive->blank_reader_recovery_pending = false;
+    ReaderDocumentAnalysis analysis = {0};
+    bool prepared = ui->basic_mode
+        || browser_engine_prepare_basic_view(engine, &analysis);
+    bool presentable = ui->basic_mode
+        || (prepared && psp_basic_default_presentable(state, profile,
+                                                       loaded_url, &analysis));
+    bool shown = presentable
+        && (ui->basic_mode
+            || psp_app_set_basic_view(app, loaded_url, true, page_dirty));
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    printf("tilefinch-basic-default: shown=%s nodes=%u dropped=%u "
+           "text=%u truncated=%d\n", shown ? "yes" : "no",
+           (unsigned) analysis.extracted_nodes,
+           (unsigned) analysis.dropped_controls,
+           (unsigned) analysis.visible_text_bytes,
+           (int) analysis.extraction_truncated);
+#endif
+    if (!shown) {
+        /* Basic view would not keep the page (its controls, an empty app
+           shell, a redirect to another site), or is unavailable: the site
+           loads with its scripts, and keeps the "Load without scripts?"
+           offer. A page that was the reason is remembered in the profile. */
+        if (psp_basic_default_keep_full_page(state, profile, loaded_url,
+                                             prepared && !presentable))
+            psp_profile_store_mark_dirty(&app->browser->profile_store,
+                                         psp_time_us(NULL));
+        if (frame != NULL) {
+            PspUiIntent reload = {0};
+            reload.action = PSP_UI_ACTION_RELOAD;
+            psp_app_dispatch_action(app, frame, &reload);
+        }
+        return true;
+    }
+    ui->basic_default_page = 1u;
+    /* X and O only the first time for the site this session: a later page
+       loads fast and a press meant for it must not start the full page. */
+    *notice = psp_basic_default_presented(state, loaded_url)
+        ? PSP_UI_COMMIT_NOTICE_BASIC_DEFAULT
+        : PSP_UI_COMMIT_NOTICE_BASIC_DEFAULT_PASSIVE;
+    return true;
+}
+
+static TILEFINCH_OUT_OF_LINE void psp_apply_reader_after_navigation(
+    PspApp *app, PspAppFrameState *frame, PspUiCommitNotice *notice)
+{
+    if (psp_basic_default_after_commit(app, frame, notice)) return;
     psp_apply_reader_after_navigation_dirty(
         app, frame == NULL ? NULL : &frame->page_dirty);
 }
@@ -3319,6 +3411,7 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_frame(PspLoop *loop)
         loop, frame.ui_sample_us, &intent, &navigation_visual_changed);
     navigation_visual_changed |= psp_app_site_storage_poll(app);
     navigation_visual_changed |= psp_app_heavy_poll(app);
+    psp_app_bot_wall_poll(app);
     navigation_visual_changed |= psp_app_youtube_login_poll(app);
     frame.page_dirty = color_mode_visual_changed
         || gamepad_visual_changed;
@@ -4377,10 +4470,12 @@ static TILEFINCH_OUT_OF_LINE void psp_loop_finish_navigation(
             == BROWSER_NAVIGATION_JOB_SUCCEEDED) {
         interactive->captive_portal_failure_count = 0;
         interactive->recovery_offer = PSP_RECOVERY_OFFER_NONE;
+        /* The bot-wall notice and the Basic-by-default notice are shown
+           by psp_ui_show_commit_status below, in place of the ready
+           status, which would replace them. */
         NavigationBotWall bot_wall;
-        if (navigation_bot_wall(engine_views->navigation, &bot_wall))
-            (void) psp_ui_show_site_blocked_status(
-                &process->presentation.ui, bot_wall.site, 480);
+        bool bot_walled =
+            navigation_bot_wall(engine_views->navigation, &bot_wall);
         process->presentation.ui.page_requests_blocked =
             page_blocked > UINT32_MAX
             ? UINT32_MAX : (uint32_t) page_blocked;
@@ -4392,7 +4487,8 @@ static TILEFINCH_OUT_OF_LINE void psp_loop_finish_navigation(
         process->presentation.ui.total_requests_blocked =
             total_blocked > UINT32_MAX
             ? UINT32_MAX : (uint32_t) total_blocked;
-        psp_apply_reader_after_navigation(app, frame);
+        PspUiCommitNotice commit_notice = PSP_UI_COMMIT_NOTICE_NONE;
+        psp_apply_reader_after_navigation(app, frame, &commit_notice);
         psp_run_deferred_activation(app, frame);
         bool tab_restored = true;
         if (interactive->tab_transition.pending) {
@@ -4442,7 +4538,9 @@ static TILEFINCH_OUT_OF_LINE void psp_loop_finish_navigation(
                     ? "PAGE READY"
                     : "PAGE READY - TAB STATE LIMITED");
         }
-        psp_ui_show_status(&process->presentation.ui, ready_status, 120);
+        psp_ui_show_commit_status(
+            &process->presentation.ui, ready_status, 120,
+            bot_walled ? bot_wall.site : NULL, 480, commit_notice);
     } else {
         if (interactive->tab_transition.pending) {
             (void) psp_tabs_finish(

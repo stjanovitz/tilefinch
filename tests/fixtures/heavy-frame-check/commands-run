@@ -1,0 +1,8 @@
+drain
+script-report
+heavy-frame-answer run
+drain
+node-text result
+script-report
+node-text cookie
+quit

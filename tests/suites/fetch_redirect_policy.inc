@@ -36,6 +36,20 @@ static bool test_blocked_origin_routes(void)
         "https://developer.mozilla.org/en-US/docs/pong/get"));
     CHECK(!fetch_origin_blocked("https://developer.mozilla.org/static/a.js"));
     CHECK(!fetch_origin_blocked("https://example.org/pong/get"));
+    /* A redirect hop's long address is matched whole, host and route. */
+    static char long_blocked[7000];
+    static const char *const long_prefixes[] = {
+        "https://e4bb.mdnplay.dev/runner.html?token=",
+        "https://developer.mozilla.org/pong/click?token=",
+        "https://developer.mozilla.org/static/a.js?token="
+    };
+    for (size_t i = 0; i < 3u; i++) {
+        size_t prefix = strlen(long_prefixes[i]);
+        memcpy(long_blocked, long_prefixes[i], prefix);
+        memset(long_blocked + prefix, 't', sizeof(long_blocked) - 1u - prefix);
+        long_blocked[sizeof(long_blocked) - 1u] = '\0';
+        CHECK(fetch_origin_blocked(long_blocked) == (i < 2u));
+    }
     fetch_set_blocked_origins(NULL, 0);
     CHECK(!fetch_origin_blocked("https://mdnplay.dev/x"));
     CHECK(!fetch_origin_blocked("https://developer.mozilla.org/pong/get"));
@@ -213,6 +227,120 @@ static bool test_private_network_admission(Budget *budget, unsigned port)
           && strstr(result.error, "private network") != NULL);
     fetch_result_destroy(&result);
     browser_session_destroy(&portal_session);
+    return true;
+}
+
+/* Requests the loopback server has had for /lan-long. */
+static unsigned lan_long_hits(Budget *budget, unsigned port)
+{
+    char url[128];
+    snprintf(url, sizeof(url), "http://127.0.0.1:%u/lan-long-hits", port);
+    FetchRequest request = {.method = "GET", .allow_http_errors = true};
+    FetchResult result = {.budget = budget};
+    unsigned hits = 9999u;
+    if (fetch_redirect(budget, url, &request, &result)
+        && result.data != NULL)
+        (void) sscanf(result.data, "hits=%u", &hits);
+    fetch_result_destroy(&result);
+    return hits;
+}
+
+/* A navigation's redirect hop may be up to 8,191 bytes. The local-network
+   rule reads such a hop's host from the whole address, as it does a short
+   one's, on the browser-thread transport and on the scheduler. */
+static bool test_long_hop_local_network(Budget *budget, unsigned port)
+{
+    char start[160];
+    /* A public page's navigation, admitted to the loopback server as a
+       captive portal, redirects through a 7,000-byte address on
+       192.168.1.1: a second address on the user's network, which the
+       portal's grant does not cover. The first hop is made and the long
+       one refused before any connection: the browser-thread transport as
+       a private-network request, the scheduler (whose hops no longer see
+       the portal navigation's own session) as a target outside the
+       portal. */
+    char portal[96];
+    snprintf(portal, sizeof(portal), "http://127.0.0.1:%u/", port);
+    snprintf(start, sizeof(start),
+             "http://127.0.0.1:%u/lan-long?to=lan&len=7000", port);
+    BrowserSession session = {0};
+    CHECK(browser_session_init(&session, budget, 64u * 1024u)
+          && browser_session_captive_portal_begin(&session, portal));
+    TilefinchRequestContext context = {
+        .target_url = start,
+        .initiator_url = "http://public.example/page",
+        .top_level_url = "http://public.example/page",
+        .method = "GET",
+        .mode = TILEFINCH_REQUEST_MODE_NAVIGATE,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .destination = TILEFINCH_DESTINATION_DOCUMENT,
+        .top_level_navigation = true,
+        .user_activated = true
+    };
+    FetchRequest transport = {.method = "GET"};
+    FetchPreparedPageRequest prepared;
+    CHECK(fetch_prepare_page_request_context(
+        &context, context.initiator_url, NULL, &session, NULL, NULL,
+        &transport, &prepared, NULL));
+    const FetchRequest *request = fetch_prepared_page_request(&prepared);
+    CHECK(request != NULL);
+    for (unsigned scheduled = 0; scheduled < 2u; scheduled++) {
+        unsigned before = lan_long_hits(budget, port);
+        FetchResult result = {.budget = budget};
+        bool followed = scheduled == 0u
+            ? fetch_redirect(budget, start, request, &result)
+            : fetch_scheduled(budget, start, request, &result);
+        bool refused = scheduled == 0u
+            ? strstr(result.error, "private network") != NULL
+            : result.chain.limit == FETCH_CHAIN_LIMIT_TARGET
+                  && result.chain.failed_hop == 0u
+                  && result.status_code == 302;
+        unsigned after = lan_long_hits(budget, port);
+        if (followed || !refused || after != before + 1u)
+            fprintf(stderr, "long LAN hop from a public page (%s): "
+                            "followed=%d error=%s redirects=%u limit=%u "
+                            "status=%ld hits=%u->%u\n",
+                    scheduled == 0u ? "transport" : "scheduler", followed,
+                    result.error, (unsigned) result.chain.redirects,
+                    (unsigned) result.chain.limit, result.status_code,
+                    before, after);
+        CHECK(!followed && refused && after == before + 1u);
+        fetch_result_destroy(&result);
+    }
+    browser_session_destroy(&session);
+
+    /* An address the user typed on their own network (no page behind it)
+       may follow its redirects there. Each hop's address is classified
+       again, and a 7,000-byte one on loopback is still local, so the hop is
+       made and the chain lands. A short parse of that hop would call it
+       public, and the private-network guard would refuse it. */
+    snprintf(start, sizeof(start),
+             "http://127.0.0.1:%u/lan-long?to=loop&len=7000", port);
+    FetchRequest typed = {
+        .method = "GET",
+        .sec_fetch_dest = "document",
+        .sec_fetch_mode = "navigate",
+        .sec_fetch_user = true
+    };
+    for (unsigned scheduled = 0; scheduled < 2u; scheduled++) {
+        FetchResult result = {.budget = budget};
+        bool followed = scheduled == 0u
+            ? fetch_redirect(budget, start, &typed, &result)
+            : fetch_scheduled(budget, start, &typed, &result);
+        bool landed = followed && result.status_code == 200
+            && result.data != NULL
+            && strstr(result.data, "query=lan-long=1;") != NULL;
+        if (!landed)
+            fprintf(stderr, "long loopback hop of a typed address (%s): "
+                            "followed=%d status=%ld error=%s\n",
+                    scheduled == 0u ? "transport" : "scheduler", followed,
+                    result.status_code, result.error);
+        CHECK(landed);
+        /* The scheduler counts the chain (the browser-thread transport
+           keeps no FetchChainFacts). */
+        CHECK(scheduled == 0u || result.chain.redirects == 2u);
+        fetch_result_destroy(&result);
+    }
     return true;
 }
 

@@ -2140,21 +2140,45 @@ static bool js_rt_compile_source_admitted(
     }
     /* A page unit whose smallest measured compile working set does not fit
        the heap the realm can still reach cannot compile: refuse it before
-       spending the compile time (script_admission.h). Larger, likely peaks
-       are left to the heap limit itself (js_rt_compile_source_type). */
+       spending the compile time (script_admission.h). A unit of 1 MiB or
+       more that is about to be parsed must also be able to obtain 4 times
+       its source (script_admission_large_unit_heap): its compile is the
+       one that costs seconds when it fails. A bytecode restore
+       (js_rt_admit_cached_compile_source, which counts no compile attempt)
+       runs no parser and keeps only the floor. Larger, likely peaks of
+       smaller units are left to the heap limit itself
+       (js_rt_compile_source_type). */
     ScriptRuntime *owner = bridge == NULL ? NULL : bridge->host;
     if (owner != NULL && owner->runtime != NULL
         && compile_kind_is_page(source_kind)
         && length >= SCRIPT_ADMISSION_FLOOR_MINIMUM_UNIT_BYTES) {
+        size_t large_heap = count_compile_attempt
+            ? script_admission_large_unit_heap(length) : 0;
         size_t floor_bytes = script_admission_compile_floor(length);
         size_t available = script_runtime_heap_admission_available(owner);
+        size_t obtainable = large_heap == 0 ? 0
+            : script_runtime_heap_obtainable(owner);
         /* Collect before refusing only when enough has been allocated
            since the last collection for it to free something
            (js_rt_gc_due): a page refusing one large unit after another
            would otherwise mark its whole heap for each. */
-        if (floor_bytes > available && js_rt_gc_due(owner)) {
+        if ((floor_bytes > available || large_heap > obtainable)
+            && js_rt_gc_due(owner)) {
             JS_RunGC(owner->runtime);
             available = script_runtime_heap_admission_available(owner);
+            if (large_heap != 0)
+                obtainable = script_runtime_heap_obtainable(owner);
+        }
+        /* Report whichever requirement failed. The 4x requirement is a
+           heuristic (a unit it refuses might have compiled near its
+           source size), so failing it alone does not prove the page too
+           large: it is not noted as oversized, which would class the page
+           OVER (script_runtime_note_oversized_script). */
+        bool heuristic_only = floor_bytes <= available
+            && large_heap > obtainable;
+        if (heuristic_only) {
+            floor_bytes = large_heap;
+            available = obtainable;
         }
         if (floor_bytes > available) {
             if (result != NULL) {
@@ -2165,7 +2189,8 @@ static bool js_rt_compile_source_admitted(
                     &result->host_compile_memory_refusals, 1);
                 js_rt_saturating_add_size(
                     &result->host_compile_memory_refused_bytes, length);
-                script_runtime_note_oversized_script(owner, length);
+                if (!heuristic_only)
+                    script_runtime_note_oversized_script(owner, length);
                 script_runtime_note_memory_refusal(owner);
                 snprintf(result->error, sizeof(result->error),
                          "JavaScript source rejected before compile: "

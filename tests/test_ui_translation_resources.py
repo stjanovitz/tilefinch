@@ -138,6 +138,23 @@ class ResourceTests(unittest.TestCase):
             "translations/ui/v18/as.tful": "067622f4e0fa0579eeb19fbaa4aa20a66880a97110a300f4cbdb85455d87227c",
             "translations/ui/v18/he.tful": "9cdd605c3aba182f90fe7e788214a9e3eecdbf4b95b2056993a9c0d0b818fbb7",
         })
+        # v19, pinned by 0.1.51 (src/generated/ui_languages.inc at a3c1f099).
+        published.update({
+            "translations/ui/v19/es.tful": "1cc133970d705fafdd5590e8e73a51aa5a8b9bc2dd57801d9a7e0c1a6d5088fb",
+            "translations/ui/v19/fr.tful": "76c3f8d42e441b0b37c3476bb8377b7435c5505991b66084a057cd458787cb5f",
+            "translations/ui/v19/de.tful": "9df2f4e73c563c5b599a625d5d7ee291c2a16b5f4ff6f08c565d4eb8d3113333",
+            "translations/ui/v19/ja.tful": "43a62fa24a98ace4ecf5a74c5307b02588cdf088985d3414e0f59cbe71cfd74e",
+            "translations/ui/v19/ru.tful": "7e3b99233253b82b1088b6c9a7bb2ebd7fef28d438da63ed37069e77fd7e788b",
+            "translations/ui/v19/uk.tful": "c7626cf53e51a83df44a6f258dd51a8f828d325878e2002b0b9ad92928138cf8",
+            "translations/ui/v19/zh-hans.tful": "8b982b6a7e869820eff3393075215529e30d0e4a57fa2e1c429ca3e94a76a5e5",
+            "translations/ui/v19/ko.tful": "05f7e2e9da2640c3035d6906b8322e428b19ea5ca60ec2a5db024a4b64b7ba0f",
+            "translations/ui/v19/hi.tful": "0fec6daff42c2306d4d0ab9a40aeabe7988e1024d526b3fa22887a553fcd5248",
+            "translations/ui/v19/ar.tful": "e01b1b39c5947ba729708638567d797804d27555855ab8a2f23ff5c5f3fa0d95",
+            "translations/ui/v19/pt.tful": "24ef743ee01b7034eca384404cf594d9e97f786f3535eef15116ae9eab6f0274",
+            "translations/ui/v19/bn.tful": "fa120fccf2713151b701e55a5b71a2fc6bf10fbf1b58c9616854e19d1d7e174a",
+            "translations/ui/v19/as.tful": "ef017d328b24fa20c0dbaa2959b80ea7c137f3b547d0abe56546067dead2bea6",
+            "translations/ui/v19/he.tful": "fd9130a521cdd9f16ad1691a8dfce21f77982c958cd8772436563d26a224e53c",
+        })
         generated = outputs(resources)
         for key, digest in published.items():
             self.assertEqual(hashlib.sha256(generated[resources / key]).hexdigest(),
@@ -156,13 +173,13 @@ class ResourceTests(unittest.TestCase):
         old_languages = generator.CATALOGS[6][1]
         rows = generator.read_rows(7, old_languages)
         for column, (code, label, glyphs) in enumerate(old_languages, 1):
-            self.assertIn(f'"translations/ui/v19/{code}.tful"', manifest)
-        self.assertIn('"translations/ui/v19/pt.tful"', manifest)
+            self.assertIn(f'"translations/ui/v20/{code}.tful"', manifest)
+        self.assertIn('"translations/ui/v20/pt.tful"', manifest)
         portuguese = generator.read_rows(8, generator.CATALOGS[7][1])
         self.assertGreaterEqual({row[0] for row in portuguese}, {row[0] for row in rows})
         self.assertEqual(dict(portuguese)["Portuguese"], "Português")
-        self.assertIn('"translations/ui/v19/bn.tful"', manifest)
-        self.assertIn('"translations/ui/v19/as.tful"', manifest)
+        self.assertIn('"translations/ui/v20/bn.tful"', manifest)
+        self.assertIn('"translations/ui/v20/as.tful"', manifest)
 
     def test_v16_stays_frozen_under_the_narrow_bound(self):
         # v16 is pinned by the release candidate, whose reader has 16-bit
@@ -198,12 +215,12 @@ class ResourceTests(unittest.TestCase):
         # it does not retire.
         # Hebrew reads right to left with Arabic and needs no shaping: no
         # niqqud or cantillation marks, no presentation forms.
-        version, languages = generator.CATALOGS[-2]
+        version, languages = generator.CATALOGS[-3]
         self.assertEqual(version, 18)
-        self.assertEqual(languages, generator.CATALOGS[-3][1] + [("he", "Hebrew", "HEBREW")])
+        self.assertEqual(languages, generator.CATALOGS[-4][1] + [("he", "Hebrew", "HEBREW")])
         self.assertEqual(generator.RIGHT_TO_LEFT, {"ar", "he"})
         rows = generator.read_rows(18, languages)
-        v17 = generator.read_rows(17, generator.CATALOGS[-3][1])
+        v17 = generator.read_rows(17, generator.CATALOGS[-4][1])
         self.assertLessEqual({row[0] for row in v17} - generator.RETIRED_KEYS[18],
                              {row[0] for row in rows})
         hebrew = [(row[0], row[-1]) for row in rows]
@@ -214,22 +231,44 @@ class ResourceTests(unittest.TestCase):
                                  for c in value), key)
         manifest = outputs()[ROOT / "src/generated/ui_languages.inc"].decode()
         self.assertIn('BROWSER_GLYPH_LANGUAGE_HEBREW', manifest)
-        self.assertRegex(manifest, r'\{"he", "Hebrew", BROWSER_GLYPH_LANGUAGE_HEBREW, "[0-9a-f]{64}", 19, 1, '
-                                   r'"translations/ui/v19/he.tful", true\},')
+        self.assertRegex(manifest, r'\{"he", "Hebrew", BROWSER_GLYPH_LANGUAGE_HEBREW, "[0-9a-f]{64}", 20, 1, '
+                                   r'"translations/ui/v20/he.tful", true\},')
         self.assertRegex(manifest, r'\{"ar", "Arabic", .*, true\},')
         self.assertEqual(manifest.count(", true},"), 2)
 
     def test_v19_adds_labels_without_rewriting_v18(self):
-        self.assertEqual(generator.ACTIVE_VERSION, 19)
-        self.assertEqual(generator.CATALOGS[-1][1], generator.CATALOGS[-2][1])
-        previous = generator.read_rows(18, generator.CATALOGS[-2][1])
-        current = generator.read_rows(19, generator.CATALOGS[-1][1])
+        self.assertEqual(generator.CATALOGS[-2][0], 19)
+        self.assertEqual(generator.CATALOGS[-2][1], generator.CATALOGS[-3][1])
+        previous = generator.read_rows(18, generator.CATALOGS[-3][1])
+        current = generator.read_rows(19, generator.CATALOGS[-2][1])
         self.assertEqual(len(current), len(previous) + 2)
         old = {row[0]: row for row in previous}
         self.assertEqual({row[0]: row for row in current if row[0] in old}, old)
         self.assertEqual(hashlib.sha256((ROOT / "translations/ui/v18/source.tsv")
                                         .read_bytes()).hexdigest(),
                          "b942dbf79450906c7d626c19570f5bafef660f19034e9e01bd1d1a3f0d46d6d9")
+
+    def test_v20_adds_labels_without_rewriting_v19(self):
+        # v19 is pinned by 0.1.51; the Basic-by-default notice, Try full
+        # page and frame offer rows went into v20.
+        self.assertEqual(generator.ACTIVE_VERSION, 20)
+        self.assertEqual(generator.CATALOGS[-1][1], generator.CATALOGS[-2][1])
+        previous = generator.read_rows(19, generator.CATALOGS[-2][1])
+        current = generator.read_rows(20, generator.CATALOGS[-1][1])
+        old = {row[0]: row for row in previous}
+        self.assertEqual({row[0]: row for row in current if row[0] in old}, old)
+        self.assertEqual({row[0] for row in current} - set(old), {
+            "BASIC VIEW: SCRIPTS RAN OUT OF MEMORY LAST TIME",
+            "X Try full page  O Keep Basic view", "Try full page",
+            "LOADING FULL PAGE...",
+            # The frame offer and its answers' statuses.
+            "A frame has a large script", "Script size:",
+            "It may take a minute or more.", "Start it?",
+            "Scripts can run out of PSP memory.", "X Start   O Not now",
+            "STARTING THE FRAME'S SCRIPT", "FRAME SCRIPT NOT STARTED"})
+        self.assertEqual(hashlib.sha256((ROOT / "translations/ui/v19/source.tsv")
+                                        .read_bytes()).hexdigest(),
+                         "4ea6c18fa757e36b351a3553d91c01ba3c034627ac2bd41a2945d4552e8838e5")
 
     def test_active_clusters_are_in_the_required_glyph_revision(self):
         # A pack revision is built from the sequences of the catalog that

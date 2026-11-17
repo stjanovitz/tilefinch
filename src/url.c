@@ -101,12 +101,13 @@ static bool ipv6_literal_valid(const char *value, size_t start, size_t end)
     return compressed ? groups < 8 : groups == 8;
 }
 
-bool tilefinch_url_parse(const char *value, TilefinchUrl *url)
+static bool url_parse_limited(const char *value, TilefinchUrl *url,
+                              size_t limit)
 {
     if (value == NULL || url == NULL) return false;
     memset(url, 0, sizeof(*url));
     size_t length = strlen(value);
-    if (length == 0 || length >= TILEFINCH_URL_SERIALIZED_LIMIT) return false;
+    if (length == 0 || length >= limit) return false;
     for (size_t i = 0; i < length; i++) {
         unsigned char byte = (unsigned char) value[i];
         /* Encoding/IDNA is not silently guessed by this bounded layer.  Page
@@ -222,6 +223,16 @@ bool tilefinch_url_parse(const char *value, TilefinchUrl *url)
     return true;
 }
 
+bool tilefinch_url_parse(const char *value, TilefinchUrl *url)
+{
+    return url_parse_limited(value, url, TILEFINCH_URL_SERIALIZED_LIMIT);
+}
+
+bool tilefinch_url_parse_long(const char *value, TilefinchUrl *url)
+{
+    return url_parse_limited(value, url, TILEFINCH_URL_LONG_LIMIT);
+}
+
 bool tilefinch_url_is_secure(const TilefinchUrl *url)
 {
     return url != NULL && url->scheme == TILEFINCH_URL_SCHEME_HTTPS;
@@ -230,7 +241,7 @@ bool tilefinch_url_is_secure(const TilefinchUrl *url)
 bool tilefinch_url_potentially_trustworthy(const char *value)
 {
     TilefinchUrl url;
-    if (!tilefinch_url_parse(value, &url)) return false;
+    if (!tilefinch_url_parse_long(value, &url)) return false;
     if (url.scheme == TILEFINCH_URL_SCHEME_HTTPS) return true;
     const char *host = value + url.host_offset;
     size_t length = url.host_length;
@@ -295,42 +306,66 @@ static bool same_origin_view(const TilefinchUrl *left, const TilefinchUrl *right
 bool tilefinch_url_same_origin(const char *left, const char *right)
 {
     TilefinchUrl left_url, right_url;
-    return tilefinch_url_parse(left, &left_url)
-        && tilefinch_url_parse(right, &right_url)
+    return tilefinch_url_parse_long(left, &left_url)
+        && tilefinch_url_parse_long(right, &right_url)
         && same_origin_view(&left_url, &right_url);
 }
 
-bool tilefinch_url_upgrade_to_https(const char *value, char *output,
-                                    size_t output_size)
+static bool url_normalize_limited(const char *value, char *output,
+                                  size_t output_size, size_t limit);
+
+/* `scratch` bounds the input and the result alike. */
+static bool url_upgrade_to_https_with(const char *value, char *output,
+                                      size_t output_size, char *scratch,
+                                      size_t scratch_size)
 {
     TilefinchUrl url;
     if (value == NULL || output == NULL || output_size == 0
-        || !tilefinch_url_parse(value, &url)
+        || !tilefinch_url_parse_long(value, &url) || url.length >= scratch_size
         || url.scheme != TILEFINCH_URL_SCHEME_HTTP) return false;
     const char *host = value + url.host_offset;
     size_t host_length = url.host_length;
     size_t suffix_offset = url.path_offset;
     if (suffix_offset > url.length) return false;
-    char candidate[TILEFINCH_URL_SERIALIZED_LIMIT];
     int written;
     if (!url.explicit_port || url.port == 80u) {
-        written = snprintf(candidate, sizeof(candidate), "https://%.*s%s",
+        written = snprintf(scratch, scratch_size, "https://%.*s%s",
                            (int) host_length, host,
                            value + suffix_offset);
     } else {
-        written = snprintf(candidate, sizeof(candidate), "https://%.*s:%u%s",
+        written = snprintf(scratch, scratch_size, "https://%.*s:%u%s",
                            (int) host_length, host, (unsigned) url.port,
                            value + suffix_offset);
     }
-    return written > 0 && (size_t) written < sizeof(candidate)
-        && tilefinch_url_normalize(candidate, output, output_size);
+    return written > 0 && (size_t) written < scratch_size
+        && url_normalize_limited(scratch, output, output_size, scratch_size);
+}
+
+bool tilefinch_url_upgrade_to_https(const char *value, char *output,
+                                    size_t output_size)
+{
+    char candidate[TILEFINCH_URL_SERIALIZED_LIMIT];
+    return url_upgrade_to_https_with(value, output, output_size, candidate,
+                                     sizeof(candidate));
+}
+
+/* Out of line: only a long redirect hop pays for the larger frame. */
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+bool tilefinch_url_upgrade_to_https_long(const char *value, char *output,
+                                         size_t output_size)
+{
+    char candidate[TILEFINCH_URL_LONG_LIMIT];
+    return url_upgrade_to_https_with(value, output, output_size, candidate,
+                                     sizeof(candidate));
 }
 
 bool tilefinch_url_is_downgrade(const char *source, const char *target)
 {
     TilefinchUrl source_url, target_url;
-    return tilefinch_url_parse(source, &source_url)
-        && tilefinch_url_parse(target, &target_url)
+    return tilefinch_url_parse_long(source, &source_url)
+        && tilefinch_url_parse_long(target, &target_url)
         && source_url.scheme == TILEFINCH_URL_SCHEME_HTTPS
         && target_url.scheme == TILEFINCH_URL_SCHEME_HTTP;
 }
@@ -377,7 +412,7 @@ bool tilefinch_url_origin(const char *value, char *output, size_t output_size)
     TilefinchUrl url;
     if (output == NULL || output_size == 0) return false;
     output[0] = '\0';
-    if (!tilefinch_url_parse(value, &url)) return false;
+    if (!tilefinch_url_parse_long(value, &url)) return false;
     return url_origin_from_parsed(value, &url, output, output_size);
 }
 
@@ -462,13 +497,15 @@ static bool append_normalized_path(char *output, size_t output_size,
     return true;
 }
 
-bool tilefinch_url_normalize(const char *value, char *output,
-                          size_t output_size)
+/* `limit`: the input's bound, terminator included. */
+static bool url_normalize_limited(const char *value, char *output,
+                                  size_t output_size, size_t limit)
 {
     TilefinchUrl url;
     char origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
     /* One parse serves both the origin and the path/query/fragment. */
-    if (output == NULL || output_size == 0 || !tilefinch_url_parse(value, &url)
+    if (output == NULL || output_size == 0 || !tilefinch_url_parse_long(value, &url)
+        || url.length >= limit
         || !url_origin_from_parsed(value, &url, origin, sizeof(origin)))
         return false;
     size_t used = 0;
@@ -492,10 +529,34 @@ bool tilefinch_url_normalize(const char *value, char *output,
     return true;
 }
 
+bool tilefinch_url_normalize(const char *value, char *output,
+                          size_t output_size)
+{
+    return url_normalize_limited(value, output, output_size,
+                                 TILEFINCH_URL_SERIALIZED_LIMIT);
+}
+
+bool tilefinch_url_normalize_long(const char *value, char *output,
+                                  size_t output_size)
+{
+    return url_normalize_limited(value, output, output_size,
+                                 TILEFINCH_URL_LONG_LIMIT);
+}
+
 bool tilefinch_url_request_key(const char *value, char *output,
                             size_t output_size)
 {
     if (!tilefinch_url_normalize(value, output, output_size)) return false;
+    char *fragment = strchr(output, '#');
+    if (fragment != NULL) *fragment = '\0';
+    return true;
+}
+
+bool tilefinch_url_request_key_long(const char *value, char *output,
+                                    size_t output_size)
+{
+    if (!tilefinch_url_normalize_long(value, output, output_size))
+        return false;
     char *fragment = strchr(output, '#');
     if (fragment != NULL) *fragment = '\0';
     return true;
@@ -513,17 +574,22 @@ static bool looks_absolute(const char *reference)
     return false;
 }
 
-bool tilefinch_url_resolve(const char *base, const char *reference,
-                        char *output, size_t output_size)
+/* `assembled` bounds the base, the reference and the result alike (its size
+   is the caller's address limit). */
+static bool url_resolve_with(const char *base, const char *reference,
+                             char *output, size_t output_size,
+                             char *assembled, size_t assembled_size)
 {
     if (reference == NULL || output == NULL || output_size == 0) return false;
     /* An absolute reference ignores the base entirely (URL Standard), so an
        opaque base such as blob: or about:blank, which cannot be a base, must
        not reject it. Only relative references need a parsable base. */
     if (looks_absolute(reference))
-        return tilefinch_url_normalize(reference, output, output_size);
+        return url_normalize_limited(reference, output, output_size,
+                                     assembled_size);
     TilefinchUrl base_url;
-    if (base == NULL || !tilefinch_url_parse(base, &base_url)) return false;
+    if (base == NULL || !tilefinch_url_parse_long(base, &base_url)
+        || base_url.length >= assembled_size) return false;
     if (reference[0] == '\0') {
         /* A relative URL with an empty input inherits path and query, but not
            the base fragment. Keeping the fragment here would make href=""
@@ -531,48 +597,50 @@ bool tilefinch_url_resolve(const char *base, const char *reference,
            stale in-page target across a real navigation. */
         size_t base_without_fragment = base_url.has_fragment
             ? base_url.fragment_offset - 1 : base_url.length;
-        char inherited[TILEFINCH_URL_SERIALIZED_LIMIT];
-        if (base_without_fragment >= sizeof(inherited)) return false;
-        memcpy(inherited, base, base_without_fragment);
-        inherited[base_without_fragment] = '\0';
-        return tilefinch_url_normalize(inherited, output, output_size);
+        if (base_without_fragment >= assembled_size) return false;
+        memcpy(assembled, base, base_without_fragment);
+        assembled[base_without_fragment] = '\0';
+        return url_normalize_limited(assembled, output, output_size,
+                                     assembled_size);
     }
-    char assembled[TILEFINCH_URL_SERIALIZED_LIMIT];
     size_t used = 0;
     assembled[0] = '\0';
     if (reference[0] == '/' && reference[1] == '/') {
         const char *scheme = base_url.scheme == TILEFINCH_URL_SCHEME_HTTPS
                              ? "https:" : "http:";
-        if (!append_bytes(assembled, sizeof(assembled), &used,
+        if (!append_bytes(assembled, assembled_size, &used,
                           scheme, strlen(scheme), false)
-            || !append_bytes(assembled, sizeof(assembled), &used,
+            || !append_bytes(assembled, assembled_size, &used,
                              reference, strlen(reference), false)) return false;
-        return tilefinch_url_normalize(assembled, output, output_size);
+        return url_normalize_limited(assembled, output, output_size,
+                                     assembled_size);
     }
     size_t base_without_fragment = base_url.has_fragment
         ? base_url.fragment_offset - 1 : base_url.length;
     if (reference[0] == '#') {
-        if (!append_bytes(assembled, sizeof(assembled), &used, base,
+        if (!append_bytes(assembled, assembled_size, &used, base,
                           base_without_fragment, false)
-            || !append_bytes(assembled, sizeof(assembled), &used, reference,
+            || !append_bytes(assembled, assembled_size, &used, reference,
                              strlen(reference), false)) return false;
-        return tilefinch_url_normalize(assembled, output, output_size);
+        return url_normalize_limited(assembled, output, output_size,
+                                     assembled_size);
     }
     size_t base_without_query = base_url.has_query
         ? base_url.query_offset - 1 : base_without_fragment;
     if (reference[0] == '?') {
-        if (!append_bytes(assembled, sizeof(assembled), &used, base,
+        if (!append_bytes(assembled, assembled_size, &used, base,
                           base_without_query, false)
-            || !append_bytes(assembled, sizeof(assembled), &used, reference,
+            || !append_bytes(assembled, assembled_size, &used, reference,
                              strlen(reference), false)) return false;
-        return tilefinch_url_normalize(assembled, output, output_size);
+        return url_normalize_limited(assembled, output, output_size,
+                                     assembled_size);
     }
     char origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
     if (!tilefinch_url_origin(base, origin, sizeof(origin))
-        || !append_bytes(assembled, sizeof(assembled), &used, origin,
+        || !append_bytes(assembled, assembled_size, &used, origin,
                          strlen(origin), false)) return false;
     if (reference[0] == '/' || reference[0] == '\\') {
-        if (!append_bytes(assembled, sizeof(assembled), &used, reference,
+        if (!append_bytes(assembled, assembled_size, &used, reference,
                           strlen(reference), false)) return false;
     } else {
         size_t directory_length = base_url.path_length;
@@ -582,23 +650,43 @@ bool tilefinch_url_resolve(const char *base, const char *reference,
             directory_length--;
         }
         if (directory_length == 0
-            && !append_bytes(assembled, sizeof(assembled), &used,
+            && !append_bytes(assembled, assembled_size, &used,
                              "/", 1, false)) return false;
         if (directory_length != 0
-            && !append_bytes(assembled, sizeof(assembled), &used,
+            && !append_bytes(assembled, assembled_size, &used,
                              base + base_url.path_offset,
                              directory_length, false)) return false;
-        if (!append_bytes(assembled, sizeof(assembled), &used, reference,
+        if (!append_bytes(assembled, assembled_size, &used, reference,
                           strlen(reference), false)) return false;
     }
-    return tilefinch_url_normalize(assembled, output, output_size);
+    return url_normalize_limited(assembled, output, output_size,
+                                 assembled_size);
+}
+
+bool tilefinch_url_resolve(const char *base, const char *reference,
+                        char *output, size_t output_size)
+{
+    char assembled[TILEFINCH_URL_SERIALIZED_LIMIT];
+    return url_resolve_with(base, reference, output, output_size, assembled,
+                            sizeof(assembled));
+}
+
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+bool tilefinch_url_resolve_long(const char *base, const char *reference,
+                                char *output, size_t output_size)
+{
+    char assembled[TILEFINCH_URL_LONG_LIMIT];
+    return url_resolve_with(base, reference, output, output_size, assembled,
+                            sizeof(assembled));
 }
 
 bool tilefinch_url_site_key(const char *value, char *output, size_t output_size)
 {
     if (value == NULL || output == NULL || output_size == 0) return false;
     TilefinchUrl url;
-    if (!tilefinch_url_parse(value, &url) || url.host_length > 253) return false;
+    if (!tilefinch_url_parse_long(value, &url) || url.host_length > 253) return false;
     UrlHostView view;
     url_host_view(&url, &view);
     char host[254];

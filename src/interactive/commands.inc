@@ -407,7 +407,10 @@ enum {
        status, render...) are not input. */
     LAB_CMD_USER_INPUT = 1u << 0,
     /* Allowed in a private console session (a privacy boundary: anything
-       that reads or prints page content stays off this list). */
+       that reads or prints page content stays off this list). The one
+       exception is private-buttons, whose button labels go only to a fixed
+       owner-only file the local sign-in script reads, shows in its own
+       terminal and deletes; they never reach stdout or a saved report. */
     LAB_CMD_PRIVATE_OK = 1u << 1
 };
 
@@ -473,6 +476,7 @@ static const LabCommand lab_commands[] = {
     {"js", 0u, "js EXPRESSION"},
     {"stop-scripts", 0u, "stop-scripts"},
     {"heavy-answer", LAB_PRIVATE, "heavy-answer run|stop"},
+    {"heavy-frame-answer", LAB_PRIVATE, "heavy-frame-answer run|stop"},
     {"tick", LAB_PRIVATE, "tick [COUNT [MS]]"},
     {"pump", LAB_PRIVATE, "pump [COUNT [MS]]"},
     {"until", 0u, "until MAX-TURNS MS EXPRESSION"},
@@ -516,6 +520,9 @@ static const LabCommand lab_commands[] = {
     {"private-focus-action", LAB_INPUT | LAB_PRIVATE, NULL},
     {"private-feedback", LAB_PRIVATE, NULL},
     {"private-snapshot", LAB_PRIVATE, NULL},
+    {"private-signin-report", LAB_PRIVATE, NULL},
+    {"private-buttons", LAB_PRIVATE, NULL},
+    {"private-press", LAB_INPUT | LAB_PRIVATE, NULL},
     {"private-open", LAB_PRIVATE, NULL},
     {"private-export-youtube-login", LAB_PRIVATE, NULL},
 };
@@ -887,7 +894,87 @@ static bool private_console_focus_field(BrowserEngine *engine,
     return matches == 1 && browser_engine_focus_node(engine, selected);
 }
 
-/* Select a unique rendered button within an ID-labelled action container.
+/* An attribute's value, ASCII case-insensitive. */
+static bool private_console_attribute_is(lxb_dom_node_t *node,
+                                         const char *name, const char *value)
+{
+    size_t length = 0;
+    const char *found = document_attribute(node, name, &length);
+    return found != NULL && length == strlen(value)
+        && strncasecmp(found, value, length) == 0;
+}
+
+/* Whether the PSP user could reach this button and see what they press:
+   its control region has area, as D-pad focus requires (layout takes it
+   from a visibility:hidden one), and some of that region lies on the page
+   inside every overflow clip around it, where layout_control_at could hit
+   it. It is enabled, painted (no ancestor at opacity 0, not
+   visibility:hidden), takes pointer events (pointer-events as the engine
+   computes it, on the button itself), and no ancestor hides it from
+   assistive technology or marks it disabled. Used only by the local
+   sign-in script's button commands, which must never press what the user
+   could not. */
+static bool private_console_button_reachable(NavigationSession *navigation,
+                                             const ControlRegion *control)
+{
+    enum { DEPTH_LIMIT = 64 };
+    const LayoutDocument *layout = &navigation->page.layout;
+    size_t length = 0;
+    if (control == NULL || control->type != CONTROL_BUTTON
+        || control->node == NULL || control->width <= 0
+        || control->height <= 0
+        || document_attribute(control->node, "disabled", &length) != NULL)
+        return false;
+    lxb_dom_node_t *chain[DEPTH_LIMIT];
+    size_t depth = 0;
+    for (lxb_dom_node_t *node = control->node;
+         node != NULL && node->type == LXB_DOM_NODE_TYPE_ELEMENT;
+         node = node->parent) {
+        if (depth == DEPTH_LIMIT
+            || private_console_attribute_is(node, "aria-hidden", "true")
+            || private_console_attribute_is(node, "aria-disabled", "true")
+            || document_attribute(node, "inert", &length) != NULL)
+            return false;
+        chain[depth++] = node;
+    }
+    ComputedStyle styles[2];
+    const ComputedStyle *parent = NULL;
+    for (size_t i = depth; i > 0; i--) {
+        ComputedStyle *style = &styles[i & 1u];
+        *style = style_for_node(&navigation->page.stylesheet, chain[i - 1],
+                                parent);
+        if (style->opacity == 0) return false;
+        parent = style;
+    }
+    if (parent == NULL || parent->visibility_hidden
+        || parent->pointer_events_none) return false;
+    int left = control->x, top = control->y;
+    LayoutScrollPlacement placement;
+    bool clipped = layout_node_overflow_placement(layout, control->node,
+                                                  &placement);
+    if (clipped) {
+        left += placement.dx;
+        top += placement.dy;
+    }
+    int right = left + control->width, bottom = top + control->height;
+    if (clipped && placement.clipped_x) {
+        if (left < placement.clip_left) left = placement.clip_left;
+        if (right > placement.clip_right) right = placement.clip_right;
+    }
+    if (clipped && placement.clipped_y) {
+        if (top < placement.clip_top) top = placement.clip_top;
+        if (bottom > placement.clip_bottom) bottom = placement.clip_bottom;
+    }
+    int page_width = layout->scroll_width > layout->width
+        ? layout->scroll_width : layout->width;
+    if (left < 0) left = 0;
+    if (top < 0) top = 0;
+    if (right > page_width) right = page_width;
+    if (bottom > layout->height) bottom = layout->height;
+    return left < right && top < bottom;
+}
+
+/* Select a unique reachable button within an ID-labelled action container.
    This uses the ordinary controller focus/activation path, not a standalone
    selector-dispatched click that leaves the edited field focused. */
 static bool private_console_focus_action(BrowserEngine *engine,
@@ -902,12 +989,8 @@ static bool private_console_focus_action(BrowserEngine *engine,
     const LayoutDocument *layout = &navigation->page.layout;
     for (size_t i = 0; i < layout->control_count; i++) {
         const ControlRegion *control = &layout->controls[i];
-        if (control->type != CONTROL_BUTTON) continue;
-        const LayoutNodeBox *box = layout_box_for_node(layout, control->node);
-        if (box == NULL || box->width <= 0 || box->height <= 0) continue;
+        if (!private_console_button_reachable(navigation, control)) continue;
         size_t length = 0;
-        if (document_attribute(control->node, "disabled", &length) != NULL)
-            continue;
         lxb_dom_node_t *node = control->node;
         for (size_t depth = 0; node != NULL && depth < 128;
              depth++, node = node->parent) {
@@ -919,6 +1002,143 @@ static bool private_console_focus_action(BrowserEngine *engine,
                 break;
             }
         }
+    }
+    return matches == 1 && browser_engine_focus_node(engine, selected);
+}
+
+/* Appends source to out as one terminal-safe line: whitespace runs
+   collapse to one space, other control characters (C0 and DEL: ESC would
+   reach the terminal) are dropped, and a label cut to fit ends on a whole
+   UTF-8 character. Returns the new length. */
+static size_t private_console_label_append(char *out, size_t used,
+                                           size_t capacity,
+                                           const char *source, size_t length)
+{
+    bool space = false, cut = false;
+    for (size_t i = 0; source != NULL && i < length; i++) {
+        unsigned char c = (unsigned char) source[i];
+        if (isspace(c)) { space = used > 0; continue; }
+        if (c < 0x20 || c == 0x7f) continue;
+        if (used + (space ? 2u : 1u) >= capacity) { cut = true; break; }
+        if (space) out[used++] = ' ';
+        space = false;
+        out[used++] = (char) c;
+    }
+    if (cut) {
+        size_t continuation = 0;
+        while (continuation < used && continuation < 3
+               && ((unsigned char) out[used - 1 - continuation] & 0xc0) == 0x80)
+            continuation++;
+        if (continuation < used) {
+            unsigned char lead = (unsigned char) out[used - 1 - continuation];
+            size_t whole = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3
+                : lead >= 0xc0 ? 2 : 1;
+            if (continuation + 1 < whole) used -= continuation + 1;
+        }
+    }
+    return used;
+}
+
+/* A reachable button's label: its text, an input's value, or its
+   aria-label, as one terminal-safe line. Used only for the local sign-in
+   script's button list (private-buttons / private-press). */
+static size_t private_console_button_label(lxb_dom_node_t *node,
+                                           char *out, size_t capacity)
+{
+    size_t length = 0, used = 0;
+    const char *source = NULL;
+    lxb_char_t *allocated = NULL;
+    if (node == NULL || capacity == 0) return 0;
+    if (node->local_name == LXB_TAG_INPUT)
+        source = document_attribute(node, "value", &length);
+    if (source == NULL || length == 0) {
+        allocated = lxb_dom_node_text_content(node, &length);
+        source = (const char *) allocated;
+    }
+    used = private_console_label_append(out, used, capacity, source, length);
+    if (allocated != NULL)
+        lxb_dom_document_destroy_text(node->owner_document, allocated);
+    if (used == 0) {
+        source = document_attribute(node, "aria-label", &length);
+        used = private_console_label_append(out, used, capacity, source,
+                                            length);
+    }
+    out[used] = '\0';
+    return used;
+}
+
+/* A new owner-only file for the local sign-in script (never an existing
+   one or a link), whatever the umask. */
+static FILE *private_console_create_file(const char *name)
+{
+    int fd = open(name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                  0600);
+    if (fd < 0) return NULL;
+    FILE *out = fdopen(fd, "w");
+    if (out == NULL) close(fd);
+    return out;
+}
+
+/* Write the labels of the page's reachable buttons, one per line, to a
+   fixed new file in the owner-only private directory. */
+static bool private_console_list_buttons(NavigationSession *navigation)
+{
+    struct stat directory;
+    char label[96];
+    size_t written = 0;
+    const LayoutDocument *layout = &navigation->page.layout;
+    if (stat(".", &directory) != 0 || !S_ISDIR(directory.st_mode)
+        || directory.st_uid != getuid() || (directory.st_mode & 0077) != 0)
+        return false;
+    FILE *out = private_console_create_file("private-buttons.txt");
+    if (out == NULL) return false;
+    bool ok = true;
+    for (size_t i = 0; i < layout->control_count && written < 32; i++) {
+        if (!private_console_button_reachable(navigation, &layout->controls[i]))
+            continue;
+        if (private_console_button_label(layout->controls[i].node, label,
+                                         sizeof(label)) == 0) continue;
+        ok = fprintf(out, "%s\n", label) >= 0 && ok;
+        written++;
+    }
+    return fclose(out) == 0 && ok;
+}
+
+/* Focus the one reachable button whose label matches (ASCII case-insensitive).
+   The label arrives hex-encoded so spaces and UTF-8 survive the command. */
+static bool private_console_press_label(BrowserEngine *engine,
+                                        NavigationSession *navigation,
+                                        const char *hex)
+{
+    char wanted[96], label[96];
+    size_t length = hex != NULL ? strlen(hex) : 0;
+    if (length == 0 || (length & 1u) != 0 || length / 2 >= sizeof(wanted))
+        return false;
+    for (size_t i = 0; i < length / 2; i++) {
+        unsigned value = 0;
+        for (size_t j = 0; j < 2; j++) {
+            unsigned char c = (unsigned char) hex[2 * i + j];
+            unsigned digit = c >= '0' && c <= '9' ? c - '0'
+                : c >= 'a' && c <= 'f' ? c - 'a' + 10
+                : c >= 'A' && c <= 'F' ? c - 'A' + 10 : 16;
+            if (digit > 15) return false;
+            value = value * 16 + digit;
+        }
+        if (value == 0) return false;
+        wanted[i] = (char) value;
+    }
+    wanted[length / 2] = '\0';
+    lxb_dom_node_t *selected = NULL;
+    size_t matches = 0;
+    const LayoutDocument *layout = &navigation->page.layout;
+    for (size_t i = 0; i < layout->control_count; i++) {
+        const ControlRegion *control = &layout->controls[i];
+        if (!private_console_button_reachable(navigation, control)) continue;
+        if (private_console_button_label(control->node, label, sizeof(label)) == 0
+            || strcasecmp(label, wanted) != 0) continue;
+        if (control->node == selected) continue;
+        selected = control->node;
+        matches++;
     }
     return matches == 1 && browser_engine_focus_node(engine, selected);
 }
@@ -1874,6 +2094,18 @@ static bool run_command_loop(FILE *commands, bool interactive,
                        !heavy.answered ? "no"
                            : heavy.allowed ? "run" : "refuse");
             }
+            NavigationHeavyFrames heavy_frames;
+            if (browser_engine_heavy_frames(engine, &heavy_frames)
+                && navigation->page.frame_count != 0) {
+                printf("heavy-frames waiting=%zu/%zu refused=%zu asks=%s "
+                       "kept=%zu/%zu url=\"%s\"\n",
+                       heavy_frames.waiting_scripts,
+                       heavy_frames.waiting_bytes,
+                       heavy_frames.refused_scripts,
+                       heavy_frames.asks ? "yes" : "no",
+                       heavy_frames.kept_responses, heavy_frames.kept_bytes,
+                       heavy_frames.url);
+            }
             if (navigation->page.runtime != NULL) {
                 script_runtime_report_memory(navigation->page.runtime,
                                              stdout);
@@ -2178,6 +2410,13 @@ static bool run_command_loop(FILE *commands, bool interactive,
             ok = browser_engine_answer_heavy_page(
                 engine, strcmp(argument, "run") == 0);
             printf("heavy-answer %s ok=%s\n", argument, ok ? "yes" : "no");
+        } else if (strcmp(line, "heavy-frame-answer") == 0
+                   && argument != NULL) {
+            /* Answer the page's frames' waiting scripts: "run" or "stop". */
+            ok = browser_engine_answer_heavy_frames(
+                engine, strcmp(argument, "run") == 0);
+            printf("heavy-frame-answer %s ok=%s\n", argument,
+                   ok ? "yes" : "no");
         } else if (strcmp(line, "stop-scripts") == 0) {
             ok = browser_engine_stop_page_scripts(engine);
             printf("stop-scripts ok=%s\n", ok ? "yes" : "no");
@@ -2473,13 +2712,14 @@ static bool run_command_loop(FILE *commands, bool interactive,
                     engine, basic_css, strlen(basic_css))
                 && browser_engine_activate_basic_view(engine);
             printf("loop-basic prepared=%s activated=%s visited=%u "
-                   "nodes=%u bytes=%u forms=%u truncated=%s bounded=%s "
-                   "prepare-us=%llu text=%u\n",
+                   "nodes=%u bytes=%u forms=%u dropped=%u truncated=%s "
+                   "bounded=%s prepare-us=%llu text=%u\n",
                    prepared ? "yes" : "no", ok ? "yes" : "no",
                    (unsigned) analysis.visited_nodes,
                    (unsigned) analysis.extracted_nodes,
                    (unsigned) analysis.extracted_bytes,
                    (unsigned) analysis.retained_forms,
+                   (unsigned) analysis.dropped_controls,
                    analysis.extraction_truncated ? "yes" : "no",
                    analysis.bounded_out ? "yes" : "no",
                    (unsigned long long) (basic_prepared - basic_started),
@@ -2606,6 +2846,33 @@ static bool run_command_loop(FILE *commands, bool interactive,
                 && directory.st_uid == getuid() && (directory.st_mode & 0077) == 0
                 && youtube_lite_session_signed_in(session)
                 && youtube_login_save(session, "youtube-device-session.bin", (int64_t) time(NULL));
+            changed = false;
+        } else if (strcmp(line, "private-buttons") == 0
+                   && private_console_fd >= 0) {
+            ok = (argument == NULL || argument[0] == '\0')
+                && private_console_list_buttons(navigation);
+            changed = false;
+        } else if (strcmp(line, "private-press") == 0
+                   && private_console_fd >= 0) {
+            ok = private_console_press_label(engine, navigation, argument);
+        } else if (strcmp(line, "private-signin-report") == 0
+                   && private_console_fd >= 0) {
+            /* The same counts-and-classes report the PSP shows as a QR
+               (docs/DIAGNOSTIC_QR.md): no addresses, names or values. It
+               goes to a fixed file in the keeper's owner-only directory,
+               never to a page-selected path or to stdout. */
+            static char report[4096];
+            struct stat directory;
+            FILE *out = NULL;
+            ok = (argument == NULL || argument[0] == '\0')
+                && stat(".", &directory) == 0 && S_ISDIR(directory.st_mode)
+                && directory.st_uid == getuid() && (directory.st_mode & 0077) == 0
+                && browser_engine_youtube_signin_report(engine, report, sizeof(report))
+                && (out = private_console_create_file("signin-report.txt")) != NULL;
+            if (out != NULL) {
+                ok = fputs(report, out) >= 0;
+                ok = fclose(out) == 0 && ok;
+            }
             changed = false;
         } else if (strcmp(line, "private-snapshot") == 0
                    && private_console_fd >= 0) {

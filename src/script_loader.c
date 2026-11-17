@@ -962,7 +962,7 @@ static bool script_evaluate_external_node(
     ScriptRuntime *runtime, Budget *budget, lxb_dom_node_t *node,
     const char *source,
     size_t source_length, const char *request_url,
-    const char *response_url, bool module,
+    const char *response_url, bool module, bool executable_precounted,
     const char *module_referrer_policy,
     TilefinchCredentialsMode module_credentials,
     BrowserSharedBody *source_body, const ScriptLazyWebpackPlan *lazy_plan,
@@ -972,6 +972,21 @@ static bool script_evaluate_external_node(
     script_runtime_note_script_source(
         runtime, source_length,
         lazy_plan != NULL ? lazy_plan->largest_factory_bytes : source_length);
+    /* A child frame's big classic script waits for the page's answer: the
+       frame's load stops here, before it runs (execute_external_node_live). */
+    ScriptHeavyFrameVerdict heavy = module ? SCRIPT_HEAVY_FRAME_RUN
+        : script_runtime_heavy_frame_verdict(runtime, source_length);
+    if (heavy == SCRIPT_HEAVY_FRAME_HOLD) {
+        if (script_runtime_heavy_frame_rollback_quota(
+                runtime, executable_precounted ? 0u : 1u,
+                source_length)) return false;
+        /* An inconsistent quota cannot safely suspend the load. Keep the
+           already-admitted source and run it in this realm instead. */
+    }
+    if (heavy == SCRIPT_HEAVY_FRAME_REFUSE) {
+        (void) script_runtime_dispatch_node(runtime, node, "error", NULL);
+        return false;
+    }
     size_t integrity_length = 0;
     const char *integrity = document_attribute(
         node, "integrity", &integrity_length);
@@ -1433,7 +1448,8 @@ static bool script_admit_inline_node(ScriptRuntime *runtime, Budget *budget,
 static bool script_evaluate_data_url_node(
     ScriptRuntime *runtime, Budget *budget, lxb_dom_node_t *node,
     const char *url, size_t url_length, const char *referrer_policy,
-    bool module, size_t maximum_file_bytes, long timeout_ms,
+    bool module, bool executable_precounted,
+    size_t maximum_file_bytes, long timeout_ms,
     ExternalScriptMetrics *metrics,
     DocumentScriptProcessResult *process_result)
 {
@@ -1499,7 +1515,8 @@ static bool script_evaluate_data_url_node(
     metrics->attempted++;
     bool ok = script_evaluate_external_node(
         runtime, budget, node, (const char *) source, source_length,
-        url, url, module, module ? effective_policy : NULL, credentials,
+        url, url, module, executable_precounted,
+        module ? effective_policy : NULL, credentials,
         NULL, NULL, true, metrics);
     if (ok) {
         metrics->loaded++;
@@ -1522,6 +1539,23 @@ bool document_script_is_parser_blocking(lxb_dom_node_t *element)
     bool external = source != NULL && source_length != 0;
     return !external || (!attribute_present(element, "async")
                          && !attribute_present(element, "defer"));
+}
+
+bool script_document_has_external_classic(const PocDocument *document)
+{
+    if (document == NULL || document->html == NULL) return false;
+    lxb_dom_node_t *root = lxb_dom_interface_node(document->html);
+    size_t visited = 0;
+    for (lxb_dom_node_t *node = root; node != NULL;
+         node = script_discovery_next(root, node)) {
+        /* Past the bound, assume one is there. */
+        if (++visited > SCRIPT_DISCOVERY_VISIT_LIMIT) return true;
+        if (script_kind(node) != SCRIPT_KIND_CLASSIC) continue;
+        size_t source_length = 0;
+        const char *source = script_source_attribute(node, &source_length);
+        if (source != NULL && source_length != 0) return true;
+    }
+    return false;
 }
 
 /* A script the page is waiting on (a module import, or an external script
@@ -1626,7 +1660,8 @@ static bool execute_external_node(
         }
         return script_evaluate_data_url_node(
             runtime, budget, node, reference, reference_length,
-            referrer_policy, module, maximum_file_bytes, timeout_ms,
+            referrer_policy, module, executable_precounted,
+            maximum_file_bytes, timeout_ms,
             metrics, process_result);
     }
     if (reference_length >= NAVIGATION_URL_LIMIT) {
@@ -1869,7 +1904,8 @@ static bool execute_external_node(
             module ? cached->module_effective_url
                 : preloaded.response_url != NULL
                 ? preloaded.response_url : resolved,
-            module, module_policy, module_credentials, cached_source.body,
+            module, executable_precounted, module_policy, module_credentials,
+            cached_source.body,
             has_lazy_plan ? &lazy_plan : NULL, false, metrics);
         (void) script_runtime_withdraw_source_release(runtime);
         if (has_lazy_plan) script_lazy_webpack_plan_destroy(&lazy_plan);
@@ -2132,7 +2168,8 @@ static bool execute_external_node(
                 runtime, script_source_owner_release, &owner);
         ok = script_evaluate_external_node(
             runtime, budget, node, source, source_length, resolved,
-            response_url, module, module_policy, module_credentials,
+            response_url, module, executable_precounted,
+            module_policy, module_credentials,
             source_body,
             has_lazy_plan ? &lazy_plan : NULL, no_store, metrics);
         (void) script_runtime_withdraw_source_release(runtime);
@@ -2200,7 +2237,8 @@ static bool execute_external_node_live(
         module, executable_precounted,
         maximum_total_bytes, maximum_file_bytes,
         timeout_ms, metrics, NULL);
-    return executed && !script_runtime_document_refresh_failed(runtime);
+    return executed && !script_runtime_document_refresh_failed(runtime)
+        && !script_runtime_heavy_frame_held(runtime, NULL);
 }
 
 /* QuickJS loads a module graph one synchronous request at a time: it asks
@@ -2917,6 +2955,14 @@ static bool script_was_parser_executed(
     return false;
 }
 
+static bool script_was_already_executed(
+    const ScriptRuntime *runtime, const StreamingScriptState *streaming,
+    long handle)
+{
+    return script_was_parser_executed(streaming, handle)
+        || script_runtime_frame_script_was_completed(runtime, handle);
+}
+
 static bool script_node_is_attached(const lxb_dom_node_t *node)
 {
     /* A parser-retained section is intentionally rooted outside the active
@@ -2981,6 +3027,18 @@ static bool script_execution_plan_finish(
     ModuleLoadContext *context, ScriptExecutionPlan *plan,
     ExternalScriptMetrics *output, bool result)
 {
+    if (context != NULL && plan != NULL
+        && script_runtime_heavy_frame_held(context->runtime, NULL)) {
+        size_t unused_slots = 0;
+        for (size_t i = 0; i < EXTERNAL_SCRIPT_HARD_LIMIT; i++) {
+            if (plan->admission[i] == SCRIPT_ADMISSION_COUNTED
+                && !script_runtime_frame_script_was_completed(
+                    context->runtime, plan->scripts[i]))
+                unused_slots++;
+        }
+        if (!script_runtime_heavy_frame_rollback_quota(
+                context->runtime, unused_slots, 0)) result = false;
+    }
     if (context != NULL) budget_free(context->budget, plan);
     return pipeline_context_finish_pass(context, output, result);
 }
@@ -3063,7 +3121,7 @@ static void script_plan_initial_admission(
             runtime, plan->scripts[i]);
         if (!script_node_is_attached(node)
             || script_runtime_dynamic_script_is_scheduled(runtime, node)
-            || script_was_parser_executed(streaming, plan->scripts[i])
+            || script_was_already_executed(runtime, streaming, plan->scripts[i])
             || script_kind(node) != SCRIPT_KIND_CLASSIC) continue;
         size_t source_length = 0;
         const char *source = script_source_attribute(node, &source_length);
@@ -3082,7 +3140,7 @@ static void script_plan_initial_admission(
             runtime, plan->scripts[i]);
         if (!script_node_is_attached(node)
             || script_runtime_dynamic_script_is_scheduled(runtime, node)
-            || script_was_parser_executed(streaming, plan->scripts[i])
+            || script_was_already_executed(runtime, streaming, plan->scripts[i])
             || script_kind(node) != SCRIPT_KIND_MODULE) continue;
         size_t source_length = 0;
         const char *source = script_source_attribute(node, &source_length);
@@ -3137,7 +3195,7 @@ static void script_plan_initial_admission(
             runtime, plan->scripts[i]);
         if (!script_node_is_attached(node)
             || script_runtime_dynamic_script_is_scheduled(runtime, node)
-            || script_was_parser_executed(streaming, plan->scripts[i])
+            || script_was_already_executed(runtime, streaming, plan->scripts[i])
             || !script_is_critical_bootstrap(node)) continue;
         if (script_quota_claim_executable(runtime)) {
             plan->admission[i] = SCRIPT_ADMISSION_COUNTED;
@@ -3158,7 +3216,7 @@ static void script_plan_initial_admission(
             runtime, plan->scripts[i]);
         if (!script_node_is_attached(node)
             || script_runtime_dynamic_script_is_scheduled(runtime, node)
-            || script_was_parser_executed(streaming, plan->scripts[i])) continue;
+            || script_was_already_executed(runtime, streaming, plan->scripts[i])) continue;
         if (script_quota_claim_executable(runtime)) {
             plan->admission[i] = SCRIPT_ADMISSION_COUNTED;
         } else {
@@ -3269,7 +3327,7 @@ static lxb_dom_node_t *whole_document_next(lxb_dom_node_t *parent,
    inline script inside write(); here it runs once the writer returns.
    False only for a pipeline failure. */
 static bool whole_document_run(const WholeDocumentScripts *scripts,
-                               lxb_dom_node_t *node, bool external,
+                               lxb_dom_node_t *node, long handle, bool external,
                                bool module, bool counted, bool inline_data,
                                unsigned depth)
 {
@@ -3286,6 +3344,7 @@ static bool whole_document_run(const WholeDocumentScripts *scripts,
               scripts->runtime, scripts->budget, node, module, counted,
               inline_data, &scripts->document->content_security_policy,
               scripts->metrics);
+    if (ok) script_runtime_frame_script_completed(scripts->runtime, handle);
     size_t length = 0;
     char *written =
         script_runtime_whole_document_write_end(scripts->runtime, &length);
@@ -3312,7 +3371,7 @@ static bool whole_document_run(const WholeDocumentScripts *scripts,
             size_t source_length = 0;
             const char *source = script_source_attribute(at, &source_length);
             if (!whole_document_run(
-                    scripts, at, source != NULL && source_length != 0,
+                    scripts, at, handle, source != NULL && source_length != 0,
                     written_module, false, !written_module, depth + 1u))
                 return false;
         }
@@ -3399,7 +3458,8 @@ static bool document_scripts_execute_internal(
         if (script_runtime_dynamic_script_is_scheduled(runtime, node)) {
             continue;
         }
-        if (script_was_parser_executed(streaming, plan->scripts[i])) continue;
+        if (script_was_already_executed(
+                runtime, streaming, plan->scripts[i])) continue;
         if (plan->admission[i] == SCRIPT_ADMISSION_DENIED
             || plan->admission[i] == SCRIPT_ADMISSION_PENDING) continue;
         ScriptKind kind = script_kind(node);
@@ -3431,7 +3491,7 @@ static bool document_scripts_execute_internal(
                 maximum_file_bytes, timeout_ms, metrics, plan, &script_count
             };
             if (!whole_document_run(
-                    &whole, node, external, module,
+                    &whole, node, plan->scripts[i], external, module,
                     plan->admission[i] == SCRIPT_ADMISSION_COUNTED,
                     plan->admission[i] == SCRIPT_ADMISSION_INLINE_DATA, 0u))
                 return script_execution_plan_finish(
@@ -3454,6 +3514,7 @@ static bool document_scripts_execute_internal(
             return script_execution_plan_finish(
                 module_context, plan, output_metrics, false);
         }
+        script_runtime_frame_script_completed(runtime, plan->scripts[i]);
     }
     for (size_t i = 0; i < deferred_count; i++) {
         lxb_dom_node_t *node = script_runtime_node_handle_resolve(
@@ -3483,6 +3544,7 @@ static bool document_scripts_execute_internal(
             return script_execution_plan_finish(
                 module_context, plan, output_metrics, false);
         }
+        script_runtime_frame_script_completed(runtime, plan->deferred[i]);
     }
     /* Scripts inserted by an earlier script are not part of the parser's
        original list. Discover them in bounded waves, as browsers do when an
@@ -3534,6 +3596,7 @@ static bool document_scripts_execute_internal(
                 return script_execution_plan_finish(
                     module_context, plan, output_metrics, false);
             }
+            script_runtime_frame_script_completed(runtime, current[i]);
         }
         if (added == 0) break;
     }

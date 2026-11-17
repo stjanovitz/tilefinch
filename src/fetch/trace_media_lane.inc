@@ -77,6 +77,16 @@ typedef struct {
     bool streaming;
     bool headers_taken;
     bool success;
+    /* Host test faults: Set-Cookie fields this answer carries, the prefix
+       of their names, and how many have been handed over. */
+    unsigned fault_cookies;
+    unsigned cookies_handed;
+    bool cookies_truncated;
+    const char *fault_cookie_prefix;
+    /* Host test detours (replay_lane_detour_*): the redirect's Location,
+       kept beside the header snapshot, and the address that answered. */
+    const char *location;
+    const char *answered_url;
 } FetchReplayLaneOperation;
 
 static struct {
@@ -223,6 +233,10 @@ static uint64_t fetch_replay_lane_enqueue(
     if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNSUPPORTED;
     if (url == NULL || maximum_bytes == 0
         || !fetch_request_validate(request, NULL)) return 0;
+#if !defined(__PSP__)
+    const char *refused = tilefinch_test_faults()->replay_lane_unsupported_url;
+    if (refused != NULL && fetch_replay_lane_same_url(url, refused)) return 0;
+#endif
     FetchReplayLaneOperation *operation = NULL;
     size_t limit = FETCH_REPLAY_LANE_LIMIT;
 #if !defined(__PSP__)
@@ -268,8 +282,37 @@ static uint64_t fetch_replay_lane_enqueue(
     FILE *body = NULL;
     const unsigned char *memory = NULL;
     size_t length = 0;
+    const char *detour_location = NULL;
+    const char *detour_url = NULL;
 #if !defined(__PSP__)
-    if (fetch_replay_lane_capturing()) {
+    {
+        const TilefinchTestFaults *faults = tilefinch_test_faults();
+        const char *from = faults->replay_lane_detour_from;
+        const char *through = faults->replay_lane_detour_through;
+        if (single_hop && from != NULL && through != NULL) {
+            if (strcmp(url, from) == 0) {
+                detour_url = from;
+                detour_location = through;
+            } else if (strcmp(url, through) == 0) {
+                detour_url = through;
+                detour_location = faults->replay_lane_detour_to;
+            }
+        }
+    }
+    if (detour_url != NULL) {
+        served = true;
+        result->status_code = detour_location != NULL ? 302 : 200;
+        /* A response URL only when it is one a document may have. */
+        if (strlen(url) < sizeof(result->effective_url))
+            snprintf(result->effective_url, sizeof(result->effective_url),
+                     "%s", url);
+        if (detour_location == NULL)
+            snprintf(result->content_type, sizeof(result->content_type),
+                     "%s", "text/html");
+        result->response_headers_length = (size_t) snprintf(
+            result->response_headers, sizeof(result->response_headers),
+            "%s", "content-length: 0\n");
+    } else if (fetch_replay_lane_capturing()) {
         served = fetch_replay_lane_capture(budget, url, request,
                                            maximum_bytes, timeout_ms,
                                            single_hop, result);
@@ -292,7 +335,7 @@ static uint64_t fetch_replay_lane_enqueue(
         length = served ? writer.deferred_replay_length : 0;
         trace_replay_rekey_release(budget, &writer.replay_rekey);
     }
-    if (served && single_hop && memory == NULL
+    if (served && detour_url == NULL && single_hop && memory == NULL
         && !fetch_trace.replay_media_served_alias
         && result->effective_url[0] != '\0'
         && !fetch_replay_lane_same_url(result->effective_url, url)) {
@@ -305,7 +348,9 @@ static uint64_t fetch_replay_lane_enqueue(
         result->status_code = 302;
         snprintf(result->effective_url, sizeof(result->effective_url), "%s",
                  url);
+        /* The redirect is not the final response: none of its fields. */
         result->content_type[0] = '\0';
+        result->accept_ch[0] = '\0';
         int written = snprintf(result->response_headers,
                                sizeof(result->response_headers),
                                "location: %s\ncontent-length: 0\n",
@@ -313,7 +358,7 @@ static uint64_t fetch_replay_lane_enqueue(
         result->response_headers_length = written > 0
             && (size_t) written < sizeof(result->response_headers)
             ? (size_t) written : 0;
-    } else if (served) {
+    } else if (served && detour_url == NULL) {
         /* The record holds curl's decoded body; frame the served copy as
            what it now is. A Range answer was framed when it was cut. */
         TraceReplayRange range;
@@ -321,7 +366,7 @@ static uint64_t fetch_replay_lane_enqueue(
         if (!range.present && result->status_code == 200)
             trace_replay_reframe_headers(result, length, NULL);
     }
-    if (served && memory == NULL)
+    if (served && memory == NULL && detour_url == NULL)
         fetch_trace.replay_media_lane_served_count++;
     if (++fetch_replay_lane.next_id >= FETCH_REPLAY_LANE_ID_TAG)
         fetch_replay_lane.next_id = 1;
@@ -338,12 +383,29 @@ static uint64_t fetch_replay_lane_enqueue(
         .expected_hash = writer.replay_expected_body_hash,
         .verify = body != NULL && writer.replay_body_hash_required,
         .streaming = streaming,
-        .success = served
+        .success = served,
+        .location = detour_location,
+        .answered_url = detour_url
     };
     if (!served && result->error[0] == '\0') {
         snprintf(result->error, sizeof(result->error),
                  "HTTP replay has no record for this media request");
     }
+#if !defined(__PSP__)
+    {
+        const TilefinchTestFaults *faults = tilefinch_test_faults();
+        long answered = result->status_code;
+        if (served && answered >= 300 && answered < 400) {
+            operation->fault_cookies = faults->replay_lane_redirect_cookies;
+            operation->fault_cookie_prefix = "lane";
+        } else if (served && faults->replay_lane_cookie_url != NULL
+                   && fetch_replay_lane_same_url(
+                          url, faults->replay_lane_cookie_url)) {
+            operation->fault_cookies = faults->replay_lane_url_cookies;
+            operation->fault_cookie_prefix = "page";
+        }
+    }
+#endif
     if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_ADMITTED;
     return operation->id;
 }
@@ -382,6 +444,14 @@ static void fetch_replay_lane_copy_headers(FetchResult *destination,
              "%s", source->last_modified);
     snprintf(destination->server, sizeof(destination->server), "%s",
              source->server);
+    /* A page the lane answers must leave its origin's Accept-CH
+       remembered, as the worker's header snapshot does, or no later
+       request on a replay carries client hints the way the device's does.
+       Critical-CH, which the worker also hands on, is left out: replays
+       would then retry documents for their critical hints as the device
+       does, which moves the replayed journeys' baselines. */
+    snprintf(destination->accept_ch, sizeof(destination->accept_ch), "%s",
+             source->accept_ch);
     memcpy(destination->response_headers, source->response_headers,
            source->response_headers_length + 1u);
     destination->response_headers_length = source->response_headers_length;
@@ -421,14 +491,69 @@ static void fetch_replay_lane_media_view(
              source->error);
 }
 
-static bool fetch_replay_lane_take_headers(uint64_t request_id,
-                                           FetchResult *metadata)
+
+/* Appends the answer's fault Set-Cookie fields not yet handed over, as the
+   worker's hand-over does: the header take hands them first, the result
+   take any left. At the chain's capacity the rest is dropped and the set
+   marked truncated (the lane answers single hops, whose redirects the
+   scheduler then fails). */
+static FetchBackgroundCookieHandoff fetch_replay_lane_hand_over_cookies(
+    FetchReplayLaneOperation *operation, Budget *budget, FetchResult *result)
 {
+    const char *url = operation->answered_url != NULL
+        ? operation->answered_url : operation->result->effective_url;
+    while (operation->cookies_handed < operation->fault_cookies) {
+        if (result->set_cookie_count >= FETCH_RESPONSE_COOKIE_CAPACITY) {
+            operation->cookies_truncated = true;
+            operation->cookies_handed = operation->fault_cookies;
+            break;
+        }
+        char cookie[32];
+        int length = snprintf(cookie, sizeof(cookie), "%s%u=1; Path=/",
+                              operation->fault_cookie_prefix,
+                              operation->cookies_handed);
+        char *value = budget_malloc(budget, (size_t) length + 1u);
+        char *source = budget_malloc(budget, strlen(url) + 1u);
+        if (value == NULL || source == NULL) {
+            budget_free(budget, value);
+            budget_free(budget, source);
+            return FETCH_BACKGROUND_COOKIES_MEMORY;
+        }
+        memcpy(value, cookie, (size_t) length + 1u);
+        memcpy(source, url, strlen(url) + 1u);
+        result->set_cookies[result->set_cookie_count] = value;
+        result->set_cookie_urls[result->set_cookie_count++] = source;
+        operation->cookies_handed++;
+    }
+    if (operation->cookies_truncated) result->set_cookies_truncated = true;
+    return FETCH_BACKGROUND_COOKIES_HANDED;
+}
+
+static bool fetch_replay_lane_take_headers_with_cookies(
+    uint64_t request_id, Budget *budget, FetchResult *metadata,
+    FetchBackgroundCookieHandoff *cookies)
+{
+    if (cookies != NULL) *cookies = FETCH_BACKGROUND_COOKIES_HANDED;
     FetchReplayLaneOperation *operation = fetch_replay_lane_find(request_id);
     if (operation == NULL || metadata == NULL || !operation->streaming
         || !operation->success || operation->headers_taken) return false;
     operation->headers_taken = true;
     fetch_replay_lane_copy_headers(metadata, operation->result);
+    if (budget != NULL) {
+        FetchBackgroundCookieHandoff handoff =
+            fetch_replay_lane_hand_over_cookies(operation, budget, metadata);
+        if (cookies != NULL) *cookies = handoff;
+    }
+    return true;
+}
+
+static bool fetch_replay_lane_response_location(uint64_t request_id,
+                                                const char **location)
+{
+    FetchReplayLaneOperation *operation = fetch_replay_lane_find(request_id);
+    if (operation == NULL || location == NULL || !operation->headers_taken
+        || operation->location == NULL) return false;
+    *location = operation->location;
     return true;
 }
 
@@ -557,6 +682,9 @@ static bool fetch_replay_lane_take_fetch_result(
              assembled ? operation->result->error
                        : "background streamed response was incomplete");
     bool success = assembled && operation->success;
+    if (fetch_replay_lane_hand_over_cookies(operation, budget, result)
+            != FETCH_BACKGROUND_COOKIES_HANDED)
+        success = false;
     fetch_replay_lane_release(operation);
     return success;
 }

@@ -53,6 +53,10 @@ int main(void)
     if (!test_compile_over_heap_is_refused_with_realm_intact(&budget)) {
         failures++;
     }
+    if (!test_large_unit_without_compile_room_is_refused_before_compile(
+            &budget)) {
+        failures++;
+    }
     if (!test_heavy_page_gate(&budget)) failures++;
     if (!test_oversized_script_marks_page_over(&budget)) failures++;
     if (!test_oversized_resource_loader_envelope_is_segmented(&budget)) {

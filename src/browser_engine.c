@@ -74,6 +74,11 @@ typedef struct {
     bool history_move;
     bool history_forward;
     bool record_history;
+    /* A load that handed over to a site adapter: its chain and last status,
+       for the sign-in trail (browser_engine_handoff_chain). */
+    bool handoff_chain_kept;
+    long handoff_http_status;
+    FetchChainFacts handoff_chain;
     char url[NAVIGATION_URL_LIMIT];
     char download_filename[FILE_DOWNLOAD_FILENAME_LIMIT];
     char media_audio_url[NAVIGATION_URL_LIMIT];
@@ -128,6 +133,10 @@ typedef struct {
     unsigned post_target, post_landing, post_outcome;
     long post_http_status;
     bool post_pending;
+    /* The last POST's redirect chain, and the host class of the hop a
+       failure happened on (browser_engine_youtube_host_class). */
+    FetchChainFacts post_chain;
+    unsigned post_failed_host;
     /* Google refusing the browser on accounts.google.com
        (SiteIdentityAccountsRefusal): how often, and the last one's class
        and reason number. */
@@ -433,7 +442,8 @@ static const char *browser_engine_youtube_commit_url(const char *url);
 static void browser_engine_youtube_on_commit(BrowserEngine *engine,
                                              bool committed);
 static void browser_engine_youtube_note_landing(
-    BrowserEngine *engine, BrowserNavigationJobStatus outcome);
+    BrowserEngine *engine, BrowserNavigationJobStatus outcome,
+    const FetchChainFacts *handoff_chain, long handoff_http_status);
 static void browser_engine_youtube_on_finish(
     BrowserEngine *engine, BrowserNavigationJobStatus outcome,
     const SiteAdapterLoadMetrics *adapter);
@@ -450,6 +460,18 @@ static void browser_engine_deferred_reader_images_ready(
 static void browser_engine_image_table_moved(
     void *opaque, NavigationSession *navigation, uintptr_t previous_base,
     size_t previous_count, const uint8_t *remap);
+
+/* A chain that lands on a site adapter's address (a sign-in that ends on
+   YouTube) is dropped at that response's headers so the native page can
+   open instead. It did not fail: its counts stand, without the failure the
+   transport read into the drop. */
+static void browser_engine_handoff_chain(FetchChainFacts *chain)
+{
+    chain->failure = FETCH_CHAIN_FAILURE_NONE;
+    chain->limit = FETCH_CHAIN_LIMIT_NONE;
+    chain->failed_hop = 0u;
+    chain->failed_host[0] = '\0';
+}
 
 static void copy_error(char *output, size_t capacity, const char *message)
 {
@@ -492,7 +514,9 @@ static bool set_error_code(BrowserEngine *engine,
    typed facts rather than the engine sentence, which stays in last_error
    for the Diagnostic QR. In order: the transport's timeout, the document
    over its byte limit, an allocation the budget refused during the load,
-   no response at all; otherwise `fallback`. */
+   no response at all; otherwise `fallback`. A redirect chain a transport
+   rule ended (FETCH_CHAIN_FAILURE_RULE) is not a network failure even
+   when no response is left to show: Wi-Fi is fine and Retry cannot help. */
 static TilefinchDiagnosticCode browser_engine_failure_code(
     const BrowserEngine *engine, size_t load_budget_failures,
     TilefinchDiagnosticCode fallback)
@@ -507,6 +531,7 @@ static TilefinchDiagnosticCode browser_engine_failure_code(
     if (load_budget_failures != 0)
         return TILEFINCH_DIAGNOSTIC_ALLOCATION_FAILED;
     if (navigation->last_http_status == 0 && !navigation->last_response_started
+        && navigation->last_chain.failure != FETCH_CHAIN_FAILURE_RULE
         && fallback == TILEFINCH_DIAGNOSTIC_NETWORK_FAILED)
         return TILEFINCH_DIAGNOSTIC_NETWORK_FAILED;
     return fallback == TILEFINCH_DIAGNOSTIC_NETWORK_FAILED
@@ -3264,6 +3289,10 @@ static BrowserNavigationJobStatus browser_engine_pump_navigation_step(
         const char *redirect = navigation_load_adapter_redirect(work->load);
         if (redirect != NULL) {
             snprintf(work->url, sizeof(work->url), "%s", redirect);
+            work->handoff_chain_kept = navigation_load_chain_facts(
+                work->load, &work->handoff_chain, &work->handoff_http_status);
+            if (work->handoff_chain_kept)
+                browser_engine_handoff_chain(&work->handoff_chain);
             navigation_load_destroy(work->load);
             work->load = NULL;
             SiteAdapterPreferences preferences = {
@@ -3404,15 +3433,26 @@ bool browser_engine_heavy_page(BrowserEngine *engine,
                                ScriptHeavyState *state)
 {
     if (state != NULL) memset(state, 0, sizeof(*state));
-    return engine != NULL && engine->navigation.page.loaded
-        && engine->navigation.page.runtime != NULL
-        && script_runtime_heavy_state(engine->navigation.page.runtime, state);
+    return engine != NULL && navigation_heavy_state(&engine->navigation, state);
 }
 
 bool browser_engine_answer_heavy_page(BrowserEngine *engine, bool run)
 {
-    return engine != NULL && engine->navigation.page.runtime != NULL
-        && script_runtime_answer_heavy(engine->navigation.page.runtime, run);
+    return engine != NULL && navigation_answer_heavy(&engine->navigation, run);
+}
+
+bool browser_engine_heavy_frames(BrowserEngine *engine,
+                                 NavigationHeavyFrames *frames)
+{
+    if (frames != NULL) memset(frames, 0, sizeof(*frames));
+    return engine != NULL
+        && navigation_heavy_frames(&engine->navigation, frames);
+}
+
+bool browser_engine_answer_heavy_frames(BrowserEngine *engine, bool run)
+{
+    return engine != NULL
+        && navigation_answer_heavy_frames(&engine->navigation, run);
 }
 
 bool browser_engine_stop_page_scripts(BrowserEngine *engine)
@@ -4908,6 +4948,22 @@ void browser_engine_suspend_page_presentations(BrowserEngine *engine)
     (void) script_runtime_exit_page_fullscreen(runtime);
 }
 
+/* What a site adapter's page opened by a page action is told about it:
+   the page it was opened from, and whether the user asked for it. */
+static void browser_engine_note_adapter_navigation(
+    BrowserEngine *engine, const ControllerAction *action)
+{
+    const char *current_url =
+        navigation_active_document_url(&engine->navigation);
+    if (current_url != NULL) {
+        snprintf(engine->navigation.pending_navigation_referer,
+                 sizeof(engine->navigation.pending_navigation_referer),
+                 "%s", current_url);
+    }
+    engine->navigation.pending_navigation_user_activated =
+        action->navigation_source == CONTROLLER_NAVIGATION_USER;
+}
+
 bool browser_engine_execute_action(BrowserEngine *engine,
                                    const ControllerAction *action,
                                    size_t maximum_bytes,
@@ -4946,15 +5002,7 @@ bool browser_engine_execute_action(BrowserEngine *engine,
     browser_engine_store_current_controls(engine);
     if (strcasecmp(method, "GET") == 0
         && site_adapter_handles_navigation(method, action->url)) {
-        const char *current_url =
-            navigation_active_document_url(&engine->navigation);
-        if (current_url != NULL) {
-            snprintf(engine->navigation.pending_navigation_referer,
-                     sizeof(engine->navigation.pending_navigation_referer),
-                     "%s", current_url);
-        }
-        engine->navigation.pending_navigation_user_activated =
-            action->navigation_source == CONTROLLER_NAVIGATION_USER;
+        browser_engine_note_adapter_navigation(engine, action);
         return browser_engine_load_url_with_limits(
             engine, action->url, maximum_bytes, timeout_ms, true);
     }
@@ -4965,11 +5013,35 @@ bool browser_engine_execute_action(BrowserEngine *engine,
         engine, action->url, method,
         action->body_length == 0 ? NULL : controller_action_body(action),
         action->body_length);
-    bool executed = controller_execute_action(
-        &engine->controller, action, maximum_bytes, timeout_ms);
+    /* A chain that lands on a site adapter's address (a sign-in that ends
+       on YouTube) is dropped at that response's headers and its native
+       page opened instead, as a navigation job does
+       (browser_engine_pump_navigation). The dropped load is not a failed
+       one: its chain keeps what it counted, without the failure the
+       transport read into the drop. */
+    char handoff[NAVIGATION_URL_LIMIT];
+    bool executed = controller_execute_action_handoff(
+        &engine->controller, action, maximum_bytes, timeout_ms, handoff,
+        sizeof(handoff));
+    if (!executed && handoff[0] != '\0') {
+        /* The next load starts by clearing the session's last_chain and
+           status (navigation_begin), and the incumbent's failure
+           classification reads them: the trail takes a copy instead. */
+        FetchChainFacts chain = engine->navigation.last_chain;
+        long http_status = engine->navigation.last_http_status;
+        browser_engine_handoff_chain(&chain);
+        browser_engine_note_adapter_navigation(engine, action);
+        bool opened = browser_engine_load_url_with_limits(
+            engine, handoff, maximum_bytes, timeout_ms, true);
+        browser_engine_youtube_note_landing(
+            engine, opened ? BROWSER_NAVIGATION_JOB_SUCCEEDED
+                           : BROWSER_NAVIGATION_JOB_FAILED,
+            &chain, http_status);
+        return opened;
+    }
     browser_engine_youtube_note_landing(
         engine, executed ? BROWSER_NAVIGATION_JOB_SUCCEEDED
-                         : BROWSER_NAVIGATION_JOB_FAILED);
+                         : BROWSER_NAVIGATION_JOB_FAILED, NULL, 0);
     if (!executed) {
         return set_error_code(
             engine, TILEFINCH_SUBSYSTEM_ENGINE,

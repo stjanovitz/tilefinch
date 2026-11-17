@@ -598,6 +598,7 @@ static void navigation_deferred_images_finish(NavigationSession *session)
     session->page.deferred_image_rank_scroll_y = 0;
     session->page.deferred_image_rank_valid = false;
     session->page.deferred_images_from_viewport = false;
+    session->page.deferred_images_replan = false;
     session->page.image_continuation_pending = false;
 }
 
@@ -716,6 +717,60 @@ bool navigation_prioritize_deferred_image(
     return true;
 }
 
+/* Commands of a box-less image looked at inside its nearest boxed ancestor;
+   past this, the ancestor's own box places the image. */
+#define NAVIGATION_DEFERRED_ALT_SCAN_LIMIT 512u
+
+/* Where an <img> without a node box of its own lies. Before its pixels
+   arrive, an image with no declared or intrinsic size flows its alt text
+   as ordinary text (or nothing) and records no box, yet it can sit at the
+   top of the screen: a masthead logo, a product capsule. Its alt-text
+   commands, within its nearest boxed ancestor, place it; without them that
+   ancestor's box does, as long as the box says which screen the image is
+   on (no taller than the viewport, or wholly off it). */
+static bool navigation_deferred_image_estimate(
+    const LayoutDocument *layout, lxb_dom_node_t *node, int viewport_top,
+    int viewport_bottom, int64_t *top, int64_t *bottom)
+{
+    const LayoutNodeBox *box = NULL;
+    unsigned depth = 0;
+    for (lxb_dom_node_t *parent = node->parent;
+         parent != NULL && box == NULL && depth < 64u;
+         parent = parent->parent, depth++) {
+        if (parent->type == LXB_DOM_NODE_TYPE_ELEMENT)
+            box = layout_box_for_node(layout, parent);
+    }
+    if (box == NULL) return false;
+    size_t alt_length = 0;
+    const char *alt = document_attribute(node, "alt", &alt_length);
+    if (alt_length == 0) alt = NULL;
+    size_t end = box->command_end < layout->count
+        ? box->command_end : layout->count;
+    size_t start = box->command_start < end ? box->command_start : end;
+    if (end - start > NAVIGATION_DEFERRED_ALT_SCAN_LIMIT)
+        end = start + NAVIGATION_DEFERRED_ALT_SCAN_LIMIT;
+    bool found = false;
+    for (size_t i = start; i < end; i++) {
+        const DrawCommand *command = &layout->commands[i];
+        if (command->type != DRAW_TEXT || command->text == NULL) continue;
+        bool boxed_alt = (command->radius & LAYOUT_TEXT_IMAGE_ALT) != 0
+            && (const void *) command->image == (const void *) node;
+        bool flowed_alt = alt != NULL && command->text >= alt
+            && command->text < alt + alt_length;
+        if (!boxed_alt && !flowed_alt) continue;
+        int64_t command_top = command->y;
+        int64_t command_bottom = command_top + command->height;
+        if (!found || command_top < *top) *top = command_top;
+        if (!found || command_bottom > *bottom) *bottom = command_bottom;
+        found = true;
+    }
+    if (found) return true;
+    *top = box->y;
+    *bottom = (int64_t) box->y + box->height;
+    return box->height <= viewport_bottom - viewport_top
+        || *bottom < viewport_top || *top > viewport_bottom;
+}
+
 static uint64_t navigation_deferred_image_distance(
     const NavigationSession *session, const ImagePriorityTarget *target,
     int scroll_y, uint16_t *display_width, uint16_t *display_height)
@@ -724,23 +779,33 @@ static uint64_t navigation_deferred_image_distance(
     if (display_height != NULL) *display_height = target->display_height;
     int64_t top = scroll_y;
     int64_t bottom = top + session->viewport.css_height;
-    const LayoutNodeBox *box = layout_box_for_node(&session->page.layout, target->node);
+    const LayoutDocument *layout = &session->page.layout;
+    const LayoutNodeBox *box = layout_box_for_node(layout, target->node);
+    int64_t box_top = 0, box_bottom = 0;
     if (box != NULL && box->width > 0 && box->height > 0) {
-        int width = layout_css_to_visual(&session->page.layout, box->width);
-        int height = layout_css_to_visual(&session->page.layout, box->height);
+        int width = layout_css_to_visual(layout, box->width);
+        int height = layout_css_to_visual(layout, box->height);
         if (display_width != NULL && width > 0 && width <= UINT16_MAX) {
             *display_width = (uint16_t) width;
         }
         if (display_height != NULL && height > 0 && height <= UINT16_MAX) {
             *display_height = (uint16_t) height;
         }
-        int64_t box_top = box->y;
-        int64_t box_bottom = box_top + box->height;
-        if (box_bottom < top) return (uint64_t) (top - box_bottom);
-        if (box_top > bottom) return (uint64_t) (box_top - bottom);
-        return 0;
+        box_top = box->y;
+        box_bottom = box_top + box->height;
+    } else if (box != NULL) {
+        /* An empty box still says where the image will appear. */
+        box_top = box->y;
+        box_bottom = box_top + (box->height > 0 ? box->height : 0);
+    } else if (!navigation_deferred_image_estimate(
+                   layout, target->node, scroll_y,
+                   scroll_y + session->viewport.css_height,
+                   &box_top, &box_bottom)) {
+        return UINT64_MAX;
     }
-    return UINT64_MAX;
+    if (box_bottom < top) return (uint64_t) (top - box_bottom);
+    if (box_top > bottom) return (uint64_t) (box_top - bottom);
+    return 0;
 }
 
 static bool navigation_deferred_target_live(
@@ -1116,9 +1181,74 @@ static NavigationBackgroundWorkOutcome navigation_publish_visual_images(
     return NAVIGATION_BACKGROUND_WORK_SUCCESS;
 }
 
+/* The realm that owned the queue's weak node handles was retired (memory,
+   a stop, Basic view) and the page kept its DOM. No author script can move a
+   node now, so the document's <img> elements are planned again the way a
+   script-free page's are, without handles: the ones not yet loaded or failed,
+   in document order and within the queue's bound (a viewport look finds any
+   past it). The Reader/Basic copy is left out; ranking maps author images to
+   it. The walk reads the DOM as it now stands, so a body a memory rescue put
+   back is planned as well. */
+static void navigation_replan_retired_document_images(
+    NavigationSession *session)
+{
+    NavigationPage *page = &session->page;
+    page->deferred_images_replan = false;
+    ImagePriorityTarget *targets = page->document.html == NULL ? NULL
+        : budget_calloc_category(
+              session->budget, BUDGET_CATEGORY_RESOURCE,
+              NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT, sizeof(*targets));
+    size_t count = 0;
+    if (targets != NULL) {
+        lxb_dom_node_t *root = lxb_dom_interface_node(page->document.html);
+        size_t visited = 0;
+        for (lxb_dom_node_t *node = root;
+             node != NULL && count < NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT
+             && ++visited <= NAVIGATION_DOM_TRAVERSAL_NODE_LIMIT;) {
+            bool descend = node != page->reader_root;
+            if (descend && node_name_is(node, "img")
+                && images_find_node(&page->images, node) == NULL
+                && !images_node_failed(&page->images, node)) {
+                targets[count++] = (ImagePriorityTarget) {
+                    .node = node, .kind = IMAGE_PRIORITY_KIND_DOCUMENT
+                };
+            }
+            if (descend && node->first_child != NULL) {
+                node = node->first_child;
+                continue;
+            }
+            while (node != root && node->next == NULL) node = node->parent;
+            if (node == root) break;
+            node = node->next;
+        }
+    }
+    images_priority_load_destroy(page->deferred_image_job);
+    page->deferred_image_job = NULL;
+    page->deferred_image_batch_count = 0;
+    budget_free(session->budget, page->deferred_image_targets);
+    page->deferred_image_targets = NULL;
+    page->deferred_image_count = 0;
+    page->deferred_image_cursor = 0;
+    page->deferred_image_rank_valid = false;
+    page->deferred_images_from_viewport = false;
+    if (count == 0) {
+        budget_free(session->budget, targets);
+        navigation_deferred_images_finish(session);
+        return;
+    }
+    page->deferred_image_targets = targets;
+    page->deferred_image_count = count;
+    page->image_continuation_pending = true;
+}
+
 static bool navigation_run_deferred_image(NavigationSession *session)
 {
     NavigationPage *page = &session->page;
+    if (page->deferred_images_replan && page->runtime == NULL
+        && page->deferred_image_job == NULL) {
+        navigation_replan_retired_document_images(session);
+        return true;
+    }
     if (page->deferred_image_targets == NULL
         || page->deferred_image_cursor >= page->deferred_image_count) {
         navigation_deferred_images_finish(session);

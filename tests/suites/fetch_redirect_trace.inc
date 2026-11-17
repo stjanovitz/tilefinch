@@ -1126,15 +1126,18 @@ static bool test_response_cookie_trace_capacity(
     char meta_path[4096];
     int meta_written = snprintf(
         meta_path, sizeof(meta_path), "%s/0000.meta", trace_directory);
-    static const char count_line[] = "set-cookie-count=64";
+    /* FETCH_RESPONSE_COOKIE_CAPACITY, then one more. */
+    _Static_assert(FETCH_RESPONSE_COOKIE_CAPACITY == 128,
+                   "the count lines below spell the capacity");
+    static const char count_line[] = "set-cookie-count=128";
     CHECK(meta_written > 0 && (size_t) meta_written < sizeof(meta_path)
           && replace_trace_byte_at_offset(
-                 meta_path, count_line, sizeof(count_line) - 2, '5')
+                 meta_path, count_line, sizeof(count_line) - 2, '9')
           && trace_replay_rejects(
                  budget, trace_directory, url, &request)
           && replace_trace_byte_at_offset(
-                 meta_path, "set-cookie-count=65",
-                 sizeof(count_line) - 2, '4'));
+                 meta_path, "set-cookie-count=129",
+                 sizeof(count_line) - 2, '8'));
 
     /* Legacy formats do not require response-URL attribution, but every
        declared value index must still exist. First prove the otherwise-valid

@@ -10,6 +10,10 @@ import sys
 import time
 from urllib.parse import urlparse
 
+# FETCH_RESPONSE_COOKIE_CAPACITY (include/tilefinch/fetch.h): Set-Cookie
+# fields a request keeps over its whole redirect chain.
+COOKIE_CAPACITY = 128
+
 
 # OPTIONS requests seen per preflight path, reported in its PUT response.
 PREFLIGHT_OPTIONS = {}
@@ -44,6 +48,121 @@ class RedirectHandler(BaseHTTPRequestHandler):
             ("X-Intermediate", "must-not-survive"),
             ("Set-Cookie", cookie),
         ))
+
+    # A sign-in handoff sized like the public descriptions of Google's:
+    # the password POST answers 302 with the account's whole cookie set,
+    # then a same-origin check, a hop to a second host that sets that
+    # host's session cookies, and two more hops to the landing page. The
+    # sizes are assumptions (the larger end of what is documented), set by
+    # the query: sidt = length of the one-time token in the cross-host
+    # Location, pad = bytes of other response headers sent before Location.
+    ACCOUNT_COOKIES = (
+        ("SID", 153), ("HSID", 17), ("SSID", 17), ("APISID", 34),
+        ("SAPISID", 34), ("S1PSID", 153), ("S3PSID", 153), ("S1PAPISID", 34),
+        ("S3PAPISID", 34), ("SIDCC", 78), ("S1PSIDCC", 78), ("S3PSIDCC", 78),
+        ("S1PSIDTS", 96), ("S3PSIDTS", 96), ("LSID", 200), ("H1PLSID", 200),
+        ("H3PLSID", 200), ("ACCOUNT_CHOOSER", 180), ("HGAPS", 250),
+        ("NID", 380), ("LSOLH", 80), ("SMSV", 60), ("OSID", 153),
+        ("SOSID", 153),
+    )
+    SERVICE_COOKIES = (
+        ("SID", 153), ("HSID", 17), ("SSID", 17), ("APISID", 34),
+        ("SAPISID", 34), ("S1PSID", 153), ("S3PSID", 153), ("S1PAPISID", 34),
+        ("S3PAPISID", 34), ("LOGIN_INFO", 320), ("SIDCC", 78),
+        ("S1PSIDCC", 78), ("S3PSIDCC", 78), ("PREF", 40),
+    )
+    # Set by the landing page itself (wide=1).
+    LANDING_COOKIES = (
+        ("VISITOR_INFO1_LIVE", 11), ("VISITOR_PRIVACY_METADATA", 60),
+        ("YSC", 11), ("__Secure-ROLLOUT_TOKEN", 60), ("PREF", 40),
+        ("__Secure-1PSIDTS", 96), ("__Secure-3PSIDTS", 96),
+        ("__Secure-YEC", 60),
+    )
+    COOKIE_ATTRIBUTES = ("; expires=Wed, 20-Dec-2028 00:45:34 GMT; path=/"
+                         "; HttpOnly; priority=high; SameSite=lax")
+
+    def account_chain(self, method):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if not path.startswith("/account-chain/"):
+            return False
+        step = path[len("/account-chain/"):]
+        options = dict(part.split("=", 1)
+                       for part in parsed.query.split("&") if "=" in part)
+        sidt = options.get("sidt", "600")
+        sidt = int(sidt) if sidt.isdigit() else 0
+        pad = int(options.get("pad", "0"))
+        # wide=1: a chain whose Set-Cookie fields pass 64 only across hops,
+        # as a real one does: the account set again from a country site's
+        # SetSID (here the check hop), the service set again on the handoff
+        # and the landing page's own (24 + 24 + 14 + 14 + 8 = 84).
+        wide = options.get("wide") == "1"
+        carry = "&wide=1" if wide else ""
+        cross = f"http://localhost:{self.server.cross_port}/account-chain/"
+        with self.server.state_lock:
+            hits = self.server.account_chain_hits
+            hits[step] = hits.get(step, 0) + 1
+
+        def cookies(table):
+            return [("Set-Cookie", f"{name}={'v' * size}"
+                     + self.COOKIE_ATTRIBUTES) for name, size in table]
+
+        def padding():
+            # Headers a sign-in response carries besides cookies (content
+            # security policy, reporting endpoints, permissions policy).
+            return [(f"X-Policy-{at}", "p" * 480)
+                    for at in range(pad // 496)]
+
+        if step == "pwd" and method == "POST":
+            self.reply(302, b"<html>Moved Temporarily</html>",
+                       [("Content-Type", "text/html; charset=UTF-8")]
+                       + cookies(self.ACCOUNT_COOKIES) + padding()
+                       + [("Location", "/account-chain/check?"
+                           + parsed.query)])
+        elif step == "check":
+            if options.get("end") == "1":
+                carry += "&end=1"
+            target = cross + "setsid?ssdc=1" + carry + "&sidt=" + "t" * sidt
+            self.reply(302, b"", padding()
+                       + (cookies(self.ACCOUNT_COOKIES) if wide else [])
+                       + [("Location", target)])
+        elif step == "setsid":
+            # The token arrives whole or the handoff is refused.
+            token = options.get("sidt", "")
+            if len(token) < 16 or set(token) != {"t"}:
+                self.reply(400, b"bad token")
+                return True
+            with self.server.state_lock:
+                self.server.account_chain_token = len(token)
+            if options.get("end") == "1":
+                # The chain ends here, on the address with the token.
+                self.reply(200, b"ended on the token address",
+                           [("Content-Type", "text/plain")])
+                return True
+            self.reply(302, b"", cookies(self.SERVICE_COOKIES)
+                       + [("Location", "/account-chain/handoff?" + carry)])
+        elif step == "handoff":
+            self.reply(302, b"",
+                       (cookies(self.SERVICE_COOKIES) if wide else [])
+                       + [("Location", "/account-chain/landed?" + carry)])
+        elif step == "landed":
+            sent = self.headers.get("Cookie", "")
+            names = sorted(part.split("=", 1)[0].strip()
+                           for part in sent.split(";") if "=" in part)
+            self.reply(200, (f"landed method={method} cookies={len(names)} "
+                             f"cookie-bytes={len(sent)} login-info="
+                             f"{int('LOGIN_INFO' in names)}").encode(),
+                       [("Content-Type", "text/plain")]
+                       + (cookies(self.LANDING_COOKIES) if wide else []))
+        elif step == "hits":
+            with self.server.state_lock:
+                count = self.server.account_chain_hits.get(
+                    options.get("step", ""), 0)
+                token = self.server.account_chain_token
+            self.reply(200, f"hits={count} token={token}".encode())
+        else:
+            self.reply(404)
+        return True
 
     def dnas_root(self):
         # A SHOUTcast DNAS v2 server's answer to its root path, byte for
@@ -253,6 +372,8 @@ class RedirectHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if self.portal_redirect(path):
             return
+        if self.account_chain("GET"):
+            return
         if path == "/portal-private-sink":
             self.portal_sink()
         elif path == "/portal-probe-count":
@@ -389,6 +510,32 @@ class RedirectHandler(BaseHTTPRequestHandler):
                 f"http://127.0.0.1:{return_port}"
                 f"/final?cross_received={cross_received}",
                 "cross_only=blocked; Path=/")
+        elif path == "/lan-long":
+            # A navigation's redirect through an address of `len` bytes on
+            # the user's own network: 192.168.1.1 (to=lan; never answered,
+            # the private-network guard refuses it before connecting) or
+            # this loopback server (to=loop), whose long hop goes on to
+            # /final.
+            options = dict(part.split("=", 1) for part in
+                           urlparse(self.path).query.split("&") if "=" in part)
+            with self.server.state_lock:
+                self.server.lan_long_hits += 1
+            length = options.get("len", "0")
+            length = int(length) if length.isdigit() else 0
+            if options.get("to") == "loop":
+                port = self.server.server_address[1]
+                prefix = f"http://127.0.0.1:{port}/lan-long-hop?t="
+            else:
+                prefix = "http://192.168.1.1/lan-long-hop?t="
+            self.reply(302, b"", (
+                ("Location", prefix + "t" * max(0, length - len(prefix))),
+            ))
+        elif path == "/lan-long-hop":
+            self.reply(302, b"", (("Location", "/final?lan-long=1"),))
+        elif path == "/lan-long-hits":
+            with self.server.state_lock:
+                hits = self.server.lan_long_hits
+            self.reply(200, f"hits={hits}".encode())
         elif path == "/final":
             self.final("GET")
         elif path == "/hold":
@@ -544,7 +691,7 @@ class RedirectHandler(BaseHTTPRequestHandler):
         elif path == "/response-cookie-capacity":
             self.reply(200, b"response-cookie-capacity", tuple(
                 ("Set-Cookie", f"cookie{i}=value; Path=/")
-                for i in range(64)))
+                for i in range(COOKIE_CAPACITY)))
         elif path == "/response-cookie-twenty":
             self.reply(200, b"response-cookie-twenty", tuple(
                 ("Set-Cookie", f"cookie{i}=value; Path=/")
@@ -552,7 +699,7 @@ class RedirectHandler(BaseHTTPRequestHandler):
         elif path == "/response-cookie-overflow":
             self.reply(200, b"response-cookie-overflow", tuple(
                 ("Set-Cookie", f"cookie{i}=value; Path=/")
-                for i in range(65)))
+                for i in range(COOKIE_CAPACITY + 1)))
         elif path == "/redirect-cookie-chain":
             self.reply(302, b"redirect-cookie-chain", (
                 (("Location", "/redirect-cookie-chain-2"),)
@@ -567,7 +714,7 @@ class RedirectHandler(BaseHTTPRequestHandler):
             self.reply(302, b"redirect-cookie-overflow", (
                 (("Location", "/final"),)
                 + tuple(("Set-Cookie", f"cookie{i}=value; Path=/")
-                        for i in range(65))))
+                        for i in range(COOKIE_CAPACITY + 1))))
         elif path == "/duplicate-client-hints":
             self.reply(200, b"duplicate-client-hints", (
                 ("Accept-CH", "Sec-CH-UA-Arch"),
@@ -784,6 +931,8 @@ class RedirectHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if self.portal_redirect(path):
             return
+        if self.account_chain("POST"):
+            return
         if path == "/portal-private-sink":
             self.portal_sink(body)
         elif path == "/beacon-sink":
@@ -838,6 +987,9 @@ def main():
     for fixture in (server, cross_server, proxy_server):
         fixture.state_lock = Lock()
         fixture.empty_location_attempts = {}
+        fixture.account_chain_hits = {}
+        fixture.account_chain_token = 0
+        fixture.lan_long_hits = 0
         fixture.portal_probe = portal_probe
         fixture.portal_probe_lock = portal_probe_lock
         fixture.beacon_log = beacon_log

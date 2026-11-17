@@ -33,7 +33,9 @@ static bool site_identity_host_is(const TilefinchUrl *parsed,
 static SiteIdentityHost site_identity_parse(const char *url,
                                             TilefinchUrl *parsed)
 {
-    if (url == NULL || !tilefinch_url_parse(url, parsed)
+    /* A redirect hop presents its own host's identity, however long its
+       address. */
+    if (url == NULL || !tilefinch_url_parse_long(url, parsed)
         || parsed->explicit_port || parsed->ipv6_literal)
         return SITE_IDENTITY_OTHER;
     if (site_identity_host_is(parsed, "google.com")

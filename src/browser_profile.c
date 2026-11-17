@@ -112,6 +112,11 @@ struct BrowserProfile {
     size_t script_memory_site_count;
     char script_memory_sites[BROWSER_PROFILE_SCRIPT_MEMORY_SITE_LIMIT]
                             [CONTENT_BLOCKER_HOST_LIMIT];
+    /* Sites whose script-free page Basic view would cut controls from
+       (SMEMFULL records), oldest first: they load in full. */
+    size_t script_memory_full_site_count;
+    char script_memory_full_sites[BROWSER_PROFILE_SCRIPT_MEMORY_SITE_LIMIT]
+                                 [CONTENT_BLOCKER_HOST_LIMIT];
     /* Origins the user answered the microphone prompt for with "Always
        allow" or "Block": only the origin and the answer. */
     size_t microphone_site_count;
@@ -885,6 +890,14 @@ static bool profile_serialize(ProfileWriter *writer,
                             sizeof(encoded))
             && profile_writef(writer, "SMEM\t%s\n", encoded);
     }
+    /* Older builds ignore SMEMFULL records; kept as SMEM records are. */
+    for (size_t i = 0; ok && profile->history_enabled
+         && i < profile->script_memory_full_site_count; i++) {
+        char encoded[CONTENT_BLOCKER_HOST_LIMIT * 3u];
+        ok = profile_encode(profile->script_memory_full_sites[i], encoded,
+                            sizeof(encoded))
+            && profile_writef(writer, "SMEMFULL\t%s\n", encoded);
+    }
     /* Older builds ignore MIC records. */
     for (size_t i = 0; ok && i < profile->microphone_site_count; i++) {
         char encoded[CONTENT_BLOCKER_HOST_LIMIT * 3u];
@@ -1364,6 +1377,18 @@ static bool profile_load_internal(
                  i++)
                 kept = strcmp(loaded->script_memory_sites[i], site) != 0;
             if (kept) loaded->script_memory_site_count++;
+            else memset(site, 0, CONTENT_BLOCKER_HOST_LIMIT);
+        } else if (strcmp(line, "SMEMFULL") == 0
+                   && loaded->script_memory_full_site_count
+                          < BROWSER_PROFILE_SCRIPT_MEMORY_SITE_LIMIT) {
+            char *site = loaded->script_memory_full_sites[
+                loaded->script_memory_full_site_count];
+            bool kept = profile_decode(first, site, CONTENT_BLOCKER_HOST_LIMIT)
+                && profile_valid_block_site(site);
+            for (size_t i = 0;
+                 kept && i < loaded->script_memory_full_site_count; i++)
+                kept = strcmp(loaded->script_memory_full_sites[i], site) != 0;
+            if (kept) loaded->script_memory_full_site_count++;
             else memset(site, 0, CONTENT_BLOCKER_HOST_LIMIT);
         } else if (strcmp(line, "JSD") == 0
                    && loaded->javascript_disabled_site_count
@@ -2068,6 +2093,20 @@ bool browser_profile_site_script_memory_stopped(
     return false;
 }
 
+bool browser_profile_site_loads_in_full(const BrowserProfile *profile,
+                                        const char *url)
+{
+    char site[CONTENT_BLOCKER_HOST_LIMIT];
+    if (profile == NULL || !profile->history_enabled
+        || !content_blocker_site_from_url(url, site))
+        return false;
+    for (size_t i = 0; i < profile->script_memory_full_site_count; i++) {
+        if (strcmp(profile->script_memory_full_sites[i], site) == 0)
+            return true;
+    }
+    return false;
+}
+
 bool browser_profile_heavy_site_allowed(const BrowserProfile *profile,
                                         const char *url)
 {
@@ -2208,6 +2247,9 @@ void browser_profile_set_history_enabled(
         memset(profile->script_memory_sites, 0,
                sizeof(profile->script_memory_sites));
         profile->script_memory_site_count = 0;
+        memset(profile->script_memory_full_sites, 0,
+               sizeof(profile->script_memory_full_sites));
+        profile->script_memory_full_site_count = 0;
     }
 }
 
@@ -2422,6 +2464,8 @@ bool browser_profile_reset_site_permissions(
                               &profile->heavy_site_count, site);
     profile_remove_exact_site(profile->script_memory_sites,
                               &profile->script_memory_site_count, site);
+    profile_remove_exact_site(profile->script_memory_full_sites,
+                              &profile->script_memory_full_site_count, site);
     (void) browser_profile_set_microphone_site(
         profile, url, MEDIA_CAPTURE_PERMISSION_PROMPT);
     profile_remove_exact_site(
@@ -2781,6 +2825,34 @@ bool browser_profile_set_site_script_memory_stopped(
                                   &profile->script_memory_site_count, oldest);
     }
     snprintf(profile->script_memory_sites[profile->script_memory_site_count++],
+             CONTENT_BLOCKER_HOST_LIMIT, "%s", site);
+    return true;
+}
+
+bool browser_profile_set_site_loads_in_full(
+    BrowserProfile *profile, const char *url, bool full)
+{
+    char site[CONTENT_BLOCKER_HOST_LIMIT];
+    if (profile == NULL || !content_blocker_site_from_url(url, site))
+        return false;
+    bool present = browser_profile_site_loads_in_full(profile, url);
+    if (!full) {
+        profile_remove_exact_site(profile->script_memory_full_sites,
+                                  &profile->script_memory_full_site_count,
+                                  site);
+        return present;
+    }
+    if (present || !profile->history_enabled) return false;
+    if (profile->script_memory_full_site_count
+            >= BROWSER_PROFILE_SCRIPT_MEMORY_SITE_LIMIT) {
+        char oldest[CONTENT_BLOCKER_HOST_LIMIT];
+        memcpy(oldest, profile->script_memory_full_sites[0], sizeof(oldest));
+        profile_remove_exact_site(profile->script_memory_full_sites,
+                                  &profile->script_memory_full_site_count,
+                                  oldest);
+    }
+    snprintf(profile->script_memory_full_sites[
+                 profile->script_memory_full_site_count++],
              CONTENT_BLOCKER_HOST_LIMIT, "%s", site);
     return true;
 }
@@ -3184,6 +3256,7 @@ bool browser_profile_forget_history(BrowserProfile *profile, const char *url)
     /* Forgetting where the reader went forgets the site's script-memory
        note too. */
     (void) browser_profile_set_site_script_memory_stopped(profile, url, false);
+    (void) browser_profile_set_site_loads_in_full(profile, url, false);
     for (size_t i = 0; i < profile->history_count; i++) {
         if (strcmp(profile->history[i].url, url) != 0) continue;
         size_t remaining = profile->history_count - i - 1u;

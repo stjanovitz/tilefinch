@@ -34,6 +34,9 @@ int main(int argc, char **argv)
         "private-network-admission",
         test_private_network_admission(&budget, (unsigned) parsed));
     RUN_REDIRECT_TEST(
+        "long-hop-local-network",
+        test_long_hop_local_network(&budget, (unsigned) parsed));
+    RUN_REDIRECT_TEST(
         "numeric-hosts-classified-by-address",
         test_numeric_hosts_classified_by_address(
             &budget, (unsigned) parsed));
@@ -127,6 +130,10 @@ int main(int argc, char **argv)
     RUN_REDIRECT_TEST(
         "response-cookie-allocation-failure",
         test_response_cookie_allocation_failure((unsigned) parsed));
+    RUN_REDIRECT_TEST(
+        "account-redirect-chain",
+        test_account_redirect_chain(
+            &budget, (unsigned) parsed, (unsigned) hint_port));
     RUN_REDIRECT_TEST(
         "informational-response-isolation",
         test_informational_response_isolation(

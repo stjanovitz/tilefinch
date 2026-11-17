@@ -93,6 +93,42 @@ static int test_security_site_state(Budget *budget)
     CHECK(!browser_session_hsts_observe(
         &session, "http://insecure.test/", hsts, sizeof(hsts) - 1u));
 
+    /* A navigation's redirect hop may be up to 8,191 bytes (a sign-in
+       hand-over's one-time token). HSTS reads such a hop's host from the
+       whole address and upgrades it whole, so it never goes out in clear
+       text; the ordinary function refuses an address that long, and an
+       upgrade that would pass the hop's bound is refused, not cut. */
+    static char long_http[TILEFINCH_URL_LONG_LIMIT];
+    static char long_output[TILEFINCH_URL_LONG_LIMIT];
+    static const char long_prefix[] = "http://hop.long-hsts.test/setsid?t=";
+    const size_t long_prefix_length = sizeof(long_prefix) - 1u;
+    CHECK(browser_session_hsts_observe(
+        &session, "https://long-hsts.test/", hsts, sizeof(hsts) - 1u));
+    memcpy(long_http, long_prefix, long_prefix_length);
+    memset(long_http + long_prefix_length, 't', 7000u - long_prefix_length);
+    long_http[7000] = '\0';
+    CHECK(browser_session_hsts_upgrade_url_long(
+              &session, long_http, long_output, sizeof(long_output))
+          && strncmp(long_output, "https://hop.long-hsts.test/setsid?t=",
+                     long_prefix_length + 1u) == 0
+          && strlen(long_output) == 7001u
+          && strspn(long_output + long_prefix_length + 1u, "t")
+                 == 7000u - long_prefix_length);
+    CHECK(!browser_session_hsts_upgrade_url(
+        &session, long_http, output, sizeof(output)));
+    memset(long_http + long_prefix_length, 't',
+           TILEFINCH_URL_LONG_LIMIT - 1u - long_prefix_length);
+    long_http[TILEFINCH_URL_LONG_LIMIT - 1u] = '\0';
+    CHECK(!browser_session_hsts_upgrade_url_long(
+        &session, long_http, long_output, sizeof(long_output)));
+    /* Positive control: the same length off the HSTS list stays as it is. */
+    memcpy(long_http, "http://hop.plain-long.test/setsid?t=",
+           long_prefix_length + 1u);
+    long_http[TILEFINCH_URL_LONG_LIMIT - 1u] = '\0';
+    CHECK(browser_session_hsts_upgrade_url_long(
+              &session, long_http, long_output, sizeof(long_output))
+          && strcmp(long_output, long_http) == 0);
+
     /* RFC 6797 permits a quoted directive-value. The first STS field is
        authoritative; later fields must neither revoke nor repair it. */
     static const char quoted[] =

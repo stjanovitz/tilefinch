@@ -307,7 +307,7 @@ static bool private_snapshot_page(BrowserEngine *engine, NavigationSession *navi
         browser_engine_youtube_login_verified(engine)) > 0;
     /* This native report contains only fixed labels and numeric fields. Do
        not substitute generic page errors, response text or session values. */
-    char handoff[2048];
+    char handoff[2816];
     if (browser_engine_youtube_signin_report(engine, handoff, sizeof(handoff))) {
         const char *line = strchr(handoff, '\n');
         while (ok && line != NULL && *++line != '\0') {

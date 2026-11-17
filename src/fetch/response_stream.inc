@@ -726,9 +726,14 @@ static void write_context_set_effective_url(WriteContext *context,
     const char *logical_url = fetch_hop_logical_url(context->hop);
     const char *effective = logical_url != NULL && logical_url[0] != '\0'
         ? logical_url : wire_url;
-    if (effective != NULL) {
+    /* Never a cut address: a hop too long to be a response URL (a long
+       redirect hop; a chain may not end on one) leaves it empty. */
+    if (effective != NULL
+        && strlen(effective) < sizeof(context->result->effective_url)) {
         snprintf(context->result->effective_url,
                  sizeof(context->result->effective_url), "%s", effective);
+    } else if (effective != NULL) {
+        context->result->effective_url[0] = '\0';
     }
 }
 
@@ -933,8 +938,9 @@ static bool remember_response_cookie_urls(WriteContext *context,
                                           const char *response_url)
 {
     FetchResult *result = context->result;
+    /* A redirect hop's address may be long, and its cookies are its own. */
     if (response_url == NULL || response_url[0] == '\0'
-        || strlen(response_url) >= sizeof(result->effective_url)) {
+        || strlen(response_url) >= TILEFINCH_URL_LONG_LIMIT) {
         return result->set_cookie_count == context->response_cookie_start;
     }
     size_t length = strlen(response_url);
@@ -954,6 +960,9 @@ static bool remember_response_cookie_urls(WriteContext *context,
 
 static bool enforce_response_credential_policy(WriteContext *context);
 static bool enforce_response_cors_policy(WriteContext *context);
+static void fetch_chain_note_response(FetchResult *result,
+                                      const FetchHopState *hop,
+                                      size_t first_cookie, bool stamp);
 
 bool fetch_response_header_value(const FetchResult *result,
                                  const char *name,
@@ -976,6 +985,45 @@ bool fetch_response_header_value(const FetchResult *result,
             && strncasecmp(line, name, name_length) == 0) {
             copy_header_value(output, output_size, colon + 1,
                               length - (size_t) (colon + 1 - line));
+            return true;
+        }
+        offset += length + (newline == NULL ? 0 : 1);
+    }
+    return false;
+}
+
+/* fetch_response_header_value() for a value that must arrive whole: false
+   when the header is absent or its value does not fit `output`, which is
+   then empty. A redirect target cut short is another URL. */
+static bool response_header_whole_value(const FetchResult *result,
+                                        const char *name, char *output,
+                                        size_t output_size)
+{
+    output[0] = '\0';
+    size_t name_length = strlen(name);
+    size_t offset = 0;
+    while (offset < result->response_headers_length) {
+        const char *line = result->response_headers + offset;
+        const char *newline = memchr(
+            line, '\n', result->response_headers_length - offset);
+        size_t length = newline == NULL
+            ? result->response_headers_length - offset
+            : (size_t) (newline - line);
+        const char *colon = memchr(line, ':', length);
+        if (colon != NULL && (size_t) (colon - line) == name_length
+            && strncasecmp(line, name, name_length) == 0) {
+            const char *value = colon + 1;
+            size_t value_length = length - (size_t) (value - line);
+            while (value_length != 0 && (*value == ' ' || *value == '\t')) {
+                value++;
+                value_length--;
+            }
+            while (value_length != 0
+                   && isspace((unsigned char) value[value_length - 1]))
+                value_length--;
+            if (value_length >= output_size) return false;
+            memcpy(output, value, value_length);
+            output[value_length] = '\0';
             return true;
         }
         offset += length + (newline == NULL ? 0 : 1);
@@ -1532,6 +1580,7 @@ static size_t receive_header(char *data, size_t size, size_t count,
                 context->result->set_cookie_count;
             context->response_cookies_truncated = false;
             context->has_response_location = false;
+            fetch_hop_clear_location(context->hop);
             context->redirect_response = false;
             context->redirect_callback_aborted = false;
             context->redirect_drain = false;
@@ -1572,6 +1621,7 @@ static size_t receive_header(char *data, size_t size, size_t count,
                     context->result, context->response_cookie_start);
                 reset_response_metadata(context->result);
                 context->has_response_location = false;
+                fetch_hop_clear_location(context->hop);
                 context->redirect_response = false;
                 context->response_cookies_truncated = false;
                 context->headers_delivered = false;
@@ -1583,6 +1633,8 @@ static size_t receive_header(char *data, size_t size, size_t count,
                                ? context->result->effective_url : cookie_url)) {
                 return 0;
             }
+            fetch_chain_note_response(context->result, context->hop,
+                                      context->response_cookie_start, true);
             long status = context->result->status_code;
             context->redirect_response = !context->single_hop
                 && (status == 301 || status == 302 || status == 303
@@ -1591,6 +1643,7 @@ static size_t receive_header(char *data, size_t size, size_t count,
             if (context->response_cookies_truncated) {
                 if (context->redirect_response) {
                     context->cookie_header_rejected = true;
+                    context->result->chain.limit = FETCH_CHAIN_LIMIT_COOKIES;
                     snprintf(
                         context->result->error,
                         sizeof(context->result->error),
@@ -1599,6 +1652,19 @@ static size_t receive_header(char *data, size_t size, size_t count,
                     return 0;
                 }
                 context->result->set_cookies_truncated = true;
+            }
+            /* A chain may pass through an address longer than a document's
+               may be, not end on one: nothing past the transport can hold
+               it. (The rejection travels as the cookie-limit ones do.) */
+            if (!context->redirect_response
+                && fetch_hop_url_is_long(context->hop)) {
+                context->cookie_header_rejected = true;
+                context->result->chain.limit =
+                    FETCH_CHAIN_LIMIT_DOCUMENT_LENGTH;
+                snprintf(context->result->error,
+                         sizeof(context->result->error), "%s",
+                         FETCH_LONG_DOCUMENT_ERROR);
+                return 0;
             }
             if (!enforce_response_cors_policy(context)) return 0;
             if (!enforce_response_credential_policy(context)) return 0;
@@ -1701,12 +1767,19 @@ static size_t receive_header(char *data, size_t size, size_t count,
     } else if (name_length == 8
                && strncasecmp(data, "location", 8) == 0) {
         /* Presence is semantically distinct from a missing field.  An empty
-           Location is a valid relative reference to the current URL. */
+           Location is a valid relative reference to the current URL. The
+           value is kept whole beside the header snapshot, which a long one
+           may not fit. */
         context->has_response_location = true;
+        if (!fetch_hop_note_location(context->hop, trimmed, trimmed_length)) {
+            context->allocation_failed = true;
+            return 0;
+        }
     } else if (name_length == 10
                && strncasecmp(data, "set-cookie", 10) == 0) {
         if (trimmed_length >= FETCH_SET_COOKIE_LIMIT) {
             context->cookie_header_rejected = true;
+            result->chain.limit = FETCH_CHAIN_LIMIT_COOKIES;
             snprintf(result->error, sizeof(result->error), "%s",
                      "response Set-Cookie exceeded 4095 bytes");
             return 0;
@@ -1861,7 +1934,17 @@ struct FetchHopState {
     uint32_t redirect_transition_hashes[FETCH_REDIRECT_LIMIT];
     uint8_t redirect_transition_count;
     bool redirect_loop_detected;
+    /* fetch_hop_advance() found the redirect's Location too long for a hop
+       of this request, or not kept whole by the transport. */
+    bool location_too_long;
+    /* The current response's Location as it arrived, whole (budget-owned;
+       an empty string for an empty field) and NULL without one; or that it
+       was TILEFINCH_URL_LONG_LIMIT bytes or more, which nothing follows.
+       Cleared at the next response's status line. */
+    char *response_location;
+    bool response_location_oversize;
     uint64_t deadline_ns;
+    long timeout_ms;
     bool body_enabled;
     bool fetch_site_none;
     /* The chain has left the initiator's origin: no later hop is same-origin. */
@@ -1882,6 +1965,44 @@ static const char *fetch_hop_logical_url(const FetchHopState *hop)
 static const char *fetch_hop_wire_url(const FetchHopState *hop)
 {
     return hop == NULL ? NULL : hop->url;
+}
+
+static void fetch_hop_clear_location(FetchHopState *hop)
+{
+    if (hop == NULL) return;
+    budget_free(hop->budget, hop->response_location);
+    hop->response_location = NULL;
+    hop->response_location_oversize = false;
+}
+
+/* False only when memory for the copy is refused. A response's first
+   Location counts, as in the header snapshot. */
+static bool fetch_hop_note_location(FetchHopState *hop, const char *value,
+                                    size_t length)
+{
+    if (hop == NULL || hop->response_location != NULL
+        || hop->response_location_oversize) return true;
+    if (length >= TILEFINCH_URL_LONG_LIMIT) {
+        hop->response_location_oversize = true;
+        return true;
+    }
+    hop->response_location = budget_malloc(hop->budget, length + 1u);
+    if (hop->response_location == NULL) return false;
+    memcpy(hop->response_location, value, length);
+    hop->response_location[length] = '\0';
+    return true;
+}
+
+/* The hop's address is one only a redirect chain's intermediate hop may
+   have. */
+static bool fetch_hop_url_is_long(const FetchHopState *hop)
+{
+    return hop != NULL
+        && ((hop->url != NULL
+             && strlen(hop->url) >= TILEFINCH_URL_SERIALIZED_LIMIT)
+            || (hop->logical_url != NULL
+                && strlen(hop->logical_url)
+                       >= TILEFINCH_URL_SERIALIZED_LIMIT));
 }
 
 static bool fetch_hop_cors_response_required(const FetchHopState *hop)

@@ -1940,6 +1940,16 @@ static void navigation_clear_frame_messages(
     }
 }
 
+/* Frees what a frame kept while its load waited for the page's
+   heavy-script answer (NavigationFrame.heavy_response). */
+static void navigation_frame_drop_heavy_hold(NavigationFrame *frame)
+{
+    fetch_result_free(frame->heavy_response);
+    frame->heavy_response = NULL;
+    frame->heavy_held = false;
+    frame->heavy_held_bytes = 0;
+}
+
 static void page_destroy_value(NavigationSession *session,
                                NavigationPage *page)
 {
@@ -1955,6 +1965,7 @@ static void page_destroy_value(NavigationSession *session,
     for (size_t i = 0; i < page->frame_count; i++) {
         navigation_frame_presentation_destroy(
             session, &page->frames[i]);
+        navigation_frame_drop_heavy_hold(&page->frames[i]);
         script_runtime_destroy(page->frames[i].runtime);
         images_destroy(&page->frames[i].images);
         document_destroy(&page->frames[i].document);
@@ -2127,10 +2138,25 @@ void navigation_retire_current_page_scripts(NavigationSession *session)
     /* The page's scheduler outlives the realm here: give back the preload
        requests the realm took over. */
     script_runtime_cancel_preload_requests(session->page.runtime);
+    /* The deferred <img> queue's weak node handles die with the realm, and
+       a queue that can no longer resolve them would end without a request.
+       The page keeps its DOM: take the plan again from it next turn. */
+    NavigationPage *page = &session->page;
+    for (size_t at = page->deferred_image_cursor;
+         page->runtime != NULL && page->deferred_image_targets != NULL
+         && at < page->deferred_image_count; at++) {
+        if (page->deferred_image_targets[at].weak_handle == 0) continue;
+        page->deferred_images_replan = true;
+        page->image_continuation_pending = true;
+        break;
+    }
     if (session->page.runtime != NULL)
         script_runtime_destroy(session->page.runtime);
     session->page.runtime = NULL;
     for (size_t i = 0; i < session->page.frame_count; i++) {
+        /* A frame waiting for the page's frame answer never loads now:
+           its kept response goes with the realms. */
+        navigation_frame_drop_heavy_hold(&session->page.frames[i]);
         script_runtime_destroy(session->page.frames[i].runtime);
         session->page.frames[i].runtime = NULL;
     }

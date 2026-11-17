@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "tilefinch/content_blocker.h"
+#include "tilefinch/psp_heavy_notice.h"
 #include "tilefinch/platform.h"
 
 /*
@@ -19,6 +20,10 @@
  * - (c) scripts that cannot fit even in the best case: they are refused
  *   and the recovery sheet, titled "Too heavy for the PSP", offers Basic
  *   view (unless the Basic view fallback is Off), Reader and Return.
+ * - a frame on the page whose large script is held: the frame offer asks
+ *   about the frame alone, with its site and its scripts' size, after the
+ *   page's own notice. X starts it, O does not; neither changes the page's
+ *   answer or the site's allowance.
  * - (a) a heavy page that already shows content: its scripts run in the
  *   background; a status says so once, and X stops them. If the page then
  *   runs low on memory (a script was refused memory and little is left,
@@ -171,6 +176,7 @@ bool psp_app_heavy_poll(PspApp *app)
     if (interactive->heavy_generation != generation) {
         interactive->heavy_generation = generation;
         interactive->heavy_offer_shown = false;
+        interactive->heavy_frame_offer_shown = false;
         interactive->heavy_status_shown = false;
         interactive->heavy_low_memory_shown = false;
         interactive->heavy_rescue_shown = false;
@@ -193,7 +199,12 @@ bool psp_app_heavy_poll(PspApp *app)
     if (!interactive->scripts_off_offer_checked
         && ui->screen == PSP_UI_SCREEN_PAGE) {
         interactive->scripts_off_offer_checked = true;
+        /* Under Automatic the site opens in Basic view by default
+           instead (psp_basic_default_*). */
         if (!interactive->script_memory_noted
+            && psp_basic_default_scripts_off_offer_allowed(
+                   browser_profile_basic_fallback_mode(profile),
+                   psp_app_basic_default(), profile, ui->url)
             && psp_scripts_off_session_due(
                    &interactive->scripts_off_session, profile, ui)) {
             psp_ui_show_scripts_off_offer(ui);
@@ -226,14 +237,23 @@ bool psp_app_heavy_poll(PspApp *app)
             return true;
         }
     }
-    /* Only the offer's own screen and the page show heavy notices. Once
-       the offer has been shown, and the status either was not or its
-       low-memory follow-up was too, nothing is left to say for this page. */
+    /* Only the offer's own screen and the page show heavy notices. */
     if (ui->screen != PSP_UI_SCREEN_PAGE
         && ui->screen != PSP_UI_SCREEN_HEAVY_OFFER) return false;
-    if (ui->screen == PSP_UI_SCREEN_PAGE && interactive->heavy_offer_shown
-        && (!interactive->heavy_status_shown
-            || interactive->heavy_low_memory_shown)) return false;
+    uint64_t now_us = tilefinch_platform_monotonic_time_us();
+    PspHeavyNoticeInput input = {
+        .offer_shown = interactive->heavy_offer_shown,
+        .status_shown = interactive->heavy_status_shown,
+        .low_memory_shown = interactive->heavy_low_memory_shown,
+        .frame_offer_shown = interactive->heavy_frame_offer_shown,
+        .on_page = ui->screen == PSP_UI_SCREEN_PAGE,
+        .on_offer = ui->screen == PSP_UI_SCREEN_HEAVY_OFFER,
+        .offer_is_frames = ui->heavy_offer_frame != 0u,
+        .scripts_off_offer_open =
+            ui->toast_kind == PSP_UI_TOAST_SCRIPTS_OFF_OFFER
+            && ui->toast_frames != 0,
+    };
+    if (psp_heavy_notice_done(&input)) return false;
     if (interactive->heavy_measure_countdown != 0) {
         interactive->heavy_measure_countdown--;
         return false;
@@ -241,6 +261,8 @@ bool psp_app_heavy_poll(PspApp *app)
     interactive->heavy_measure_countdown = PSP_HEAVY_MEASURE_INTERVAL - 1u;
     ScriptHeavyState state;
     if (!browser_engine_heavy_page(engine, &state)) return false;
+    NavigationHeavyFrames frames;
+    bool frames_known = browser_engine_heavy_frames(engine, &frames);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     if ((unsigned) state.page_class != interactive->heavy_logged_class
         || state.waiting_scripts != interactive->heavy_logged_waiting) {
@@ -248,98 +270,87 @@ bool psp_app_heavy_poll(PspApp *app)
         interactive->heavy_logged_waiting = state.waiting_scripts;
         printf("tilefinch-heavy: class=%u script=%zu estimate-ms=%u "
                "waiting=%zu/%zu needed=%zu free=%zu text=%zu "
-               "oversized=%zu answered=%d screen=%d\n",
+               "oversized=%zu answered=%d frames-waiting=%zu screen=%d\n",
                (unsigned) state.page_class, state.script_bytes,
                (unsigned) state.estimate_ms, state.waiting_scripts,
                state.waiting_bytes, state.memory_needed, state.memory_free,
                state.visible_text_bytes, state.oversized_scripts,
                state.answered ? (state.allowed ? 1 : 0) : -1,
+               frames_known ? frames.waiting_scripts : 0u,
                (int) ui->screen);
     }
 #endif
-    /* The offer is open and a script that arrived since proves the app
-       cannot fit (m.vk.ru: the offer opens on its 1.1 MB vendor chunk,
-       then the 3.0 MiB application chunk arrives): replace the offer with
-       the explanation instead of offering to start what cannot run. */
-    if (ui->screen == PSP_UI_SCREEN_HEAVY_OFFER && !state.answered
-        && state.page_class == SCRIPT_HEAVY_CLASS_OVER) {
-        (void) browser_engine_answer_heavy_page(engine, false);
-        heavy_show_over(app, &state);
-        return true;
-    }
-    if (ui->screen != PSP_UI_SCREEN_PAGE) return false;
-    char line[96];
-    if (state.waiting && !interactive->heavy_offer_shown) {
-        interactive->heavy_offer_shown = true;
-        if (heavy_policy_for_url(interactive, ui->url)
-            == SCRIPT_HEAVY_POLICY_RUN) {
-            (void) browser_engine_answer_heavy_page(engine, true);
-            return false;
-        }
-        snprintf(interactive->heavy_offer_url,
-                 sizeof(interactive->heavy_offer_url), "%s", ui->url);
-        if (state.page_class == SCRIPT_HEAVY_CLASS_OVER) {
-            (void) browser_engine_answer_heavy_page(engine, false);
-            heavy_show_over(app, &state);
-            return true;
-        }
-        char site[CONTENT_BLOCKER_HOST_LIMIT];
-        psp_ui_show_heavy_offer(
-            ui, heavy_site_key(ui->url, site) ? site : ui->url,
-            state.script_bytes, state.estimate_ms);
-        return true;
-    }
-    if (state.page_class == SCRIPT_HEAVY_CLASS_OVER && !state.waiting
-        && state.oversized_scripts != 0 && !interactive->heavy_offer_shown) {
-        interactive->heavy_offer_shown = true;
-        heavy_show_over(app, &state);
-        return true;
-    }
-    if (state.refused_scripts != 0 && !interactive->heavy_offer_shown) {
-        /* Heavy pages: Basic view refused the big scripts by itself. */
-        interactive->heavy_offer_shown = true;
-        psp_ui_show_status(ui, "LARGE APP NOT STARTED (HEAVY PAGES SETTING)",
-                           PSP_HEAVY_STATUS_FRAMES);
-        return true;
-    }
-    /* The scripts-off offer stands until it is answered or ends. */
-    if (ui->toast_kind == PSP_UI_TOAST_SCRIPTS_OFF_OFFER
-        && ui->toast_frames != 0) return false;
-    /* (a), or an app shell whose scripts were already running when it
-       became heavy (they came with the page, not after it, so there was
-       nothing to hold): say what it costs once, and offer the stop. */
     /* A shell's big scripts usually arrive after its first ones (the
        offer then asks first); give them PSP_HEAVY_SHELL_GRACE_US before
        saying the app is starting, so the status does not precede an
        offer to start it. */
-    uint64_t now_us = tilefinch_platform_monotonic_time_us();
     if (state.page_class == SCRIPT_HEAVY_CLASS_SHELL
         && interactive->heavy_shell_since_us == 0)
         interactive->heavy_shell_since_us = now_us;
-    bool shell_settled = state.page_class == SCRIPT_HEAVY_CLASS_SHELL
+    input.shell_settled = state.page_class == SCRIPT_HEAVY_CLASS_SHELL
         && now_us - interactive->heavy_shell_since_us
                >= PSP_HEAVY_SHELL_GRACE_US;
-    if ((state.page_class == SCRIPT_HEAVY_CLASS_CONTENT || shell_settled)
-        && !interactive->heavy_status_shown && !state.answered
-        && !interactive->heavy_offer_shown) {
-        interactive->heavy_status_shown = true;
-        heavy_format_status(line, sizeof(line), &state,
-                            state.page_class == SCRIPT_HEAVY_CLASS_SHELL
-                                ? "LARGE APP STARTING" : "PAGE SCRIPTS");
-        psp_ui_show_heavy_scripts_status(ui, line, PSP_HEAVY_STATUS_FRAMES);
-        return true;
+    input.site_runs = heavy_policy_for_url(interactive, ui->url)
+        == SCRIPT_HEAVY_POLICY_RUN;
+    char line[96];
+    char site[CONTENT_BLOCKER_HOST_LIMIT];
+    switch (psp_heavy_notice_next(&input, &state,
+                                  frames_known ? &frames : NULL)) {
+        case PSP_HEAVY_NOTICE_RUN_SILENTLY:
+            interactive->heavy_offer_shown = true;
+            (void) browser_engine_answer_heavy_page(engine, true);
+            return false;
+        case PSP_HEAVY_NOTICE_OFFER:
+            interactive->heavy_offer_shown = true;
+            snprintf(interactive->heavy_offer_url,
+                     sizeof(interactive->heavy_offer_url), "%s", ui->url);
+            psp_ui_show_heavy_offer(
+                ui, heavy_site_key(ui->url, site) ? site : ui->url,
+                state.script_bytes, state.estimate_ms);
+            return true;
+        case PSP_HEAVY_NOTICE_OVER_REFUSE:
+        case PSP_HEAVY_NOTICE_OVER_REPLACES_OFFER:
+            interactive->heavy_offer_shown = true;
+            (void) browser_engine_answer_heavy_page(engine, false);
+            heavy_show_over(app, &state);
+            return true;
+        case PSP_HEAVY_NOTICE_OVER:
+            interactive->heavy_offer_shown = true;
+            heavy_show_over(app, &state);
+            return true;
+        case PSP_HEAVY_NOTICE_SETTING_REFUSED:
+            /* Heavy pages: Basic view refused the big scripts by itself. */
+            interactive->heavy_offer_shown = true;
+            psp_ui_show_status(ui, "LARGE APP NOT STARTED (HEAVY PAGES "
+                                   "SETTING)",
+                               PSP_HEAVY_STATUS_FRAMES);
+            return true;
+        case PSP_HEAVY_NOTICE_FRAME_OFFER:
+            /* The frame's own site and its held scripts' size; the page's
+               bytes and estimate are not the frame's. */
+            interactive->heavy_frame_offer_shown = true;
+            psp_ui_show_heavy_frame_offer(
+                ui, heavy_site_key(frames.url, site) ? site : frames.url,
+                frames.waiting_bytes);
+            return true;
+        case PSP_HEAVY_NOTICE_SCRIPTS_STATUS:
+            interactive->heavy_status_shown = true;
+            heavy_format_status(line, sizeof(line), &state,
+                                state.page_class == SCRIPT_HEAVY_CLASS_SHELL
+                                    ? "LARGE APP STARTING" : "PAGE SCRIPTS");
+            psp_ui_show_heavy_scripts_status(ui, line,
+                                             PSP_HEAVY_STATUS_FRAMES);
+            return true;
+        case PSP_HEAVY_NOTICE_LOW_MEMORY:
+            interactive->heavy_low_memory_shown = true;
+            psp_ui_show_heavy_scripts_status(
+                ui, "PAGE SCRIPTS ARE RUNNING LOW ON MEMORY",
+                PSP_HEAVY_STATUS_FRAMES);
+            return true;
+        case PSP_HEAVY_NOTICE_NONE:
+        default:
+            return false;
     }
-    if (state.page_class == SCRIPT_HEAVY_CLASS_CONTENT
-        && interactive->heavy_status_shown
-        && !interactive->heavy_low_memory_shown
-        && script_heavy_state_low_on_memory(&state)) {
-        interactive->heavy_low_memory_shown = true;
-        psp_ui_show_heavy_scripts_status(
-            ui, "PAGE SCRIPTS ARE RUNNING LOW ON MEMORY",
-            PSP_HEAVY_STATUS_FRAMES);
-        return true;
-    }
-    return false;
 }
 
 void psp_app_heavy_action(PspApp *app, PspAppFrameState *frame,
@@ -373,6 +384,16 @@ void psp_app_heavy_action(PspApp *app, PspAppFrameState *frame,
         case PSP_UI_ACTION_HEAVY_CANCEL:
             (void) browser_engine_answer_heavy_page(engine, false);
             psp_ui_show_status(ui, "APP NOT STARTED. PAGE KEPT AS IS", 180);
+            break;
+        /* The frame offer answers the page's frames only: the page's own
+           answer and the site's allowance stay as they are. */
+        case PSP_UI_ACTION_HEAVY_FRAME_START:
+            (void) browser_engine_answer_heavy_frames(engine, true);
+            psp_ui_show_status(ui, "STARTING THE FRAME'S SCRIPT", 180);
+            break;
+        case PSP_UI_ACTION_HEAVY_FRAME_NOT_NOW:
+            (void) browser_engine_answer_heavy_frames(engine, false);
+            psp_ui_show_status(ui, "FRAME SCRIPT NOT STARTED", 180);
             break;
         case PSP_UI_ACTION_HEAVY_STOP_SCRIPTS:
             psp_ui_show_status(ui,

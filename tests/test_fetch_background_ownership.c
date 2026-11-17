@@ -115,6 +115,20 @@ static void test_redirect_cookie_overflow_policy(void)
     CHECK(!fetch_background_redirect_cookie_overflow_fatal(
         false, 200, true));
 
+    /* A followed redirect's Location must arrive whole in the buffer the
+       worker keeps it in, whatever the header snapshot held. */
+    CHECK(!fetch_background_redirect_location_lost(302, 20u, 64u));
+    CHECK(!fetch_background_redirect_location_lost(308, 63u, 64u));
+    CHECK(fetch_background_redirect_location_lost(301, 64u, 64u));
+    CHECK(fetch_background_redirect_location_lost(303, 99u, 64u));
+    CHECK(fetch_background_redirect_location_lost(307, 8192u, 8192u));
+    CHECK(!fetch_background_redirect_location_lost(307, 8191u, 8192u));
+    /* Statuses nothing follows: their Location is never a target. */
+    CHECK(!fetch_background_redirect_location_lost(300, 99u, 64u));
+    CHECK(!fetch_background_redirect_location_lost(304, 99u, 64u));
+    CHECK(!fetch_background_redirect_location_lost(305, 99u, 64u));
+    CHECK(!fetch_background_redirect_location_lost(200, 99u, 64u));
+
     CHECK(fetch_background_cookie_capture_policy(20u, 0u, 0u)
           == FETCH_BACKGROUND_COOKIE_CAPTURED);
     CHECK(fetch_background_cookie_capture_policy(

@@ -677,6 +677,11 @@ bool browser_session_hsts_observe_metadata(
 bool browser_session_hsts_upgrade_url(
     BrowserSession *session, const char *url,
     char *output, size_t output_capacity);
+/* For a redirect hop, whose address may be up to
+   TILEFINCH_URL_LONG_LIMIT - 1 bytes. */
+bool browser_session_hsts_upgrade_url_long(
+    BrowserSession *session, const char *url,
+    char *output, size_t output_capacity);
 bool browser_session_site_adapter_state_put(
     BrowserSession *session, const char *key, const void *data,
     size_t data_length, uint64_t now_ns);

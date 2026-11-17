@@ -269,6 +269,8 @@ const char *psp_ui_action_acknowledgement(PspUiAction action)
             return NULL;
         case PSP_UI_ACTION_RECOVERY_RELOAD_BASIC:
             return "RELOADING IN BASIC VIEW...";
+        case PSP_UI_ACTION_TRY_FULL_PAGE:
+            return "LOADING FULL PAGE...";
         case PSP_UI_ACTION_OPEN_ADDRESS: return "OPENING ADDRESS INPUT...";
         case PSP_UI_ACTION_OPEN_FIND:
         case PSP_UI_ACTION_FIND_EDIT:
@@ -825,6 +827,13 @@ void psp_sync_ui(PspUiState *ui, const BrowserEngine *engine,
     BrowserViewSnapshot view;
     if (ui == NULL || !browser_engine_view_snapshot(engine, &view)) return;
     psp_ui_set_page(ui, view.title, view.url, view.secure);
+    /* Try full page belongs to the page presented in Basic view by
+       default; any other page shown since (an offline or native page, a
+       restored tab) does not offer it. */
+    if (ui->basic_default_page
+        && !psp_basic_default_page_current(psp_app_basic_default(),
+                                           view.url))
+        ui->basic_default_page = 0u;
     ui->youtube_signin_continue = browser_engine_youtube_signin_continue_available(engine);
     ui->microphone_live = tilefinch_media_capture_live();
     psp_ui_set_history(ui, view.can_go_back, view.can_go_forward);

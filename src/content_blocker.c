@@ -277,7 +277,8 @@ static bool blocker_url_host(const char *url,
                              char output[CONTENT_BLOCKER_HOST_LIMIT])
 {
     TilefinchUrl parsed;
-    return tilefinch_url_parse(url, &parsed)
+    /* A redirect hop's long address is matched like any other. */
+    return tilefinch_url_parse_long(url, &parsed)
         && !parsed.ipv6_literal
         && blocker_normalize_host(
                url + parsed.host_offset, parsed.host_length, output);
@@ -726,6 +727,11 @@ bool content_blocker_would_block(
     char host[CONTENT_BLOCKER_HOST_LIMIT];
     char request_site[CONTENT_BLOCKER_HOST_LIMIT];
     char initiator_site[CONTENT_BLOCKER_HOST_LIMIT];
+    /* An address that does not parse answers "not blocked". Unreachable
+       today: every caller passes addresses it has already resolved or
+       normalized (a resource's, a redirect hop's, the page's own), which
+       parse. A new caller with raw input must refuse what does not parse
+       first. */
     if (!blocker_url_host(request_url, host)
         || !content_blocker_site_from_url(request_url, request_site)
         || !content_blocker_site_from_url(initiator_url, initiator_site))

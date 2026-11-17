@@ -14,6 +14,14 @@ extraction. The owned libraries include only narrow PSP portability changes.
 Runtime initialization also checks the linked curl, TLS, and nghttp2
 provenance against the versions compiled into Tilefinch.
 
+The pinned Mbed TLS also carries narrow upstream 3.6.8 client safety fixes:
+invalid TLS 1.2 ServerHello version rejection, CertificateRequest length
+checks, serialized-session ID bounds, TLS 1.3 transform failure cleanup,
+and empty distinguished-name termination. Its public layouts and saved-session
+format are unchanged. The host behavioral safety test uses the same patch
+with synthetic handshake records and allocation refusal; its configurable
+allocator is host-test-only, not part of the PSP configuration.
+
 ## Build modes
 
 ### Client-only footprint

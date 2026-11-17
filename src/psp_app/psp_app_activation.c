@@ -526,10 +526,8 @@ void psp_app_route_controller_action(
         return;
 #endif
     if (navigates) {
-        if (!browser_engine_set_javascript_enabled(
-                engine,
-                browser_profile_javascript_allowed_for_url(
-                    profile, action->url))) {
+        if (!psp_navigation_begin_javascript(engine, profile, action->url,
+                                             action->method)) {
             psp_ui_show_status(
                 &app->process->presentation.ui,
                 "JAVASCRIPT POLICY UNAVAILABLE", 240);
@@ -574,6 +572,7 @@ void psp_app_route_controller_action(
         }
     } else {
         if (navigates) {
+            psp_navigation_abandon_javascript(engine, profile);
             (void) psp_engine_views_refresh(app->views, engine);
             char incumbent_buffer[NAVIGATION_URL_LIMIT];
             const char *incumbent_url = psp_app_current_url(

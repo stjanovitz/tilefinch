@@ -701,20 +701,52 @@ time on top):
   On a page that already shows its content, a status says a large page
   script was skipped and you keep reading.
 
+A frame inside a page (a bot check such as DataDome's, an embedded player)
+is weighed by itself: any of its scripts of 256 KB or more is asked about,
+whatever the rest of the page weighs, because such scripts often take far
+longer on the PSP than their size suggests. The question names the frame's
+site and its script's size ("A frame has a large script ... It may take a
+minute or more"); it comes after any question about the page itself, so a
+page whose own app cannot fit still asks about its frame. The frame stays
+empty while you decide. Cross starts it with the script; Circle (or Select)
+loads it without, so it shows what it would show without that script (a bot
+check then usually cannot be completed). There is no "always" for a frame,
+and the answer covers only the page's frames, so you are asked at most once
+per page about them; it does not answer the page's own scripts or change
+the site's Heavy pages choice.
+
 When a page's scripts stop because they ran out of memory, Tilefinch
 remembers the site (only its name, for the last 8 such sites) while **URL
 history** is on; turning history off forgets these notes, and removing a page
-from history forgets its site's note. The next page
-you open on that site says "This page ran out of script memory last time"
-and asks **Load without scripts?**: Cross turns off JavaScript for the site
-and reloads the page, which then opens as the server sent it, much faster
-and in far less memory; Circle keeps scripts on and forgets the note until
-it happens again. An offer you let pass without an answer (it runs out, or
-you go on to another page) is not shown for that site again until the browser
-restarts. Tilefinch never turns scripts off by itself. **Menu → Page
-tools → Site information → Permissions & controls → JavaScript** turns them
-back on, and **Reset permissions** in
-**Site information** forgets the note.
+from history forgets its site's note. What the next page you open on that
+site does depends on **Basic view fallback**
+([Basic view](BASIC_VIEW.md#opening-in-basic-view-by-default)):
+
+- **Automatic** (the default) opens it in Basic view, loaded without its
+  scripts, with the note "Basic view: scripts ran out of memory last time".
+  Cross (**X Try full page**) loads the full page with its scripts this
+  once; Circle keeps Basic view. **Menu → Page tools → Try full page** does
+  the same while the page is open. Only the first such page of a site in a
+  session takes Cross and Circle; later ones show the note without taking
+  buttons. When the full page loads, the note is forgotten and the site
+  opens normally until its scripts run out of memory again. A form's result
+  (a POST) is never opened this way. A page whose form fields Basic view
+  would leave out, a page with almost no text without its scripts, or a
+  redirect to another site loads in full instead, and its site gets the
+  question below; the site is remembered (while **URL history** is on) so
+  later visits load in full at once.
+- **Ask** and **Off** say "This page ran out of script memory last time" and
+  ask **Load without scripts?**: Cross turns off JavaScript for the site and
+  reloads the page, which then opens as the server sent it, much faster and
+  in far less memory; Circle keeps scripts on and forgets the note until it
+  happens again. An offer you let pass without an answer (it runs out, or
+  you go on to another page) is not shown for that site again until the
+  browser restarts.
+
+Neither turns the site's JavaScript setting off by itself. **Menu → Page
+tools → Site information → Permissions & controls → JavaScript** turns it
+back on after you chose **Load without scripts?**, and **Reset permissions**
+in **Site information** forgets the note.
 
 **Menu → Settings → Browsing & input → Heavy pages** chooses **Ask** (the
 default, as above), **Run** (never ask; scripts still show their status) or

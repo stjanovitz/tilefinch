@@ -178,6 +178,45 @@ unusual-traffic interstitial, 3 HTTP 429 from the account site.
 at most four digits, or 0 when there was none. Nothing else from that
 address is recorded: no account hint, no other parameter.
 
+Version 5 adds one line, `post-chain=`, for the redirect chain of the last
+form submitted on the account pages. It is twelve numbers, kept short so the
+report normally fits one QR code (one with many other non-zero fields, after
+a script stop or a feed failure, takes two); `tools/decode_diagnostic_qr.py`
+prints them with their names. In order:
+
+1. `class`: 0 the chain finished, 1 timeout, 2 name lookup failed, 3 could
+   not connect, 4 TLS failure, 5 HTTP/2 failure, 6 broken transfer, 7 a
+   redirect or transport rule, 8 cancelled, 9 anything else.
+2. `hops`: redirects followed.
+3. `failed-hop`: the hop that failed, counting the submission itself as 0.
+4. `failed-host`: that hop's host as a class: 1 the Google account site, 2 a
+   YouTube host, 3 YouTube's account host, 4 another Google host, 5 any
+   other, 0 none.
+5. `limit`: the rule for class 7 and the kind of timeout for class 1: 1 the
+   request deadline, 2 too many redirects, 3 a redirect loop, 4 a redirect
+   to an address the redirect rules refuse, 5 more or larger cookies
+   than the transport keeps (128 fields over the whole chain), 6 a request the transport
+   cannot carry, 7 no data for the stall allowance, 8 a response over the
+   size limit, 9 a redirect address longer than a redirect may name
+   (8,191 bytes while opening a page, 2,047 for any other request), 10 a
+   chain that ended on an address longer than a page may have (2,047 bytes;
+   the redirects before it may be longer).
+6. `hop-header-bytes` and 7. `hop-set-cookies`: the last response of the hop
+   that failed, 0 when it never answered.
+8. `max-header-bytes` and 9. `chain-set-cookies`: the largest response
+   header block and the cookies received over the whole chain.
+10. `first-byte-ms`: from the submission to that last response's headers.
+11. `elapsed-ms`: from the submission to the end of the chain.
+12. `timeout-ms`: the deadline they ran against.
+
+These are counts, classes and durations: no address, host name, header or
+cookie is recorded. A chain that ends by handing over to the native YouTube
+page is dropped at the YouTube response's headers so that page can open
+instead. It reads as finished (class 0, no failed hop, host or limit) with
+the counts it reached: its redirects, the YouTube response's headers and
+cookies, and the time to them. `post-http-status` is then that response's
+status; the native page's own request reports in `handoff-http-status`.
+
 The last completed feed hop also reports a numeric transport error, timeout
 flag, TLS verification result and whether that result was available. These
 fields contain no URL, certificate identity, cookie or response text. An

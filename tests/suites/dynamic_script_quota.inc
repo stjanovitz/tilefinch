@@ -1059,6 +1059,140 @@ cleanup:
     return ok;
 }
 
+/* A unit of 1 MiB or more is refused before its compile when the heap it
+   can obtain is under 4 times its source (script_admission_large_unit_heap),
+   as cnn.com's 2.3 MB inline bundle and ign.com's 1.4 MB _app chunk were
+   not: both passed the 1.0x floor and ran out of heap mid-compile after
+   100-150 ms of host compile. A 2 MB literal table on an 8 MiB heap clears
+   the floor and needs about 22 MB; it gets an error event without being
+   parsed, the realm is intact, and the next script runs. A 1.2 MB script
+   that compiles small (its text is one lazy function) still runs when the
+   heap can give it 4 times its source. */
+static bool test_large_unit_without_compile_room_is_refused_before_compile(
+    Budget *budget)
+{
+    const char *test_name = "a large unit without compile room is refused";
+    static const char empty_page[] =
+        "<!doctype html><head></head><body></body>";
+    static const char append_scripts[] =
+        "globalThis.largeEvents=[];"
+        "for(const name of ['table','after','lazy']){"
+        "const script=document.createElement('script');"
+        "script.src='/'+name+'.js';script.async=false;"
+        "script.addEventListener('load',()=>{"
+        "largeEvents.push('load:'+name);"
+        "globalThis.pocSummary='large:'+largeEvents.join(',');});"
+        "script.addEventListener('error',()=>{"
+        "largeEvents.push('error:'+name);"
+        "globalThis.pocSummary='large:'+largeEvents.join(',');});"
+        "document.head.appendChild(script);}"
+        "globalThis.pocSummary='large:pending';";
+    static const char after_source[] =
+        "globalThis.largeEvents.push('execute:after:'"
+        "+(typeof globalThis.table));";
+    size_t entries = 130000u, capacity = entries * 24u + 64u, used = 0;
+    char *table_source = malloc(capacity);
+    if (table_source != NULL) {
+        used = (size_t) snprintf(table_source, capacity,
+                                 "globalThis.table=[");
+        for (size_t i = 0; i < entries && used < capacity; i++) {
+            used += (size_t) snprintf(table_source + used, capacity - used,
+                                      "%s{a:%zu,b:\"x\"}",
+                                      i == 0 ? "" : ",", i);
+        }
+        if (used < capacity)
+            used += (size_t) snprintf(table_source + used, capacity - used,
+                                      "];");
+    }
+    /* One function whose 1.2 MB body is never called: compiled lazily,
+       its heap peak is a small fraction of its source. */
+    size_t lazy_lines = 36000u, lazy_capacity = lazy_lines * 40u + 256u;
+    size_t lazy_used = 0;
+    char *lazy_source = malloc(lazy_capacity);
+    if (lazy_source != NULL) {
+        lazy_used = (size_t) snprintf(
+            lazy_source, lazy_capacity,
+            "globalThis.lazyUnit=function(){let total=0;\n");
+        for (size_t i = 0; i < lazy_lines && lazy_used < lazy_capacity; i++)
+            lazy_used += (size_t) snprintf(
+                lazy_source + lazy_used, lazy_capacity - lazy_used,
+                "total+=%zu*globalThis.unused%zu;\n", i, i % 97u);
+        if (lazy_used < lazy_capacity)
+            lazy_used += (size_t) snprintf(
+                lazy_source + lazy_used, lazy_capacity - lazy_used,
+                "return total;};globalThis.largeEvents.push("
+                "'execute:lazy:'+typeof globalThis.lazyUnit);");
+    }
+    ScriptReplayRecord records[3] = {
+        {.url = "https://large-compile.test/table.js",
+         .source = table_source},
+        {.url = "https://large-compile.test/after.js",
+         .source = after_source},
+        {.url = "https://large-compile.test/lazy.js",
+         .source = lazy_source}
+    };
+    char directory[128] = {0}, error[256] = {0};
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool fixture_ready = false, replaying = false;
+    bool browser_ready = false, navigation_ready = false, ok = true;
+
+    REQUIRE(table_source != NULL && used >= 2u * MIB && used < capacity);
+    REQUIRE(lazy_source != NULL
+            && lazy_used >= SCRIPT_ADMISSION_LARGE_UNIT_BYTES
+            && lazy_used < lazy_capacity);
+    REQUIRE(write_replay_fixture(directory, records, 3));
+    fixture_ready = true;
+    REQUIRE(fetch_trace_replay_begin(directory, error, sizeof(error)));
+    replaying = true;
+    REQUIRE(browser_session_init(&browser, budget, 1u * MIB));
+    browser_ready = true;
+    REQUIRE(start_custom_runtime_page(
+        &navigation, budget, &browser, "https://large-compile.test/",
+        empty_page, 8, 16u * MIB, 4u * MIB));
+    navigation_ready = true;
+    REQUIRE(evaluate(&navigation, append_scripts, "<append-large>"));
+    size_t advances = 0;
+    REQUIRE(advance_until(
+        &navigation,
+        "large:error:table,execute:after:undefined,load:after,"
+        "execute:lazy:function,load:lazy", 96, &advances));
+    REQUIRE(navigation.page.runtime != NULL);
+    REQUIRE(!navigation.page.script_degradation_observed);
+    /* Refused before its compile: nothing was abandoned mid-compile. */
+    REQUIRE(navigation.page.script_result.host_compile_memory_abandoned
+            == 0u);
+    REQUIRE(navigation.page.script_result.host_compile_memory_refusals
+            == 1u);
+    REQUIRE(navigation.page.script_result.host_compile_memory_refused_bytes
+            == used);
+    REQUIRE(strstr(navigation.page.script_result.error,
+                   "out of memory") == NULL);
+    /* It cleared the floor and failed only the 4x heuristic, which does
+       not prove the page too large: the page is not classed OVER (its
+       later big dynamic scripts are not held or refused for it, a shell
+       gets no "Too heavy" sheet), though the refusal still counts. */
+    ScriptHeavyState heavy;
+    REQUIRE(script_runtime_heavy_state(navigation.page.runtime, &heavy));
+    REQUIRE(heavy.oversized_scripts == 0u && heavy.oversized_bytes == 0u);
+    REQUIRE(heavy.page_class != SCRIPT_HEAVY_CLASS_OVER);
+    REQUIRE(heavy.memory_refusals != 0u);
+
+cleanup:
+    if (navigation_ready) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    if (replaying) fetch_trace_end();
+    if (fixture_ready) remove_replay_fixture(directory, 3);
+    free(table_source);
+    free(lazy_source);
+    if (budget->current != 0) {
+        fprintf(stderr, "%s leaked %zu owned bytes\n", test_name,
+                budget->current);
+        ok = false;
+    }
+    return ok;
+}
+
 /* The embedder's per-site answer for the gate page's site; any other URL
    (a wrong one passed to the resolver) refuses, which the cases notice. */
 static ScriptHeavyPolicy heavy_gate_site_policy(void *opaque, const char *url)
@@ -1114,9 +1248,12 @@ static bool run_heavy_gate_case(Budget *budget, ScriptHeavyPolicy policy,
     replaying = true;
     REQUIRE(browser_session_init(&browser, budget, 1u * MIB));
     browser_ready = true;
+    /* A 12 MiB heap, so that the 2 MiB app, once it may run, can obtain
+       the 4 times its source a unit of 1 MiB or more needs before it
+       compiles (script_admission_large_unit_heap). */
     REQUIRE(start_custom_runtime_page_heavy(
         &navigation, budget, &browser, "https://heavy-gate.test/",
-        empty_page, 8, 16u * MIB, 4u * MIB,
+        empty_page, 12u * MIB, 8, 16u * MIB, 4u * MIB,
         stale_default != NULL ? *stale_default : policy,
         stale_default != NULL ? heavy_gate_site_policy : NULL, &policy));
     navigation_ready = true;
