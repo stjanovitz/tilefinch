@@ -8,8 +8,9 @@ and maintainers. Tilefinch's documentation has three layers:
    [TROUBLESHOOTING](../TROUBLESHOOTING.md), [SECURITY](../SECURITY.md),
    [CHANGELOG](../CHANGELOG.md), [CONTRIBUTING](../CONTRIBUTING.md), and
    [THIRD_PARTY_NOTICES](../THIRD_PARTY_NOTICES.md); in this directory, the
-   [user guide](USER_GUIDE.md) (tabs, typing, Reader mode, saving, YouTube,
-   language packs, games, per-site controls) and
+   [user guide](USER_GUIDE.md) (tabs, typing, Reader mode and Basic view,
+   saving, video and YouTube, language packs, games, page messages, the
+   microphone, heavy pages, per-site controls) and
    [licensing, attribution, and independence](LICENSING.md).
 2. **Current reference contracts in this directory** — the authoritative
    architecture, security, storage, update, and feature behavior.
@@ -23,8 +24,6 @@ and maintainers. Tilefinch's documentation has three layers:
   navigation that commits only when it succeeds, work limits, rendering,
   transport, lifecycle machines, media, frontend, storage, updates, and
   validation.
-- Detailed state-machine audit notes and investigation evidence are maintained
-  privately; current lifecycle contracts remain in the architecture reference.
 - [Development](DEVELOPMENT.md): fast edit loop, presets, focused tests,
   generated-source workflow, source/target boundaries, and dependency
   acquisition.

@@ -69,6 +69,7 @@ void psp_boot_config_defaults(PspBootConfig *config)
     config->gc_growth_pct = (long) BROWSER_PSP_APP_GC_GROWTH_PERCENT;
     config->lazy_functions = -1;
     config->page_task_yield = -1;
+    config->interface_snapshot = -1;
     config->script_timeout_ms = (long) BROWSER_PSP_APP_SCRIPT_TIMEOUT_MS;
     config->css_width = PSP_DEFAULT_CSS_WIDTH;
     config->css_height = PSP_DEFAULT_CSS_HEIGHT;
@@ -309,6 +310,8 @@ static BootConfigLoad psp_boot_config_load_one(
             loaded.lazy_functions = atol(value);
         } else if (strcmp(line, "page_task_yield") == 0) {
             loaded.page_task_yield = atol(value);
+        } else if (strcmp(line, "interface_snapshot") == 0) {
+            loaded.interface_snapshot = atol(value);
         } else if (strcmp(line, "script_timeout_ms") == 0) {
             loaded.script_timeout_ms = atol(value);
         } else if (strcmp(line, "css_width") == 0) {
@@ -738,6 +741,9 @@ bool psp_boot_config_validate(
     REQUIRE_CONFIG(
         config->page_task_yield >= -1 && config->page_task_yield <= 1,
         "page_task_yield");
+    REQUIRE_CONFIG(
+        config->interface_snapshot >= -1 && config->interface_snapshot <= 1,
+        "interface_snapshot");
     REQUIRE_CONFIG(
         config->module_cache_write == 0 || config->module_cache_write == 1,
         "module_cache_write");

@@ -2067,8 +2067,8 @@ static bool psp_media_playlist_tick(PspMediaSession *media)
 {
     if (!media->playlist || !media->ui.visible || media->system_suspended) return false;
     bool changed = false;
-    if (media->ui.ended && !media->playlist_end_handled) {
-        media->playlist_end_handled = true;
+    if (psp_media_playlist_end_edge(media->ui.ended,
+                                   &media->playlist_end_handled)) {
         if (media->ui_presentation.automatic_next && youtube_playlist_has_next(media->playlist))
             changed = youtube_playlist_step(media->playlist, 1);
         else if (!youtube_playlist_has_next(media->playlist)) {
@@ -2084,8 +2084,8 @@ static bool psp_media_playlist_tick(PspMediaSession *media)
     FetchPumpQuota quota = {.maximum_time_us = 1500, .maximum_body_callbacks = 2, .maximum_body_bytes = 16384};
     /* Metadata prefetch is optional during active decode. Start only near
        the tail of the retained window; one bounded provider pump per turn. */
-    if (youtube_playlist_selecting(media->playlist)
-        || (media->have_frame && !media->ui.resolving
+    if (youtube_playlist_should_pump(media->playlist,
+        media->have_frame && !media->ui.resolving
             && !media->ui.buffering && !media->ui.ended))
         changed = youtube_playlist_pump(media->playlist, &quota) || changed;
     char url[NAVIGATION_URL_LIMIT];
@@ -2881,8 +2881,13 @@ void psp_media_execute_intent(PspMediaSession *media,
                 media->ui_presentation.selected_subtitle_track = -1;
             } else if (intent.track_index
                            < media->stream.caption_track_count
-                       && media->stream.selected_caption_track
-                           != (int) intent.track_index) {
+                       && (media->stream.selected_caption_track
+                               != (int) intent.track_index
+                           || psp_media_subtitle_can_retry(
+                               media->subtitles != NULL,
+                               media->caption_resolution_pending,
+                               media->subtitle_request_id != 0,
+                               media->subtitle_request_attempted))) {
                 psp_media_request_caption_resolution(
                     media, intent.track_index);
             }

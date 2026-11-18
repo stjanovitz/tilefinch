@@ -8,6 +8,7 @@
      module throws is never the page's global. */
   let DOMException;
   const { Node, Document } = globalThis;
+  const domShared = globalThis.__tilefinchDomShared;
   __tilefinchRealmGlobal.__tilefinchTrustedEventShare.bindDOMException(
     (value) => { DOMException = value; });
   /* Definitions made in any registry, main or scoped. */
@@ -396,10 +397,11 @@
         );
       let localName = name;
       if (options?.extends !== undefined) {
-        localName = String(options.extends).toLowerCase();
+        localName = String(options.extends);
         if (
           validName(localName) ||
-          !/^[a-z][a-z0-9-]*$/.test(localName)
+          !/^[a-z][a-z0-9-]*$/.test(localName) ||
+          !domShared.isKnownHTMLTag(localName)
         )
           throw new DOMException(
             "Invalid customized built-in name",
@@ -442,9 +444,7 @@
           "attributeChangedCallback",
         );
         const observed = callbacks.attributeChangedCallback
-            ? sequence(constructor.observedAttributes, 64).map((value) =>
-                value.toLowerCase(),
-              )
+            ? sequence(constructor.observedAttributes, 64)
             : [],
           disabled = new Set(sequence(constructor.disabledFeatures, 8)),
           formAssociated = !!constructor.formAssociated;
@@ -492,7 +492,7 @@
     get(name) {
       const scoped = scopedRegistryStates.get(this),
         activeDefinitions = scoped?.definitions || definitions;
-      return activeDefinitions.get(String(name).toLowerCase())?.constructor;
+      return activeDefinitions.get(String(name))?.constructor;
     }
     getName(constructor) {
       if (typeof constructor !== "function")
@@ -504,7 +504,7 @@
     whenDefined(name) {
       const scoped = scopedRegistryStates.get(this),
         activeWaiting = scoped?.waiting || waiting;
-      name = String(name).toLowerCase();
+      name = String(name);
       if (!validName(name))
         return Promise.reject(
           new DOMException("Invalid custom element name", "SyntaxError"),
@@ -1450,6 +1450,8 @@
       !!definitionFor(node)
     );
   };
+  domShared.customShadowDisabled = (node) =>
+    definedAnywhere !== 0 && !!definitionFor(node)?.disabled?.has("shadow");
   globalThis.__tilefinchRestoreCustomElement = (node) => {
     /* Until some registry defines an element, no node can be custom or
        failed; wrapping every node must not pay the registry lookup. */

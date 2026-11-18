@@ -755,10 +755,11 @@ if(PSP)
             # (2026-11-08) and 5,556,000 (2026-11-07).
             set(TILEFINCH_PSP_TEXT_LIMIT 6200000)
         else()
-            # Ordinary: user-approved 9 KiB increase on 2026-11-16 for the
-            # integrated runtime safety fixes and bootstrap interfaces.
-            # Page-memory, download and cache limits are unchanged.
-            set(TILEFINCH_PSP_TEXT_LIMIT 5533792)
+            # Ordinary: user-approved 35 KiB increase for 0.1.53
+            # (2026-11-18). The profile-optimized ordinary and relocatable
+            # images measured 5,583,528 and 5,585,496 bytes respectively.
+            # Page-memory, download, cache and validation limits are unchanged.
+            set(TILEFINCH_PSP_TEXT_LIMIT 5585840)
         endif()
         # Local size experiments only (an engine built at -O2 under PPSSPP,
         # for instance): a build directory that sets this is over the

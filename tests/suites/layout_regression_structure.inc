@@ -437,7 +437,7 @@
             "#fill{display:grid;position:relative;margin-left:20px;"
             "width:300px;height:40px;justify-content:%s;align-content:%s;"
             "grid-template-columns:repeat(auto-fill,minmax(100px,1fr))}"
-            "#abs{position:absolute;grid-column:1;inset-inline:0;top:0;"
+            "#abs{position:absolute;grid-column:1 / 2;inset-inline:0;top:0;"
             "height:10px}</style><body><div id=fill><span id=abs></span>"
             "</div></body>",
             abspos_fill_justify[justify], abspos_fill_justify[justify]);
@@ -647,7 +647,7 @@
         ".atomic-line{display:block;width:460px}.inline-block{display:inline-block;width:40px;height:14px}"
         ".inline-flex{display:inline-flex;width:60px;height:14px;gap:4px}"
         ".inline-flex>b{display:block;flex:1 1 0}"
-        ".inline-grid{display:inline-grid;width:62px;grid-template-columns:repeat(2,1fr);gap:2px}"
+        ".inline-grid{display:inline-grid;width:62px;grid-template-columns:repeat(2,minmax(0,1fr));gap:2px}"
         ".inline-grid>b{display:block;height:14px}"
         ".atomic-button{display:inline-flex;width:60px;height:20px}"
         ".auto-cross{display:flex;width:120px;align-items:center}.auto-cross>span{display:block;width:30px}"

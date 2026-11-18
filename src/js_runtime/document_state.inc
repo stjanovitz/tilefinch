@@ -4,6 +4,7 @@ void script_runtime_relocate_document_storage(ScriptRuntime *runtime,
     if (runtime == NULL || document == NULL) return;
     image_preload_cancel_job(runtime);
     runtime->document = document;
+    document->script_realm_bound = true;
     runtime->bridge.document = document;
     runtime->bridge.document_base_dirty = true;
 }
@@ -588,6 +589,51 @@ static void script_runtime_release_script_bodies(ScriptRuntime *runtime,
         &runtime->result.script_body_cache_released_bytes, freed);
 }
 
+size_t script_runtime_admission_reclaimable(const ScriptRuntime *runtime,
+                                            bool include_store)
+{
+    if (runtime == NULL || runtime->budget == NULL) return 0;
+    size_t total = runtime->bridge.preloaded_script_bytes;
+    if (runtime->session != NULL
+        && runtime->session->budget == runtime->budget) {
+        size_t session = browser_session_admission_reclaimable_bytes(
+            runtime->session);
+        total = total > SIZE_MAX - session ? SIZE_MAX : total + session;
+    }
+    if (include_store) {
+        size_t store = script_source_store_reclaimable(runtime->source_store);
+        store = store > SIZE_MAX - runtime->lazy_webpack_plain_text_bytes
+            ? SIZE_MAX : store + runtime->lazy_webpack_plain_text_bytes;
+        total = total > SIZE_MAX - store ? SIZE_MAX : total + store;
+    }
+    return total;
+}
+
+size_t script_runtime_reclaim_for_admission(ScriptRuntime *runtime,
+                                            size_t needed, bool include_store)
+{
+    if (runtime == NULL || runtime->budget == NULL || needed == 0) return 0;
+    size_t before = budget_remaining(runtime->budget);
+    size_t wanted = before > SIZE_MAX - needed ? SIZE_MAX : before + needed;
+    (void) budget_make_room(runtime->budget, wanted);
+    size_t free_bytes = budget_remaining(runtime->budget);
+    if (free_bytes < wanted) {
+        script_runtime_release_script_bodies(runtime, wanted - free_bytes);
+        free_bytes = budget_remaining(runtime->budget);
+    }
+    if (free_bytes < wanted) {
+        (void) script_runtime_release_preloaded_scripts(
+            runtime, wanted - free_bytes);
+        free_bytes = budget_remaining(runtime->budget);
+    }
+    if (include_store && free_bytes < wanted
+        && runtime->source_store != NULL) {
+        (void) js_rt_source_store_relieve(runtime, wanted - free_bytes);
+        free_bytes = budget_remaining(runtime->budget);
+    }
+    return free_bytes > before ? free_bytes - before : 0;
+}
+
 /* Called by the allocator (no JavaScript, and no allocation except the
    memory-rescue copy on refusal) when a request would pass the limit.
    Grows in whole steps so the next allocations do not each ask again, and
@@ -970,6 +1016,7 @@ size_t script_runtime_heap_available(const ScriptRuntime *runtime)
    of the free Budget, so they are not taken again. */
 static size_t js_rt_heap_reachable_raw(const ScriptRuntime *runtime,
                                        size_t budget_taken_first,
+                                       size_t budget_freed_first,
                                        bool count_stored_text)
 {
     if (runtime == NULL || runtime->runtime == NULL
@@ -996,6 +1043,8 @@ static size_t js_rt_heap_reachable_raw(const ScriptRuntime *runtime,
         taken = taken > SIZE_MAX - unheld ? SIZE_MAX : taken + unheld;
     }
     size_t free_bytes = budget_remaining(runtime->budget);
+    free_bytes = free_bytes > SIZE_MAX - budget_freed_first
+        ? SIZE_MAX : free_bytes + budget_freed_first;
     free_bytes = free_bytes > taken ? free_bytes - taken : 0;
     /* Allocations under the current limit still come from the page
        Budget: headroom the Budget cannot back is not reachable. */
@@ -1017,12 +1066,18 @@ static size_t js_rt_heap_reachable_raw(const ScriptRuntime *runtime,
 size_t script_runtime_heap_reachable(const ScriptRuntime *runtime,
                                      size_t budget_taken_first)
 {
-    return js_rt_heap_reachable_raw(runtime, budget_taken_first, true);
+    return js_rt_heap_reachable_raw(runtime, budget_taken_first, 0, true);
+}
+
+size_t script_runtime_heap_reachable_after_release(
+    const ScriptRuntime *runtime, size_t budget_freed)
+{
+    return js_rt_heap_reachable_raw(runtime, 0, budget_freed, true);
 }
 
 size_t script_runtime_heap_obtainable(const ScriptRuntime *runtime)
 {
-    return js_rt_heap_reachable_raw(runtime, 0, false);
+    return js_rt_heap_reachable_raw(runtime, 0, 0, false);
 }
 
 bool script_error_reports_out_of_memory(const char *error)
@@ -1040,8 +1095,9 @@ size_t script_runtime_heap_admission_available(const ScriptRuntime *runtime)
        text named by external id); what holds it now is counted in the
        Budget (the store), or already was (a factory's compressed copy), so
        this is never above what the unstripped realm had. */
-    size_t text = script_source_store_text_bytes(runtime->source_store)
-        + runtime->lazy_webpack_external_text_bytes;
+    size_t text = script_source_store_text_bytes(runtime->source_store);
+    text = text > SIZE_MAX - runtime->lazy_webpack_external_text_bytes
+        ? SIZE_MAX : text + runtime->lazy_webpack_external_text_bytes;
     return available > text ? available - text : 0;
 }
 

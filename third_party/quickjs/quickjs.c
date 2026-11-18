@@ -325,7 +325,50 @@ typedef struct {
 
 /* end JS Malloc */
 
+/* Tilefinch interface snapshot (see JS_SnapshotInterfaces()): one entry
+   per interface object author code has changed */
+typedef struct JSSnapTwin { struct JSObject *live; struct JSObject *twin; } JSSnapTwin;
+static void js_snap_mark(JSContext *ctx, JSValueConst v, int depth);
+static struct JSObject *js_snap_twin_of(JSRuntime *rt, struct JSObject *p);
+static void js_snap_drop(JSRuntime *rt, struct JSObject *p);
+static BOOL js_snap_trusted(JSContext *ctx);
+static BOOL js_snap_browser_write(JSContext *ctx, struct JSObject *p);
+static int js_snap_cow(JSContext *ctx, struct JSObject *p);
+static struct JSObject *js_snap_resolve(JSContext *ctx, struct JSObject *p, JSAtom prop);
+static int js_snap_before_global_write(JSContext *ctx, struct JSObject *g, JSAtom prop, BOOL redefine);
+static BOOL js_snap_global_is_variable(struct JSObject *g, JSAtom prop);
+static struct JSObject *js_snap_kept_of(struct JSObject *g);
+static struct JSObject *js_snap_interface_member(JSContext *ctx, struct JSObject *p, JSAtom prop);
+static int js_snap_after_write(JSContext *ctx, struct JSObject *p, JSAtom prop, BOOL created);
+static struct JSObject *js_snap_page_changed(JSContext *ctx, struct JSObject *p, JSAtom prop);
+static void js_snap_mark_published(JSContext *ctx, struct JSObject *twin, JSAtom prop);
+static int JS_DefineProperty_impl(JSContext *ctx, JSValueConst this_obj,
+                      JSAtom prop, JSValueConst val,
+                      JSValueConst getter, JSValueConst setter, int flags);
+static int delete_property_impl(JSContext *ctx, struct JSObject *p, JSAtom atom);
+
+#define JS_CFUNC_BROWSER_NATIVE 0x80
+
 struct JSRuntime {
+    /* open-addressed by object address; snap_twin_size is a power of two */
+    struct JSSnapTwin *snap_twins;
+    uint32_t snap_twin_count, snap_twin_size, snap_member_count;
+    /* JS_SetEmbedderPageView(): embedder code outside any script reads
+       and changes the interfaces as author code does */
+    uint8_t snap_embedder_page_view;
+    /* a realm of this runtime plans or has a snapshot: promise jobs and
+       async functions record whose work they do; nothing does otherwise */
+    uint8_t snap_enabled;
+    /* nesting of JS_EnterBrowserCode(): browser code is installing */
+    uint32_t snap_install_depth;
+    /* a promise job's frameless work (resolving the promise it settles,
+       an await's resumption) acts for the code the job runs for, an
+       async function's work outside its frame for that function, and a
+       JS_EnterBrowserCode() bracket for the browser: 0 when none, else
+       that code's js_snap_code() + 1; frames older than snap_job_frame
+       are not the job's */
+    uint8_t snap_job_view;
+    struct JSStackFrame *snap_job_frame;
 #ifdef CONFIG_TILEFINCH_EXECUTION_CENSUS
     BOOL execution_census;
     JSCensusFunction *census_function_hook;
@@ -538,6 +581,13 @@ typedef struct JSVarRef {
     uint8_t is_detached;
     uint8_t is_lexical; /* only used with global variables */
     uint8_t is_const; /* only used with global variables */
+    /* Tilefinch interface snapshot: a global the browser's script reads
+       by name; author code that rebinds it gets a reference of its own
+       (js_snap_keep_global()); 2: the embedder left it to the page
+       (JS_LeaveGlobalToPage()) and it is never pinned; 3: a kept
+       reference of a name browser code unbound in its view alone
+       (js_snap_kept_unbound()) */
+    uint8_t is_pinned;
     JSValue *pvalue; /* pointer to the value, either on the stack or
                         to 'value' */
     union {
@@ -660,6 +710,12 @@ struct JSContext {
                              const char *input, size_t input_len,
                              const char *filename, int flags, int scope_idx);
     void *user_opaque;
+    /* Tilefinch interface snapshot: taken in this realm; the function
+       being created is browser code; everything compiled is */
+    uint8_t snap_active, snap_compiling_trusted;
+    /* JS_PlanInterfaceSnapshot(): this realm will be snapshotted, so its
+       browser closures bind globals apart from author closures already */
+    uint8_t snap_planned;
 };
 
 #ifdef CONFIG_TILEFINCH_OP_COUNTS
@@ -958,7 +1014,9 @@ typedef struct JSFunctionBytecode {
        JS_SetExternalSourceHooks()): debug.source_owner is its record and
        debug.source_offset, not debug.source, says where the text starts */
     uint8_t source_external : 1;
-    /* XXX: 7 bits available */
+    /* Tilefinch: browser (bootstrap) code, which reads the interfaces as
+       they were at JS_SnapshotInterfaces() */
+    uint8_t trusted : 1;
     uint8_t *byte_code_buf; /* (self pointer) */
     int byte_code_len;
     JSAtom func_name;
@@ -1301,7 +1359,6 @@ struct JSObject {
        - the prototype of Object.prototype is null (always true as it is immutable)
     */
     uint8_t is_std_array_prototype : 1;
-    
     uint8_t extensible : 1;
     uint8_t free_mark : 1; /* only used when freeing objects with cycles */
     uint8_t platform_prototype : 1; /* a Web IDL interface prototype object */
@@ -1320,7 +1377,14 @@ struct JSObject {
     /* count the number of weak references to this object. The object
        structure is freed only if header.ref_count = 0 and
        weakref_count = 0 */
-    uint32_t weakref_count; 
+    uint32_t weakref_count : 30;
+    /* Tilefinch interface snapshot: an interface object marked by
+       JS_SnapshotInterfaces(); and one author code has changed since, whose
+       properties as browser code still reads them are its twin's. They
+       share the weak count's word: the two flag bytes above are full, and
+       a third would grow every object by one JSValue alignment step. */
+    uint32_t snap_member : 1;
+    uint32_t has_twin : 1;
     JSShape *shape; /* prototype and property names + flag */
     JSProperty *prop; /* array of properties */
     union {
@@ -1357,6 +1421,9 @@ struct JSObject {
             JSContext *realm;
             JSCFunctionType c_function;
             uint8_t length;
+            /* JSCFunctionEnum; JS_CFUNC_BROWSER_NATIVE is or-ed in for an
+               embedder native that is browser code whoever calls it
+               (JS_MarkBrowserNative()) */
             uint8_t cproto;
             int16_t magic;
         } cfunc;
@@ -1389,6 +1456,10 @@ struct JSObject {
         JSGlobalObject global_object;
     } u;
 };
+
+/* Every page object pays for a field added here. */
+_Static_assert(sizeof(JSObject) <= (sizeof(void *) == 4 ? 40 : 64),
+               "JSObject grew");
 
 typedef struct JSMapRecord {
     int ref_count; /* used during enumeration to avoid freeing the record */
@@ -3216,6 +3287,7 @@ void JS_FreeRuntime(JSRuntime *rt)
         }
     }
     js_free_rt(rt, rt->class_array);
+    js_free_rt(rt, rt->snap_twins); /* Tilefinch interface snapshot */
 
 #ifdef DUMP_LEAKS
     /* only the atoms defined in JS_InitAtoms() should be left */
@@ -6730,6 +6802,8 @@ static JSValue JS_NewObjectFromShape2(JSContext *ctx, JSShape *sh, JSClassID cla
     p->class_id = class_id;
     p->shared_closure_metadata = shared_props != NULL;
     p->is_std_array_prototype = 0;
+    p->snap_member = 0;
+    p->has_twin = 0;
     p->extensible = TRUE;
     p->free_mark = 0;
     p->platform_prototype = 0;
@@ -7590,6 +7664,8 @@ static void free_object(JSRuntime *rt, JSObject *p)
 
     p->free_mark = 1; /* used to tell the object is invalid when
                          freeing cycles */
+    if (unlikely(p->has_twin))
+        js_snap_drop(rt, p);
     /* free all the fields */
     sh = p->shape;
     pr = get_shape_prop(sh);
@@ -7824,6 +7900,11 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
             int i;
             sh = p->shape;
             mark_func(rt, &sh->header);
+            if (unlikely(p->has_twin)) {
+                JSObject *twin = js_snap_twin_of(rt, p);
+                if (twin != p)
+                    mark_func(rt, &twin->header);
+            }
             /* mark all the fields */
             prs = get_shape_prop(sh);
             for(i = 0; i < sh->prop_count; i++) {
@@ -9291,13 +9372,40 @@ static void JS_SetImmutablePrototype(JSContext *ctx, JSValueConst obj)
     p->has_immutable_prototype = TRUE;
 }
 
+/* Interface snapshot: whether making 'proto' the prototype of p (or of
+   its twin) in the browser's view closes a cycle there. Browser code's
+   lookups continue from an object's twin (js_snap_resolve()), so the
+   chain it walks can differ from the objects' own: look for p and its
+   twin along the chain as browser code walks it. */
+static BOOL js_snap_view_cycle(JSRuntime *rt, JSObject *proto, JSObject *p,
+                               JSObject *twin)
+{
+    JSObject *q;
+    for (q = proto; q; q = q->shape->proto) {
+        if (q == p || q == twin)
+            return TRUE;
+        if (q->has_twin)
+            q = js_snap_twin_of(rt, q);
+    }
+    return FALSE;
+}
+
+static int js_set_prototype_refused(JSContext *ctx, BOOL throw_flag,
+                                    const char *message)
+{
+    if (!throw_flag)
+        return FALSE;
+    JS_ThrowTypeError(ctx, "%s", message);
+    return -1;
+}
+
 /* Return -1 (exception) or TRUE/FALSE. 'throw_flag' = FALSE indicates
    that it is called from Reflect.setPrototypeOf(). */
 static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
                                    JSValueConst proto_val,
                                    BOOL throw_flag)
 {
-    JSObject *proto, *p, *p1;
+    JSObject *proto, *p, *p1, *twin;
     JSShape *sh;
 
     if (throw_flag) {
@@ -9337,9 +9445,41 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
         }
     }
 
+    /* Tilefinch interface snapshot: author code's change is copied on
+       write; browser code's own change reaches the browser's view too,
+       once p's own checks below have passed. When author code changed
+       p's prototype since, or made p non-extensible, the browser's change
+       is made in its view alone, as for a member (js_snap_page_changed()). */
+    twin = NULL;
+    if (unlikely(p->has_twin)) {
+        JSObject *t = js_snap_twin_of(ctx->rt, p);
+        /* the same prototype in both views: nothing changes, whoever asks */
+        if (p->shape->proto == proto && t->shape->proto == proto)
+            return TRUE;
+        if (t != p && js_snap_browser_write(ctx, p)) {
+            twin = t;
+            if (twin->shape->proto != p->shape->proto ||
+                (!p->extensible && twin->extensible)) {
+                /* in the browser's view alone, where only it is checked
+                   for a cycle; a prototype the engine made immutable is
+                   so in both views */
+                if (p->has_immutable_prototype)
+                    return js_set_prototype_refused(ctx, throw_flag,
+                                                    "prototype is immutable");
+                if (proto && js_snap_view_cycle(ctx->rt, proto, p, twin))
+                    return js_set_prototype_refused(ctx, throw_flag,
+                                                    "circular prototype chain");
+                return JS_SetPrototypeInternal(ctx, JS_MKPTR(JS_TAG_OBJECT, twin),
+                                               proto_val, throw_flag);
+            }
+        }
+    }
     sh = p->shape;
     if (sh->proto == proto)
         return TRUE;
+    if (unlikely(p->snap_member) && !p->has_twin && js_snap_cow(ctx, p))
+        return -1;
+    sh = p->shape;
     if (unlikely(p->has_immutable_prototype)) {
         if (throw_flag) {
             JS_ThrowTypeError(ctx, "prototype is immutable");
@@ -9371,10 +9511,19 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
             /* Note: for Proxy objects, proto is NULL */
             p1 = p1->shape->proto;
         } while (p1 != NULL);
+        /* and in the browser's view, where it changes too: p is read
+           there as it is, or its twin changes with it */
+        if (unlikely(ctx->rt->snap_twin_count) &&
+            (twin || js_snap_twin_of(ctx->rt, p) == p) &&
+            js_snap_view_cycle(ctx->rt, proto, p, twin))
+            return js_set_prototype_refused(ctx, throw_flag,
+                                            "circular prototype chain");
         JS_DupValue(ctx, proto_val);
     }
 
-    if (js_shape_prepare_update(ctx, p, NULL)) {
+    if (js_shape_prepare_update(ctx, p, NULL) ||
+        (twin && JS_SetPrototypeInternal(ctx, JS_MKPTR(JS_TAG_OBJECT, twin),
+                                         proto_val, FALSE) < 0)) {
         if (proto)
             JS_FreeValue(ctx, proto_val);
         return -1;
@@ -9582,6 +9731,11 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
     func = js_autoinit_func_table[id];
     /* 'func' shall not modify the object properties 'pr' */
     val = func(realm, p, prop, pr->u.init.opaque);
+    if (p->snap_member)
+        js_snap_mark(ctx, val, 1);
+    else if (unlikely(realm->snap_active) &&
+             p->class_id == JS_CLASS_GLOBAL_OBJECT && JS_IsFunction(ctx, val))
+        js_snap_mark(ctx, val, 3);
     /* A refused initialization keeps the autoinit record, so a later
        access retries instead of finding a permanent 'undefined'. */
     if (JS_IsException(val))
@@ -9609,6 +9763,8 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
         pr->u.var_ref = var_ref;
         var_ref->value = val; 
         var_ref->is_const = !(prs->flags & JS_PROP_WRITABLE);
+        var_ref->is_pinned = realm->snap_active &&
+            JS_VALUE_GET_TAG(val) == JS_TAG_OBJECT;
     } else {
         js_autoinit_free(ctx->rt, pr);
         prs->flags &= ~JS_PROP_TMASK;
@@ -9627,6 +9783,1187 @@ static JSValue js_call_property_getter(JSContext *ctx, JSProperty *pr,
     func = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.getter));
     return JS_CallFree(ctx, func, receiver, 0, NULL);
 }
+
+
+/* Tilefinch interface snapshot.
+
+   The browser's own script (bytecode read with JS_READ_OBJ_PLATFORM_METHODS,
+   or compiled with JS_EVAL_FLAG_TRUSTED) shares its realm with author
+   code, which may replace any built-in. JS_SnapshotInterfaces() marks the
+   interface objects as they are when the browser's start-up script ends.
+   From then on:
+   - the first change code other than the browser's makes to a marked object
+     first copies the object's own properties and prototype to a twin;
+   - a property read, an inherited-setter or read-only check, `in`, for-in
+     and own-property reflection by browser code continue in the twin;
+   - a change browser code makes reaches the object and its twin, except
+     one to an ECMAScript prototype outside a module load, which is copied
+     on like a page's (js_snap_browser_write());
+   - a global variable holding an object is pinned: author code that names,
+     assigns, declares, redefines or deletes it gets a variable reference
+     of its own, and browser closures keep theirs (js_snap_keep_global());
+   - a function author code puts on an object, or defines in a subclass,
+     does not stand in for a member the browser defined further up the
+     prototype chain when browser code reads it
+     (js_snap_interface_member()).
+   Whose code is running is the nearest bytecode frame's; an engine native
+   acts for its caller; an embedder native is browser code if the embedder
+   marked it (JS_MarkBrowserNative()) or it declared itself so for a stretch
+   of work (JS_EnterBrowserCode()). Below the frame a promise job, an
+   async function's work outside its frame or such a bracket started at,
+   or with no frame, the caller is the code that job runs for
+   (js_snap_enter_job(), js_snap_enter_own()) or the bracket's browser
+   code, or else the embedder, which is browser code unless it asked for
+   the page's view (JS_SetEmbedderPageView()).
+   Nothing is allocated until author code changes a marked object. */
+/* 0: author code; 1: browser code; 2: the embedder outside any script */
+static int js_snap_code(JSContext *ctx)
+{
+    JSStackFrame *sf;
+    for (sf = ctx->rt->current_stack_frame; sf; sf = sf->prev_frame) {
+        JSObject *f;
+        if (ctx->rt->snap_job_view && sf == ctx->rt->snap_job_frame)
+            break;
+        if (JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
+            continue;
+        f = JS_VALUE_GET_OBJ(sf->cur_func);
+        if (js_class_has_bytecode(f->class_id))
+            return f->u.func.function_bytecode->trusted;
+        if (f->class_id == JS_CLASS_C_FUNCTION &&
+            (f->u.cfunc.cproto & JS_CFUNC_BROWSER_NATIVE))
+            return 1;
+    }
+    if (ctx->rt->snap_job_view)
+        return ctx->rt->snap_job_view - 1;
+    return ctx->rt->snap_embedder_page_view ? 0 : 2;
+}
+
+static BOOL js_snap_trusted(JSContext *ctx)
+{
+    return js_snap_code(ctx) != 0;
+}
+
+/* An ECMAScript prototype of some realm (Object.prototype,
+   Array.prototype, an iterator prototype...). */
+static BOOL js_snap_is_engine_prototype(JSRuntime *rt, JSObject *q)
+{
+    struct list_head *el;
+    int i;
+    list_for_each(el, &rt->context_list) {
+        JSContext *ctx1 = list_entry(el, JSContext, link);
+        for (i = 0; i < rt->class_count; i++) {
+            if (JS_VALUE_GET_TAG(ctx1->class_proto[i]) == JS_TAG_OBJECT &&
+                JS_VALUE_GET_OBJ(ctx1->class_proto[i]) == q)
+                return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/* Whether author code's frames lie between the running code and the
+   start of the current view (a module load's bracket, a job): browser
+   code that author code called there, during a module load, is not the
+   module's own work. */
+static BOOL js_snap_author_in_view(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+    JSStackFrame *sf;
+    for (sf = rt->current_stack_frame; sf; sf = sf->prev_frame) {
+        JSObject *f;
+        if (rt->snap_job_view && sf == rt->snap_job_frame)
+            break;
+        if (JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
+            continue;
+        f = JS_VALUE_GET_OBJ(sf->cur_func);
+        if (js_class_has_bytecode(f->class_id) &&
+            !f->u.func.function_bytecode->trusted)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+/* Whether a change the running code makes to the interface object p is
+   the browser's own, to be read by browser code, rather than one to copy
+   p on. Author code's never is. Browser code's is, except on an
+   ECMAScript prototype outside a module load's own work
+   (JS_EnterBrowserCode(); browser code that author code called during the
+   load is not that work, js_snap_author_in_view()): the
+   browser has no late changes of its own to make there, so one that
+   happens was steered by the page (a key path or a copy that walked out
+   of the page's value into Object.prototype), and it stays out of the
+   browser's view like any page change. Platform interfaces are not held
+   to this: the browser completes some of them late (an event interface's
+   prototype on its first event). */
+static __attribute__((noinline)) BOOL js_snap_browser_write(JSContext *ctx, JSObject *p)
+{
+    int code = js_snap_code(ctx);
+    if (code == 0)
+        return FALSE;
+    if (code == 2 ||
+        (ctx->rt->snap_install_depth > 0 && !js_snap_author_in_view(ctx)))
+        return TRUE;
+    return !js_snap_is_engine_prototype(ctx->rt, p);
+}
+
+static inline uint32_t js_snap_slot(JSRuntime *rt, JSObject *p)
+{
+    return (uint32_t)((uintptr_t)p >> 3) & (rt->snap_twin_size - 1);
+}
+
+/* the twin of p, or p itself */
+static JSObject *js_snap_twin_of(JSRuntime *rt, JSObject *p)
+{
+    uint32_t at;
+    if (!rt->snap_twin_size)
+        return p;
+    for (at = js_snap_slot(rt, p); rt->snap_twins[at].live;
+         at = (at + 1) & (rt->snap_twin_size - 1)) {
+        if (rt->snap_twins[at].live == p)
+            return rt->snap_twins[at].twin;
+    }
+    return p;
+}
+
+static JSShapeProperty *js_snap_kept_entry(JSObject *g, JSAtom prop,
+                                           JSProperty **ppr);
+
+/* Where browser code continues a lookup of 'prop' that reached p: p's
+   twin, or for the global object the kept binding of 'prop' if author code
+   replaced it. Anyone else, and JS_ATOM_NULL on the global object, gets p. */
+static __attribute__((noinline)) JSObject *js_snap_resolve(JSContext *ctx, JSObject *p, JSAtom prop)
+{
+    if (!js_snap_trusted(ctx))
+        return p;
+    if (p->class_id == JS_CLASS_GLOBAL_OBJECT) {
+        JSProperty *pr;
+        if (prop == JS_ATOM_NULL || !js_snap_kept_entry(p, prop, &pr))
+            return p;
+        return js_snap_kept_of(p);
+    }
+    return js_snap_twin_of(ctx->rt, p);
+}
+
+static void js_snap_insert(JSRuntime *rt, JSObject *p, JSObject *twin)
+{
+    uint32_t at = js_snap_slot(rt, p);
+    while (rt->snap_twins[at].live)
+        at = (at + 1) & (rt->snap_twin_size - 1);
+    rt->snap_twins[at].live = p;
+    rt->snap_twins[at].twin = twin;
+}
+
+/* room for one more entry at no more than half load */
+static int js_snap_reserve(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+    JSSnapTwin *old = rt->snap_twins, *tab;
+    uint32_t old_size = rt->snap_twin_size, size, i;
+
+    if ((rt->snap_twin_count + 1) * 2 <= old_size)
+        return 0;
+    size = old_size ? old_size * 2 : 16;
+    tab = js_mallocz(ctx, size * sizeof(*tab));
+    if (!tab)
+        return -1;
+    rt->snap_twins = tab;
+    rt->snap_twin_size = size;
+    for (i = 0; i < old_size; i++) {
+        if (old[i].live)
+            js_snap_insert(rt, old[i].live, old[i].twin);
+    }
+    js_free_rt(rt, old);
+    return 0;
+}
+
+/* p is being freed: its twin goes with it */
+static void js_snap_drop(JSRuntime *rt, JSObject *p)
+{
+    uint32_t mask = rt->snap_twin_size - 1, at, next;
+    JSObject *twin;
+
+    if (!rt->snap_twin_size)
+        return;
+    for (at = js_snap_slot(rt, p); rt->snap_twins[at].live != p;
+         at = (at + 1) & mask) {
+        if (!rt->snap_twins[at].live)
+            return;
+    }
+    twin = rt->snap_twins[at].twin;
+    /* close the gap so later probes still reach the entries behind it */
+    for (next = (at + 1) & mask; rt->snap_twins[next].live;
+         next = (next + 1) & mask) {
+        uint32_t home = js_snap_slot(rt, rt->snap_twins[next].live);
+        if (((next - home) & mask) >= ((next - at) & mask)) {
+            rt->snap_twins[at] = rt->snap_twins[next];
+            at = next;
+        }
+    }
+    rt->snap_twins[at].live = NULL;
+    rt->snap_twins[at].twin = NULL;
+    rt->snap_twin_count--;
+    p->has_twin = 0;
+    JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_OBJECT, twin));
+}
+
+/* A function author code supplied: its own script's, a bound function or
+   a callable proxy. (An engine or embedder native is not: author code can
+   only pass one along.) */
+static inline BOOL js_snap_is_author_function(JSObject *f)
+{
+    if (js_class_has_bytecode(f->class_id))
+        return !f->u.func.function_bytecode->trusted;
+    return f->class_id == JS_CLASS_BOUND_FUNCTION ||
+        f->class_id == JS_CLASS_PROXY;
+}
+
+static inline BOOL js_snap_is_author_function_value(JSValueConst v)
+{
+    return JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT &&
+        js_snap_is_author_function(JS_VALUE_GET_OBJ(v));
+}
+
+/* Browser code found 'prop' on p as a function author code supplied (an
+   own property of an element, a method of a page's subclass). If an object
+   further up p's prototype chain defines 'prop' as the browser's own
+   function or accessor, that member is what the browser's own work means:
+   returns that object to continue the lookup from, else NULL. ECMAScript's
+   own prototypes do not count: toString, then and the like on an author's
+   object are the author's to define. */
+static __attribute__((noinline)) JSObject *js_snap_interface_member(JSContext *ctx, JSObject *p, JSAtom prop)
+{
+    JSObject *q, *view;
+    JSShapeProperty *prs;
+    JSProperty *pr;
+
+    if (!ctx->snap_active || !js_snap_trusted(ctx))
+        return NULL;
+    for (q = p->shape->proto; q; q = q->shape->proto) {
+        view = q->has_twin ? js_snap_twin_of(ctx->rt, q) : q;
+        prs = find_own_property(&pr, view, prop);
+        if (!prs)
+            continue;
+        switch (prs->flags & JS_PROP_TMASK) {
+        case JS_PROP_NORMAL:
+            if (JS_VALUE_GET_TAG(pr->u.value) != JS_TAG_OBJECT ||
+                !JS_IsFunction(ctx, pr->u.value))
+                return NULL;
+            if (js_snap_is_author_function(JS_VALUE_GET_OBJ(pr->u.value)))
+                continue; /* another layer of the page's */
+            break;
+        case JS_PROP_GETSET:
+            if (pr->u.getset.getter ?
+                js_snap_is_author_function(pr->u.getset.getter) :
+                !pr->u.getset.setter ||
+                js_snap_is_author_function(pr->u.getset.setter))
+                continue;
+            break;
+        case JS_PROP_AUTOINIT:
+            break; /* a native not created yet: on an engine prototype, below */
+        default:
+            return NULL;
+        }
+        /* of any realm: the object may be a worker's or a frame's */
+        if (js_snap_is_engine_prototype(ctx->rt, q))
+            return NULL;
+        return q;
+    }
+    return NULL;
+}
+
+/* Copies p's own property 'prs'/'pr' to 'twin' as it is now. */
+static int js_snap_copy_property(JSContext *ctx, JSValueConst twin,
+                                 JSShapeProperty *prs, JSProperty *pr)
+{
+    int flags = (prs->flags & JS_PROP_C_W_E) | JS_PROP_HAS_CONFIGURABLE |
+        JS_PROP_HAS_ENUMERABLE;
+    switch (prs->flags & JS_PROP_TMASK) {
+    case JS_PROP_GETSET:
+        return JS_DefineProperty_impl(ctx, twin, prs->atom, JS_UNDEFINED,
+            pr->u.getset.getter ? (JSValueConst)JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.getter) : JS_UNDEFINED,
+            pr->u.getset.setter ? (JSValueConst)JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.setter) : JS_UNDEFINED,
+            (flags & ~JS_PROP_WRITABLE) | JS_PROP_HAS_GET | JS_PROP_HAS_SET);
+    case JS_PROP_NORMAL:
+        return JS_DefineProperty_impl(ctx, twin, prs->atom, pr->u.value,
+                                      JS_UNDEFINED, JS_UNDEFINED,
+                                      flags | JS_PROP_HAS_VALUE |
+                                      JS_PROP_HAS_WRITABLE);
+    default:
+        return 0;
+    }
+}
+
+/* Author code is about to change p: keep p as browser code reads it. A
+   refusal leaves p without a twin and fails the change. */
+static __attribute__((noinline)) int js_snap_cow(JSContext *ctx, JSObject *p)
+{
+    JSShape *sh;
+    JSShapeProperty *prs;
+    JSValue twin;
+    int i;
+
+    if (js_snap_browser_write(ctx, p))
+        return 0;
+    if (js_own_closure_metadata(ctx, p))
+        return -1;
+    /* both views share one function object per lazily created method */
+ redo:
+    sh = p->shape;
+    for (i = 0, prs = get_shape_prop(sh); i < sh->prop_count; i++, prs++) {
+        if (prs->atom != JS_ATOM_NULL &&
+            (prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT) {
+            if (JS_AutoInitProperty(ctx, p, prs->atom, &p->prop[i], prs))
+                return -1;
+            goto redo;
+        }
+    }
+    if (js_snap_reserve(ctx))
+        return -1;
+    twin = JS_NewObjectProto(ctx, sh->proto ?
+                             (JSValueConst)JS_MKPTR(JS_TAG_OBJECT, sh->proto) :
+                             JS_NULL);
+    if (JS_IsException(twin))
+        return -1;
+    for (i = 0; i < p->shape->prop_count; i++) {
+        prs = get_shape_prop(p->shape) + i;
+        if (prs->atom == JS_ATOM_NULL)
+            continue;
+        if (js_snap_copy_property(ctx, twin, prs, &p->prop[i]) < 0) {
+            JS_FreeValue(ctx, twin);
+            return -1;
+        }
+    }
+    /* as p is now: author code's preventExtensions comes after this */
+    JS_VALUE_GET_OBJ(twin)->extensible = p->extensible;
+    js_snap_insert(ctx->rt, p, JS_VALUE_GET_OBJ(twin));
+    ctx->rt->snap_twin_count++;
+    p->has_twin = 1;
+    return 0;
+}
+
+/* before any change to p's own properties or prototype */
+static inline int js_snap_before_write(JSContext *ctx, JSObject *p)
+{
+    if (unlikely(p->snap_member) && !p->has_twin)
+        return js_snap_cow(ctx, p);
+    return 0;
+}
+
+static void js_snap_mark(JSContext *ctx, JSValueConst v, int depth)
+{
+    JSObject *p;
+    JSShape *sh;
+    JSShapeProperty *prs;
+    int i;
+
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
+        return;
+    p = JS_VALUE_GET_OBJ(v);
+    if (p->snap_member || p->class_id == JS_CLASS_GLOBAL_OBJECT ||
+        p->class_id == JS_CLASS_PROXY)
+        return;
+    p->snap_member = 1;
+    ctx->rt->snap_member_count++;
+    if (depth <= 0)
+        return;
+    sh = p->shape;
+    for (i = 0, prs = get_shape_prop(sh); i < sh->prop_count; i++, prs++) {
+        JSProperty *pr = &p->prop[i];
+        if (prs->atom == JS_ATOM_NULL)
+            continue;
+        if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
+            if (pr->u.getset.getter)
+                js_snap_mark(ctx, JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.getter), depth - 1);
+            if (pr->u.getset.setter)
+                js_snap_mark(ctx, JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.setter), depth - 1);
+        } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL) {
+            js_snap_mark(ctx, pr->u.value, depth - 1);
+        }
+    }
+}
+
+/* The global bindings author code has replaced, as browser code still
+   reads them, and the references browser closures hold for names that are
+   not variables yet; NULL until there is one. The table is the prototype
+   of the global object's hidden uninitialized-variables object, which is
+   only ever searched for its own properties, so the global object (and
+   with it every object) needs no field for it. */
+static JSObject *js_snap_kept_of(JSObject *g)
+{
+    if (JS_VALUE_GET_TAG(g->u.global_object.uninitialized_vars) != JS_TAG_OBJECT)
+        return NULL;
+    return JS_VALUE_GET_OBJ(g->u.global_object.uninitialized_vars)->shape->proto;
+}
+
+/* The binding of the global 'prop' that the browser kept because author
+   code replaced it, or NULL: none, or a reference still pending (which
+   names no binding of the browser's). */
+static JSShapeProperty *js_snap_kept_entry(JSObject *g, JSAtom prop,
+                                           JSProperty **ppr)
+{
+    JSObject *kept = js_snap_kept_of(g);
+    JSShapeProperty *prs;
+    if (!kept)
+        return NULL;
+    prs = find_own_property(ppr, kept, prop);
+    if (prs && (prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF &&
+        JS_IsUninitialized(*(*ppr)->u.var_ref->pvalue))
+        return NULL;
+    return prs;
+}
+
+static BOOL check_define_prop_flags(int prop_flags, int flags);
+static int js_update_property_flags(JSContext *ctx, JSObject *p,
+                                    JSShapeProperty **pprs, int flags);
+
+/* whether the global data binding 'prs'/'pr' (a variable or a value) is
+   writable: a variable's own flag is is_const */
+static BOOL js_snap_data_writable(JSShapeProperty *prs, JSProperty *pr)
+{
+    if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF)
+        return !pr->u.var_ref->is_const;
+    return (prs->flags & JS_PROP_WRITABLE) != 0;
+}
+
+static JSValueConst js_snap_data_value(JSShapeProperty *prs, JSProperty *pr)
+{
+    if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF)
+        return *pr->u.var_ref->pvalue;
+    return pr->u.value;
+}
+
+/* A kept binding that says browser code deleted the name in its view
+   alone (js_snap_kept_delete()): a reference marked is_pinned 3, which
+   reads undefined. No binding's shape or value says it, so a shared
+   global the browser set to undefined stays shared. It differs from every
+   binding of the page's, so the name stays unbound for the browser and
+   the page keeps its own. */
+static BOOL js_snap_kept_unbound(JSShapeProperty *prs, JSProperty *pr)
+{
+    return (prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF &&
+        pr->u.var_ref->is_pinned == 3;
+}
+
+/* Whether the page's binding 'prs'/'pr' of a global differs from the
+   browser's kept one 'kprs'/'kpr', as a member differs from its twin's
+   (js_snap_page_changed()): other attributes, an accessor against a value
+   or other functions, or another value. A variable and a value holding
+   the same are the same: a binding the page only named split off with
+   the same value and stays both views'. */
+static BOOL js_snap_global_differs(JSContext *ctx, JSShapeProperty *prs,
+                                   JSProperty *pr, JSShapeProperty *kprs,
+                                   JSProperty *kpr)
+{
+    int tmask = prs->flags & JS_PROP_TMASK;
+    BOOL getset = tmask == JS_PROP_GETSET;
+    if (js_snap_kept_unbound(kprs, kpr))
+        return TRUE;
+    if (tmask == JS_PROP_AUTOINIT) /* not created yet: nobody's change */
+        return FALSE;
+    if (getset != ((kprs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) ||
+        ((prs->flags ^ kprs->flags) &
+         (JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE)))
+        return TRUE;
+    if (getset)
+        return pr->u.getset.getter != kpr->u.getset.getter ||
+            pr->u.getset.setter != kpr->u.getset.setter;
+    return js_snap_data_writable(prs, pr) != js_snap_data_writable(kprs, kpr) ||
+        !js_same_value(ctx, js_snap_data_value(prs, pr),
+                       js_snap_data_value(kprs, kpr));
+}
+
+/* Rule 1 on the global object, as for a member. Author code replaced the
+   browser's binding of the global 'prop' (it is kept) and has changed it
+   since: its binding differs from the kept one, or it deleted it. Then
+   the browser's change is made to its kept binding alone: returns that,
+   else NULL (the binding is both views', and the change reaches both).
+   So the page keeps a binding it replaced, redefined or wrapped, and a
+   name it deleted stays deleted; neither is the page's binding copied
+   into the browser's view (it would hand browser closures the page's
+   value), nor is a page's setter called with the browser's value. */
+static JSShapeProperty *js_snap_global_page_changed(JSContext *ctx, JSObject *g,
+                                                    JSAtom prop,
+                                                    JSProperty **ppr)
+{
+    JSShapeProperty *prs, *kept;
+    JSProperty *pr;
+    if (!(kept = js_snap_kept_entry(g, prop, ppr)))
+        return NULL;
+    prs = find_own_property(&pr, g, prop);
+    if (!prs || js_snap_global_differs(ctx, prs, pr, kept, *ppr))
+        return kept;
+    return NULL;
+}
+
+/* A function browser code bound to the global 'prop' in its kept table
+   alone is an interface, as js_snap_after_write() marks one it binds on
+   the global object. */
+static void js_snap_mark_kept(JSContext *ctx, JSObject *g, JSAtom prop)
+{
+    JSProperty *pr;
+    JSShapeProperty *prs = js_snap_kept_entry(g, prop, &pr);
+    JSValueConst v;
+    if (!prs)
+        return;
+    switch (prs->flags & JS_PROP_TMASK) {
+    case JS_PROP_NORMAL:
+        v = pr->u.value;
+        break;
+    case JS_PROP_VARREF:
+        v = *pr->u.var_ref->pvalue;
+        break;
+    default:
+        return;
+    }
+    if (JS_IsFunction(ctx, v))
+        js_snap_mark(ctx, v, 3);
+}
+
+/* Browser code deletes the global 'prop', whose kept binding is
+   'prs'/'pr', and the page has changed it (js_snap_global_page_changed()).
+   In the browser's view the name is then unbound: the kept binding becomes
+   the unbound marker (js_snap_kept_unbound()), so that browser code
+   neither reads the page's binding nor the old one (a lazy placeholder
+   whose module is loading now), and its next assignment or definition
+   binds the name for it. The binding is changed in place, and an accessor
+   or value becomes a reference allocated before it is touched, so a
+   refusal leaves it as it was. */
+static int js_snap_kept_delete(JSContext *ctx, JSObject *g,
+                               JSShapeProperty *prs, JSProperty *pr)
+{
+    JSObject *kept = js_snap_kept_of(g);
+    JSVarRef *ref = NULL;
+    JSProperty old;
+    int old_flags = prs->flags;
+    if (!(prs->flags & JS_PROP_CONFIGURABLE))
+        return FALSE;
+    if ((prs->flags & JS_PROP_TMASK) != JS_PROP_VARREF &&
+        !(ref = js_create_var_ref(ctx, FALSE)))
+        return -1;
+    if (js_update_property_flags(ctx, kept, &prs,
+                                 JS_PROP_VARREF | JS_PROP_CONFIGURABLE |
+                                 JS_PROP_WRITABLE)) {
+        if (ref)
+            free_var_ref(ctx->rt, ref);
+        return -1;
+    }
+    if (ref) {
+        /* browser closures read an accessor or value through the table */
+        old = *pr;
+        pr->u.var_ref = ref;
+        free_property(ctx->rt, &old, old_flags);
+    } else {
+        /* the reference browser closures hold reads undefined */
+        set_value(ctx, pr->u.var_ref->pvalue, JS_UNDEFINED);
+        pr->u.var_ref->is_const = FALSE;
+    }
+    pr->u.var_ref->is_pinned = 3;
+    return TRUE;
+}
+
+/* A data definition of a kept variable 'prs'/'pr' of the kept table: made
+   to the variable in place, as the global object makes it. (The table is
+   an ordinary object, where making a reference read-only would detach it
+   from the closures that hold it.) */
+static int js_snap_kept_define_var(JSContext *ctx, JSObject *kept,
+                                   JSShapeProperty *prs, JSProperty *pr,
+                                   JSValueConst val, int flags)
+{
+    JSVarRef *ref = pr->u.var_ref;
+    int mask = 0;
+    if (!check_define_prop_flags(prs->flags, flags) ||
+        (!(prs->flags & JS_PROP_CONFIGURABLE) && ref->is_const &&
+         (flags & JS_PROP_HAS_VALUE) && !js_same_value(ctx, val, *ref->pvalue)))
+        return JS_ThrowTypeErrorOrFalse(ctx, flags, "property is not configurable");
+    if (flags & JS_PROP_HAS_CONFIGURABLE)
+        mask |= JS_PROP_CONFIGURABLE;
+    if (flags & JS_PROP_HAS_ENUMERABLE)
+        mask |= JS_PROP_ENUMERABLE;
+    if (flags & JS_PROP_HAS_WRITABLE)
+        mask |= JS_PROP_WRITABLE;
+    if (js_update_property_flags(ctx, kept, &prs,
+                                 (prs->flags & ~mask) | (flags & mask)))
+        return -1;
+    if (flags & JS_PROP_HAS_VALUE)
+        set_value(ctx, ref->pvalue, JS_DupValue(ctx, val));
+    if (flags & JS_PROP_HAS_WRITABLE)
+        ref->is_const = !(flags & JS_PROP_WRITABLE);
+    ref->is_pinned = 0; /* bound again (js_snap_kept_unbound()) */
+    return TRUE;
+}
+
+/* Browser code defines the global 'prop', whose kept binding is 'prs'/'pr',
+   and the page has changed it (js_snap_global_page_changed()): the
+   definition is made to the kept binding alone. Browser closures' reference
+   changes only with a definition that was made. */
+static int js_snap_kept_define(JSContext *ctx, JSObject *g, JSAtom prop,
+                               JSShapeProperty *prs, JSProperty *pr,
+                               JSValueConst val, JSValueConst getter,
+                               JSValueConst setter, int flags)
+{
+    JSObject *kept = js_snap_kept_of(g);
+    int ret;
+    if ((prs->flags & JS_PROP_TMASK) != JS_PROP_VARREF) {
+        ret = JS_DefineProperty_impl(ctx, JS_MKPTR(JS_TAG_OBJECT, kept),
+                                     prop, val, getter, setter, flags);
+    } else if (!(flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET))) {
+        ret = js_snap_kept_define_var(ctx, kept, prs, pr, val, flags);
+    } else {
+        JSVarRef *ref = pr->u.var_ref;
+        js_rc(ref)->ref_count++;
+        ret = JS_DefineProperty_impl(ctx, JS_MKPTR(JS_TAG_OBJECT, kept),
+                                     prop, val, getter, setter, flags);
+        /* no longer a variable: closures holding the reference fall back
+           to the property, which is read through the kept table */
+        if (ret > 0) {
+            set_value(ctx, ref->pvalue, JS_UNINITIALIZED);
+            ref->is_pinned = 0;
+        }
+        free_var_ref(ctx->rt, ref);
+    }
+    if (ret > 0)
+        js_snap_mark_kept(ctx, g, prop);
+    return ret;
+}
+
+/* whether the global 'prop' of g is a variable already */
+static BOOL js_snap_global_is_variable(JSObject *g, JSAtom prop)
+{
+    JSProperty *pr;
+    JSShapeProperty *prs = find_own_property(&pr, g, prop);
+    return prs && (prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF;
+}
+
+/* The global object's kept bindings, created on first use. */
+static JSObject *js_snap_kept_globals(JSContext *ctx, JSObject *g)
+{
+    JSObject *kept = js_snap_kept_of(g);
+    if (!kept) {
+        JSValue table;
+        int ret;
+        if (JS_VALUE_GET_TAG(g->u.global_object.uninitialized_vars) != JS_TAG_OBJECT)
+            return NULL;
+        table = JS_NewObjectProto(ctx, JS_NULL);
+        if (JS_IsException(table))
+            return NULL;
+        ret = JS_SetPrototypeInternal(ctx, g->u.global_object.uninitialized_vars,
+                                      table, FALSE);
+        JS_FreeValue(ctx, table);
+        if (ret <= 0)
+            return NULL;
+        kept = js_snap_kept_of(g);
+    }
+    return kept;
+}
+
+/* Author code is about to rebind the global 'prs'/'pr' of g: by naming
+   it, assigning it, or with 'redefine' redefining or deleting it. A global
+   the browser reads by name (an object-valued variable, or an accessor the
+   browser defined) keeps its binding for browser code: the reference every
+   browser closure already holds moves to the kept table and the property
+   gets a fresh one with the same value, which is what author closures
+   bind and write from now on; an accessor is copied to the kept table. */
+static __attribute__((noinline)) int js_snap_keep_global(JSContext *ctx, JSObject *g,
+                                                         JSShapeProperty *prs, JSProperty *pr,
+                                                         BOOL redefine)
+{
+    JSObject *kept;
+    JSProperty *pr1;
+    int tmask = prs->flags & JS_PROP_TMASK;
+
+    if (tmask == JS_PROP_VARREF) {
+        if (pr->u.var_ref->is_pinned != 1)
+            return 0;
+    } else if (tmask != JS_PROP_GETSET || !redefine ||
+               !((pr->u.getset.getter && pr->u.getset.getter->snap_member) ||
+                 (pr->u.getset.setter && pr->u.getset.setter->snap_member))) {
+        /* An assignment leaves an accessor global in place (its setter
+           runs), and one the browser did not define is the page's window
+           state. An accessor the browser defined (a lazy placeholder, a
+           named property) that author code redefines or deletes stays
+           the browser's: browser code that names it, or reads it from the
+           global object, reaches the kept copy. */
+        return 0;
+    }
+    kept = js_snap_kept_globals(ctx, g);
+    if (!kept)
+        return -1;
+    {
+        JSShapeProperty *prs1 = find_own_property(&pr1, kept, prs->atom);
+        if (prs1) {
+            if ((prs1->flags & JS_PROP_TMASK) != JS_PROP_VARREF ||
+                !JS_IsUninitialized(*pr1->u.var_ref->pvalue))
+                return 0; /* kept already */
+            /* a pending reference of browser closures: they read the
+               property, so the binding kept below is what they get */
+            if (delete_property_impl(ctx, kept, prs->atom) < 0)
+                return -1;
+        }
+    }
+    if (tmask == JS_PROP_VARREF) {
+        JSVarRef *page = js_create_var_ref(ctx, FALSE);
+        if (!page)
+            return -1;
+        pr1 = add_property(ctx, kept, prs->atom,
+                           (prs->flags & JS_PROP_C_W_E) | JS_PROP_VARREF);
+        if (!pr1) {
+            free_var_ref(ctx->rt, page);
+            return -1;
+        }
+        page->value = JS_DupValue(ctx, *pr->u.var_ref->pvalue);
+        page->is_const = pr->u.var_ref->is_const;
+        pr1->u.var_ref = pr->u.var_ref;
+        pr->u.var_ref = page;
+    } else {
+        if (js_snap_copy_property(ctx, JS_MKPTR(JS_TAG_OBJECT, kept), prs, pr) < 0)
+            return -1;
+    }
+    g->has_twin = 1;
+    return 0;
+}
+
+/* An author closure or declaration is about to name the global 'name'. */
+static int js_snap_before_author_bind(JSContext *ctx, JSObject *g, JSAtom name)
+{
+    JSShapeProperty *prs;
+    JSProperty *pr;
+ redo:
+    prs = find_own_property(&pr, g, name);
+    if (!prs)
+        return 0;
+    if (unlikely((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT)) {
+        if (JS_AutoInitProperty(ctx, g, name, pr, prs))
+            return -1;
+        goto redo;
+    }
+    if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF &&
+        unlikely(pr->u.var_ref->is_pinned == 1))
+        return js_snap_keep_global(ctx, g, prs, pr, FALSE);
+    return 0;
+}
+
+static int js_snap_before_global_write(JSContext *ctx, JSObject *g, JSAtom prop,
+                                       BOOL redefine)
+{
+    JSProperty *pr;
+    JSShapeProperty *prs;
+ redo:
+    prs = find_own_property(&pr, g, prop);
+    if (!prs)
+        return 0;
+    if (unlikely((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT)) {
+        /* an engine global not created yet: the browser's once it is */
+        if (JS_AutoInitProperty(ctx, g, prop, pr, prs))
+            return -1;
+        goto redo;
+    }
+    return js_snap_keep_global(ctx, g, prs, pr, redefine);
+}
+
+/* Browser code changed the global 'prop' of g, whose property is now
+   'prs'/'pr' (NULL: deleted). What browser code reads must be the new
+   binding, also where author code had replaced the old one. */
+static int js_snap_after_global_write(JSContext *ctx, JSObject *g, JSAtom prop,
+                                      JSShapeProperty *prs, JSProperty *pr,
+                                      BOOL created)
+{
+    JSObject *kept;
+    JSShapeProperty *prs1;
+    JSProperty *pr1;
+    int tmask = prs ? (prs->flags & JS_PROP_TMASK) : -1;
+
+    if ((kept = js_snap_kept_of(g)) != NULL) {
+        prs1 = find_own_property(&pr1, kept, prop);
+        if (prs1) {
+            BOOL kept_ref = (prs1->flags & JS_PROP_TMASK) == JS_PROP_VARREF;
+            if (kept_ref && tmask == JS_PROP_VARREF &&
+                JS_IsUninitialized(*pr1->u.var_ref->pvalue) &&
+                js_rc(pr->u.var_ref)->ref_count == 1) {
+                /* A variable for a name browser closures were waiting
+                   for, and no author closure holds its reference: their
+                   pending reference becomes the variable's. */
+                JSVarRef *pending = pr1->u.var_ref, *fresh = pr->u.var_ref;
+                pending->value = JS_DupValue(ctx, fresh->value);
+                pending->is_const = fresh->is_const;
+                pending->is_pinned =
+                    JS_VALUE_GET_TAG(pending->value) == JS_TAG_OBJECT;
+                js_rc(pending)->ref_count++;
+                pr->u.var_ref = pending;
+                free_var_ref(ctx->rt, fresh);
+                return delete_property_impl(ctx, kept, prop) < 0 ? -1 : 0;
+            }
+            if (kept_ref && (tmask == JS_PROP_VARREF || tmask == JS_PROP_NORMAL)) {
+                /* the reference browser closures hold takes the value and
+                   the attributes, so the binding stays both views' (a
+                   difference would keep later browser changes from the
+                   page: js_snap_global_page_changed()); the property's
+                   stays the one author closures hold */
+                BOOL writable = js_snap_data_writable(prs, pr);
+                if (js_update_property_flags(ctx, kept, &prs1,
+                        JS_PROP_VARREF |
+                        (prs->flags & (JS_PROP_CONFIGURABLE |
+                                       JS_PROP_ENUMERABLE)) |
+                        (writable ? JS_PROP_WRITABLE : 0)))
+                    return -1;
+                pr1->u.var_ref->is_const = !writable;
+                set_value(ctx, pr1->u.var_ref->pvalue,
+                          JS_DupValue(ctx, tmask == JS_PROP_VARREF ?
+                                      *pr->u.var_ref->pvalue : pr->u.value));
+                g->has_twin = 1;
+                return 0;
+            }
+            if (kept_ref && JS_IsUninitialized(*pr1->u.var_ref->pvalue))
+                goto pin; /* still pending: browser code reads the property */
+            if (kept_ref) {
+                /* no longer a variable: closures holding the reference
+                   fall back to the property, which is read through here */
+                set_value(ctx, pr1->u.var_ref->pvalue, JS_UNINITIALIZED);
+            }
+            if (delete_property_impl(ctx, kept, prop) < 0)
+                return -1;
+            if (tmask == JS_PROP_VARREF) {
+                JSVarRef *ref = js_create_var_ref(ctx, FALSE);
+                if (!ref)
+                    return -1;
+                pr1 = add_property(ctx, kept, prop,
+                                   (prs->flags & JS_PROP_C_W_E) | JS_PROP_VARREF);
+                if (!pr1) {
+                    free_var_ref(ctx->rt, ref);
+                    return -1;
+                }
+                ref->value = JS_DupValue(ctx, *pr->u.var_ref->pvalue);
+                ref->is_const = pr->u.var_ref->is_const;
+                pr1->u.var_ref = ref;
+            } else if (prs &&
+                       js_snap_copy_property(ctx, JS_MKPTR(JS_TAG_OBJECT, kept),
+                                             prs, pr) < 0) {
+                return -1;
+            }
+            return 0;
+        }
+    }
+    /* Not replaced by author code. A variable this write created is the
+       browser's new binding and is pinned; after the snapshot, if
+       something else holds its reference, author closures named it while
+       it did not exist: they keep that reference, and the browser gets
+       one of its own. A variable that existed keeps its standing: pinned,
+       or the page's state. */
+ pin:
+    if (tmask == JS_PROP_VARREF && !created) {
+        /* nothing: see above */
+    } else if (tmask == JS_PROP_VARREF) {
+        BOOL is_object = JS_VALUE_GET_TAG(*pr->u.var_ref->pvalue) == JS_TAG_OBJECT;
+        if (is_object && pr->u.var_ref->is_pinned != 2 && ctx->snap_active &&
+            js_rc(pr->u.var_ref)->ref_count > 1) {
+            JSVarRef *ref;
+            kept = js_snap_kept_globals(ctx, g);
+            if (!kept)
+                return -1;
+            if (find_own_property(&pr1, kept, prop) &&
+                delete_property_impl(ctx, kept, prop) < 0)
+                return -1;
+            ref = js_create_var_ref(ctx, FALSE);
+            if (!ref)
+                return -1;
+            pr1 = add_property(ctx, kept, prop,
+                               (prs->flags & JS_PROP_C_W_E) | JS_PROP_VARREF);
+            if (!pr1) {
+                free_var_ref(ctx->rt, ref);
+                return -1;
+            }
+            ref->value = JS_DupValue(ctx, *pr->u.var_ref->pvalue);
+            ref->is_const = pr->u.var_ref->is_const;
+            pr1->u.var_ref = ref;
+            pr->u.var_ref->is_pinned = FALSE;
+            g->has_twin = 1;
+        } else if (pr->u.var_ref->is_pinned != 2) {
+            pr->u.var_ref->is_pinned = is_object;
+        }
+    } else if (tmask == JS_PROP_GETSET) {
+        if (pr->u.getset.getter)
+            js_snap_mark(ctx, JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.getter), 0);
+        if (pr->u.getset.setter)
+            js_snap_mark(ctx, JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.setter), 0);
+    }
+    return 0;
+}
+
+/* Browser code changed 'prop' of p, an interface object or the global
+   object of a realm with a snapshot: the twin follows, and a function it
+   published is an interface too. */
+static __attribute__((noinline)) int js_snap_after_write(JSContext *ctx, JSObject *p, JSAtom prop,
+                                                         BOOL created)
+{
+    JSShapeProperty *prs;
+    JSProperty *pr;
+    BOOL is_global = (p->class_id == JS_CLASS_GLOBAL_OBJECT);
+
+    if (is_global && !ctx->snap_planned)
+        return 0;
+ redo:
+    prs = find_own_property(&pr, p, prop);
+    if (prs && (prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT && p->has_twin) {
+        if (JS_AutoInitProperty(ctx, p, prop, pr, prs))
+            return -1;
+        goto redo;
+    }
+    if (is_global) {
+        if (js_snap_after_global_write(ctx, p, prop, prs, pr, created) < 0)
+            return -1;
+    } else if (p->has_twin) {
+        JSObject *twin = js_snap_twin_of(ctx->rt, p);
+        if (twin != p) {
+            if (!prs) {
+                if (delete_property_impl(ctx, twin, prop) < 0)
+                    return -1;
+            } else if (js_snap_copy_property(ctx, JS_MKPTR(JS_TAG_OBJECT, twin),
+                                             prs, pr) < 0) {
+                return -1;
+            }
+        }
+    }
+    if (!prs)
+        return 0;
+    if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
+        if (!is_global) {
+            if (pr->u.getset.getter)
+                js_snap_mark(ctx, JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.getter), 0);
+            if (pr->u.getset.setter)
+                js_snap_mark(ctx, JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.setter), 0);
+        }
+    } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL) {
+        if (!is_global)
+            js_snap_mark(ctx, pr->u.value, 1);
+        else if (JS_IsFunction(ctx, pr->u.value))
+            js_snap_mark(ctx, pr->u.value, 3);
+    } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
+        if (is_global && JS_IsFunction(ctx, *pr->u.var_ref->pvalue))
+            js_snap_mark(ctx, *pr->u.var_ref->pvalue, 3);
+    }
+    return 0;
+}
+
+/* Browser code is about to change 'prop' of the interface object p, which
+   has a twin. If author code changed that property since (p's own differs
+   from the twin's: another value or accessor, other attributes, added or
+   deleted), or the member is new and author code made p non-extensible,
+   the page keeps what it made and the browser's change is made in the
+   browser's view alone: returns the twin to change instead, else NULL. So
+   a module that loads after a page wrapped a member neither takes the
+   page's wrapper away nor fails on a member, or an object, the page
+   froze. */
+static __attribute__((noinline)) JSObject *js_snap_page_changed(JSContext *ctx, JSObject *p,
+                                                                JSAtom prop)
+{
+    JSObject *twin = js_snap_twin_of(ctx->rt, p);
+    JSShapeProperty *prs, *prs1;
+    JSProperty *pr, *pr1;
+
+    if (twin == p)
+        return NULL;
+    prs = find_own_property(&pr, p, prop);
+    prs1 = find_own_property(&pr1, twin, prop);
+    if (!prs && !prs1) /* a new member author code made p refuse */
+        return !p->extensible && twin->extensible ? twin : NULL;
+    if (!prs || !prs1)
+        return twin;
+    if ((prs->flags ^ prs1->flags) & (JS_PROP_TMASK | JS_PROP_C_W_E)) {
+        /* a member not created yet is nobody's change */
+        if ((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT)
+            return NULL;
+        return twin;
+    }
+    switch (prs->flags & JS_PROP_TMASK) {
+    case JS_PROP_NORMAL:
+        return js_same_value(ctx, pr->u.value, pr1->u.value) ? NULL : twin;
+    case JS_PROP_GETSET:
+        return pr->u.getset.getter == pr1->u.getset.getter &&
+            pr->u.getset.setter == pr1->u.getset.setter ? NULL : twin;
+    default:
+        return NULL;
+    }
+}
+
+/* a function browser code published as 'prop' of an interface object's
+   twin alone is an interface too */
+static void js_snap_mark_published(JSContext *ctx, JSObject *twin, JSAtom prop)
+{
+    JSProperty *pr;
+    JSShapeProperty *prs = find_own_property(&pr, twin, prop);
+    if (!prs)
+        return;
+    if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
+        if (pr->u.getset.getter)
+            js_snap_mark(ctx, JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.getter), 0);
+        if (pr->u.getset.setter)
+            js_snap_mark(ctx, JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.setter), 0);
+    } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL) {
+        js_snap_mark(ctx, pr->u.value, 1);
+    }
+}
+
+/* Marks the interfaces as they are now: every class prototype, and every
+   function the global object holds with its prototype and their methods.
+   Functions the browser's script publishes later are marked as it defines
+   them. The global object itself and plain objects it holds (document,
+   navigator) are not interfaces: author code's changes to them are the
+   page's state. */
+void JS_SnapshotInterfaces(JSContext *ctx)
+{
+    JSObject *g = JS_VALUE_GET_OBJ(ctx->global_obj);
+    JSShape *sh = g->shape;
+    JSShapeProperty *prs;
+    int i;
+
+    for (i = 0; i < ctx->rt->class_count; i++)
+        js_snap_mark(ctx, ctx->class_proto[i], 2);
+    for (i = 0, prs = get_shape_prop(sh); i < sh->prop_count; i++, prs++) {
+        JSProperty *pr = &g->prop[i];
+        if (prs->atom == JS_ATOM_NULL)
+            continue;
+        if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
+            if (JS_IsFunction(ctx, *pr->u.var_ref->pvalue))
+                js_snap_mark(ctx, *pr->u.var_ref->pvalue, 3);
+            /* the browser reads its object-valued globals by name */
+            if (JS_VALUE_GET_TAG(*pr->u.var_ref->pvalue) == JS_TAG_OBJECT &&
+                pr->u.var_ref->is_pinned != 2)
+                pr->u.var_ref->is_pinned = 1;
+        } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL) {
+            if (JS_IsFunction(ctx, pr->u.value))
+                js_snap_mark(ctx, pr->u.value, 3);
+        } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
+            /* marks the accessor as the browser's (js_snap_keep_global) */
+            if (pr->u.getset.getter)
+                js_snap_mark(ctx, JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.getter), 0);
+            if (pr->u.getset.setter)
+                js_snap_mark(ctx, JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.setter), 0);
+        }
+    }
+    ctx->snap_active = 1;
+    ctx->snap_planned = 1;
+    ctx->rt->snap_enabled = 1;
+}
+
+/* Announces JS_SnapshotInterfaces() for this realm before any browser
+   code is created in it, so that browser closures naming a global that is
+   not a variable yet (a lazily defined class) do not share a pending
+   reference with author closures. */
+void JS_PlanInterfaceSnapshot(JSContext *ctx)
+{
+    ctx->snap_planned = 1;
+    ctx->rt->snap_enabled = 1;
+}
+
+/* The global variable 'name' is the page's to replace for the browser
+   too (an embedder test seam): it is never pinned. */
+void JS_LeaveGlobalToPage(JSContext *ctx, const char *name)
+{
+    JSObject *g = JS_VALUE_GET_OBJ(ctx->global_obj);
+    JSAtom atom = JS_NewAtom(ctx, name);
+    JSShapeProperty *prs;
+    JSProperty *pr;
+    if (atom == JS_ATOM_NULL)
+        return;
+    prs = find_own_property(&pr, g, atom);
+    if (prs && (prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF)
+        pr->u.var_ref->is_pinned = 2;
+    JS_FreeAtom(ctx, atom);
+}
+
+/* a namespace object (Math, JSON, console...) the embedder names */
+void JS_SnapshotObject(JSContext *ctx, JSValueConst obj)
+{
+    js_snap_mark(ctx, obj, 2);
+}
+
+/* An embedder native (a plain C function) is browser code whoever calls
+   it: what it reads and changes on the interfaces and the global object is
+   the browser's. */
+void JS_MarkBrowserNative(JSContext *ctx, JSValueConst func)
+{
+    JSObject *p;
+    (void) ctx;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT)
+        return;
+    p = JS_VALUE_GET_OBJ(func);
+    if (p->class_id == JS_CLASS_C_FUNCTION)
+        p->u.cfunc.cproto |= JS_CFUNC_BROWSER_NATIVE;
+}
+
+/* Makes a script function browser code (a test's stand-in for a piece of
+   the browser's own script). Every closure of the same function is
+   affected. Only an embedder's test builds call this. */
+void JS_MarkBrowserFunction(JSContext *ctx, JSValueConst func)
+{
+    JSObject *p;
+    (void) ctx;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT)
+        return;
+    p = JS_VALUE_GET_OBJ(func);
+    if (js_class_has_bytecode(p->class_id))
+        p->u.func.function_bytecode->trusted = 1;
+}
+
+/* An embedder native that does the browser's own work when author code
+   calls it (loading a module on first use) brackets that work: until
+   JS_LeaveBrowserCode(), it and the engine natives it calls read and
+   change the interfaces as browser code. Script it calls is judged by its
+   own frames. Returns the token JS_LeaveBrowserCode() takes.
+   The bracket is a view of its own, as a promise job's is: frames from
+   the current one down are browser code, also when there is none (a
+   frameless native a promise job calls). The token holds the view it
+   replaces: the frame, with the view (0..3) in its low bits, which a
+   frame's alignment leaves clear. */
+void *JS_EnterBrowserCode(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+    uintptr_t previous = (uintptr_t)rt->snap_job_frame;
+    _Static_assert(_Alignof(JSStackFrame) >= 4, "the token's view bits");
+    assert(rt->snap_job_view <= 3);
+    previous |= rt->snap_job_view;
+    rt->snap_job_view = 1 + 1;
+    rt->snap_job_frame = rt->current_stack_frame;
+    rt->snap_install_depth++;
+    return (void *)previous;
+}
+
+void JS_LeaveBrowserCode(JSContext *ctx, void *previous)
+{
+    JSRuntime *rt = ctx->rt;
+    uintptr_t token = (uintptr_t)previous;
+    rt->snap_job_view = (uint8_t)(token & 3);
+    rt->snap_job_frame = (JSStackFrame *)(token & ~(uintptr_t)3);
+    rt->snap_install_depth--;
+}
+
+/* While set, embedder code running outside any script reads and changes
+   the interfaces as author code does (an instrument that must see, or
+   replace, what the page sees). */
+void JS_SetEmbedderPageView(JSRuntime *rt, int page_view)
+{
+    rt->snap_embedder_page_view = page_view != 0;
+}
+
+void JS_GetSnapshotCounts(JSContext *ctx, uint32_t *pmembers, uint32_t *ptwins)
+{
+    *pmembers = ctx->rt->snap_member_count;
+    *ptwins = ctx->rt->snap_twin_count;
+}
+
+/* The own property 'prop' of the global object as browser code's reads
+   of the global see it: the binding the browser kept where author code
+   replaced it, else the property. (Own-property reflection on the global
+   object is live: JS_GetOwnProperty() returns the page's binding.)
+   Returns -1, FALSE or TRUE as JS_GetOwnProperty() does. */
+int JS_GetBrowserGlobalProperty(JSContext *ctx, JSPropertyDescriptor *desc,
+                                JSAtom prop)
+{
+    JSObject *g = JS_VALUE_GET_OBJ(ctx->global_obj);
+    JSProperty *pr;
+    if (g->has_twin && js_snap_kept_entry(g, prop, &pr))
+        g = js_snap_kept_of(g);
+    return JS_GetOwnPropertyInternal(ctx, desc, g, prop);
+}
+
 
 JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                                JSAtom prop, JSValueConst this_obj,
@@ -9688,11 +11025,21 @@ JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
     }
 
     for(;;) {
+        if (unlikely(p->has_twin))
+            p = js_snap_resolve(ctx, p, prop);
         prs = find_own_property(&pr, p, prop);
         if (prs) {
             /* found */
             if (unlikely(prs->flags & JS_PROP_TMASK)) {
                 if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
+                    if (pr->u.getset.getter &&
+                        unlikely(js_snap_is_author_function(pr->u.getset.getter))) {
+                        JSObject *q = js_snap_interface_member(ctx, p, prop);
+                        if (q) {
+                            p = q;
+                            continue;
+                        }
+                    }
                     TF_CENSUS_PATH(ctx->rt, JS_CENSUS_GET_GETTER);
                     return js_call_property_getter(ctx, pr, this_obj);
                 } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
@@ -9707,6 +11054,13 @@ JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                     continue;
                 }
             } else {
+                if (unlikely(js_snap_is_author_function_value(pr->u.value))) {
+                    JSObject *q = js_snap_interface_member(ctx, p, prop);
+                    if (q) {
+                        p = q;
+                        continue;
+                    }
+                }
                 return JS_DupValue(ctx, pr->u.value);
             }
         }
@@ -10033,6 +11387,8 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
     /* clear pointer for consistency in case of failure */
     *ptab = NULL;
     *plen = 0;
+    if (unlikely(p->has_twin))
+        p = js_snap_resolve(ctx, p, JS_ATOM_NULL);
 
     /* compute the number of returned properties */
     num_keys_count = 0;
@@ -10239,6 +11595,10 @@ static int JS_GetOwnPropertyInternal(JSContext *ctx, JSPropertyDescriptor *desc,
     JSShapeProperty *prs;
     JSProperty *pr;
 
+    /* own-property reflection on the global object is always live: the
+       browser manages the window's named properties with it */
+    if (unlikely(p->has_twin) && p->class_id != JS_CLASS_GLOBAL_OBJECT)
+        p = js_snap_resolve(ctx, p, prop);
 retry:
     prs = find_own_property(&pr, p, prop);
     if (prs) {
@@ -10364,6 +11724,16 @@ int JS_PreventExtensions(JSContext *ctx, JSValueConst obj)
             }
         }
     }
+    /* Tilefinch interface snapshot: extensibility is part of each view.
+       Author code's change is copied on write (the twin stays
+       extensible, so the browser can still add its members there);
+       browser code's own reaches its view too. */
+    if (unlikely(p->snap_member) && p->extensible) {
+        if (js_snap_before_write(ctx, p))
+            return -1;
+        if (p->has_twin && js_snap_browser_write(ctx, p))
+            js_snap_twin_of(ctx->rt, p)->extensible = FALSE;
+    }
     p->extensible = FALSE;
     return TRUE;
 }
@@ -10379,6 +11749,8 @@ int JS_HasProperty(JSContext *ctx, JSValueConst obj, JSAtom prop)
         return FALSE;
     p = JS_VALUE_GET_OBJ(obj);
     for(;;) {
+        if (unlikely(p->has_twin) && p->class_id != JS_CLASS_GLOBAL_OBJECT)
+            p = js_snap_resolve(ctx, p, prop);
         if (p->is_exotic) {
             const JSClassExoticMethods *em = ctx->rt->class_array[p->class_id].exotic;
             if (em && em->has_property) {
@@ -10614,6 +11986,7 @@ static JSProperty *add_property(JSContext *ctx,
     JSShape *sh, *new_sh;
 
     if (js_own_closure_metadata(ctx, p)) return NULL;
+    if (js_snap_before_write(ctx, p)) return NULL;
     if (unlikely(__JS_AtomIsTaggedInt(prop))) {
         /* update is_std_array_prototype */
         if (unlikely(p->is_std_array_prototype)) {
@@ -11189,7 +12562,42 @@ static int remove_global_object_property(JSContext *ctx, JSObject *p,
     return 0;
 }
 
+static int delete_property_impl(JSContext *ctx, JSObject *p, JSAtom atom);
+
+/* Tilefinch interface snapshot: browser code's own change to an object
+   author code already changed reaches the browser's view of it too */
 static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom)
+{
+    int ret;
+    BOOL follow = FALSE;
+    if (unlikely(p->class_id == JS_CLASS_GLOBAL_OBJECT)) {
+        follow = js_snap_trusted(ctx);
+        if (!follow && js_snap_before_global_write(ctx, p, atom, TRUE) < 0)
+            return -1;
+        if (follow && unlikely(p->has_twin)) {
+            JSProperty *pr1;
+            JSShapeProperty *prs1 =
+                js_snap_global_page_changed(ctx, p, atom, &pr1);
+            if (prs1)
+                return js_snap_kept_delete(ctx, p, prs1, pr1);
+        }
+    } else if (unlikely(p->has_twin)) {
+        follow = js_snap_browser_write(ctx, p);
+        if (follow) {
+            JSObject *twin = js_snap_page_changed(ctx, p, atom);
+            if (twin)
+                return delete_property_impl(ctx, twin, atom);
+        }
+    }
+    ret = delete_property_impl(ctx, p, atom);
+    /* only a change that was made (a refused one changed nothing) */
+    if (unlikely(follow) && ret > 0 &&
+        js_snap_after_write(ctx, p, atom, FALSE) < 0)
+        return -1;
+    return ret;
+}
+
+static int delete_property_impl(JSContext *ctx, JSObject *p, JSAtom atom)
 {
     JSShape *sh;
     JSShapeProperty *pr, *lpr, *prop;
@@ -11200,6 +12608,7 @@ static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom)
     if (p->shared_closure_metadata
         && (atom == JS_ATOM_length || atom == JS_ATOM_name)
         && js_own_closure_metadata(ctx, p)) return -1;
+    if (js_snap_before_write(ctx, p)) return -1;
  redo:
     sh = p->shape;
     h1 = atom & sh->prop_hash_mask;
@@ -11445,6 +12854,8 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
     uint64_t minimum_bytes, requested_bytes, headroom;
     size_t slack;
     JSValue *new_array_prop;
+    if (js_snap_before_write(ctx, p))
+        return -1;
     BOOL headroom_limited = FALSE;
     if (unlikely(ctx->rt->fast_array_byte_limit != 0)
         && sizeof(JSValue) * (uint64_t) new_len
@@ -11766,7 +13177,127 @@ static void js_free_desc(JSContext *ctx, JSPropertyDescriptor *desc)
    freed by the function. 'flags' is a bitmask of JS_PROP_THROW and
    JS_PROP_THROW_STRICT. 'this_obj' is the receiver. If obj !=
    this_obj, then obj must be an object (Reflect.set case). */
+static int JS_SetPropertyInternal_impl(JSContext *ctx, JSValueConst obj,
+                           JSAtom prop, JSValue val, JSValueConst this_obj, int flags);
+
+/* Browser code assigns the global 'prop', whose kept binding is
+   'prs'/'pr', and the page has changed it (js_snap_global_page_changed()):
+   the assignment is made to the kept binding alone. A name unbound in the
+   browser's view is bound as an assignment creates a global. 'val' is
+   freed. */
+static int js_snap_kept_set(JSContext *ctx, JSObject *g, JSAtom prop,
+                            JSShapeProperty *prs, JSProperty *pr, JSValue val,
+                            JSValueConst this_obj, int flags)
+{
+    int tmask = prs->flags & JS_PROP_TMASK;
+    switch (tmask) {
+    case JS_PROP_GETSET:
+        /* the browser's own accessor */
+        return call_setter(ctx, pr->u.getset.setter, this_obj, val, flags);
+    case JS_PROP_VARREF:
+    case JS_PROP_NORMAL:
+        if (!js_snap_data_writable(prs, pr))
+            goto read_only;
+        if (js_snap_kept_unbound(prs, pr)) {
+            if (js_update_property_flags(ctx, js_snap_kept_of(g), &prs,
+                                         tmask | JS_PROP_C_W_E)) {
+                JS_FreeValue(ctx, val);
+                return -1;
+            }
+            pr->u.var_ref->is_pinned = 0;
+        }
+        set_value(ctx, tmask == JS_PROP_VARREF ? pr->u.var_ref->pvalue :
+                  &pr->u.value, val);
+        break;
+    default:
+        goto read_only;
+    }
+    js_snap_mark_kept(ctx, g, prop);
+    return TRUE;
+ read_only:
+    JS_FreeValue(ctx, val);
+    return JS_ThrowTypeErrorReadOnly(ctx, flags, prop);
+}
+
 int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
+                           JSAtom prop, JSValue val, JSValueConst this_obj, int flags)
+{
+    int ret;
+    BOOL follow = FALSE, created = FALSE;
+    if (JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT) {
+        JSObject *p = JS_VALUE_GET_OBJ(this_obj);
+        if (unlikely(p->snap_member || p->class_id == JS_CLASS_GLOBAL_OBJECT)) {
+            follow = p->class_id == JS_CLASS_GLOBAL_OBJECT ?
+                js_snap_trusted(ctx) : js_snap_browser_write(ctx, p);
+            if (p->class_id == JS_CLASS_GLOBAL_OBJECT) {
+                if (!follow) {
+                    if (js_snap_before_global_write(ctx, p, prop, FALSE) < 0) {
+                        JS_FreeValue(ctx, val);
+                        return -1;
+                    }
+                } else {
+                    created = !js_snap_global_is_variable(p, prop);
+                }
+            }
+        }
+    }
+    if (unlikely(follow)) {
+        JSObject *p = JS_VALUE_GET_OBJ(this_obj), *twin;
+        if (p->has_twin && p->class_id == JS_CLASS_GLOBAL_OBJECT &&
+            JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT &&
+            JS_VALUE_GET_OBJ(obj) == p) {
+            JSProperty *pr1;
+            JSShapeProperty *prs1 =
+                js_snap_global_page_changed(ctx, p, prop, &pr1);
+            if (prs1)
+                return js_snap_kept_set(ctx, p, prop, prs1, pr1, val,
+                                        this_obj, flags);
+        }
+        if (p->has_twin && p->class_id != JS_CLASS_GLOBAL_OBJECT &&
+            (twin = js_snap_page_changed(ctx, p, prop)) != NULL) {
+            /* The page's member stays; the browser's view takes the value
+               as a data property of its own, or its accessor there is
+               called on p. */
+            JSProperty *pr1;
+            JSShapeProperty *prs1 = find_own_property(&pr1, twin, prop);
+            if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT ||
+                JS_VALUE_GET_OBJ(obj) != p) {
+                /* A receiver set (Reflect.set, super.x = v): what it
+                   defines on p goes to the twin alone (JS_DefineProperty),
+                   and p's own member, the page's, is not copied over the
+                   twin after it. */
+                follow = FALSE;
+            } else if (prs1 && (prs1->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
+                return call_setter(ctx, pr1->u.getset.setter, this_obj, val,
+                                   flags);
+            } else if (!prs1 || (prs1->flags & JS_PROP_TMASK) == JS_PROP_NORMAL) {
+                JSValueConst twin_val = JS_MKPTR(JS_TAG_OBJECT, twin);
+                if (prs1) {
+                    ret = JS_SetPropertyInternal_impl(ctx, twin_val, prop, val,
+                                                      twin_val, flags);
+                } else {
+                    ret = JS_DefineProperty_impl(ctx, twin_val, prop, val,
+                                                 JS_UNDEFINED, JS_UNDEFINED,
+                                                 JS_PROP_C_W_E | JS_PROP_HAS_VALUE |
+                                                 JS_PROP_HAS_CONFIGURABLE |
+                                                 JS_PROP_HAS_WRITABLE |
+                                                 JS_PROP_HAS_ENUMERABLE);
+                    JS_FreeValue(ctx, val);
+                }
+                if (ret > 0)
+                    js_snap_mark_published(ctx, twin, prop);
+                return ret;
+            }
+        }
+    }
+    ret = JS_SetPropertyInternal_impl(ctx, obj, prop, val, this_obj, flags);
+    if (unlikely(follow) && ret > 0 &&
+        js_snap_after_write(ctx, JS_VALUE_GET_OBJ(this_obj), prop, created) < 0)
+        return -1;
+    return ret;
+}
+
+static int JS_SetPropertyInternal_impl(JSContext *ctx, JSValueConst obj,
                            JSAtom prop, JSValue val, JSValueConst this_obj, int flags)
 {
     TF_CENSUS(ctx->rt, JS_CENSUS_SET_PROPERTY, 0);
@@ -11811,6 +13342,10 @@ int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
     }
 
     /* fast path if obj == this_obj */
+    if (js_snap_before_write(ctx, p)) {
+        JS_FreeValue(ctx, val);
+        return -1;
+    }
  retry:
     prs = find_own_property(&pr, p1, prop);
     if (prs) {
@@ -11946,6 +13481,8 @@ int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
             break;
 
     retry2:
+        if (unlikely(p1->has_twin) && p1 != p)
+            p1 = js_snap_resolve(ctx, p1, prop);
         prs = find_own_property(&pr, p1, prop);
         if (prs) {
             if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
@@ -12473,7 +14010,58 @@ static int js_update_property_flags(JSContext *ctx, JSObject *p,
    define_own_property callback.
    return -1 (exception), FALSE or TRUE.
 */
+static int JS_DefineProperty_impl(JSContext *ctx, JSValueConst this_obj,
+                      JSAtom prop, JSValueConst val,
+                      JSValueConst getter, JSValueConst setter, int flags);
+
 int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
+                      JSAtom prop, JSValueConst val,
+                      JSValueConst getter, JSValueConst setter, int flags)
+{
+    int ret;
+    BOOL follow = FALSE, created = FALSE;
+    if (JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT) {
+        JSObject *p = JS_VALUE_GET_OBJ(this_obj);
+        if (unlikely(p->snap_member || p->class_id == JS_CLASS_GLOBAL_OBJECT)) {
+            follow = p->class_id == JS_CLASS_GLOBAL_OBJECT ?
+                js_snap_trusted(ctx) : js_snap_browser_write(ctx, p);
+            if (p->class_id == JS_CLASS_GLOBAL_OBJECT) {
+                if (!follow) {
+                    if (js_snap_before_global_write(ctx, p, prop, TRUE) < 0)
+                        return -1;
+                } else {
+                    created = !js_snap_global_is_variable(p, prop);
+                }
+            }
+        }
+    }
+    if (unlikely(follow)) {
+        JSObject *p = JS_VALUE_GET_OBJ(this_obj), *twin;
+        if (p->has_twin && p->class_id == JS_CLASS_GLOBAL_OBJECT) {
+            JSProperty *pr1;
+            JSShapeProperty *prs1 =
+                js_snap_global_page_changed(ctx, p, prop, &pr1);
+            if (prs1)
+                return js_snap_kept_define(ctx, p, prop, prs1, pr1, val,
+                                           getter, setter, flags);
+        }
+        if (p->has_twin && p->class_id != JS_CLASS_GLOBAL_OBJECT &&
+            (twin = js_snap_page_changed(ctx, p, prop)) != NULL) {
+            ret = JS_DefineProperty_impl(ctx, JS_MKPTR(JS_TAG_OBJECT, twin), prop,
+                                         val, getter, setter, flags);
+            if (ret > 0)
+                js_snap_mark_published(ctx, twin, prop);
+            return ret;
+        }
+    }
+    ret = JS_DefineProperty_impl(ctx, this_obj, prop, val, getter, setter, flags);
+    if (unlikely(follow) && ret > 0 &&
+        js_snap_after_write(ctx, JS_VALUE_GET_OBJ(this_obj), prop, created) < 0)
+        return -1;
+    return ret;
+}
+
+static int JS_DefineProperty_impl(JSContext *ctx, JSValueConst this_obj,
                       JSAtom prop, JSValueConst val,
                       JSValueConst getter, JSValueConst setter, int flags)
 {
@@ -12489,6 +14077,7 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
     }
     p = JS_VALUE_GET_OBJ(this_obj);
     if (js_own_closure_metadata(ctx, p)) return -1;
+    if (js_snap_before_write(ctx, p)) return -1;
 
  redo_prop_update:
     prs = find_own_property(&pr, p, prop);
@@ -19110,7 +20699,7 @@ static JSValue JS_IteratorNext2(JSContext *ctx, JSValueConst enum_obj,
     if (JS_IsObject(method)) {
         JSObject *p = JS_VALUE_GET_OBJ(method);
         if (p->class_id == JS_CLASS_C_FUNCTION &&
-            p->u.cfunc.cproto == JS_CFUNC_iterator_next) {
+            (p->u.cfunc.cproto & ~JS_CFUNC_BROWSER_NATIVE) == JS_CFUNC_iterator_next) {
             JSCFunctionType func;
             JSValueConst args[1];
 
@@ -19569,6 +21158,7 @@ static JSVarRef *js_create_var_ref(JSContext *ctx, BOOL is_lexical)
     var_ref->is_detached = TRUE;
     var_ref->is_lexical = FALSE;
     var_ref->is_const = FALSE;
+    var_ref->is_pinned = FALSE;
     add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
     return var_ref;
 }
@@ -19702,7 +21292,8 @@ static JSVarRef *js_global_object_find_uninitialized_var(JSContext *ctx, JSObjec
 }
 
 static JSVarRef *js_closure_define_global_var(JSContext *ctx, JSClosureVar *cv,
-                                              BOOL is_direct_or_indirect_eval)
+                                              BOOL is_direct_or_indirect_eval,
+                                              BOOL trusted)
 {
     JSObject *p, *p1;
     JSShapeProperty *prs;
@@ -19710,6 +21301,21 @@ static JSVarRef *js_closure_define_global_var(JSContext *ctx, JSClosureVar *cv,
     JSProperty *pr;
     JSVarRef *var_ref;
     
+    /* Tilefinch interface snapshot: after the snapshot a browser script
+       binds no global by declaration; it would take the page's reference */
+    if (trusted && ctx->snap_active) {
+        char buf[ATOM_GET_STR_BUF_SIZE];
+        JS_ThrowInternalError(ctx, "browser script declares the global '%s'"
+                              " after the interface snapshot",
+                              JS_AtomGetStr(ctx, buf, sizeof(buf), cv->var_name));
+        return NULL;
+    }
+    /* Tilefinch interface snapshot: an author declaration of a global the
+       browser reads by name declares the author's own binding */
+    if (!trusted && ctx->snap_planned &&
+        js_snap_before_author_bind(ctx, JS_VALUE_GET_OBJ(ctx->global_obj),
+                                   cv->var_name) < 0)
+        return NULL;
     if (cv->is_lexical) {
         p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
         flags = JS_PROP_ENUMERABLE | JS_PROP_CONFIGURABLE;
@@ -19785,6 +21391,24 @@ static JSVarRef *js_closure_define_global_var(JSContext *ctx, JSClosureVar *cv,
     
     /* if there is a corresponding uninitialized variable, use it */
     p1 = JS_VALUE_GET_OBJ(ctx->global_obj);
+    /* Tilefinch interface snapshot: the browser's declaration of a name
+       its closures were waiting for takes their pending reference */
+    if (trusted && ctx->snap_planned && js_snap_kept_of(p1)) {
+        JSObject *kept = js_snap_kept_of(p1);
+        prs = find_own_property(&pr, kept, cv->var_name);
+        if (prs && (prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF &&
+            JS_IsUninitialized(*pr->u.var_ref->pvalue)) {
+            var_ref = pr->u.var_ref;
+            js_rc(var_ref)->ref_count++;
+            if (delete_property_impl(ctx, kept, cv->var_name) < 0) {
+                free_var_ref(ctx->rt, var_ref);
+                return NULL;
+            }
+            if (!cv->is_lexical)
+                var_ref->value = JS_UNDEFINED;
+            goto add_var_ref;
+        }
+    }
     var_ref = js_global_object_find_uninitialized_var(ctx, p1, cv->var_name, cv->is_lexical);
     if (!var_ref)
         return NULL;
@@ -19804,13 +21428,84 @@ static JSVarRef *js_closure_define_global_var(JSContext *ctx, JSClosureVar *cv,
     return var_ref;
 }
 
-static JSVarRef *js_closure_global_var(JSContext *ctx, JSClosureVar *cv)
+static JSVarRef *js_closure_global_var(JSContext *ctx, JSClosureVar *cv,
+                                       BOOL trusted)
 {
     JSObject *p;
     JSShapeProperty *prs;
     JSProperty *pr;
     JSVarRef *var_ref;
     
+    /* Tilefinch interface snapshot: browser code binds the global as it
+       reads it (the binding kept when author code replaced it, or the
+       pinned one, whatever author code declared since); author code
+       naming a pinned global takes a reference of its own */
+    p = JS_VALUE_GET_OBJ(ctx->global_obj);
+    if (!ctx->snap_planned) {
+        /* a realm without the snapshot binds as upstream does */
+    } else if (trusted) {
+        JSObject *kept;
+        if ((kept = js_snap_kept_of(p)) != NULL) {
+            prs = find_own_property(&pr, kept, cv->var_name);
+            if (prs) {
+                if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
+                    var_ref = pr->u.var_ref;
+                    js_rc(var_ref)->ref_count++;
+                    return var_ref;
+                }
+                /* a kept accessor: a reference never initialized reads
+                   the property each time, through the kept table */
+                var_ref = js_create_var_ref(ctx, FALSE);
+                if (var_ref)
+                    var_ref->value = JS_UNINITIALIZED;
+                return var_ref;
+            }
+        }
+    trusted_redo:
+        prs = find_own_property(&pr, p, cv->var_name);
+        if (prs && (prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT) {
+            if (JS_AutoInitProperty(ctx, p, cv->var_name, pr, prs))
+                return NULL;
+            goto trusted_redo;
+        }
+        if (prs && (prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
+            if (pr->u.var_ref->is_pinned == 1) {
+                var_ref = pr->u.var_ref;
+                js_rc(var_ref)->ref_count++;
+                return var_ref;
+            }
+            /* not pinned: the page's state, or not yet snapshotted;
+               bound like anyone's below */
+        } else {
+            /* Not a variable (yet): an accessor, or absent. Browser
+               closures share a pending reference of their own for the
+               name, never the one author closures hold, so a variable the
+               browser defines later is theirs alone
+               (js_snap_after_global_write()). Meanwhile they read the
+               property. */
+            JSObject *lex = JS_VALUE_GET_OBJ(ctx->global_var_obj);
+            if (!find_own_property(&pr, lex, cv->var_name)) {
+                kept = js_snap_kept_globals(ctx, p);
+                if (!kept)
+                    return NULL;
+                var_ref = js_create_var_ref(ctx, FALSE);
+                if (!var_ref)
+                    return NULL;
+                pr = add_property(ctx, kept, cv->var_name,
+                                  JS_PROP_C_W_E | JS_PROP_VARREF);
+                if (!pr) {
+                    free_var_ref(ctx->rt, var_ref);
+                    return NULL;
+                }
+                var_ref->value = JS_UNINITIALIZED;
+                pr->u.var_ref = var_ref;
+                js_rc(var_ref)->ref_count++;
+                return var_ref;
+            }
+        }
+    } else if (js_snap_before_author_bind(ctx, p, cv->var_name) < 0) {
+        return NULL;
+    }
     p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
     prs = find_own_property(&pr, p, cv->var_name);
     if (prs) {
@@ -19891,10 +21586,11 @@ static JSValue js_closure2(JSContext *ctx, JSValue func_obj,
                 var_ref = js_create_var_ref(ctx, cv->is_lexical);
                 break;
             case JS_CLOSURE_GLOBAL_DECL:
-                var_ref = js_closure_define_global_var(ctx, cv, b->is_direct_or_indirect_eval);
+                var_ref = js_closure_define_global_var(ctx, cv, b->is_direct_or_indirect_eval,
+                                                       b->trusted);
                 break;
             case JS_CLOSURE_GLOBAL:
-                var_ref = js_closure_global_var(ctx, cv);
+                var_ref = js_closure_global_var(ctx, cv, b->trusted);
                 break;
             case JS_CLOSURE_LOCAL:
                 /* reuse the existing variable reference if it already exists */
@@ -20269,7 +21965,7 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
 
     p = JS_VALUE_GET_OBJ(func_obj);
     if (p->u.cfunc.realm->host_retired) return JS_UNDEFINED;
-    cproto = p->u.cfunc.cproto;
+    cproto = p->u.cfunc.cproto & ~JS_CFUNC_BROWSER_NATIVE;
     arg_count = p->u.cfunc.length;
 
     /* better to always check stack overflow */
@@ -21969,12 +23665,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {   \
                     p = JS_VALUE_GET_OBJ(obj);                          \
                     for(;;) {                                           \
+                        if (unlikely(p->has_twin)) {                    \
+                            obj = JS_MKPTR(JS_TAG_OBJECT, p);           \
+                            goto name ## _slow_path;                    \
+                        }                                               \
                         prs = find_own_property(&pr, p, atom);          \
                         if (prs) {                                      \
                             /* found */                                 \
                             if (unlikely(prs->flags & JS_PROP_TMASK)) { \
                                 if ((prs->flags & JS_PROP_TMASK) != JS_PROP_GETSET) \
                                     goto name ## _slow_path;            \
+                                if (unlikely(b->trusted) && pr->u.getset.getter && \
+                                    js_snap_is_author_function(pr->u.getset.getter)) { \
+                                    obj = JS_MKPTR(JS_TAG_OBJECT, p);   \
+                                    goto name ## _slow_path;            \
+                                }                                       \
                                 sf->cur_pc = pc;                       \
                                 TF_CENSUS_PATH(rt, JS_CENSUS_GET_GETTER); \
                                 val = js_call_property_getter(ctx, pr, sp[-1]); \
@@ -21982,6 +23687,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                     goto exception;                    \
                                 break;                                 \
                             }                                          \
+                            if (unlikely(b->trusted) &&                 \
+                                js_snap_is_author_function_value(pr->u.value)) { \
+                                obj = JS_MKPTR(JS_TAG_OBJECT, p);       \
+                                goto name ## _slow_path;                \
+                            }                                           \
                             val = JS_DupValue(ctx, pr->u.value);        \
                             break;                                      \
                         }                                               \
@@ -22045,6 +23755,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 obj = sp[-2];
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
                     p = JS_VALUE_GET_OBJ(obj);
+                    if (unlikely(p->snap_member))
+                        goto put_field_slow_path;
                     prs = find_own_property(&pr, p, atom);
                     if (!prs)
                         goto put_field_slow_path;
@@ -23906,6 +25618,8 @@ static void async_func_free_frame(JSRuntime *rt, JSAsyncFunctionState *s)
         JS_FreeValueRT(rt, *sp);
     }
     JS_FreeValueRT(rt, sf->cur_func);
+    /* js_snap_code_of_function() may still look at a completed one */
+    sf->cur_func = JS_UNDEFINED;
     JS_FreeValueRT(rt, s->this_val);
 }
 
@@ -24196,11 +25910,52 @@ static int js_async_function_resolve_create(JSContext *ctx,
     return 0;
 }
 
+/* Interface snapshot: what an async function (or async generator) does
+   outside its frame, once a segment of it has run (setting up an await,
+   settling its promise, resolving a request), is its own code's work, not
+   its caller's: a page's patch of Promise.prototype.then sees the page's
+   async functions settle wherever they were called from, and cannot steer
+   the browser's. The view is entered as a promise job's is
+   (js_snap_enter_job()): 'code' is the function's (0 author code, 1
+   browser code), -1 none. */
+static int js_snap_code_of_bytecode(JSValueConst f)
+{
+    JSObject *p;
+    if (JS_VALUE_GET_TAG(f) != JS_TAG_OBJECT)
+        return -1;
+    p = JS_VALUE_GET_OBJ(f);
+    return js_class_has_bytecode(p->class_id) ?
+        p->u.func.function_bytecode->trusted : -1;
+}
+
+static void js_snap_enter_own(JSRuntime *rt, int code, uint8_t *pview,
+                              JSStackFrame **pframe)
+{
+    *pview = rt->snap_job_view;
+    *pframe = rt->snap_job_frame;
+    if (code >= 0) {
+        rt->snap_job_view = code + 1;
+        rt->snap_job_frame = rt->current_stack_frame;
+    }
+}
+
+static void js_snap_leave_own(JSRuntime *rt, uint8_t view, JSStackFrame *frame)
+{
+    rt->snap_job_view = view;
+    rt->snap_job_frame = frame;
+}
+
 static void js_async_function_resume(JSContext *ctx, JSAsyncFunctionState *s)
 {
     JSValue func_ret, ret2;
+    /* read before the segment runs: a completed function's frame is gone */
+    int snap_code = ctx->rt->snap_enabled ?
+        js_snap_code_of_bytecode(s->frame.cur_func) : -1;
+    uint8_t snap_view;
+    JSStackFrame *snap_frame;
 
     func_ret = async_func_resume(ctx, s);
+    js_snap_enter_own(ctx->rt, snap_code, &snap_view, &snap_frame);
     if (s->is_completed) {
         if (JS_IsException(func_ret)) {
             JSValue error;
@@ -24249,6 +26004,7 @@ static void js_async_function_resume(JSContext *ctx, JSAsyncFunctionState *s)
         if (res)
             goto fail;
     }
+    js_snap_leave_own(ctx->rt, snap_view, snap_frame);
 }
 
 static JSValue js_async_function_resolve_call(JSContext *ctx,
@@ -24325,6 +26081,9 @@ typedef struct JSAsyncGeneratorRequest {
 typedef struct JSAsyncGeneratorData {
     JSObject *generator; /* back pointer to the object (const) */
     JSAsyncGeneratorStateEnum state;
+    /* the generator function's code, for the interface snapshot
+       (js_snap_code_of_bytecode()) */
+    int8_t snap_code;
     /* func_state is NULL is state AWAITING_RETURN and COMPLETED */
     JSAsyncFunctionState *func_state;
     struct list_head queue; /* list of JSAsyncGeneratorRequest.link */
@@ -24531,7 +26290,13 @@ static void js_async_generator_resume_next(JSContext *ctx,
 {
     JSAsyncGeneratorRequest *next;
     JSValue func_ret, value;
+    uint8_t snap_view;
+    JSStackFrame *snap_frame;
 
+    /* resolving its requests and setting up its awaits is the
+       generator's own work, also when a caller drives it */
+    js_snap_enter_own(ctx->rt, ctx->rt->snap_enabled ? s->snap_code : -1,
+                      &snap_view, &snap_frame);
     for(;;) {
         if (list_empty(&s->queue))
             break;
@@ -24625,7 +26390,8 @@ static void js_async_generator_resume_next(JSContext *ctx,
             abort();
         }
     }
- done: ;
+ done:
+    js_snap_leave_own(ctx->rt, snap_view, snap_frame);
 }
 
 static JSValue js_async_generator_resolve_function(JSContext *ctx,
@@ -24719,6 +26485,7 @@ static JSValue js_async_generator_function_call(JSContext *ctx, JSValueConst fun
     if (!s)
         return JS_EXCEPTION;
     s->state = JS_ASYNC_GENERATOR_STATE_SUSPENDED_START;
+    s->snap_code = js_snap_code_of_bytecode(func_obj);
     init_list_head(&s->queue);
     s->func_state = async_func_init(ctx, func_obj, this_obj, argc, argv);
     if (!s->func_state)
@@ -40078,6 +41845,8 @@ static JSValue js_create_lazy_function(JSContext *ctx, JSFunctionDef *fd)
     }
     js_rc(b)->ref_count = 1;
     b->is_lazy = 1;
+    /* a lazily compiled function is browser code if its script is */
+    b->trusted = ctx->snap_compiling_trusted;
     b->byte_code_buf = (uint8_t *)lz;
     b->func_name = fd->func_name;
     fd->func_name = JS_ATOM_NULL;
@@ -40409,6 +42178,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     b->arguments_allowed = fd->arguments_allowed;
     b->is_direct_or_indirect_eval = (fd->eval_type == JS_EVAL_TYPE_DIRECT ||
                                      fd->eval_type == JS_EVAL_TYPE_INDIRECT);
+    b->trusted = ctx->snap_compiling_trusted;
     b->realm = JS_DupContext(ctx);
 
     add_gc_object(ctx->rt, &b->header, JS_GC_OBJ_TYPE_FUNCTION_BYTECODE);
@@ -40631,13 +42401,19 @@ duplicate:
     return js_parse_error(s, "duplicate argument names not allowed in this context");
 }
 
-/* create a function to initialize class fields */
+/* create a function to initialize class fields. Tilefinch: it starts at
+   the token inside the class that first needs it (a field, a static block
+   or the private brand), not at the start of the buffer. Its line table is
+   built relative to that position; from offset 0, each class with fields
+   made the line/column cache walk back to the start of the file and
+   forward again, which is quadratic in a long module. Reported positions
+   are unchanged: every field opcode carries its own source position. */
 static JSFunctionDef *js_parse_function_class_fields_init(JSParseState *s)
 {
     JSFunctionDef *fd;
 
     fd = js_new_function_def(s->ctx, s->cur_func, FALSE, FALSE,
-                             s->filename, s->buf_start,
+                             s->filename, s->token.ptr,
                              &s->get_line_col_cache);
     if (!fd)
         return NULL;
@@ -45029,7 +46805,9 @@ static int js_lazy_function_compile1(JSContext *caller_ctx, JSFunctionBytecode *
         fd->source_start = 0;
         fd->source_owner = owner;
     }
+    ctx->snap_compiling_trusted = b->trusted;
     func_obj = js_create_function(ctx, fd);
+    ctx->snap_compiling_trusted = 0;
     fd = NULL; /* freed or turned into func_obj */
     if (JS_IsException(func_obj))
         goto fail;
@@ -45259,7 +47037,9 @@ static JSValue __JS_EvalInternalWithColumn(
         m->has_tla = fd->has_await;
 
     /* create the function object and all the enclosed functions */
+    ctx->snap_compiling_trusted = (flags & JS_EVAL_FLAG_TRUSTED) != 0;
     fun_obj = js_create_function(ctx, fd);
+    ctx->snap_compiling_trusted = 0;
     if (JS_IsException(fun_obj))
         goto fail1;
     /* Could add a flag to avoid resolution if necessary */
@@ -47307,6 +49087,7 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
     bc.is_direct_or_indirect_eval = bc_get_flags(v16, &idx, 1);
     is_lazy = bc_get_flags(v16, &idx, 1);
     bc.read_only_bytecode = s->is_rom_data;
+    bc.trusted = s->platform_methods;
     if (bc_get_u8(s, &v8))
         goto fail;
     bc.js_mode = v8;
@@ -61089,6 +62870,8 @@ static JSValue js_weakref_new(JSContext *ctx, JSValueConst val)
 {
     if (JS_VALUE_GET_TAG(val) == JS_TAG_OBJECT) {
         JSObject *p = JS_VALUE_GET_OBJ(val);
+        /* a 30-bit field: it shares its word with the snapshot's flags */
+        assert(p->weakref_count < (1u << 30) - 1);
         p->weakref_count++;
     } else if (JS_VALUE_GET_TAG(val) == JS_TAG_SYMBOL) {
         JSString *p = JS_VALUE_GET_STRING(val);
@@ -62692,6 +64475,7 @@ typedef struct JSPromiseReactionData {
     struct list_head link; /* not used in promise_reaction_job */
     JSValue resolving_funcs[2];
     JSValue handler;
+    uint8_t snap_code; /* js_snap_code() of the code that asked for it */
 } JSPromiseReactionData;
 
 JSPromiseStateEnum JS_PromiseState(JSContext *ctx, JSValue promise)
@@ -62722,15 +64506,99 @@ static void promise_reaction_data_free(JSRuntime *rt,
     js_free_rt(rt, rd);
 }
 
+/* Interface snapshot: the code a function a promise job calls belongs
+   to (its handler, or a thenable's `then`): 0 author code, 1 browser
+   code, -1 none of its own (an engine native, a promise's resolving
+   function, no handler). The functions that resume an await are their
+   async function's code, and set *presumes. */
+static int js_snap_code_of_function(JSValueConst f, BOOL *presumes)
+{
+    for (;;) {
+        JSObject *p;
+        if (JS_VALUE_GET_TAG(f) != JS_TAG_OBJECT)
+            return -1;
+        p = JS_VALUE_GET_OBJ(f);
+        if (js_class_has_bytecode(p->class_id))
+            return p->u.func.function_bytecode->trusted;
+        switch (p->class_id) {
+        case JS_CLASS_BOUND_FUNCTION:
+            f = p->u.bound_function->func_obj;
+            break;
+        case JS_CLASS_C_FUNCTION:
+            return (p->u.cfunc.cproto & JS_CFUNC_BROWSER_NATIVE) ? 1 : -1;
+        case JS_CLASS_ASYNC_FUNCTION_RESOLVE:
+        case JS_CLASS_ASYNC_FUNCTION_REJECT:
+            if (!p->u.async_function_data)
+                return -1;
+            *presumes = TRUE;
+            f = p->u.async_function_data->frame.cur_func;
+            break;
+        case JS_CLASS_C_FUNCTION_DATA: {
+            JSCFunctionDataRecord *r = p->u.c_function_data_record;
+            JSAsyncGeneratorData *g;
+            if (r->func != js_async_generator_resolve_function)
+                return -1;
+            g = JS_GetOpaque(r->data[0], JS_CLASS_ASYNC_GENERATOR);
+            if (!g || !g->func_state)
+                return -1;
+            *presumes = TRUE;
+            f = g->func_state->frame.cur_func;
+            break;
+        }
+        default:
+            return -1;
+        }
+    }
+}
+
+/* What a promise job does outside any frame (resolving the promise its
+   reaction settles, the rest of an await's resumption) acts for the code
+   it runs for, not for the embedder that drains the queue. An await
+   resumes as its async function (as the code that asked, if the function
+   has no code of its own left). Otherwise it is author code's when the
+   function the job calls is author code or author code asked for it
+   (called `then`, resolved the promise with a thenable); browser code's
+   only when both are the browser's. `requester` is the js_snap_code() of
+   the code that asked. */
+static void js_snap_enter_job(JSContext *ctx, JSValueConst func,
+                              int requester, uint8_t *pview,
+                              JSStackFrame **pframe)
+{
+    JSRuntime *rt = ctx->rt;
+    BOOL resumes = FALSE;
+    int code = js_snap_code_of_function(func, &resumes);
+    if (!resumes && (code == 0 || requester == 0))
+        code = 0;
+    else if (code < 0)
+        code = requester; /* also a resumption with no code of its own */
+    *pview = rt->snap_job_view;
+    *pframe = rt->snap_job_frame;
+    rt->snap_job_view = code + 1;
+    rt->snap_job_frame = rt->current_stack_frame;
+}
+
+static void js_snap_leave_job(JSContext *ctx, uint8_t view,
+                              JSStackFrame *frame)
+{
+    ctx->rt->snap_job_view = view;
+    ctx->rt->snap_job_frame = frame;
+}
+
 static JSValue promise_reaction_job(JSContext *ctx, int argc,
                                     JSValueConst *argv)
 {
     JSValueConst handler, arg, func;
     JSValue res, res2;
     BOOL is_reject;
+    uint8_t snap_view = 0;
+    JSStackFrame *snap_frame = NULL;
 
-    assert(argc == 5);
+    /* a sixth argument, with a snapshot: the code that asked for it */
+    assert(argc == 5 || argc == 6);
     handler = argv[2];
+    if (argc > 5)
+        js_snap_enter_job(ctx, handler, JS_VALUE_GET_INT(argv[5]),
+                          &snap_view, &snap_frame);
     is_reject = JS_ToBool(ctx, argv[3]);
     arg = argv[4];
 #ifdef DUMP_PROMISE
@@ -62760,6 +64628,8 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
         res2 = JS_UNDEFINED;
     }
     JS_FreeValue(ctx, res);
+    if (argc > 5)
+        js_snap_leave_job(ctx, snap_view, snap_frame);
 
     return res2;
 }
@@ -62778,7 +64648,7 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
     JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
     struct list_head *el, *el1;
     JSPromiseReactionData *rd;
-    JSValueConst args[5];
+    JSValueConst args[6];
 
     if (!s || s->promise_state != JS_PROMISE_PENDING)
         return; /* should never happen */
@@ -62802,7 +64672,9 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
         args[2] = rd->handler;
         args[3] = JS_NewBool(ctx, is_reject);
         args[4] = value;
-        JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
+        args[5] = JS_NewInt32(ctx, rd->snap_code);
+        JS_EnqueueJob(ctx, promise_reaction_job,
+                      5 + ctx->rt->snap_enabled, args);
         list_del(&rd->link);
         promise_reaction_data_free(ctx->rt, rd);
     }
@@ -62825,22 +64697,30 @@ static JSValue js_promise_resolve_thenable_job(JSContext *ctx,
 {
     JSValueConst promise, thenable, then;
     JSValue args[2], res;
+    uint8_t snap_view = 0;
+    JSStackFrame *snap_frame = NULL;
 
 #ifdef DUMP_PROMISE
     printf("js_promise_resolve_thenable_job\n");
 #endif
-    assert(argc == 3);
+    /* a fourth argument, with a snapshot: the code that asked for it */
+    assert(argc == 3 || argc == 4);
     promise = argv[0];
     thenable = argv[1];
     then = argv[2];
     if (js_create_resolving_functions(ctx, args, promise) < 0)
         return JS_EXCEPTION;
+    if (argc > 3)
+        js_snap_enter_job(ctx, then, JS_VALUE_GET_INT(argv[3]),
+                          &snap_view, &snap_frame);
     res = JS_Call(ctx, then, thenable, 2, (JSValueConst *)args);
     if (JS_IsException(res)) {
         JSValue error = JS_GetException(ctx);
         res = JS_Call(ctx, args[1], JS_UNDEFINED, 1, (JSValueConst *)&error);
         JS_FreeValue(ctx, error);
     }
+    if (argc > 3)
+        js_snap_leave_job(ctx, snap_view, snap_frame);
     JS_FreeValue(ctx, args[0]);
     JS_FreeValue(ctx, args[1]);
     return res;
@@ -62926,7 +64806,7 @@ static JSValue js_promise_resolve_function_call(JSContext *ctx,
 {
     JSObject *p = JS_VALUE_GET_OBJ(func_obj);
     JSPromiseFunctionData *s;
-    JSValueConst resolution, args[3];
+    JSValueConst resolution, args[4];
     JSValue then;
     BOOL is_reject;
 
@@ -62965,7 +64845,11 @@ static JSValue js_promise_resolve_function_call(JSContext *ctx,
         args[0] = s->promise;
         args[1] = resolution;
         args[2] = then;
-        JS_EnqueueJob(ctx, js_promise_resolve_thenable_job, 3, args);
+        /* the job's view (js_snap_enter_job()), with a snapshot only */
+        if (ctx->rt->snap_enabled)
+            args[3] = JS_NewInt32(ctx, js_snap_code(ctx));
+        JS_EnqueueJob(ctx, js_promise_resolve_thenable_job,
+                      3 + ctx->rt->snap_enabled, args);
         JS_FreeValue(ctx, then);
     }
     return JS_UNDEFINED;
@@ -63530,7 +65414,7 @@ static __exception int perform_promise_then(JSContext *ctx,
 {
     JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
     JSPromiseReactionData *rd_array[2], *rd;
-    int i, j;
+    int i, j, snap_code = ctx->rt->snap_enabled ? js_snap_code(ctx) : 0;
 
     rd_array[0] = NULL;
     rd_array[1] = NULL;
@@ -63548,6 +65432,7 @@ static __exception int perform_promise_then(JSContext *ctx,
         if (!JS_IsFunction(ctx, handler))
             handler = JS_UNDEFINED;
         rd->handler = JS_DupValue(ctx, handler);
+        rd->snap_code = snap_code;
         rd_array[i] = rd;
     }
 
@@ -63555,7 +65440,7 @@ static __exception int perform_promise_then(JSContext *ctx,
         for(i = 0; i < 2; i++)
             list_add_tail(&rd_array[i]->link, &s->promise_reactions[i]);
     } else {
-        JSValueConst args[5];
+        JSValueConst args[6];
         if (s->promise_state == JS_PROMISE_REJECTED && !s->is_handled) {
             JSRuntime *rt = ctx->rt;
             if (rt->host_promise_rejection_tracker) {
@@ -63570,7 +65455,9 @@ static __exception int perform_promise_then(JSContext *ctx,
         args[2] = rd->handler;
         args[3] = JS_NewBool(ctx, i);
         args[4] = s->promise_result;
-        JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
+        args[5] = JS_NewInt32(ctx, rd->snap_code);
+        JS_EnqueueJob(ctx, promise_reaction_job,
+                      5 + ctx->rt->snap_enabled, args);
         for(i = 0; i < 2; i++)
             promise_reaction_data_free(ctx->rt, rd_array[i]);
     }

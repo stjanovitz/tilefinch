@@ -24,11 +24,12 @@
       --text_body: #d2ccc8;
       --text_muted: #898480;
       --text_faint: #686360;
-      --accent: #3d78b6;
+      --accent: #3d80ba;
       --accent_high: #72aae2;
       --on_accent: #17120e;
       --ok: #7fd6a2;
       --warn: #e08a52;
+      --danger: #ef6b75;
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
         "Segoe UI", sans-serif;
     }
@@ -191,6 +192,7 @@
     .menu-row.focus { color: var(--on_accent); background: var(--accent); font-weight: 700; }
     .menu-row .value { color: var(--accent_high); }
     .menu-row.disabled { color: var(--text_faint); }
+    .menu-row.danger { color: var(--danger); }
     .panel-footer { position: absolute; inset: auto 0 0; height: 4.167cqw; display: flex; align-items: center; padding: 0 3.333cqw; color: var(--text_muted); background: var(--hint_bar); font-size: 1.667cqw; }
     .reader { background: var(--ground_reader); }
     .reader article { position: absolute; left: 5cqw; right: 5cqw; top: 7.083cqw; bottom: 4.167cqw; overflow: hidden; }
@@ -318,6 +320,7 @@
                 <div class="menu-row" data-uses="text_body"><span>Night mode</span><span class="value" data-uses="accent_high">Off</span></div>
                 <div class="menu-row" data-uses="text_body"><span>Reader font</span><span class="value" data-uses="accent_high">Serif</span></div>
                 <div class="menu-row disabled" data-uses="text_faint"><span>Optional pack</span><span>Not installed</span></div>
+                <div class="menu-row danger" data-uses="danger"><span>Clear cookies</span></div>
               </div>
               <div class="panel-footer" data-uses="hint_bar text_muted">X Open or toggle &nbsp; O Back</div>
             </div>
@@ -375,7 +378,7 @@
     <section class="editor" aria-label="Theme colors">
       <div class="editor-head">
         <h2>Colors</h2>
-        <p>Every omitted field inherits Midnight in Tilefinch. This designer exports all fields so the result is portable and explicit.</p>
+        <p>Every omitted field inherits Midnight in Tilefinch, except <code>danger</code>, which is derived from the theme's own panel and focused row. This designer exports all fields so the result is portable and explicit.</p>
       </div>
       <div class="preset-row" aria-label="Theme presets">
         <span>Start from:</span>
@@ -414,7 +417,7 @@
       ["Surfaces", ["surface", "surface_focus", "line"]],
       ["Text ramp", ["text", "text_body", "text_muted", "text_faint"]],
       ["Accent", ["accent", "accent_high", "on_accent"]],
-      ["Semantic", ["ok", "warn"]]
+      ["Semantic", ["ok", "warn", "danger"]]
     ];
     const presets = {
       midnight: {
@@ -422,8 +425,8 @@
         hint_bar:"#0A0908", panel:"#140F0D", surface:"#1B1918",
         surface_focus:"#262322", line:"#232120", text:"#FBF6F2",
         text_body:"#D2CCC8", text_muted:"#898480", text_faint:"#686360",
-        accent:"#3D78B6", accent_high:"#72AAE2", on_accent:"#17120E",
-        ok:"#7FD6A2", warn:"#E08A52"
+        accent:"#3D80BA", accent_high:"#72AAE2", on_accent:"#17120E",
+        ok:"#7FD6A2", warn:"#E08A52", danger:"#EF6B75"
       },
       daylight: {
         ground:"#F2F5FA", ground_reader:"#F7F3EA", chrome_bar:"#E4EAF3",
@@ -431,7 +434,7 @@
         surface_focus:"#D7E6FA", line:"#B7C4D4", text:"#10213A",
         text_body:"#263B56", text_muted:"#596C83", text_faint:"#8492A5",
         accent:"#24588F", accent_high:"#3F78B8", on_accent:"#FFFFFF",
-        ok:"#267A55", warn:"#A94F24"
+        ok:"#267A55", warn:"#A94F24", danger:"#B3261E"
       },
       forest: {
         ground:"#0D1410", ground_reader:"#111912", chrome_bar:"#0A100C",
@@ -439,20 +442,23 @@
         surface_focus:"#223128", line:"#29372E", text:"#F3F8F4",
         text_body:"#CBD8CE", text_muted:"#839087", text_faint:"#606C64",
         accent:"#4F9A72", accent_high:"#83C49D", on_accent:"#07150D",
-        ok:"#7FD6A2", warn:"#E08A52"
+        ok:"#7FD6A2", warn:"#E08A52", danger:"#EF6B75"
       },
       violet: {
         ground:"#110F17", ground_reader:"#16121B", chrome_bar:"#0D0B12",
         hint_bar:"#09080D", panel:"#16111D", surface:"#201B28",
         surface_focus:"#2D2638", line:"#342D3D", text:"#F8F5FC",
         text_body:"#D5CFDD", text_muted:"#8C8595", text_faint:"#696170",
-        accent:"#826BC5", accent_high:"#B5A1EA", on_accent:"#100B1B",
-        ok:"#7FD6A2", warn:"#E08A52"
+        accent:"#826BC5", accent_high:"#B5A1EA", on_accent:"#100418",
+        ok:"#7FD6A2", warn:"#E08A52", danger:"#EF6B75"
       }
     };
     const values = {...presets.midnight};
     const THEME_HEADER = "tilefinch-theme";
-    const THEME_FORMAT_VERSION = 1;
+    /* Format 2 added danger; Tilefinch still reads format 1 files. */
+    const THEME_FORMAT_VERSION = 2;
+    const THEME_FORMAT_OLDEST = 1;
+    const FIELD_SINCE_FORMAT = {danger: 2};
     const fields = document.getElementById("fields");
     const output = document.getElementById("theme-output");
     const message = document.getElementById("message");
@@ -533,6 +539,42 @@
       });
       return .2126 * linear[0] + .7152 * linear[1] + .0722 * linear[2];
     }
+    function contrast(first, second) {
+      const a = luminance(rgb565(first)) + .05, b = luminance(rgb565(second)) + .05;
+      return a > b ? a / b : b / a;
+    }
+    /* The red Tilefinch derives for a theme file without danger: the same
+       ramp and order as theme_derived_danger in src/psp_ui_theme.c. */
+    const DANGER_REDS = ["#FFC4C8", "#FFA4AA", "#F7868E", "#EF6B75", "#E0505C",
+      "#CC3A44", "#B3261E", "#961C22", "#7A1418", "#5C0C10"];
+    function derivedDanger(palette) {
+      const panel = palette.panel, focus = palette.surface_focus;
+      const weakest = (color) => Math.min(contrast(color, panel), contrast(color, focus));
+      const dark = luminance(rgb565(panel)) + .05 < Math.sqrt(.0525);
+      for (let step = 0; step < 4; step++) {
+        const red = DANGER_REDS[dark ? 3 - step : 6 + step];
+        if (weakest(red) >= 4.5) return rgb565(red);
+      }
+      let best = palette.text;
+      DANGER_REDS.forEach((red) => { if (weakest(red) > weakest(best)) best = red; });
+      return rgb565(best);
+    }
+    /* The accent pair and the ink drawn on it (the highlighted row, buttons,
+       the selected key). The ink is whichever of near-black and white reads
+       better on both accent and accent_high; when neither reaches 4.5:1 the
+       accent steps away from the ink until it does. */
+    function accentInk(primary, light) {
+      const inks = ["#080808", "#FFFFFF"];
+      let accent = rgb565(primary);
+      for (let step = 0; ; step++) {
+        const accent_high = mixHex(accent, light ? "#000000" : "#FFFFFF", .28);
+        const weakest = (ink) => Math.min(contrast(ink, accent), contrast(ink, accent_high));
+        const on_accent = weakest(inks[0]) >= weakest(inks[1]) ? inks[0] : inks[1];
+        if (weakest(on_accent) >= 4.5 || step === 32)
+          return {accent, accent_high, on_accent: rgb565(on_accent)};
+        accent = mixHex(accent, on_accent === inks[0] ? "#FFFFFF" : "#000000", .06);
+      }
+    }
     function setToken(token, value) {
       if (!validHex(value)) return false;
       value = rgb565(value);
@@ -574,13 +616,13 @@
         panel:mixHex(neutral, secondary, .15), surface:mixHex(neutral, secondary, .19),
         surface_focus:mixHex(neutral, primary, .27), line:mixHex(neutral, secondary, .30)
       };
-      Object.assign(palette, {
-        text, text_body:body, text_muted:muted, text_faint:faint,
-        accent:primary, accent_high:mixHex(primary, light ? "#000000" : "#FFFFFF", .28),
-        on_accent:luminance(primary) > .42 ? "#080808" : "#FFFFFF"
-      });
+      Object.assign(palette, {text, text_body:body, text_muted:muted, text_faint:faint},
+        accentInk(primary, light));
+      palette.danger = derivedDanger(palette);
       Object.entries(palette).forEach(([token, value]) => setToken(token, value));
-      message.textContent = `Applied ${primary} with ${secondary}; all colors snapped to RGB565.`;
+      message.textContent = palette.accent === primary
+        ? `Applied ${primary} with ${secondary}; all colors snapped to RGB565.`
+        : `Applied ${palette.accent} (${primary} adjusted so its ink reads at 4.5:1) with ${secondary}; all colors snapped to RGB565.`;
     }
     function updateSuggestions(value) {
       const primary = rgb565(value);
@@ -671,6 +713,7 @@
       const next = {...presets.midnight};
       let importedName = "Imported Theme";
       let formatSeen = false;
+      let format = 0;
       const seen = new Set();
       for (const line of lines.slice(1)) {
         if (!line || line.startsWith("#")) continue;
@@ -681,7 +724,8 @@
         if (seen.has(key)) throw new Error(`Duplicate field: ${key}`);
         seen.add(key);
         if (key === "format") {
-          if (value !== String(THEME_FORMAT_VERSION))
+          format = /^[0-9]$/.test(value) ? Number(value) : 0;
+          if (format < THEME_FORMAT_OLDEST || format > THEME_FORMAT_VERSION)
             throw new Error(`Unsupported theme format: ${value || "missing"}`);
           formatSeen = true;
         } else if (key === "name") {
@@ -695,6 +739,11 @@
         }
       }
       if (!formatSeen) throw new Error("Theme format version is missing.");
+      for (const key of seen) {
+        if ((FIELD_SINCE_FORMAT[key] || 1) > format)
+          throw new Error(`Unknown or invalid field: ${key} (needs format=${FIELD_SINCE_FORMAT[key]})`);
+      }
+      if (!seen.has("danger")) next.danger = derivedDanger(next);
       Object.entries(next).forEach(([token, value]) => setToken(token, value));
       nameInput.value = importedName;
       updateSuggestions(values.accent);

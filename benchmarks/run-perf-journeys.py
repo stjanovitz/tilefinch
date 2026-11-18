@@ -40,11 +40,12 @@ Usage:
     run-perf-journeys.py --prepare-trace CAPTURE_DIR NAME [--corpus DIR]
 
 --record    writes this run's values as the baselines of the journeys run
-            (a new journey, or a deliberate reset recorded in
-            .private-investigations/PERFORMANCE_LEDGER.md).
+            (a new journey, or a deliberate reset explained in its commit
+            message).
 --ratchet   lowers baselines that this run beat by more than their
             tolerance; it never raises one. A regression is fixed, or the
-            baseline is raised by hand with the reason in the ledger.
+            baseline is raised by hand with the reason in the commit
+            message.
 --record-missing PREFIX adds a baseline for each metric starting with
             PREFIX that has none (a new metric for an existing journey) and
             only compares the rest; combine it with --ratchet to lower

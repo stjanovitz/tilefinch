@@ -625,10 +625,13 @@ static bool run_webgl_index_identity_invalidation(void)
         /* Every indexed draw each flush hands the native renderer: its
            index identity words (64, 65) in the 96-word command records. */
         "const seen=[],flush=gl._flushCurrent;"
-        "gl._flushCurrent=function(...rest){const u=this._commandWireU32;"
+        /* through the test seam: a page's own function on the context
+           does not stand in for the context's flush */
+        "__tilefinchTestBrowserPatch(gl,'_flushCurrent',function(...rest){"
+        "const u=this._commandWireU32;"
         "for(let i=0;i<this._commands.length;i++){const b=4+i*96;"
         "if(u[b+4]!==0)seen.push(u[b+64]+':'+u[b+65]);}"
-        "return flush.apply(this,rest)};"
+        "return flush.apply(this,rest)});"
         "const shader=(kind,source)=>{const value=gl.createShader(kind);"
         "gl.shaderSource(value,source);gl.compileShader(value);return value};"
         "const program=gl.createProgram();"
@@ -1787,6 +1790,75 @@ static bool run_snapshot_copy_publication(void)
     return true;
 }
 
+/* A page's canvases are drawn into a staging table that commit moves by
+   value into the page, after which the staging storage is freed and reused.
+   The native surface record must move with its resource: nothing may still
+   read or clear it through the old storage. */
+static bool run_native_surface_table_move(void)
+{
+    static _Alignas(16) unsigned char native[512u * 4u * 4u];
+    lxb_dom_node_t identity[3] = {{0}};
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    ImageResources *staging = budget_calloc(&budget, 1, sizeof(*staging));
+    CHECK(staging != NULL);
+    staging->budget = &budget;
+    for (size_t i = 0; i < 3u; i++) {
+        unsigned char *live = NULL;
+        CHECK(images_prepare_canvas_surface(staging, &budget, &identity[i],
+                  480, 4, &live) != IMAGE_CANVAS_COMMIT_REFUSED);
+        CHECK(live != NULL);
+    }
+    /* At most two canvases of a table borrow a native surface. */
+    CHECK(images_set_canvas_native_surface(staging, &identity[0], native,
+                                           512u * 4u, 0));
+    CHECK(images_set_canvas_native_surface(staging, &identity[1], native,
+                                           512u * 4u, 0));
+    CHECK(!images_set_canvas_native_surface(staging, &identity[2], native,
+                                            512u * 4u, 0));
+    CHECK(images_set_canvas_native_surface(staging, &identity[0], native,
+                                           512u * 4u, 0));
+    ImageResources page = *staging;
+    memset(staging, 0xa5, sizeof(*staging));
+    const ImageResource *moved = NULL;
+    for (size_t i = 0; i < page.count; i++)
+        if (page.items[i].node == &identity[0]) moved = &page.items[i];
+    CHECK(moved != NULL);
+    const unsigned char *source = NULL;
+    size_t stride = 0;
+    CHECK(image_resource_native_canvas_source(moved, &source, &stride)
+          && source == native && stride == 512u * 4u);
+    CHECK(images_materialize_canvas_native_surface(&page, &identity[0]));
+    CHECK(!image_resource_native_canvas_source(moved, &source, &stride));
+    for (size_t i = 0; i < sizeof(*staging); i++)
+        CHECK(((const unsigned char *) staging)[i] == 0xa5u);
+    /* The materialized record made room for the third canvas. */
+    CHECK(images_set_canvas_native_surface(&page, &identity[2], native,
+                                           512u * 4u, 0));
+    budget_free(&budget, staging);
+
+    /* Commit saves the old page by value, puts the new page's table at the
+       same address, then destroys the saved copy: that must leave the new
+       page's records alone. */
+    ImageResources previous = page;
+    memset(&page, 0, sizeof(page));
+    page.budget = &budget;
+    lxb_dom_node_t next = {0};
+    unsigned char *live = NULL;
+    CHECK(images_prepare_canvas_surface(&page, &budget, &next, 480, 4,
+                                        &live) != IMAGE_CANVAS_COMMIT_REFUSED);
+    CHECK(images_set_canvas_native_surface(&page, &next, native, 512u * 4u,
+                                           0));
+    images_destroy(&previous);
+    CHECK(page.count == 1u
+          && image_resource_native_canvas_source(&page.items[0], &source,
+                                                 &stride)
+          && source == native && stride == 512u * 4u);
+    images_destroy(&page);
+    CHECK(budget.current == 0);
+    return true;
+}
+
 static bool run_webgl_frame_publication(void)
 {
     static const char html[] =
@@ -1908,6 +1980,9 @@ static bool run_webgl_frame_publication(void)
     return true;
 }
 
+/* Set: native realm scripts run without the interface snapshot. */
+static bool native_realm_no_snapshot;
+
 static bool run_native_realm_inspect(const char *html, const char *script,
                                      const char *label, const char *expected,
                                      bool expected_prefix,
@@ -1944,7 +2019,8 @@ static bool run_native_realm_inspect(const char *html, const char *script,
     ScriptRuntimeOptions options = {
         .viewport = viewport,
         .execution_policy = policy,
-        .fonts = &fonts
+        .fonts = &fonts,
+        .interface_snapshot_disabled = native_realm_no_snapshot
     };
     ScriptResult result;
     ScriptRuntime *runtime = script_runtime_create_configured(
@@ -2297,11 +2373,22 @@ static bool run_canvas_taint_hostile(void)
 {
     TaintSceneSurfaces surfaces;
     /* Control: with #x same-origin its bytes do reach script, and the
-       traps see them, so a quiet run means they never went there. */
-    CHECK(run_taint_scene_once(false, true, "TAINT-HOSTILE-SEEN:", true,
-                               &surfaces));
-    return run_taint_scene_once(true, true, "TAINT-HOSTILE-PASS:", true,
-                                &surfaces);
+       traps see them, so a quiet run means they never went there. The
+       scene runs with the interface snapshot, where the browser's own
+       script never meets the traps, and again without it, where the
+       traps see the browser's work too: only that pass shows the
+       bootstrap moves no tainted pixel through a builtin a page can
+       replace (the defence when boot.cfg turns the snapshot off). */
+    bool ok = true;
+    for (int pass = 0; pass < 2 && ok; pass++) {
+        native_realm_no_snapshot = pass == 1;
+        ok = run_taint_scene_once(false, true, "TAINT-HOSTILE-SEEN:", true,
+                                  &surfaces)
+            && run_taint_scene_once(true, true, "TAINT-HOSTILE-PASS:", true,
+                                    &surfaces);
+    }
+    native_realm_no_snapshot = false;
+    return ok;
 }
 
 /* Every program a shipping example links (including its instancing
@@ -2350,7 +2437,7 @@ static bool run_webgl_shader_diagnostics(void)
         "(()=>{const canvas=document.createElement('canvas');"
         "canvas.width=4;canvas.height=4;document.body.appendChild(canvas);"
         "const gl=canvas.getContext('webgl'),stats=__tilefinchWebGLDiagnostics,"
-        "warned=[],failures=[];console.warn=(...args)=>warned.push(args.join(' '));"
+        "warned=[],failures=[];globalThis.__tilefinchTestConsoleSink=(level,...args)=>{if(level==='warn')warned.push(args.join(' '))};"
         "const build=(vs,fs)=>{const program=gl.createProgram();"
         "for(const [kind,source] of [[gl.VERTEX_SHADER,vs],[gl.FRAGMENT_SHADER,fs]]){"
         "const shader=gl.createShader(kind);gl.shaderSource(shader,source);"
@@ -6227,6 +6314,8 @@ int main(int argc, char **argv)
     if (!run_deferred_webgl_flush()) return 1;
     puts("test: a WebGL frame flushed in parts is shown only once complete");
     if (!run_snapshot_copy_publication() || !run_webgl_frame_publication()) return 1;
+    puts("test: a native canvas surface moves with its table");
+    if (!run_native_surface_table_move()) return 1;
     if (!run_webgl_index_identity_invalidation()) return 1;
     if (!run_webgl_shader_diagnostics()) return 1;
     puts("test: installable Prism Break exercises levels, input, and effects");

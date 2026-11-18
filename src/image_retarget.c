@@ -505,7 +505,7 @@ static ImageResource *retarget_owner(ImageResources *images, size_t first,
     for (size_t i = first; i < images->count; i++) {
         ImageResource *item = &images->items[i];
         if (retarget_identity(item) != identity) continue;
-        if (item->is_canvas || item->canvas_native_surface != NULL
+        if (item->is_canvas || item->canvas_native.pixels != NULL
             || item->borrows_previous
             || (item->retarget_flags
                 & (IMAGE_RETARGET_PINNED | IMAGE_RETARGET_REFUSED)) != 0) {

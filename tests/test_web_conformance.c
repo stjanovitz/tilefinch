@@ -27,9 +27,9 @@
 /* Runs `script` as the only classic script of a fresh document whose body
    starts with `body` and returns whether globalThis.pocSummary equalled
    `expected`. */
-static bool run_probe_at(const char *label, const char *url,
-                         const char *body, const char *script,
-                         const char *expected)
+static bool run_probe_at_with_turns(const char *label, const char *url,
+                                    const char *body, const char *script,
+                                    const char *expected, unsigned turns)
 {
     static char page[64 * 1024];
     int written = snprintf(page, sizeof(page),
@@ -50,8 +50,13 @@ static bool run_probe_at(const char *label, const char *url,
         return false;
     }
     ScriptResult result;
-    bool ran = scripts_run_document_at(&document, &budget, 8u * MIB, 3000,
-                                       url, &result);
+    ScriptRuntime *runtime = script_runtime_create(
+        &document, &budget, 8u * MIB, 3000, url, &result);
+    bool ran = runtime != NULL;
+    for (unsigned turn = 0; ran && turn < turns
+         && strcmp(result.summary, expected) != 0; turn++)
+        ran = script_runtime_advance(runtime, 1, 64, &result);
+    script_runtime_destroy(runtime);
     bool ok = ran && result.success
         && strcmp(result.summary, expected) == 0;
     if (!ok) {
@@ -64,6 +69,13 @@ static bool run_probe_at(const char *label, const char *url,
         ok = false;
     }
     return ok;
+}
+
+static bool run_probe_at(const char *label, const char *url,
+                         const char *body, const char *script,
+                         const char *expected)
+{
+    return run_probe_at_with_turns(label, url, body, script, expected, 0);
 }
 
 static bool run_probe_after(const char *label, const char *body,
@@ -852,6 +864,40 @@ static const char url_members_probe[] =
     "&&URL.parse.length===1;});"
     "globalThis.pocSummary=failures.length?'FAIL '+failures.join(' | ')"
     ":'URL-MEMBERS-OK';";
+
+/* A refused query must not leave a live URL and its searchParams describing
+   different addresses. The 8192-entry ceiling is intentionally exercised. */
+static const char url_query_refusal_probe[] =
+    "const u=new URL('https://example.test/a?old=1'),p=u.searchParams;"
+    "let refused=false;try{u.search='?'+Array(8193).fill('a=1').join('&')}"
+    "catch(e){refused=e instanceof RangeError}"
+    "globalThis.pocSummary=refused&&u.search==='?old=1'"
+    "&&u.href==='https://example.test/a?old=1'&&p===u.searchParams"
+    "&&p.size===1&&p.get('old')==='1'?'URL-REFUSAL-OK':'FAIL';";
+
+static const char body_clone_isolation_probe[] =
+    "globalThis.pocSummary='PENDING';"
+    "(async()=>{for(const body of [new Response(new Uint8Array([97,98,99])),"
+    "new Request('https://conformance.test/',{method:'POST',"
+    "body:new Uint8Array([97,98,99])})]){"
+    "const copy=body.clone(),a=await body.body.getReader().read();"
+    "a.value[0]=90;const b=await copy.body.getReader().read();"
+    "if(b.value[0]!==97){globalThis.pocSummary='FAIL';return}}"
+    "globalThis.pocSummary='BODY-CLONE-OK'})()"
+    ".catch(e=>globalThis.pocSummary='FAIL '+e);";
+
+static const char xhr_content_type_probe[] =
+    "const load=(body,type)=>{const url=URL.createObjectURL("
+    "new Blob([body],{type}));try{const x=new XMLHttpRequest();"
+    "x.open('GET',url,false);x.send();return x}finally{"
+    "URL.revokeObjectURL(url)}};"
+    "const latin=load(new Uint8Array([233]),"
+    "'text/plain;charset=windows-1252'),"
+    "xml=load('<MixedCase/>','application/xml');"
+    "globalThis.pocSummary=latin.status===200"
+    "&&latin.responseText==='\u00e9'&&xml.status===200"
+    "&&xml.responseXML?.contentType==='text/xml'"
+    "?'XHR-CONTENT-TYPE-OK':'FAIL';";
 
 /* document.open: the 3-argument form is window.open; during parsing it is
    ignored (HTML's active-parser case); otherwise it empties the body and
@@ -1722,7 +1768,7 @@ static int test_writable_terminal_handoffs(void)
         "true}),owner=failed.getWriter(),closed=out(owner.closed);"
         "await owner.write('discard');const error=await out(owner.write("
         "{type:'write'}));expect('file write rejects',error instanceof TypeError);await closed;"
-        "const next=await file.createWritable({keepExistingData:true});await owner.abort();"
+        "const next=await file.createWritable({keepExistingData:true,mode:'exclusive'});await owner.abort();"
         "const locked=await out(file.createWritable());expect('old abort preserves new lock',"
         "locked.name==='NoModificationAllowedError');await next.abort();expect('failed file "
         "write rolls back',await(await file.getFile()).text()==='keep')}"
@@ -2521,18 +2567,86 @@ static const char navigation_timing_probe[] =
     "t('fetch phases',()=>T.navigationStart===o&&T.fetchStart===o"
     "&&T.domainLookupStart===o&&T.requestStart===o);"
     "globalThis.pocSummary='PENDING';"
-    "addEventListener('load',()=>queueMicrotask(()=>{"
+    "addEventListener('load',()=>{queueMicrotask(()=>"
+    "t('inside load checkpoint',()=>T.loadEventEnd===0&&n.loadEventEnd===0));"
+    "setTimeout(()=>{"
     "t('after load',()=>life.every(k=>T[k]===o+n[k]&&n[k]>0));"
     "t('in order',()=>{const c=['fetchStart','domLoading',...life];"
     "for(let i=1;i<c.length;i++)if(T[c[i]]<T[c[i-1]])return false;"
     "return n.duration===n.loadEventEnd&&n.domInteractive"
     ">=n.responseStart});"
-    COMPAT_SUMMARY("NAVIGATION-TIMING-OK") "}));";
+    COMPAT_SUMMARY("NAVIGATION-TIMING-OK") "},0)});";
+
+/* ---- load stops at the document ----
+   DOM's "get the parent" of a Document is its global except for an event
+   of type load, so an element's load (bubbling or not)
+   reaches document listeners in capture and, when it bubbles, in bubble,
+   but never window's. The window's own load still fires once, to its
+   listeners and onload. A capturing window listener that adds another
+   while the document loads (a monitoring script's "wait for load") runs
+   once, at the window's load, instead of doubling per resource. */
+static const char load_path_body[] =
+    "<script>globalThis.seen={wc:[],wb:[],dc:[],db:[],again:0,onload:0,"
+    "ping:0};"
+    "const tag=e=>e.target===document?'#document':e.target===window"
+    "?'#window':e.target.tagName;"
+    "addEventListener('load',e=>seen.wc.push(tag(e)),true);"
+    "addEventListener('load',e=>seen.wb.push(tag(e)));"
+    "document.addEventListener('load',e=>seen.dc.push(tag(e)+':'"
+    "+e.eventPhase),true);"
+    "document.addEventListener('load',e=>seen.db.push(tag(e)+':'"
+    "+e.eventPhase));"
+    "addEventListener('ping',()=>seen.ping++,true);"
+    "addEventListener('ping',()=>seen.ping++);"
+    "onload=()=>seen.onload++;"
+    "const again=()=>{seen.again++;if(document.readyState!=='complete')"
+    "addEventListener('load',()=>again(),true)};again();</script>"
+    "<p id=p>text</p>";
+static const char load_path_probe[] =
+    COMPAT_PRELUDE
+    "const p=document.getElementById('p'),count=(list,item)=>"
+    "list.filter(x=>x===item).length;let path=null;"
+    "p.addEventListener('load',e=>path=e.composedPath());"
+    "for(let i=0;i<4;i++)p.dispatchEvent(new Event('load'));"
+    "p.dispatchEvent(new Event('load',{bubbles:true}));"
+    "document.dispatchEvent(new Event('load',{bubbles:true}));"
+    "t('path ends at document',()=>path&&path[0]===p"
+    "&&path[path.length-1]===document&&!path.includes(window));"
+    "t('window sees no element load',()=>seen.wc.length===0"
+    "&&seen.wb.length===0);"
+    "t('document capture',()=>count(seen.dc,'P:1')===5"
+    "&&count(seen.dc,'#document:2')===1);"
+    "t('document bubble',()=>count(seen.db,'P:3')===1"
+    "&&count(seen.db,'#document:2')===1);"
+    "t('no re-adds',()=>seen.again===1);"
+    "p.dispatchEvent(new Event('ping',{bubbles:true}));"
+    "document.dispatchEvent(new Event('ping',{bubbles:true}));"
+    "t('other types reach window',()=>seen.ping===4);"
+    "globalThis.pocSummary='PENDING';"
+    "addEventListener('load',()=>queueMicrotask(()=>{"
+    "t('own load once',()=>seen.wc.length===1&&seen.wb.length===1"
+    "&&seen.onload===1);"
+    "t('listener ran once',()=>seen.again===2);"
+    COMPAT_SUMMARY("LOAD-PATH-OK") "}));";
+
+static int test_load_stops_at_document(void)
+{
+    puts("test: element load events reach the document but not window");
+    CHECK(run_probe_after("load-path", load_path_body, load_path_probe,
+                          "LOAD-PATH-OK"));
+    return 0;
+}
 
 static int test_window_and_document_constants(void)
 {
     puts("test: window position, name, status, no-op operations, characterSet, frame globals, reflected attributes, frame eval, frame documents, WebGL interfaces, navigation timing");
     int failed = 0;
+    if (!run_probe("url-query-refusal", url_query_refusal_probe,
+                   "URL-REFUSAL-OK")) failed++;
+    if (!run_probe("body-clone-isolation", body_clone_isolation_probe,
+                   "BODY-CLONE-OK")) failed++;
+    if (!run_probe("xhr-content-type", xhr_content_type_probe,
+                   "XHR-CONTENT-TYPE-OK")) failed++;
     if (!run_probe("window-members", window_members_probe,
                    "WINDOW-MEMBERS-OK"))
         failed++;
@@ -2618,8 +2732,9 @@ static int test_window_and_document_constants(void)
     if (!run_probe("promise-operations", promise_operations_probe,
                    "PROMISE-OPERATIONS-OK"))
         failed++;
-    if (!run_probe("navigation-timing", navigation_timing_probe,
-                   "NAVIGATION-TIMING-OK"))
+    if (!run_probe_at_with_turns("navigation-timing", "https://conformance.test/start",
+                                 "<p id=p>text</p>", navigation_timing_probe,
+                                 "NAVIGATION-TIMING-OK", 8))
         failed++;
     return failed;
 }
@@ -2640,6 +2755,7 @@ int main(int argc, char **argv)
     failures += test_handler_form_members_and_unscopables();
     failures += test_platform_methods_present_as_native();
     failures += test_init_events_and_token_list();
+    failures += test_load_stops_at_document();
     failures += test_large_character_data();
     failures += test_writable_terminal_handoffs();
     failures += test_window_and_document_constants();

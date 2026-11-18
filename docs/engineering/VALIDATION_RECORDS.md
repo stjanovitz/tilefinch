@@ -158,6 +158,7 @@ Use `validation_js_profile=0` and `validation_script_split=1` for this
 capture, then join the result to `load_timeline.py` and the per-checkpoint
 script-split records. CPU bins, exact script wall time, and end-to-end wall
 time have different denominators; never add their nested views together.
+
 Mode `2` adds function identities (8,192), source labels (256), a bounded
 joint function/family table (8,192), property/call path counts and records
 for promise jobs lasting at least 100 ms. Identities restore across nested
@@ -166,6 +167,14 @@ never evict and explicitly report overflow and unknown CPU. The fixed
 diagnostic storage and sampler stack are Budget reserved; this is roughly
 1 MiB in detailed mode. Job output happens after its exact wall timer closes
 and is charged to diagnostic host bookkeeping, not the callback.
+
+The validation interpreter compiles the census checks in. Setting
+`validation_execution_census=0` stops the sampler but not the checks; for a
+device timing control, configure the same tree with
+`-DPSP_BROWSER_EXECUTION_CENSUS=OFF`, rebuild the named targets and the
+PSPLink PRX, keep the boot configuration, input script, and capture
+unchanged, and compare completed replies and final pixels. Restore `ON`
+before collecting family attribution.
 
 The `call-frame-*` bins separate ordinary bytecode-frame bookkeeping,
 argument copying, local/reference-slot initialization and cleanup from
@@ -258,7 +267,7 @@ shipping PSP build does not define.
 | `tilefinch-session-split` | The session category: fixed tables, bytecode caches by kind and their tables, cookies, site storage, cache-entry metadata, shared-body headers and the disk queue. |
 | `tilefinch-render-split` | The render category: the framebuffer, the provisional frame, tiles (`bytes/count`, of which `reserved-tiles` are the base slots and `paint-ahead` the rest), tile tables, glyph pixels, scaled images, the overflow cache and the fixed layer. |
 | `tilefinch-frame-realm` | One line for the top document and one per live child frame: `origin-hash` (FNV-1a of `scheme://host`; the log names no page), `realm=own`, `page` (runs in the page's realm) or `none`, `heap-after-bootstrap` (pool bytes once the bootstrap ran), `heap-now`, `heap-limit`, `budget-javascript-bytes` (what the realm holds in the JavaScript category: pool, source store, buffers, handle tables and the runtime structure), `budget-after-bootstrap` (pool plus source store once the bootstrap ran), `document-dom-bytes`. `tilefinch-frame-realms` totals the child realms and repeats the navigation's frame counts. |
-| `tilefinch-frame-lite` | Frame memory counters since boot: `lazy_realm` (the validation-only boot key `frame_lite_lazy_realm`, host `TILEFINCH_FRAME_LITE_LAZY_REALM`: a child document nothing in which can run script or take a press commits without a realm; presses into it are not delivered), `realms-skipped`, `realms-created` and `realm-create-us` (child realms and the time creating them took), `pool-trims=count/bytes` (child-realm allocator trims), `handle-growths=count/total-us/max-us` (DOM handle table doublings in every realm), `hidden-snapshots-skipped` (frame snapshots laid out without pixels because the element had no box) and `mutation-journals` (journals allocated, one per realm that mutated its document). |
+| `tilefinch-frame-lite` | Frame memory counters since boot: `lazy_realm` (whether the lazy-realm switch is on, see `include/tilefinch/frame_lite.h`; with it on, a child document that has nothing able to run script or take a press commits without a realm, and presses into it are not delivered), `realms-skipped`, `realms-created` and `realm-create-us` (child realms and the time creating them took), `pool-trims=count/bytes` (child-realm allocator trims), `handle-growths=count/total-us/max-us` (DOM handle table doublings in every realm), `hidden-snapshots-skipped` (frame snapshots laid out without pixels because the element had no box) and `mutation-journals` (journals allocated, one per realm that mutated its document). |
 
 Every split line ends with `remainder`: the category less every named part,
 clamped at 0, so a large remainder is unexplained memory and a part that
@@ -422,7 +431,7 @@ Verify `vfpu` row counts in the conversion records: for an aligned 320x180
 canvas using the 3:2 fast path, require 180 VFPU rows per applicable
 single-conversion frame.
 
-#### Fixed-pixel canvas setup probe
+### Fixed-pixel canvas setup probe
 
 Validation mark `canvas-setup-probe` (after `canvas-vfpu-check`, outside the
 timing window) compares baseline and setup-once dispatch in one binary.
@@ -518,14 +527,8 @@ same envelopes on the host (and writes WAVs when `TILEFINCH_GAME_AUDIO_WAV_DIR`
 is set); the two must match. It then logs `tilefinch-audio-program-run:` for
 six alternating 256-block runs: four program voices (gain ramp plus swept
 lowpass each) against four integer-path oscillators. PPSSPP reports no thread
-CPU, so compare `mix-wall` there; on a PSP use `mix-cpu`.
-
-A PPSSPP run at a fixed clock on 2026-11-13: envelopes identical to the
-host. Per 512-frame block (11.6 ms of audio), four program voices took
-1,041 us at 333 MHz and 1,571 us at 222 MHz; four integer oscillators took
-266 us and 404 us. The program path costs about 3.9 times the integer path,
-about 9 % of the CPU at 333 MHz. PPSSPP timing is an instruction-count proxy,
-not a device measurement.
+CPU, so compare `mix-wall` there; on a PSP use `mix-cpu`. PPSSPP timing is
+an instruction-count proxy, not a device measurement.
 
 `audio-fft-probe` (input script `webaudio-fft-probe`) covers microphone
 stream voices and AnalyserNodes without opening the microphone: it feeds a
@@ -535,17 +538,12 @@ stream voice and a 1 kHz oscillator, each tapped by its own analyser, against
 the same two voices without analysers. Then it logs
 `tilefinch-audio-analyser-fft:` with the time of one `getFloatFrequencyData`
 computation (the mean of 32) at `fftSize` 256, 1024 and 2048, and the loudest
-bin, which must be 6, 23 and 46.
-
-A PPSSPP run at a fixed clock on 2026-11-13: peak bins 6, 23 and 46 at
-both clocks. Per 512-frame block (11.6 ms of audio), the two voices took
-about 357 us with analysers and 283 us without at 333 MHz (540 us and 432 us
-at 222 MHz), so two taps add about 74 us (108 us), under 1 % of the CPU at
-333 MHz. One frequency analysis took 370 us at fftSize 256, 1,485 us at 1024
-and 3,066 us at 2048 at 333 MHz (530, 2,253 and 4,652 us at 222 MHz). At
-most one analysis runs per analyser per 512-frame block, so a page polling
-a 2048-point analyser every frame spends about 3 ms of each 16.7 ms frame on
-it. PPSSPP timing is an instruction-count proxy, not a device measurement.
+bin, which must be 6, 23 and 46. A frequency read recomputes the spectrum
+only when the audio output has advanced since the last analysis (the read's
+stamp, `src/js_runtime/game_audio_slots.inc`), so at most one analysis runs
+per analyser per 512-frame block however often the page polls. Read the
+per-size analysis time as the cost a page pays once per block for each
+analyser it polls.
 
 Presentation and WebGL A/B marks select the same binary's previous path for
 a device comparison. Validation builds start on the shipping path, and
@@ -789,7 +787,7 @@ output directory must be new so prior evidence is not overwritten. This is a
 Changing session/request identifiers in the private replay adapter is solely
 fixture normalization; live requests and browser policy must remain unchanged.
 
-#### Fast screening versus hardware confirmation
+### Fast screening versus hardware confirmation
 
 Use buffered host replay for the inner edit loop: responses are already
 available, page time advances without sleeping, and a batch builds once then
@@ -948,14 +946,13 @@ minimal `js-bench` scenario) ends the run. `js_bench_dir=DIR` names an HTTP
 trace beside the EBOOT whose JavaScript records the bench compiles; it
 defaults to the replay trace when one is configured. The report is the
 run's `tilefinch-js-bench:` lines (one per kernel, then `outcome=complete`).
-`scripts/js-bench-device.sh` stages the boot.cfg for a host0 device run
-from the trace directory it is given (a required argument, or
-`JS_BENCH_TRACE`);
-under PPSSPP pass `--script js-bench --measure --boot validation_js_bench=1
---trace DIR` at `TILEFINCH_PPSSPP_CPU_MHZ=333` (the runner's native-HOME
-boot gate fails afterwards because the bench key is a validation key; the
-lines are in the run's tilefinch-validation.txt). Shipping builds ignore
-both keys.
+`scripts/js-bench-device.sh [BUILD_DIR] TRACE_DIR` (or `JS_BENCH_TRACE`)
+stages the boot.cfg for a host0 device run; the trace is required because
+kernel timings depend on it. Under PPSSPP pass `--script js-bench --measure
+--boot validation_js_bench=1 --trace DIR` at `TILEFINCH_PPSSPP_CPU_MHZ=333`
+(the runner's native-HOME boot gate fails afterwards because the bench key is
+a validation key; the lines are in the run's tilefinch-validation.txt).
+Shipping builds ignore both keys.
 Each bench line ends in `at-ms=`, the monotonic clock when it was printed,
 so a kernel ran between the previous line's stamp and its own.
 

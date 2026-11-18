@@ -73,19 +73,21 @@ buffer never shows them, and `getParameter(BLEND_SRC_ALPHA)` and
 and `FUNC_REVERSE_SUBTRACT` the reverse. A result below zero is stored as
 zero, as a WebGL unorm buffer clamps after the equation; with these factors
 a subtraction never exceeds one. The GE draws them with its own subtract and
-reverse-subtract operations and the same factor mapping as `FUNC_ADD`, and
-the host renderer gives the same pixels, clamped the same way.
+reverse-subtract operations and the same factor mapping as `FUNC_ADD`.
+Tilefinch's host renderer gives the same pixels for these and for the
+`EXT_blend_minmax` equations below, clamped the same way; its conformance
+fixtures check every pixel against a reference
+(`tests/test_canvas_webgl_conformance.c`).
 
-The GE truncates each weighted term where the host rounds the result once,
-so with any factor other than `ZERO` and `ONE` (alpha, colour or constant) a
-PSP channel can be one step in 255 away from the host's, as WebGL allows;
-every factor pair and equation of the conformance fixture stays within that
-step on a PSP.
+The GE truncates each weighted term where the host renderer rounds the result
+once, so with any factor other than `ZERO` and `ONE` (alpha, colour or
+constant) a PSP channel can be one step in 255 away from the host's, as WebGL
+allows.
 With `EXT_blend_minmax` enabled, `blendEquation()` also takes `MIN_EXT`
 (0x8007) and `MAX_EXT` (0x8008): each colour channel becomes the smaller or
 larger of the fragment and the drawing buffer, and the blend factors are
 ignored, as WebGL specifies. The GE draws them with its own minimum and
-maximum blend operations, and the host renderer gives the same pixels. In
+maximum blend operations. In
 `blendEquationSeparate()` the RGB equation draws all channels; the alpha
 equation is kept and reported by `getParameter(BLEND_EQUATION_ALPHA)` but,
 like a separate alpha factor, never shows in the opaque buffer.
@@ -338,10 +340,9 @@ are copied into every draw.
 - Separate static geometry from dynamic geometry. Use `bufferSubData()` only
   for the range that changed.
 - Keep a stable VAO, program, primitive shape, and index range for repeated
-  draws. Tilefinch caches the validated draw plan and lazily retains one
-  96-word packed template per active plan; each draw patches only live source
-  indices/generations, matrices, colors, texture selection, and instance
-  count. This is bounded internal acceleration, not a new API.
+  draws. Tilefinch caches the validated plan of such a draw and patches only
+  what changed (matrices, colours, texture selection, instance count), so a
+  stable draw costs less than one whose shape changes.
 - Upload buffers and textures before issuing the frame's draws. A resource
   mutation after draws have queued must flush those draws first to preserve
   WebGL ordering.
@@ -399,8 +400,8 @@ same depth testing and blending:
 Each extra submission costs a GE list flush, so a split draw is slower than
 the same geometry in fewer, smaller draws, but nothing is left out. A strip
 part with a vertex that cannot be drawn (not finite, or past the clip range)
-is dropped by itself, where before the whole strip was. Draws that fit one
-submission are unchanged.
+is dropped by itself, not the whole strip. Draws that fit one submission are
+drawn in one.
 
 Two kinds of draw cannot be split exactly and are refused with
 `OUT_OF_MEMORY` and one `console.warn` per program and draw shape:
@@ -616,11 +617,10 @@ renderer.
 
 PPSSPP's hardware renderer does not always keep the WebGL surface in EDRAM in
 step with what the GE drew into it. When the GE scales a full-screen canvas
-straight from that surface, a recording from the emulator can show a frame
-drawn in parts with its later parts missing (for example the first frame of
-a three.js scene with one mesh absent), even though the browser presents it
-only once complete. A PSP shows the complete frame, so judge such frames on
-the device.
+straight from that surface, an emulator recording can show a frame with
+later parts missing, even though the browser presents a frame only once it
+is complete. A PSP shows the complete frame, so judge such frames on the
+device.
 
 ## Preflight checklist
 

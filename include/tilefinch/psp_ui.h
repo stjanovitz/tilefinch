@@ -1488,6 +1488,9 @@ void psp_ui_set_tabs(PspUiState *ui, const PspUiTabsView *tabs);
 void psp_ui_set_home(PspUiState *ui, const PspUiHomeView *home);
 void psp_ui_set_collections(
     PspUiState *ui, const PspUiCollectionsView *collections);
+void psp_ui_collection_format_bytes(PspUiCollectionsRow *row, uint64_t bytes);
+void psp_ui_collection_download_progress(
+    PspUiCollectionsRow *row, uint64_t received, uint64_t total);
 void psp_ui_show_offline_app_preview(
     PspUiState *ui, const PspUiOfflineAppPreview *preview);
 void psp_ui_show_file_download(PspUiState *ui,

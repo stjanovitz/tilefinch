@@ -431,10 +431,15 @@ static int test_offset_geometry_semantics(void)
         "7,79,50\n"
         "0,0\n"
         "31,200,0\n"
-        "-2,NaN,50\n"
-        "77,200,2\n"
+        /* a getBoundingClientRect the page puts on one element is not the
+           interface's, which the offset properties read */
+        "31,200,50\n"
+        /* a page's replacement of the DOMRect global is not the class the
+           browser builds its rectangles with */
+        "31,200,0\n"
         "31,true\n"
-        "1,2,3,4.4,4,50\n"
+        /* nor is a page's own __tilefinchGeometryValue the bridge's */
+        "8,72,200,31,31,50\n"
         "31,8:22:200:50 8:72:200:31 8:103:200:0 0:0:0:0"));
     CHECK(bridge_page_close(&page));
     return 0;

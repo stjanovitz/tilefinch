@@ -88,8 +88,9 @@ boundaries. Moving APIs between modules or changing runtime order should be a
 separate, behavior-reviewed change.
 
 Canvas, IndexedDB, CSS motion, bounded Streams, bounded capability probes,
-DOM traversal (NodeFilter, TreeWalker, NodeIterator and the Document
-factories for them) and the CSSOM rule objects (`cssom-rules.js`: CSSRule
+DOM traversal (NodeFilter, TreeWalker, NodeIterator, their Document
+factories, and the point hit-test APIs) and the CSSOM rule objects
+(`cssom-rules.js`: CSSRule
 and its subclasses, built the first time a page reads a sheet's `cssRules`
 or names a rule interface) are ROM-backed on-demand modules. The capability module exposes the Web Speech
 shape with an empty engine and a Media Source shape that advertises no
@@ -104,9 +105,13 @@ Window messaging's bounded structured-clone wire (`frame-clone.js`, the
 encoder and decoder every `postMessage()` between windows and frames uses)
 is built the first time a realm posts or receives such a message; it has
 no global names of its own, so `platform.js` asks for it through a private
-native, as the form collections, secondary documents and CSSOM rule
+native, as the form collections and typed form-value conversions, secondary documents and CSSOM rule
 modules do. It is the one lazy module whose atoms the generator pins with
 the eager modules' (`sources.def`), so it runs from ROM when it loads.
+A lazy module runs after the interface snapshot, so it declares nothing at
+its top level: it is one function expression or call that publishes through
+`globalThis`, and the engine refuses a top-level declaration (see Interface
+snapshot in `docs/engineering/JS_RUNTIME.md`).
 `TILEFINCH_TRACE_JS_STARTUP=1` reports heap bytes after each eager or lazy
 module. Regression tests require an ordinary realm to start with zero lazy
 module loads, then verify that each first-use boundary activates only its

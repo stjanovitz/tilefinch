@@ -5523,3 +5523,13 @@ int stylesheet_border_radius_code(
     if (style == NULL) return 0;
     return style->border_radius;
 }
+
+size_t style_selector_rightmost_compound_start(const char *text, size_t length)
+{
+    size_t split = 0;
+    char combinator = 0;
+    size_t start = style_selector_last_combinator(
+        text, length, &split, &combinator) ? split + 1 : 0;
+    while (start < length && isspace((unsigned char) text[start])) start++;
+    return start;
+}

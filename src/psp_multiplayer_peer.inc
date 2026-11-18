@@ -1,4 +1,25 @@
 /* Worker-owned peer decision transitions, shared with host event-order tests. */
+static bool multiplayer_apply_remote_endpoint(
+    PspMultiplayerSession *session, const struct sockaddr_in *endpoint)
+{
+    /* A setup command may have been queued while JS still saw "connecting".
+       Only the worker knows whether the handshake has since finished. */
+    if (session->opened) return false;
+    if (session->request.mode == TILEFINCH_MULTIPLAYER_MODE_HOST) {
+        session->punch_endpoint = *endpoint;
+        session->punch_valid = true;
+        session->last_punch_us = 0;
+    } else {
+        session->remote = *endpoint;
+        session->remote_valid = true;
+        session->remote_nonce = 0;
+        session->cookie = 0;
+        session->request.mode = TILEFINCH_MULTIPLAYER_MODE_JOIN;
+        session->last_handshake_us = 0;
+    }
+    return true;
+}
+
 static void multiplayer_consider_candidate(
     PspMultiplayerSession *session, const struct sockaddr_in *source,
     uint32_t sender, const unsigned char *payload, size_t payload_length)

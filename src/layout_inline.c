@@ -2098,7 +2098,8 @@ static void align_line_text_baselines(LineState *line)
     size_t atomic_first = line->atomic_base;
     size_t atomic_last = stack != NULL ? stack->count : 0;
     if (atomic_first > atomic_last) atomic_first = atomic_last;
-    if (line->command_start >= line->layout->count) {
+    /* An unpainted inline-block still takes part in line alignment. */
+    if (line->command_start >= line->layout->count && atomic_first == atomic_last) {
         if (stack != NULL) stack->count = atomic_first;
         return;
     }
@@ -2215,6 +2216,9 @@ static void align_line_text_baselines(LineState *line)
             continue;
         }
         int bottom = command->y - line->y + command->height;
+        for (unsigned r = 0; r < line->relative_count; r++)
+            if (i >= line->relative_start[r] && i < line->relative_end[r])
+                bottom -= line->relative_dy[r];
         if ((command->radius & LAYOUT_TEXT_ZERO_LINE_HEIGHT) == 0
             && bottom > used_height) used_height = bottom;
         command->radius |= LAYOUT_TEXT_BASELINE_ALIGNED;
@@ -2593,8 +2597,37 @@ static void line_inline_overflow_ellipsis(LineState *line)
     }
 }
 
+typedef struct InlineCssomOpenBox {
+    struct InlineCssomOpenBox *parent;
+    lxb_dom_node_t *node;
+    int start_x, height, top_edge, right_margin;
+    bool emitted;
+} InlineCssomOpenBox;
+
+/* A failed flow leaves the open box: the line must not keep pointing at
+   the caller's stack frame. */
+static bool cssom_box_abandon(LineState *line, InlineCssomOpenBox *open)
+{
+    line->cssom_open = open->parent;
+    return false;
+}
+
+static void seal_inline_fragment(LineState *line, InlineCssomOpenBox *open,
+                                 bool last)
+{
+    int width = line->x - open->start_x - (last ? open->right_margin : 0);
+    /* If the first word moved to the next line, don't report a phantom
+       fragment on the previous one. An empty inline still has a box. */
+    if (width <= 0 && (!last || open->emitted)) return;
+    layout_add_inline_fragment(line, open->node, open->start_x,
+        line->y - open->top_edge, width > 0 ? width : 0, open->height);
+    open->emitted = true;
+}
+
 void layout_flush_line(LineState *line)
 {
+    for (InlineCssomOpenBox *open = line->cssom_open; open != NULL;
+         open = open->parent) seal_inline_fragment(line, open, false);
     if (line->line_height != 0 || line->line_height_fixed != 0
         || line->has_text_character) {
         bool bidi_resolved = layout_bidi_resolve_line(line);
@@ -2676,6 +2709,8 @@ void layout_flush_line(LineState *line)
         int bounded_offset_fixed = offset_fixed > INT_MAX ? INT_MAX
             : (offset_fixed < INT_MIN ? INT_MIN : (int) offset_fixed);
         int offset = layout_fixed_floor(bounded_offset_fixed);
+        layout_align_inline_fragments(line, offset > 0 ? offset : 0,
+            line->direction_rtl && !bidi_resolved, layout_fixed_ceil(cursor_fixed));
         if (offset > 0) {
             layout_translate_range(line->layout, line->command_start,
                             line->link_start, line->control_start,
@@ -2727,10 +2762,14 @@ void layout_flush_line(LineState *line)
     line->link_start = line->layout->link_count;
     line->control_start = line->layout->control_count;
     line->node_box_start = line->layout->node_box_count;
+    line->cssom_line = 0;
+    line->relative_count = 0;
     if (line->atomics != NULL && line->atomics->count > line->atomic_base) {
         line->atomics->count = line->atomic_base;
     }
     update_float_bounds(line);
+    for (InlineCssomOpenBox *open = line->cssom_open; open != NULL;
+         open = open->parent) open->start_x = line->start_x;
 }
 
 static int inline_style_line_height_fixed(
@@ -2888,6 +2927,7 @@ static bool coalesce_rtl_text_fragment(
     first->text_length = (uint32_t) used;
     first->width = right - first->x;
     context->layout->count = command_start + 1;
+    layout_clamp_inline_fragment_commands(context->layout);
     return true;
 }
 
@@ -5535,6 +5575,7 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
     size_t aligned_inline_commands = context->layout->count;
     size_t aligned_inline_links = context->layout->link_count;
     size_t aligned_inline_controls = context->layout->control_count;
+    size_t aligned_inline_boxes = context->layout->node_box_count;
     size_t aligned_inline_atomics = line->atomics == NULL ? 0 : line->atomics->count;
     int aligned_inline_y = line->y;
     GeneratedPseudoFlow inline_before = generated_pseudo_flow(
@@ -5593,6 +5634,16 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
             layout_flush_line(line);
         }
     }
+    InlineCssomOpenBox cssom_inline = {
+        .parent = line->cssom_open, .node = node,
+        .start_x = line->x + style.margin.left,
+        .height = layout_fixed_ceil(computed_style_font_size_fixed(&style))
+            + style.padding.top + style.padding.bottom
+            + style.border.top + style.border.bottom,
+        .top_edge = style.padding.top + style.border.top,
+        .right_margin = style.margin.right
+    };
+    line->cssom_open = &cssom_inline;
     if (inline_left_edges > 0) {
         line_cursor_set(line, line->x + inline_left_edges);
     }
@@ -5612,7 +5663,7 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
         };
         inline_background_index = context->layout->count;
         if (layout_add_command(context->layout, placeholder) == NULL)
-            return false;
+            return cssom_box_abandon(line, &cssom_inline);
     }
     /* Generated inline content belongs inside the originating inline's
        left padding/border and background, just like its real children. */
@@ -5620,13 +5671,14 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
         && !flow_generated_inline_pseudo(
             context, node, &style, PSEUDO_BEFORE, line, link_url,
             link_url_length, link_node, NULL)) {
-        return false;
+        return cssom_box_abandon(line, &cssom_inline);
     }
     if (select_control) {
         lxb_dom_node_t *option = select_display_option(node);
         if (option != NULL
             && !flow_inline(context, option, &style, line,
-                            link_url, link_url_length, link_node)) return false;
+                            link_url, link_url_length, link_node))
+            return cssom_box_abandon(line, &cssom_inline);
     } else {
         bool has_flowed_text_child = false;
         for (lxb_dom_node_t *child = document_flat_first_child(node);
@@ -5636,7 +5688,8 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
             }
             uint32_t text_generation = line->text_generation;
             if (!flow_inline(context, child, &style, line,
-                             link_url, link_url_length, link_node)) return false;
+                             link_url, link_url_length, link_node))
+                return cssom_box_abandon(line, &cssom_inline);
             if (line->text_generation != text_generation) {
                 has_flowed_text_child = true;
             }
@@ -5646,16 +5699,18 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
         && !flow_generated_inline_pseudo(
             context, node, &style, PSEUDO_AFTER, line, link_url,
             link_url_length, link_node, NULL)) {
-        return false;
+        return cssom_box_abandon(line, &cssom_inline);
     }
     if (!flow_generated_block_pseudo(context, node, &style, PSEUDO_AFTER,
                                      line, &inline_after)) {
-        return false;
+        return cssom_box_abandon(line, &cssom_inline);
     }
     if (inline_right_edges > 0) {
         line_cursor_set(line, line->x + inline_right_edges);
         line->pending_space = false;
     }
+    seal_inline_fragment(line, &cssom_inline, true);
+    line->cssom_open = cssom_inline.parent;
     if (inline_background_index != SIZE_MAX
         && !paint_inline_background(context, line, &style,
                                     inline_background_index)) {
@@ -5783,6 +5838,43 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
         }
         line_record_atomic(line, node, &style, parent, aligned_inline_y, height,
             baseline, aligned_inline_commands, aligned_inline_links, aligned_inline_controls);
+    }
+    if (style.relative_position) {
+        int dx = 0, dy = 0;
+        bool right = style.has_right && (!style.has_left
+            || computed_style_direction_rtl(parent));
+        if (style.has_left || right) {
+            (void) resolve_computed_length(context->sheet,
+                right ? style.right : style.left,
+                (style.inset_percent_mask & (right ? STYLE_INSET_RIGHT_PERCENT
+                                                   : STYLE_INSET_LEFT_PERCENT)) != 0,
+                line->base_right - line->base_left, &dx);
+            if (right) dx = -dx;
+        }
+        if (style.has_top || style.has_bottom) {
+            bool bottom = !style.has_top;
+            (void) resolve_computed_length(context->sheet,
+                bottom ? style.bottom : style.top,
+                (style.inset_percent_mask & (bottom ? STYLE_INSET_BOTTOM_PERCENT
+                                                    : STYLE_INSET_TOP_PERCENT)) != 0,
+                line->positioned_box.height, &dy);
+            if (bottom) dy = -dy;
+        }
+        if (dx != 0 || dy != 0)
+            layout_translate_range(context->layout, aligned_inline_commands,
+                aligned_inline_links, aligned_inline_controls, aligned_inline_boxes,
+                dx, dy, "relative inline", node);
+        /* Lines already flushed were sized before the shift; the open line
+           must not count it toward its height (CSS 2.1 9.4.3). */
+        size_t first = aligned_inline_commands > line->command_start
+            ? aligned_inline_commands : line->command_start;
+        unsigned slot = line->relative_count;
+        if (dy != 0 && first < context->layout->count && slot < LINE_RELATIVE_LIMIT) {
+            line->relative_start[slot] = (uint32_t) first;
+            line->relative_end[slot] = (uint32_t) context->layout->count;
+            line->relative_dy[slot] = dy;
+            line->relative_count = (uint8_t) (slot + 1);
+        }
     }
     return true;
 }

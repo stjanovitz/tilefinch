@@ -15,6 +15,7 @@
 #include "tilefinch/psp_input_route.h"
 #include "media_presentation_fence_probe.h"
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -304,6 +305,102 @@ static bool test_loading_progress_ramp_pixels(void)
         psp_ui_composite(&ui, other, WIDTH, HEIGHT, WIDTH);
         CHECK(memcmp(pixels + top * WIDTH, other + top * WIDTH,
                      3u * WIDTH * sizeof(*pixels)) != 0);
+    }
+    return true;
+}
+
+/* The install sheet rings the app's theme-color swatch in the theme's muted
+   text color, so a dark app color on a dark sheet still shows its edges. */
+static bool test_offline_app_preview_swatch_outline(void)
+{
+    enum { WIDTH = 480, HEIGHT = 272 };
+    static uint16_t pixels[WIDTH * HEIGHT];
+    PspUiOfflineAppPreview preview = {
+        .estimated_bytes = 1024u * 1024u,
+        .theme_color = UINT32_C(0x102b38),
+        .captured_resources = 8,
+        .theme_alpha = 255,
+        .display_mode = 3,
+        .theme_color_valid = true
+    };
+    snprintf(preview.name, sizeof(preview.name), "Swatch app");
+    const uint16_t swatch = tilefinch_rgb565_pack_u8(0x10, 0x2b, 0x38);
+    static const BrowserChromeTheme themes[] = {
+        BROWSER_CHROME_THEME_FINCH, BROWSER_CHROME_THEME_LIGHT
+    };
+    for (size_t at = 0; at < sizeof(themes) / sizeof(themes[0]); at++) {
+        PspUiState ui;
+        psp_ui_init(&ui);
+        ui.toast_frames = 0;
+        ui.chrome_theme = themes[at];
+        psp_ui_show_offline_app_preview(&ui, &preview);
+        ui.overlay_animation_frames = 0;
+        ui.overlay_motion = 0;
+        memset(pixels, 0, sizeof(pixels));
+        psp_ui_composite(&ui, pixels, WIDTH, HEIGHT, WIDTH);
+        uint16_t ring = psp_ui_theme_palette(themes[at])->text_muted;
+        CHECK(ring != swatch);
+        /* Sheet at (42, 12); swatch 24x14 at (+16, +151), ring 1 px out. */
+        int left = 42 + 15, top = 12 + 150, right = left + 25,
+            bottom = top + 15;
+        CHECK(pixels[(top + 8) * WIDTH + left] == ring
+              && pixels[(top + 8) * WIDTH + right] == ring
+              && pixels[top * WIDTH + left + 12] == ring
+              && pixels[bottom * WIDTH + left + 12] == ring);
+        CHECK(pixels[(top + 8) * WIDTH + left + 1] == swatch
+              && pixels[(top + 8) * WIDTH + right - 1] == swatch);
+    }
+    return true;
+}
+
+/* The Library's app-color strip gets the same muted ring, on the selected
+   row's focus surface and on a plain row alike. */
+static bool test_library_app_strip_outline(void)
+{
+    enum { WIDTH = 480, HEIGHT = 272 };
+    static uint16_t pixels[WIDTH * HEIGHT];
+    static PspUiCollectionsView view;
+    memset(&view, 0, sizeof(view));
+    view.section = PSP_UI_COLLECTION_SAVED;
+    view.count = 2;
+    const uint16_t strip = tilefinch_rgb565_pack_u8(0x10, 0x2b, 0x38);
+    for (size_t at = 0; at < view.count; at++) {
+        view.rows[at].title = "Strip app";
+        view.rows[at].detail = "example.org";
+        view.rows[at].is_web_app = true;
+        view.rows[at].app_theme_valid = true;
+        view.rows[at].app_theme_rgb565 = strip;
+    }
+    static const BrowserChromeTheme themes[] = {
+        BROWSER_CHROME_THEME_FINCH, BROWSER_CHROME_THEME_LIGHT
+    };
+    for (size_t at = 0; at < sizeof(themes) / sizeof(themes[0]); at++) {
+        PspUiState ui;
+        psp_ui_init(&ui);
+        ui.toast_frames = 0;
+        ui.chrome_theme = themes[at];
+        psp_ui_show_collections(&ui, PSP_UI_COLLECTION_SAVED);
+        psp_ui_set_collections(&ui, &view);
+        CHECK(ui.collections_selection == 0);
+        memset(pixels, 0, sizeof(pixels));
+        psp_ui_composite(&ui, pixels, WIDTH, HEIGHT, WIDTH);
+        uint16_t ring = psp_ui_theme_palette(themes[at])->text_muted;
+        CHECK(ring != strip);
+        /* Rows at x 16, y 46 + 35n; strip 5x22 at (+8, +7), ring 1 px out.
+           Row 0 is selected, row 1 is not. */
+        for (int row = 0; row < 2; row++) {
+            int left = 16 + 7, top = 46 + 35 * row + 6, right = left + 6,
+                bottom = top + 23;
+            CHECK(pixels[(top + 11) * WIDTH + left] == ring
+                  && pixels[(top + 11) * WIDTH + right] == ring
+                  && pixels[top * WIDTH + left + 3] == ring
+                  && pixels[bottom * WIDTH + left + 3] == ring);
+            CHECK(pixels[(top + 11) * WIDTH + left + 1] == strip
+                  && pixels[(top + 11) * WIDTH + right - 1] == strip);
+            /* Clear of the focus bar and of the title text beside it. */
+            CHECK(pixels[(top + 11) * WIDTH + left - 1] != ring
+                  && pixels[(top + 11) * WIDTH + right + 1] != ring);
+        }
     }
     return true;
 }
@@ -2822,7 +2919,7 @@ static bool test_custom_theme_file_is_bounded_and_atomic(void)
     file = fopen(path, "wb");
     CHECK(file != NULL);
     CHECK(fputs(
-        "tilefinch-theme\nformat=2\naccent=#123456\n", file) >= 0);
+        "tilefinch-theme\nformat=3\naccent=#123456\n", file) >= 0);
     CHECK(fclose(file) == 0);
     CHECK(!psp_ui_theme_load_custom_file(path, error, sizeof(error)));
     CHECK(strcmp(error, "UNSUPPORTED THEME FORMAT") == 0);
@@ -2992,6 +3089,464 @@ static bool test_panels_draw_the_token_ground(void)
             CHECK(hint > 1000u);
         }
     }
+    return true;
+}
+
+/* Colors the chrome once drew whatever theme was selected: the Ember
+   accent pair, the warning orange that titled the failure sheet, the pink
+   failed-video headline and the retired navy startup neutrals. None may
+   appear on a surface drawn in another theme. */
+static size_t retired_chrome_pixels(const uint16_t *frame, size_t count,
+                                    BrowserChromeTheme theme)
+{
+    const uint16_t retired[] = {
+        PSP_THEME_ACCENT_EMBER, PSP_THEME_ACCENT_EMBER_HI,
+        PSP_THEME_RGB(248, 160, 160), PSP_THEME_RGB(13, 32, 43),
+        PSP_THEME_RGB(236, 244, 244), PSP_THEME_RGB(128, 151, 161)
+    };
+    size_t found = 0;
+    for (size_t pixel = 0; pixel < count; pixel++) {
+        for (size_t at = 0; at < sizeof(retired) / sizeof(retired[0]); at++) {
+            /* Ember's own accent is the one place its pair belongs. */
+            if (theme == BROWSER_CHROME_THEME_EMBER && at < 2u) continue;
+            if (frame[pixel] == retired[at]) found++;
+        }
+    }
+    return found;
+}
+
+static size_t color_pixels(const uint16_t *frame, size_t count,
+                           uint16_t color)
+{
+    size_t found = 0;
+    for (size_t pixel = 0; pixel < count; pixel++)
+        if (frame[pixel] == color) found++;
+    return found;
+}
+
+/* Dialogs with a choice mark it with the selected theme's accent, and none
+   keeps a color of its own: the "Page did not open" sheet drew its title in
+   the fixed warning orange and its choice in a neutral grey, so under every
+   theme it looked like the old Ember default. */
+static bool test_dialogs_follow_the_selected_accent(void)
+{
+    enum { WIDTH = 480, HEIGHT = 272 };
+    static uint16_t frame[WIDTH * HEIGHT];
+    const char *path = "/tmp/tilefinch-theme-accent-test.tfth";
+    FILE *file = fopen(path, "wb");
+    CHECK(file != NULL);
+    CHECK(fputs("tilefinch-theme\nformat=1\nname=Accent Probe\n"
+                "accent=#2BD96E\naccent_high=#9CF0BC\n", file) >= 0);
+    CHECK(fclose(file) == 0);
+    char error[64];
+    CHECK(psp_ui_theme_load_custom_file(path, error, sizeof(error)));
+    CHECK(remove(path) == 0);
+
+    static const unsigned themes[] = {
+        BROWSER_CHROME_THEME_FINCH, BROWSER_CHROME_THEME_OCEAN,
+        BROWSER_CHROME_THEME_PLUM, BROWSER_CHROME_THEME_EMBER,
+        BROWSER_CHROME_THEME_LIGHT, BROWSER_CHROME_THEME_CUSTOM
+    };
+    for (size_t theme = 0; theme < sizeof(themes) / sizeof(themes[0]);
+         theme++) {
+        const PspUiThemePalette *palette = psp_ui_theme_palette(
+            (BrowserChromeTheme) themes[theme]);
+        for (unsigned surface = 0; surface < 4u; surface++) {
+            PspUiState ui;
+            psp_ui_init(&ui);
+            psp_ui_set_page(&ui, "github.com",
+                            "https://github.com/example/issues/1", true);
+            ui.chrome_theme = (uint8_t) themes[theme];
+            if (surface == 0u) {
+                psp_ui_show_status(
+                    &ui, "Could not reach the site\nCheck Wi-Fi, then Retry",
+                    300);
+                psp_ui_show_failure_recovery(
+                    &ui, "Could not reach the site\nCheck Wi-Fi, then Retry",
+                    PSP_UI_FAILURE_DISABLE_JAVASCRIPT);
+            } else if (surface == 1u) {
+                psp_ui_show_failure_recovery_actions(&ui, "Failed", 0u);
+                ui.failure_recovery_heavy = true;
+            } else if (surface == 2u) {
+                psp_ui_show_youtube_login_offer(&ui);
+            } else {
+                ui.screen = PSP_UI_SCREEN_MENU;
+            }
+            ui.toast_frames = 0;
+            ui.overlay_animation_frames = 0;
+            for (size_t pixel = 0; pixel < WIDTH * HEIGHT; pixel++)
+                frame[pixel] = 0xffffu;
+            psp_ui_composite(&ui, frame, WIDTH, HEIGHT, WIDTH);
+            /* The selected row is an accent pill: hundreds of pixels. */
+            CHECK(color_pixels(frame, WIDTH * HEIGHT, palette->accent)
+                  > 2000u);
+            CHECK(retired_chrome_pixels(
+                      frame, WIDTH * HEIGHT,
+                      (BrowserChromeTheme) themes[theme]) == 0u);
+            /* Neither recovery sheet is titled in the warning color. */
+            if (surface < 2u)
+                CHECK(color_pixels(frame, WIDTH * HEIGHT, palette->warn)
+                      == 0u);
+        }
+
+        /* The failed-video panel states its failure in the theme's text;
+           the accent is its Retry. */
+        PspUiMediaState media;
+        PspUiMediaPresentation presentation;
+        psp_ui_media_init(&media);
+        psp_ui_media_bind_presentation(&media, &presentation);
+        psp_ui_media_set(&media, true, false, false, UINT64_C(10000000),
+                         UINT64_C(18950000), "Fixture video");
+        psp_ui_media_set_error_reason(
+            &media, "NETWORK PROBLEM", "Check Wi-Fi, then press X to retry");
+        psp_ui_theme_select((BrowserChromeTheme) themes[theme]);
+        for (size_t pixel = 0; pixel < WIDTH * HEIGHT; pixel++)
+            frame[pixel] = 0xffffu;
+        psp_ui_media_composite(&media, frame, WIDTH, HEIGHT, WIDTH);
+        CHECK(color_pixels(frame, WIDTH * HEIGHT, palette->accent) > 1000u);
+        CHECK(retired_chrome_pixels(
+                  frame, WIDTH * HEIGHT,
+                  (BrowserChromeTheme) themes[theme]) == 0u);
+    }
+
+    /* A startup surface drawn after the profile chose a theme (a startup
+       failure) leaves that theme selected for the painters that read it
+       directly, and draws only the default palette's own neutrals. */
+    psp_ui_theme_select(BROWSER_CHROME_THEME_CUSTOM);
+    psp_ui_startup_composite(PSP_UI_STARTUP_SPLASH, "STARTUP FAILED", 0,
+                             frame, WIDTH, HEIGHT, WIDTH);
+    CHECK(psp_ui_theme_active_palette
+          == psp_ui_theme_palette(BROWSER_CHROME_THEME_CUSTOM));
+    CHECK(retired_chrome_pixels(frame, WIDTH * HEIGHT,
+                                BROWSER_CHROME_THEME_FINCH) == 0u);
+    psp_ui_theme_select(BROWSER_CHROME_THEME_FINCH);
+    return true;
+}
+
+/* WCAG contrast of two RGB565 colors, computed independently of the
+   theme loader's integer tables. */
+static double test_luminance(uint16_t color)
+{
+    unsigned channels[3] = {
+        tilefinch_rgb5_to_u8(tilefinch_rgb565_red_code(color)),
+        tilefinch_rgb6_to_u8(tilefinch_rgb565_green_code(color)),
+        tilefinch_rgb5_to_u8(tilefinch_rgb565_blue_code(color))
+    };
+    double linear[3];
+    for (size_t at = 0; at < 3u; at++) {
+        double value = channels[at] / 255.0;
+        linear[at] = value <= 0.04045 ? value / 12.92
+            : pow((value + 0.055) / 1.055, 2.4);
+    }
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
+}
+
+static double test_contrast(uint16_t first, uint16_t second)
+{
+    double a = test_luminance(first) + 0.05;
+    double b = test_luminance(second) + 0.05;
+    return a > b ? a / b : b / a;
+}
+
+/* Recognisably red: red leads green and blue by a wide margin. */
+static bool test_red_family(uint16_t color)
+{
+    unsigned red = tilefinch_rgb5_to_u8(tilefinch_rgb565_red_code(color));
+    unsigned green = tilefinch_rgb6_to_u8(tilefinch_rgb565_green_code(color));
+    unsigned blue = tilefinch_rgb5_to_u8(tilefinch_rgb565_blue_code(color));
+    return red >= green + 60u && red >= blue + 60u;
+}
+
+static bool test_danger_reads_on(const PspUiThemePalette *palette)
+{
+    /* Danger text sits on the panel (unfocused rows, dialogs) and on the
+       focused row (Site information, the Library). */
+    return test_contrast(palette->danger, palette->panel) >= 4.5
+        && test_contrast(palette->danger, palette->surface_focus) >= 4.5;
+}
+
+static bool test_write_text_file(const char *path, const char *text)
+{
+    FILE *file = fopen(path, "wb");
+    if (file == NULL) return false;
+    bool written = fputs(text, file) >= 0;
+    return fclose(file) == 0 && written;
+}
+
+/* Every built-in theme's danger color is red and reads at 4.5:1 on each
+   surface it is drawn on, and on the ground and raised surface too. */
+static bool test_builtin_danger_colors_read(void)
+{
+    static const BrowserChromeTheme themes[] = {
+        BROWSER_CHROME_THEME_FINCH, BROWSER_CHROME_THEME_OCEAN,
+        BROWSER_CHROME_THEME_PLUM, BROWSER_CHROME_THEME_EMBER,
+        BROWSER_CHROME_THEME_LIGHT
+    };
+    for (size_t at = 0; at < sizeof(themes) / sizeof(themes[0]); at++) {
+        const PspUiThemePalette *palette = psp_ui_theme_palette(themes[at]);
+        CHECK(test_danger_reads_on(palette));
+        CHECK(test_contrast(palette->danger, palette->ground) >= 4.5
+              && test_contrast(palette->danger, palette->surface) >= 4.5);
+        CHECK(test_red_family(palette->danger));
+        /* Danger is not the warning color. */
+        CHECK(palette->danger != palette->warn);
+    }
+    /* The old fixed red was 2.6:1 on Daylight's panel. */
+    CHECK(test_contrast(PSP_THEME_RGB(239, 107, 117),
+                        psp_ui_theme_palette(
+                            BROWSER_CHROME_THEME_LIGHT)->panel) < 3.0);
+    return true;
+}
+
+/* Every built-in theme's on-accent ink reads at 4.5:1 on the accent fill
+   (the highlighted row, buttons, the selected key, the LIVE chip) and on
+   accent HI, after RGB565 reduction. */
+static bool test_builtin_on_accent_reads(void)
+{
+    static const BrowserChromeTheme themes[] = {
+        BROWSER_CHROME_THEME_FINCH, BROWSER_CHROME_THEME_OCEAN,
+        BROWSER_CHROME_THEME_PLUM, BROWSER_CHROME_THEME_EMBER,
+        BROWSER_CHROME_THEME_LIGHT
+    };
+    for (size_t at = 0; at < sizeof(themes) / sizeof(themes[0]); at++) {
+        const PspUiThemePalette *palette = psp_ui_theme_palette(themes[at]);
+        CHECK(test_contrast(palette->on_accent, palette->accent) >= 4.5);
+        CHECK(test_contrast(palette->on_accent, palette->accent_high)
+              >= 4.5);
+    }
+    /* Midnight's earlier accent gave its ink only 4.15:1. */
+    CHECK(test_contrast(PSP_THEME_RGB(0x3D, 0x78, 0xB6),
+                        psp_ui_theme_palette(
+                            BROWSER_CHROME_THEME_FINCH)->on_accent) < 4.5);
+    return true;
+}
+
+/* A format 1 file predates `danger`; it still loads, with a red derived
+   from its own surfaces. A file copying a built-in theme's surfaces gets
+   that theme's danger. */
+static bool test_theme_file_without_danger_derives_one(void)
+{
+    const char *path = "/tmp/tilefinch-theme-danger-test.tfth";
+    char error[64];
+    static const struct {
+        const char *text;
+        BrowserChromeTheme same_as;
+    } files[] = {
+        /* Forest, as shipped before format 2. */
+        {"tilefinch-theme\nformat=1\nname=Forest\n"
+         "ground=#0D1410\nground_reader=#111912\nchrome_bar=#0A100C\n"
+         "hint_bar=#080D0A\npanel=#101812\nsurface=#18231C\n"
+         "surface_focus=#223128\nline=#29372E\ntext=#F3F8F4\n"
+         "text_body=#CBD8CE\ntext_muted=#839087\ntext_faint=#606C64\n"
+         "accent=#4F9A72\naccent_high=#83C49D\non_accent=#07150D\n"
+         "ok=#7FD6A2\nwarn=#E08A52\n", BROWSER_CHROME_THEME_FINCH},
+        /* An accent-only file inherits Midnight's surfaces. */
+        {"tilefinch-theme\nformat=1\naccent=#2BD96E\n",
+         BROWSER_CHROME_THEME_FINCH},
+        /* Daylight's surfaces. */
+        {"tilefinch-theme\nformat=1\nname=Day Copy\n"
+         "ground=#F2F5FA\npanel=#EDF1F7\nsurface=#FFFFFF\n"
+         "surface_focus=#D7E6FA\ntext=#10213A\naccent=#24588F\n"
+         "on_accent=#FFFFFF\n", BROWSER_CHROME_THEME_LIGHT},
+        /* Format 2 without the field is the same as format 1. */
+        {"tilefinch-theme\nformat=2\n"
+         "ground=#F2F5FA\npanel=#EDF1F7\nsurface=#FFFFFF\n"
+         "surface_focus=#D7E6FA\ntext=#10213A\n",
+         BROWSER_CHROME_THEME_LIGHT},
+        /* A cream light theme and a deep violet one: neither is a
+           built-in, so the red is chosen for them. */
+        {"tilefinch-theme\nformat=1\npanel=#F6EBD2\nsurface=#FFF8E8\n"
+         "surface_focus=#E2CDA0\ntext=#2A1E0A\n", (BrowserChromeTheme) 0xff},
+        {"tilefinch-theme\nformat=1\npanel=#24123A\nsurface=#2E1A48\n"
+         "surface_focus=#3E2860\ntext=#F4EEFF\n", (BrowserChromeTheme) 0xff}
+    };
+    for (size_t at = 0; at < sizeof(files) / sizeof(files[0]); at++) {
+        CHECK(test_write_text_file(path, files[at].text));
+        CHECK(psp_ui_theme_load_custom_file(path, error, sizeof(error)));
+        const PspUiThemePalette *custom =
+            psp_ui_theme_palette(BROWSER_CHROME_THEME_CUSTOM);
+        CHECK(test_danger_reads_on(custom));
+        CHECK(test_red_family(custom->danger));
+        if (files[at].same_as != (BrowserChromeTheme) 0xff)
+            CHECK(custom->danger
+                  == psp_ui_theme_palette(files[at].same_as)->danger);
+    }
+
+    /* Surfaces no red can read on keep a legible color: a mid-grey panel
+       gets whichever of the reds and its own text contrasts most. */
+    CHECK(test_write_text_file(path,
+        "tilefinch-theme\nformat=1\npanel=#767676\n"
+        "surface_focus=#767676\ntext=#000000\n"));
+    CHECK(psp_ui_theme_load_custom_file(path, error, sizeof(error)));
+    CHECK(test_contrast(
+              psp_ui_theme_palette(BROWSER_CHROME_THEME_CUSTOM)->danger,
+              PSP_THEME_RGB(0x76, 0x76, 0x76)) >= 4.5);
+
+    /* Format 1 has no danger field; naming it there is an unknown field,
+       as it is to a format 1 reader, wherever the format line sits. */
+    uint16_t retained =
+        psp_ui_theme_palette(BROWSER_CHROME_THEME_CUSTOM)->danger;
+    static const char *const premature[] = {
+        "tilefinch-theme\nformat=1\ndanger=#C01020\n",
+        "tilefinch-theme\ndanger=#C01020\nformat=1\n"
+    };
+    for (size_t at = 0; at < 2u; at++) {
+        CHECK(test_write_text_file(path, premature[at]));
+        CHECK(!psp_ui_theme_load_custom_file(path, error, sizeof(error)));
+        CHECK(strcmp(error, "UNKNOWN THEME FIELD") == 0);
+        CHECK(psp_ui_theme_palette(BROWSER_CHROME_THEME_CUSTOM)->danger
+              == retained);
+    }
+    CHECK(remove(path) == 0);
+    return true;
+}
+
+/* A format 2 file naming every field, danger included, loads exactly;
+   writing the loaded palette back out the way the theme designer does
+   and loading that gives the same palette. */
+static bool test_theme_file_round_trip_keeps_danger(void)
+{
+    static const char *const names[] = {
+        "ground", "ground_reader", "chrome_bar", "hint_bar", "panel",
+        "surface", "surface_focus", "line", "text", "text_body",
+        "text_muted", "text_faint", "accent", "accent_high", "on_accent",
+        "ok", "warn", "danger"
+    };
+    _Static_assert(sizeof(names) / sizeof(names[0])
+                       == sizeof(PspUiThemePalette) / sizeof(uint16_t),
+                   "every palette field is written");
+    const char *path = "/tmp/tilefinch-theme-round-trip.tfth";
+    CHECK(test_write_text_file(path,
+        "tilefinch-theme\nformat=2\nname=Round Trip\n"
+        "ground=#0D1410\nground_reader=#111912\nchrome_bar=#0A100C\n"
+        "hint_bar=#080D0A\npanel=#101812\nsurface=#18231C\n"
+        "surface_focus=#223128\nline=#29372E\ntext=#F3F8F4\n"
+        "text_body=#CBD8CE\ntext_muted=#839087\ntext_faint=#606C64\n"
+        "accent=#4F9A72\naccent_high=#83C49D\non_accent=#07150D\n"
+        "ok=#7FD6A2\nwarn=#E08A52\ndanger=#FF8090\n"));
+    char error[64];
+    CHECK(psp_ui_theme_load_custom_file(path, error, sizeof(error)));
+    PspUiThemePalette first =
+        *psp_ui_theme_palette(BROWSER_CHROME_THEME_CUSTOM);
+    CHECK(first.danger == PSP_THEME_RGB(0xFF, 0x80, 0x90));
+    CHECK(first.warn == PSP_THEME_RGB(0xE0, 0x8A, 0x52));
+    CHECK(strcmp(psp_ui_theme_custom_label(), "Round Trip") == 0);
+
+    char text[PSP_UI_THEME_FILE_LIMIT];
+    int length = snprintf(text, sizeof(text),
+                          "tilefinch-theme\nformat=%d\nname=Round Trip\n",
+                          PSP_UI_THEME_FORMAT_VERSION);
+    const uint16_t *fields = (const uint16_t *) &first;
+    for (size_t at = 0; at < sizeof(names) / sizeof(names[0]); at++) {
+        uint16_t color = fields[at];
+        length += snprintf(
+            text + length, sizeof(text) - (size_t) length,
+            "%s=#%02X%02X%02X\n", names[at],
+            tilefinch_rgb5_to_u8(tilefinch_rgb565_red_code(color)),
+            tilefinch_rgb6_to_u8(tilefinch_rgb565_green_code(color)),
+            tilefinch_rgb5_to_u8(tilefinch_rgb565_blue_code(color)));
+        CHECK(length > 0 && (size_t) length < sizeof(text));
+    }
+    CHECK(test_write_text_file(path, text));
+    CHECK(psp_ui_theme_load_custom_file(path, error, sizeof(error)));
+    CHECK(memcmp(psp_ui_theme_palette(BROWSER_CHROME_THEME_CUSTOM), &first,
+                 sizeof(first)) == 0);
+    CHECK(remove(path) == 0);
+    return true;
+}
+
+/* The destructive rows draw in the selected theme's danger color: the
+   Clear rows of Site data & storage, a site's Delete its data, Site
+   information's Clear data and Reset permissions (focused and armed), and
+   an armed Library delete. They drew a fixed red, which Daylight's panel
+   left at 2.6:1, and the armed rows the warning color. */
+static bool test_destructive_rows_use_the_danger_color(void)
+{
+    enum { WIDTH = 480, HEIGHT = 272 };
+    static uint16_t frame[WIDTH * HEIGHT];
+    const char *path = "/tmp/tilefinch-theme-danger-rows.tfth";
+    CHECK(test_write_text_file(path,
+        "tilefinch-theme\nformat=1\npanel=#F6EBD2\nsurface=#FFF8E8\n"
+        "surface_focus=#E2CDA0\ntext=#2A1E0A\ntext_body=#3A2E1A\n"
+        "accent=#8A4B00\non_accent=#FFFFFF\n"));
+    char error[64];
+    CHECK(psp_ui_theme_load_custom_file(path, error, sizeof(error)));
+    CHECK(remove(path) == 0);
+
+    PspUiSiteStorageView view = {.count = 2};
+    snprintf(view.stick_free, sizeof(view.stick_free), "1.2 GB free");
+    snprintf(view.rows[0].origin, sizeof(view.rows[0].origin), "game.test");
+    snprintf(view.rows[0].detail, sizeof(view.rows[0].detail), "1.4 MB");
+    snprintf(view.rows[1].origin, sizeof(view.rows[1].origin), "news.test");
+    snprintf(view.rows[1].detail, sizeof(view.rows[1].detail), "32 KB");
+    static PspUiCollectionsView collections;
+    memset(&collections, 0, sizeof(collections));
+    collections.section = PSP_UI_COLLECTION_BOOKMARKS;
+    collections.count = 3;
+    for (size_t at = 0; at < collections.count; at++) {
+        collections.rows[at].title = "Saved item";
+        collections.rows[at].detail = "example.org";
+        collections.rows[at].deletable = true;
+    }
+
+    static const unsigned themes[] = {
+        BROWSER_CHROME_THEME_FINCH, BROWSER_CHROME_THEME_OCEAN,
+        BROWSER_CHROME_THEME_PLUM, BROWSER_CHROME_THEME_EMBER,
+        BROWSER_CHROME_THEME_LIGHT, BROWSER_CHROME_THEME_CUSTOM
+    };
+    const uint16_t old_red = PSP_THEME_RGB(239, 107, 117);
+    for (size_t theme = 0; theme < sizeof(themes) / sizeof(themes[0]);
+         theme++) {
+        const PspUiThemePalette *palette = psp_ui_theme_palette(
+            (BrowserChromeTheme) themes[theme]);
+        for (unsigned surface = 0; surface < 4u; surface++) {
+            PspUiState ui;
+            psp_ui_init(&ui);
+            psp_ui_set_page(&ui, "Publisher",
+                            "https://publisher.example/article", true);
+            ui.chrome_theme = (uint8_t) themes[theme];
+            ui.base_screen = PSP_UI_SCREEN_PAGE;
+            if (surface == 0u) {
+                /* Two sites, then ten fixed rows; the last five are the
+                   Clear rows, and the last of them is focused. */
+                ui.screen = PSP_UI_SCREEN_DATA_OPTIONS;
+                psp_ui_set_site_storage(&ui, &view);
+                ui.data_options_selection = 2u + 9u;
+            } else if (surface == 1u) {
+                ui.screen = PSP_UI_SCREEN_STORAGE_SITE;
+                psp_ui_set_site_storage(&ui, &view);
+                ui.data_options_selection = 0u;
+                ui.data_clear_confirmation = 0u;
+            } else if (surface == 2u) {
+                ui.screen = PSP_UI_SCREEN_PAGE_INFORMATION;
+                ui.menu_selection = 3u;
+                ui.data_clear_confirmation = 4u;
+            } else {
+                psp_ui_show_collections(&ui, PSP_UI_COLLECTION_BOOKMARKS);
+                psp_ui_set_collections(&ui, &collections);
+                ui.collections_selection = 1u;
+                ui.collections_delete_confirmation = 2u;
+            }
+            ui.toast_frames = 0;
+            ui.overlay_animation_frames = 0;
+            for (size_t pixel = 0; pixel < WIDTH * HEIGHT; pixel++)
+                frame[pixel] = 0xffffu;
+            psp_ui_composite(&ui, frame, WIDTH, HEIGHT, WIDTH);
+            size_t danger = color_pixels(frame, WIDTH * HEIGHT,
+                                         palette->danger);
+            if (danger <= 200u)
+                fprintf(stderr, "theme %u surface %u danger pixels %zu\n",
+                        themes[theme], surface, danger);
+            CHECK(danger > 200u);
+            if (palette->danger != old_red)
+                CHECK(color_pixels(frame, WIDTH * HEIGHT, old_red) == 0u);
+            /* An armed delete is not drawn as a warning. */
+            if (surface == 3u)
+                CHECK(color_pixels(frame, WIDTH * HEIGHT, palette->warn)
+                      == 0u);
+        }
+    }
+    psp_ui_theme_select(BROWSER_CHROME_THEME_FINCH);
     return true;
 }
 
@@ -9648,8 +10203,25 @@ static bool test_media_open_complete_keeps_open_menu(void)
     return true;
 }
 
+static bool test_collection_download_progress(void)
+{
+    PspUiCollectionsRow row = {0};
+    psp_ui_collection_download_progress(&row, 1024, 4096);
+    CHECK(row.progress_per_mille == 250 && strcmp(row.trailing, "25%") == 0);
+    psp_ui_collection_download_progress(&row, 1024, 0);
+    CHECK(row.progress_per_mille == 0 && strcmp(row.trailing, "1 KB") == 0);
+    psp_ui_collection_download_progress(&row, 1536 * 1024, 0);
+    CHECK(strcmp(row.trailing, "1.5 MB") == 0);
+    psp_ui_collection_download_progress(&row, UINT64_MAX, 0);
+    CHECK(strcmp(row.trailing, "99999.9 MB") == 0);
+    psp_ui_collection_download_progress(&row, 0, 0);
+    CHECK(row.trailing[0] == '\0');
+    return true;
+}
+
 int main(void)
 {
+    if (!test_collection_download_progress()) return 1;
     if (!test_media_open_press_has_one_owner()) return 1;
     if (!test_media_open_press_has_one_owner_audio_only()) return 1;
     if (!test_media_open_command_outlasts_later_presses()) return 1;
@@ -9712,6 +10284,12 @@ int main(void)
         || !test_custom_theme_file_is_bounded_and_atomic()
         || !test_theme_catalog_is_bounded_sorted_and_selectable()
         || !test_panels_draw_the_token_ground()
+        || !test_dialogs_follow_the_selected_accent()
+        || !test_builtin_danger_colors_read()
+        || !test_builtin_on_accent_reads()
+        || !test_theme_file_without_danger_derives_one()
+        || !test_theme_file_round_trip_keeps_danger()
+        || !test_destructive_rows_use_the_danger_color()
         || !test_page_tools_windows_last_row_above_hint()
         || !test_youtube_signin_continue_menu()
         || !test_site_storage_screens()
@@ -9759,6 +10337,8 @@ int main(void)
         || !test_media_parked_command_note()
         || !test_media_title_glyphs_are_retained()
         || !test_loading_progress_ramp_pixels()
+        || !test_offline_app_preview_swatch_outline()
+        || !test_library_app_strip_outline()
         || !test_native_surfaces_own_the_panel()
         || !test_home_traversal_and_activation()
         || !test_implicit_cursor_handoff()

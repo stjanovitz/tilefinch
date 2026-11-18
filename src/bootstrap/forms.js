@@ -29,6 +29,7 @@ globalThis.__tilefinchEventInterfaces.defineProperty(globalThis,
     defineProperty,
     defineProperties,
     freeze,
+    DateType,
   }) {
     /* Loaded after the page may have replaced these globals: build
        errors, promises and platform objects with the constructors
@@ -216,7 +217,136 @@ globalThis.__tilefinchEventInterfaces.defineProperty(globalThis,
         optionsCollections.set(select, collection);
         return collection;
       };
+    /* Keep typed form conversions off pages that use only text fields. */
+    const calendarNumber = (type, value, isCalendarDate) => {
+      if (type === "month") {
+        const year = Number(value.slice(0, -3)), month = Number(value.slice(-2));
+        return year >= 1 && month >= 1 && month <= 12
+          ? (year - 1970) * 12 + month - 1 : NaN;
+      }
+      const dayNumber = date => {
+        if (!isCalendarDate(date)) return NaN;
+        const d = new DateType(0);
+        d.setUTCFullYear(Number(date.slice(0, -6)), Number(date.slice(-5, -3)) - 1,
+          Number(date.slice(-2)));
+        return d.getTime();
+      };
+      if (type === "date") return dayNumber(value);
+      if (type === "week") {
+        const year = value.slice(0, -4), week = Number(value.slice(-2)),
+          first = y => {
+            const d = dayNumber(y + "-01-04");
+            return d - ((new DateType(d).getUTCDay() + 6) % 7) * 86400000;
+          },
+          start = first(year), next = first(String(Number(year) + 1).padStart(4, "0")),
+          chosen = start + (week - 1) * 604800000;
+        return week >= 1 && chosen < next ? chosen : NaN;
+      }
+      const at = type === "time" ? -1 : value.indexOf("T"),
+        [h, m, s = 0] = value.slice(at + 1).split(":").map(Number);
+      if (h >= 24 || m >= 60 || s >= 60) return NaN;
+      return (at < 0 ? 0 : dayNumber(value.slice(0, at))) +
+        Math.round(((h * 60 + m) * 60 + s) * 1000);
+    };
+    const rangeValue = (input, value, inputNumber) => {
+      const lo = inputNumber(input.getAttribute("min")),
+        hi = inputNumber(input.getAttribute("max")),
+        min = Number.isFinite(lo) ? lo : 0,
+        max = Math.max(min, Number.isFinite(hi) ? hi : 100),
+        parsed = inputNumber(value), rawStep = input.getAttribute("step");
+      let result = Number.isFinite(parsed) ? Math.min(max, Math.max(min, parsed))
+        : min / 2 + max / 2;
+      if (rawStep?.toLowerCase() !== "any") {
+        const n = inputNumber(rawStep), step = n > 0 ? n : 1,
+          attr = inputNumber(input.getAttribute("value")),
+          base = Number.isFinite(lo) ? lo : Number.isFinite(attr) ? attr : 0,
+          units = (result - base) / step, tolerance = 1e-9,
+          low = Math.ceil((min - base) / step - tolerance),
+          high = Math.floor((max - base) / step + tolerance);
+        if (Number.isFinite(units) && low <= high &&
+            Math.abs(units - Math.round(units)) > tolerance) {
+          const snapped = base + Math.min(high, Math.max(low, Math.round(units))) * step;
+          if (Number.isFinite(snapped))
+            result = Math.min(max, Math.max(min, Number(snapped.toPrecision(15))));
+        }
+      }
+      return String(result);
+    };
+    const dateInputString = (type, number) => {
+      if (type === "month") {
+        const month = Math.trunc(number), year = Math.floor(month / 12) + 1970;
+        return year >= 1 ? String(year).padStart(4, "0") + "-" +
+          String(month - (year - 1970) * 12 + 1).padStart(2, "0") : "";
+      }
+      const date = new DateType(number), year = date.getUTCFullYear();
+      if (!(year >= 1)) return "";
+      if (type === "week") {
+        /* Thursday determines the ISO week-year. Time within the day is
+           irrelevant, including before the Unix epoch. */
+        date.setUTCHours(0, 0, 0, 0);
+        date.setUTCDate(date.getUTCDate() + 3 - (date.getUTCDay() + 6) % 7);
+        const weekYear = date.getUTCFullYear(), first = new DateType(0);
+        first.setUTCFullYear(weekYear, 0, 1);
+        const week = Math.floor((date - first) / 604800000) + 1;
+        return weekYear >= 1 && Number.isFinite(week)
+          ? String(weekYear).padStart(4, "0") + "-W" + String(week).padStart(2, "0") : "";
+      }
+      if (type === "time") {
+        const milliseconds = ((date.getTime() % 86400000) + 86400000) % 86400000;
+        return new DateType(milliseconds).toISOString().slice(11, -1)
+          .replace(/\.?0+$/, "").replace(/:00$/, "");
+      }
+      const iso = date.toISOString(), rest = iso.slice(iso.indexOf("-") + 1),
+        day = String(year).padStart(4, "0") + "-" + rest.slice(0, 5);
+      return type === "date" ? day :
+        day + "T" + rest.slice(6, -1).replace(/\.?0+$/, "").replace(/:00$/, "");
+    };
+    const calendarDate = (type, number) => {
+      if (type !== "month") return new DateType(number);
+      const d = new DateType(0), years = Math.floor(number / 12);
+      d.setUTCFullYear(1970 + years, number - years * 12, 1);
+      return d;
+    };
+    const decimalPlaces = (value) => {
+      const [mantissa, exp] = String(value).toLowerCase().split("e"),
+        point = mantissa.indexOf("."), fraction = point < 0 ? 0 : mantissa.length - point - 1;
+      return Math.min(9, Math.max(0, fraction - (Number(exp) || 0)));
+    };
+    const stepInput = (input, type, count, inputNumber) => {
+      if (type !== "number" && type !== "range")
+        throw domException("Stepping does not apply to this input type", "InvalidStateError");
+      const rawStep = input.getAttribute("step");
+      if (rawStep?.toLowerCase() === "any")
+        throw domException("Stepping is unavailable when step is any", "InvalidStateError");
+      const parsed = inputNumber(rawStep), step = parsed > 0 ? parsed : 1,
+        min = inputNumber(input.getAttribute("min")), max = inputNumber(input.getAttribute("max")),
+        authored = inputNumber(input.getAttribute("value")),
+        hasMin = Number.isFinite(min), hasMax = Number.isFinite(max),
+        base = hasMin ? min : Number.isFinite(authored) ? authored : 0,
+        current = inputNumber(input.value);
+      const value = Number.isFinite(current) ? current : 0;
+      count = Math.trunc(Number(count) || 0);
+      const scale = 10 ** Math.max(decimalPlaces(step), decimalPlaces(base),
+        decimalPlaces(value), hasMin ? decimalPlaces(min) : 0,
+        hasMax ? decimalPlaces(max) : 0),
+        stepUnits = Math.max(1, Math.round(step * scale)), baseUnits = Math.round(base * scale);
+      let units = Math.round(value * scale), remainder = (units - baseUnits) % stepUnits;
+      if (remainder < 0) remainder += stepUnits;
+      if (remainder && count > 0) { units += stepUnits - remainder; count--; }
+      else if (remainder && count < 0) { units -= remainder; count++; }
+      units += count * stepUnits;
+      const low = hasMin ? baseUnits +
+          Math.ceil((Math.round(min * scale) - baseUnits) / stepUnits) * stepUnits : -Infinity,
+        high = hasMax ? baseUnits +
+          Math.floor((Math.round(max * scale) - baseUnits) / stepUnits) * stepUnits : Infinity;
+      if (low <= high) input.value = String(Math.max(low, Math.min(high, units)) / scale);
+    };
     return {
+      calendarNumber,
+      calendarDate,
+      rangeValue,
+      dateInputString,
+      stepInput,
       liveOptions,
       addOption,
       removeOptionAt,

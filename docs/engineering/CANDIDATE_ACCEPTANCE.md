@@ -1,8 +1,10 @@
 # Interactive candidate acceptance
 
-The five newer sites remain a candidate suite. They are intentionally separate
-from `benchmarks/acceptance-sites.tsv` until each replay qualifies under its
-declared memory, JavaScript, content, and rendering envelope.
+For maintainers. The sites in
+`benchmarks/acceptance-sites-interactive-candidates.tsv` are a candidate
+suite, kept separate from `benchmarks/acceptance-sites.tsv` until each replay
+qualifies under its declared memory, JavaScript, content, and rendering
+envelope.
 
 Run the suite against a caller-supplied, consolidated qualified replay corpus
 outside the repository:
@@ -11,7 +13,7 @@ outside the repository:
 ./benchmarks/run-candidate-interactive-acceptance.sh \
   build-preset-release \
   /path/to/corpora/acceptance-candidates-qualified-CAPTURE_DATE \
-  /tmp/tilefinch-candidate-interactive
+  /path/to/output/candidate-interactive
 ```
 
 `benchmarks/acceptance-sites-interactive-candidates.tsv` owns all site-specific
@@ -41,24 +43,42 @@ content. Neither is a pixel-similarity assertion. Visual reference review
 remains a separate qualification step because a hard pixel hash would reject
 harmless font and rasterization improvements.
 
-The hydration fields are deliberately generic counters. For example, a row
-for a script-hydrated timeline can require loaded modules, DOM mutation and a
+The hydration fields are deliberately generic counters. For example, a row for
+a script-hydrated timeline can require loaded modules, DOM mutation and a
 completed API operation, and reject the page's "enable JavaScript" fallback
 text. These expectations are manifest data; the runner and engine contain no
-per-site branch. Omitted
-hydration columns use zero/disabled defaults, while the checked-in candidate
-manifest requires positive evidence for every required dynamic site.
+per-site branch. Omitted hydration columns use zero/disabled defaults, while
+the checked-in candidate manifest requires positive evidence for every
+required dynamic site.
 
-Each summary preserves the original result columns and appends loaded/failed
-script counts, DOM mutations, completed asynchronous fetch/XHR operations, the
+Each summary row holds the site result followed by loaded/failed script
+counts, DOM mutations, completed asynchronous fetch/XHR operations, the
 configured byte ceiling and remaining headroom, externally reserved bytes,
 first-DOM/first-paint/completion timing, summed measured engine work, maximum
 cooperative slice and phase, maximum compile/callback/frame time, Git revision
 and worktree state, and the lab-binary SHA-256 (when a host SHA-256 tool is
 available) and byte length. The same identity is written once to `run.meta`.
-This does not claim host timings are PSP
-predictions; it makes regressions and indivisible work visible before hardware
-qualification.
+This does not claim host timings are PSP predictions; it makes regressions and
+indivisible work visible before hardware qualification.
+
+The corpus argument (`REPLAY_ROOT`) must contain one subdirectory per
+`replay_dir` in the manifest. A missing subdirectory is a missing corpus, not
+a skipped row. The suite never copies a corpus into the repository.
+
+A manifest row may declare an `external` block policy for a site whose
+captured response is the server's block page. That policy is narrow: the
+engine must still run and tear down cleanly, and the final result must match
+both the row's declared HTTP status and its declared block marker. Such a
+result is reported as `EXTERNAL_BLOCKED`, never `PASS`. A `required` row may
+not declare a block status or marker. An engine failure, a missing corpus,
+another HTTP result, or a marker without the declared status is a hard
+failure.
+
+Exit status is `0` only when every selected candidate passes, `1` for any hard
+failure, `2` for invalid inputs, and `3` only when all runnable rows pass while
+one or more explicitly declared external rows are positively classified as
+blocked. Set `CANDIDATE_SITE_FILTER` to one manifest name for a bounded
+single-site iteration.
 
 ## Visual references
 
@@ -97,20 +117,3 @@ Normalization verifies 480x272 geometry by default, decodes the generated PNG
 again with the acceptance decoder, and rewrites one canonical RGB PNG. PNG and
 PPM use the standard-library implementation. JPEG needs Pillow, ImageMagick,
 macOS `sips`, or ffmpeg; the selected decoder is printed in the result.
-
-`REPLAY_ROOT` must contain one subdirectory per `replay_dir` in the manifest.
-A missing subdirectory is a missing corpus, not a skipped row. The suite never
-copies a corpus into the repository.
-
-Google currently has an explicit `external` block policy in the candidate
-manifest. That policy is narrow: the engine must still run and tear down cleanly,
-and the final result must match both the declared HTTP 403 and the declared
-`Error 403` marker. Such a result is reported as `EXTERNAL_BLOCKED`, never
-`PASS`. An engine failure, a missing corpus, another HTTP result, or a marker
-without the declared status is a hard failure.
-
-Exit status is `0` only when every selected candidate passes, `1` for any hard
-failure, `2` for invalid inputs, and `3` only when all runnable rows pass while
-one or more explicitly declared external rows are positively classified as
-blocked. Set `CANDIDATE_SITE_FILTER` to one manifest name for a bounded
-single-site iteration.

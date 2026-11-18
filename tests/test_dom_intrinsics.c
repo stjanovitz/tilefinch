@@ -617,14 +617,18 @@ int main(int argc, char **argv)
         "(()=>{const h=document.createElement('div');"
         "h.appendChild(document.createElement('i'));h.attachShadow({mode:'open'});"
         "const l=h.childNodes,filter=Array.prototype.filter;"
+        /* The counts are injected into the browser's script through the
+           test seam: a page's own replacement does not reach it (the
+           interface snapshot). */
+        "const patch=__tilefinchTestBrowserPatch;"
         "for(const length of [0x20000000,0x20000001,0xffffffff]){"
-        "let error=null;Array.prototype.filter=function(){return {length}};"
+        "let error=null;patch(Array.prototype,'filter',function(){return {length}});"
         "try{Object.getOwnPropertyNames(l)}catch(e){error=e}"
-        "finally{Array.prototype.filter=filter}"
+        "finally{patch(Array.prototype,'filter',filter)}"
         "if(error&&error.name!=='RangeError')throw Error('unsafe list refusal '+error);"
         "if(l.length!==1||l[0].localName!=='i')throw Error('list damaged');"
         "const d=Object.create(Document.prototype);"
-        "d.querySelectorAll=()=>({length});error=null;"
+        "patch(d,'querySelectorAll',()=>({length}));error=null;"
         "try{Object.getOwnPropertyNames(d.all)}catch(e){error=e}"
         "if(error?.name!=='RangeError')throw Error('unsafe all refusal '+error);"
         "}globalThis.pocSummary='OK'})()");
@@ -1205,6 +1209,18 @@ int main(int argc, char **argv)
         "if(host.shadowRoot.querySelector('a').textContent!=='Last')throw Error('new root');"
         "globalThis.pocSummary='OK';})().catch(error=>{"
         "globalThis.pocSummary=error.name+':'+error.message})");
+    /* A shadow root is a fragment, not an element: combinators in a
+       root-scoped query cannot match it, only :scope can. */
+    ok &= run_case("shadow-root-query-combinators",
+        "(()=>{const host=document.createElement('div');document.body.append(host);"
+        "const root=host.attachShadow({mode:'open'});"
+        "root.innerHTML='<span id=t></span><p><span id=n></span></p>';"
+        "const ids=s=>[...root.querySelectorAll(s)].map(e=>e.id).join();"
+        "const got=[ids('* > span'),ids('* span'),ids(':scope > span'),"
+        "ids(':scope span'),ids('div > span'),ids('div span')].join('|');"
+        "if(got!=='n|n|t|t,n||')throw Error(got);"
+        "if(root.querySelector('* > span').id!=='n')throw Error('first');"
+        "globalThis.pocSummary='OK';})()");
     ok &= run_case("shared-shadow-native-members",
         "(()=>{const roots=[],hosts=[];for(let i=0;i<48;i++){"
         "const host=document.createElement('div');document.body.append(host);"

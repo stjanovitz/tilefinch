@@ -111,7 +111,7 @@ static void js_rt_answer_refused_script(ScriptRuntime *runtime,
     JSValue function = JS_Eval(
         runtime->context, refused_script_answer,
         sizeof(refused_script_answer) - 1u, "<refused-script-answer>",
-        JS_EVAL_TYPE_GLOBAL);
+        JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_TRUSTED);
     if (JS_IsException(function)) {
         JSValue exception = JS_GetException(runtime->context);
         JS_FreeValue(runtime->context, exception);
@@ -718,7 +718,8 @@ bool script_runtime_update_media_state(
         JSValue factory = JS_Eval(
             context, media_update_bootstrap,
             sizeof(media_update_bootstrap) - 1u,
-            "<browser-media-update>", JS_EVAL_TYPE_GLOBAL);
+            "<browser-media-update>",
+            JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_TRUSTED);
         if (JS_IsException(factory)) {
             JSValue exception = JS_GetException(context);
             JS_FreeValue(context, exception);
@@ -1440,6 +1441,13 @@ static void runtime_queue_image_loads(ScriptRuntime *runtime, ImageResources *im
         runtime->image_load_states[runtime->image_load_state_count - 1u] = queued;
     }
     image_queue_page_failures(runtime, images);
+}
+
+void script_runtime_inherit_storage_scope(ScriptRuntime *child,
+                                         const ScriptRuntime *parent)
+{
+    if (child != NULL && parent != NULL)
+        child->bridge.session_storage_scope = parent->bridge.session_storage_scope;
 }
 
 void script_runtime_set_images(ScriptRuntime *runtime,

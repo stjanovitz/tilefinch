@@ -724,9 +724,13 @@ bool browser_engine_history_restore_scroll(
 bool browser_engine_replace_history(
     BrowserEngine *engine, const NavigationHistoryRecord *records,
     size_t count, size_t current_index);
+void browser_engine_recover_tab_history(BrowserEngine *engine);
 bool browser_engine_restore_view(
     BrowserEngine *engine, int scroll_y, int focus_kind,
     size_t focus_index);
+bool browser_engine_restore_view_with_identity(
+    BrowserEngine *engine, int scroll_y, int focus_kind,
+    size_t focus_index, uint64_t focus_identity);
 bool browser_engine_execute_action(BrowserEngine *engine,
                                    const ControllerAction *action,
                                    size_t maximum_bytes,

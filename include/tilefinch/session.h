@@ -110,7 +110,8 @@ typedef enum {
     BROWSER_OPFS_NOT_EMPTY,
     BROWSER_OPFS_QUOTA_EXCEEDED,
     BROWSER_OPFS_INVALID_PATH,
-    BROWSER_OPFS_STALE
+    BROWSER_OPFS_STALE,
+    BROWSER_OPFS_LOCKED
 } BrowserOpfsResult;
 
 typedef struct {
@@ -501,6 +502,9 @@ typedef struct BrowserSession {
        the first write (or when the Memory Stick tier is configured), so
        ordinary pages pay one pointer. */
     struct BrowserSiteStore *site_store;
+    struct BrowserOpfsLease *opfs_leases;
+    /* The frontend's selected tab, captured by each newly created realm. */
+    uint32_t session_storage_scope;
     /* Outlives the store, so an OPFS writer from before a clear can never
        match a recreated file's generation. */
     uint64_t site_storage_generation;
@@ -721,6 +725,11 @@ bool browser_session_storage_get(const BrowserSession *session,
                                  const char *url, bool local,
                                  const char *key, const char **value,
                                  size_t *value_length);
+/* Web Storage accepts empty keys and embedded zero bytes. The C-string
+   variants below remain for native callers with ordinary keys. */
+bool browser_session_storage_get_bytes(
+    const BrowserSession *session, const char *url, bool local,
+    const char *key, size_t key_length, const char **value, size_t *value_length);
 size_t browser_session_storage_length(
     const BrowserSession *session, const char *url, bool local);
 typedef struct {
@@ -745,16 +754,41 @@ bool browser_session_clear_site_data(
 bool browser_session_storage_key(
     const BrowserSession *session, const char *url, bool local,
     size_t index, const char **key);
+bool browser_session_storage_key_bytes(
+    const BrowserSession *session, const char *url, bool local,
+    size_t index, const char **key, size_t *key_length);
 bool browser_session_storage_set(BrowserSession *session, const char *url,
                                  bool local, const char *key,
                                  const char *value, size_t value_length);
+bool browser_session_storage_set_bytes(
+    BrowserSession *session, const char *url, bool local,
+    const char *key, size_t key_length, const char *value, size_t value_length);
 /* Removal from a site kept on the Memory Stick is logged there; when that
    write fails the entry stays (it would reappear at the next load) and
    these return false. */
 bool browser_session_storage_remove(BrowserSession *session, const char *url,
                                     bool local, const char *key);
+bool browser_session_storage_remove_bytes(
+    BrowserSession *session, const char *url, bool local,
+    const char *key, size_t key_length);
 bool browser_session_storage_clear(BrowserSession *session, const char *url,
                                    bool local);
+bool browser_session_storage_get_scoped(
+    const BrowserSession *, const char *, bool, uint32_t, const char *, size_t,
+    const char **, size_t *);
+size_t browser_session_storage_length_scoped(
+    const BrowserSession *, const char *, bool, uint32_t);
+bool browser_session_storage_key_scoped(
+    const BrowserSession *, const char *, bool, uint32_t, size_t,
+    const char **, size_t *);
+bool browser_session_storage_set_scoped(
+    BrowserSession *, const char *, bool, uint32_t, const char *, size_t,
+    const char *, size_t);
+bool browser_session_storage_remove_scoped(
+    BrowserSession *, const char *, bool, uint32_t, const char *, size_t);
+bool browser_session_storage_clear_scoped(
+    BrowserSession *, const char *, bool, uint32_t);
+void browser_session_storage_retire_scope(BrowserSession *, uint32_t);
 /* Clears every entry in one storage namespace, for every site, in RAM and
    on the Memory Stick. Sites keep their tier and standing choice. */
 bool browser_session_storage_clear_all(BrowserSession *session, bool local);
@@ -778,6 +812,15 @@ BrowserOpfsResult browser_session_opfs_write(
 BrowserOpfsResult browser_session_opfs_remove(
     BrowserSession *session, const char *url, const char *path,
     bool recursive);
+BrowserOpfsResult browser_session_opfs_lock(
+    BrowserSession *session, const char *url, const char *path,
+    const void *owner, bool shared, uint64_t *token);
+BrowserOpfsResult browser_session_opfs_commit_shared(
+    BrowserSession *session, const char *url, const char *path,
+    const void *owner, uint64_t token, const unsigned char *bytes, size_t length);
+/* A zero token retires all of the given owner's locks at realm teardown. */
+void browser_session_opfs_unlock(BrowserSession *session, const void *owner,
+                                 uint64_t token);
 BrowserOpfsResult browser_session_opfs_child(
     const BrowserSession *session, const char *url, const char *parent,
     size_t index, const char **name, BrowserOpfsView *view);
@@ -1444,6 +1487,11 @@ size_t browser_session_cache_reclaim(BrowserSession *session,
    its lease (script_loader.c, js_fetch_cors.c dynamic scripts, the
    document preload scan), and none of those runs JavaScript in between.
    Returns the bytes physically freed. */
+/* At most what the Budget reclaim hook's session caches (compiled scripts,
+   their persistent write queue, cache-only decoded pixels) and
+   browser_session_cache_release_script_bodies() could release now. */
+size_t browser_session_admission_reclaimable_bytes(
+    const BrowserSession *session);
 size_t browser_session_cache_release_script_bodies(BrowserSession *session,
                                                    size_t target_bytes);
 /* Evicts older HTTP entries until a bounded working set can be inserted
@@ -1466,6 +1514,13 @@ size_t browser_session_cache_collect_offline_same_origin(
     BrowserSession *session, const char *document_url,
     BrowserOfflineCacheView *views, size_t capacity,
     size_t maximum_bytes, size_t *total_bytes, bool *complete);
+/* Whether the cache holds `url` (a request key) as one of the responses an
+   offline install of `document_url` captures (the selection above, without
+   its bounds). `bytes` and `count` receive the size of that whole selection;
+   `url` may be NULL to measure only. */
+bool browser_session_cache_offline_holds(
+    BrowserSession *session, const char *document_url, const char *url,
+    size_t *bytes, size_t *count);
 bool browser_session_cache_restore_offline(
     BrowserSession *session, const char *document_url,
     const BrowserOfflineCacheView *view);

@@ -575,6 +575,9 @@ static int test_focus_style_and_selector_helpers(void)
         "<input id=gone><input id=kept><input id=flip></body>";
     CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
     ScriptResult result = {0};
+    /* Cases below count the browser's own computed-style reads by
+       replacing getComputedStyle through the test seam
+       (__tilefinchTestBrowserPatch). */
     ScriptRuntime *runtime = script_runtime_create_with_session(
         &document, &budget, 6u * MIB, 4000, "https://helpers.test/", NULL,
         &result);
@@ -615,9 +618,10 @@ static int test_focus_style_and_selector_helpers(void)
               runtime,
               "(()=>{const kept=document.getElementById('kept');kept.focus();"
               "const list=document.getElementById('list'),original="
-              "getComputedStyle;globalThis.focusReads=0;globalThis."
-              "getComputedStyle=function(target){if(target===kept)"
-              "globalThis.focusReads++;return original.apply(this,arguments)};"
+              "getComputedStyle;globalThis.focusReads=0;"
+              "__tilefinchTestBrowserPatch(globalThis,'getComputedStyle',"
+              "function(target){if(target===kept)"
+              "globalThis.focusReads++;return original.apply(this,arguments)});"
               "for(let i=0;i<12;i++)setTimeout(()=>{list.textContent=String(i);"
               "list.setAttribute('data-i',String(i))},0);"
               "setTimeout(()=>{globalThis.unrelatedReads=focusReads;"
@@ -776,6 +780,51 @@ static int test_inserted_subtree_resource_classification(void)
         CHECK(journal->image_resource_scan_required == cases[i].image_scan
               && journal->resource_rebuild_required == cases[i].rebuild);
     }
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* slot.assign() can newly render a light image: the journal must ask for
+   an image scan, and a node of another document is ignored rather than
+   failing the assignment. */
+static int test_manual_slot_assignment_journal(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] =
+        "<!doctype html><body><div id=host><img id=pic src=a.png alt=x>"
+        "<b id=text>T</b></div></body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 6u * MIB, 4000, "https://slots.test/", NULL,
+        &result);
+    CHECK(runtime != NULL);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+              "(()=>{const host=document.getElementById('host');"
+              "const root=host.attachShadow({mode:'open',slotAssignment:'manual'});"
+              "root.innerHTML='<slot></slot>';globalThis.pocSummary='ready';})()",
+              "<slots-setup>", &result)
+          && strcmp(result.summary, "ready") == 0);
+    if (runtime->bridge.mutations != NULL)
+        memset(runtime->bridge.mutations, 0, sizeof(*runtime->bridge.mutations));
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+              "(()=>{const root=document.getElementById('host').shadowRoot;"
+              "const slot=root.querySelector('slot');"
+              "const other=document.implementation.createHTMLDocument('o')"
+              ".createElement('i');"
+              "slot.assign(document.getElementById('pic'),other,"
+              "document.getElementById('text'));"
+              "const ids=slot.assignedNodes().map(n=>n.id).join();"
+              "globalThis.pocSummary=ids;})()",
+              "<slots-assign>", &result));
+    CHECK(strcmp(result.summary, "pic,text") == 0);
+    const ScriptMutationJournal *journal = runtime->bridge.mutations;
+    CHECK(journal != NULL && journal->image_resource_scan_required);
     script_runtime_destroy(runtime);
     document_destroy(&document);
     CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
@@ -1947,6 +1996,9 @@ static int test_intersection_observer_registration_budget(void)
     static const char html[] = "<!doctype html><body></body>";
     CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
     ScriptResult result = {0};
+    /* The page counts the browser's own rectangle reads by wrapping
+       getBoundingClientRect on the prototype through the test seam
+       (__tilefinchTestBrowserPatch). */
     ScriptRuntime *runtime = script_runtime_create_with_session(
         &document, &budget, 5u * MIB, 4000,
         "https://io-budget.test/", NULL, &result);
@@ -1958,8 +2010,8 @@ static int test_intersection_observer_registration_budget(void)
         "createElement('div');document.body.appendChild(d);els.push(d)}"
         "const proto=Object.getPrototypeOf(els[0]),"
         "rect=proto.getBoundingClientRect;"
-        "proto.getBoundingClientRect=function(){io.calls++;"
-        "return rect.call(this)};"
+        "__tilefinchTestBrowserPatch(proto,'getBoundingClientRect',"
+        "function(){io.calls++;return rect.call(this)});"
         "try{for(let i=0;i<200;i++)new IntersectionObserver(entries=>{"
         "io.initial+=entries.length}).observe(els[i]);"
         "const big=new IntersectionObserver(()=>{});"
@@ -3078,9 +3130,10 @@ static int test_focus_fixup_follows_moved_subtree(void)
               "(()=>{const $=(i)=>document.getElementById(i),input=$('moved'),"
               "wrap=$('wrap');input.focus();"
               "const original=globalThis.getComputedStyle;"
-              "globalThis.movedReads=0;globalThis.getComputedStyle="
+              "globalThis.movedReads=0;"
+              "__tilefinchTestBrowserPatch(globalThis,'getComputedStyle',"
               "function(target){if(target===input)globalThis.movedReads++;"
-              "return original.apply(this,arguments)};"
+              "return original.apply(this,arguments)});"
               "setTimeout(()=>{document.body.appendChild("
               "document.createElement('p'));wrap.appendChild("
               "document.createElement('span'));wrap.append('text')},0);"
@@ -7246,14 +7299,18 @@ static int test_usv_string_conversion(void)
     /* ASCII query components already are their UTF-8 decoding. Pin the
        work bound: the decoder must not materialize one array item per byte.
        This counter is scoped to construction; the ordinary entry-list push
-       remains visible and is allowed. */
+       remains visible and is allowed, and must be seen (the counter goes in
+       through the test seam, since a page's own push does not reach the
+       browser's script). */
     static const char ascii_probe[] =
         "{const text='value'.repeat(2048),push=Array.prototype.push;"
-        "let calls=0,params;Array.prototype.push=function(...values){"
-        "calls++;return Reflect.apply(push,this,values)};try{params="
+        "let calls=0,params;__tilefinchTestBrowserPatch(Array.prototype,"
+        "'push',function(...values){calls++;"
+        "return Reflect.apply(push,this,values)});try{params="
         "new URLSearchParams('plain='+text+'&second=a+b')}finally{"
-        "Array.prototype.push=push}pocSummary=params.get('plain')===text&&"
-        "params.get('second')==='a b'&&calls<=4?'URL-ASCII-OK':"
+        "__tilefinchTestBrowserPatch(Array.prototype,'push',push)}"
+        "pocSummary=params.get('plain')===text&&"
+        "params.get('second')==='a b'&&calls>0&&calls<=4?'URL-ASCII-OK':"
         "'URL-ASCII-FAILED:'+calls;}";
     CHECK(host_state_eval(runtime, ascii_probe, "URL-ASCII-OK", &result));
     static const char url_decode_probe[] =
@@ -7843,7 +7900,9 @@ static int test_base64_large_payloads(void)
 }
 
 /* Every connected <img> of a page with more than 128 images gets its load
-   event, exactly once across republications. */
+   event, exactly once across republications. The document's capture
+   listener sees each one; window's listeners see none (DOM "get the
+   parent": a Document has no parent for a load). */
 static int test_connected_image_loads_past_128(void)
 {
     enum { IMAGE_COUNT = 150 };
@@ -7886,6 +7945,9 @@ static int test_connected_image_loads_past_128(void)
     CHECK(handle_table_eval(runtime,
         "globalThis.loads=0;document.addEventListener('load',event=>{"
         "if(event.target.tagName==='IMG')loads++},true);"
+        "globalThis.windowLoads=0;"
+        "addEventListener('load',()=>windowLoads++,true);"
+        "addEventListener('load',()=>windowLoads++);"
         "pocSummary=String(document.images.length)", "150", &result));
     script_runtime_set_images(runtime, &images);
     for (size_t i = 0; i < 64u; i++)
@@ -7894,7 +7956,8 @@ static int test_connected_image_loads_past_128(void)
     script_runtime_set_images(runtime, &images);
     for (size_t i = 0; i < 8u; i++)
         CHECK(script_runtime_advance(runtime, 16u, 8u, &result));
-    bool ok = handle_table_eval(runtime, "pocSummary=String(loads)", "150",
+    bool ok = handle_table_eval(runtime,
+                                "pocSummary=loads+','+windowLoads", "150,0",
                                 &result);
     CHECK(ok);
     script_runtime_set_images(runtime, NULL);
@@ -9085,6 +9148,10 @@ static int test_css_property_name_canonical_fast_path(void)
     const char html[] = "<!doctype html><html><body></body></html>";
     CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
     ScriptResult result;
+    /* The page counts the browser's fallback scans by wrapping
+       String.prototype.charCodeAt through the test seam
+       (__tilefinchTestBrowserPatch); its own replacement of
+       RegExp.prototype.exec must not reach the browser's script. */
     ScriptRuntime *runtime = script_runtime_create(
         &document, &budget, 8u * MIB, 4000, "https://css-name.test/", &result);
     CHECK(runtime != NULL);
@@ -9092,7 +9159,7 @@ static int test_css_property_name_canonical_fast_path(void)
         "(()=>{const normalize=__tilefinchCssName,"
         "original=String.prototype.charCodeAt,exec=RegExp.prototype.exec;"
         "let scans=0,conversions=0;"
-        "String.prototype.charCodeAt=function(i){scans++;return original.call(this,i)};"
+        "__tilefinchTestBrowserPatch(String.prototype,'charCodeAt',function(i){scans++;return original.call(this,i)});"
         "try{for(const value of ['', 'display', 'background-color',"
         "'scroll-margin-block-start','--MixedCase','width-\\u00c4',"
         "'width-\\ud83d\\ude00','a'.repeat(2048)]){"
@@ -9112,7 +9179,7 @@ static int test_css_property_name_canonical_fast_path(void)
         "RegExp.prototype.exec=function(){throw Error('author exec')};"
         "if(normalize('border-left')!=='border-left'||"
         "normalize('borderLeft')!=='border-left')throw Error('intrinsic');"
-        "}finally{String.prototype.charCodeAt=original;RegExp.prototype.exec=exec}"
+        "}finally{__tilefinchTestBrowserPatch(String.prototype,'charCodeAt',original);RegExp.prototype.exec=exec}"
         "pocSummary='CSS-NAME-FAST-PATH-OK'})()",
         "<css-name-fast-path>", &result);
     if (!normalized) fprintf(stderr, "CSS name normalization: %s\n", result.error);
@@ -9528,6 +9595,8 @@ static int test_indexeddb_close_pending_upgrade(void)
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--manual-slot-journal-only") == 0)
+        return test_manual_slot_assignment_journal();
     if (argc == 2 && strcmp(argv[1], "--heavy-frame-once-only") == 0)
         return test_heavy_frame_does_not_replay_prior_scripts();
     CHECK(test_heavy_frame_does_not_replay_prior_scripts() == 0);
@@ -9824,6 +9893,7 @@ int main(int argc, char **argv)
     CHECK(test_focus_style_and_selector_helpers() == 0);
     CHECK(test_focus_fixup_follows_moved_subtree() == 0);
     CHECK(test_inserted_subtree_resource_classification() == 0);
+    CHECK(test_manual_slot_assignment_journal() == 0);
     CHECK(test_blank_recovery_author_work_census() == 0);
     CHECK(test_host_state_timers_and_scroll(false) == 0);
     CHECK(test_host_state_timers_and_scroll(true) == 0);
@@ -11607,14 +11677,14 @@ int main(int argc, char **argv)
     CHECK(script_runtime_evaluate_diagnostic(runtime,
               "(()=>{const g=__gameSynthGain,c=g.context,curve=new Float32Array([.25,.25]);"
               "const original=performance.now;let reads=0;"
-              "performance.now=function(){reads++;return original.call(performance)};"
+              "__tilefinchTestBrowserPatch(performance,'now',function(){reads++;return original.call(performance)});"
               "let due=false,future=false,later=-1;"
               "try{g.gain.cancelScheduledValues(0);const now=c.currentTime;reads=0;"
               "g.gain.cancelScheduledValues(now);g.gain.setValueCurveAtTime(curve,now,.005);"
               "due=reads===0;reads=0;g.gain.cancelScheduledValues(0);"
               "g.gain.setTargetAtTime(.2,c.currentTime+.25,.01);"
               "future=reads===2;later=c.currentTime-now}"
-              "finally{performance.now=original;g.gain.cancelScheduledValues(0)}"
+              "finally{__tilefinchTestBrowserPatch(performance,'now',original);g.gain.cancelScheduledValues(0)}"
               "globalThis.pocSummary=due&&future&&later>=0?'GAME-AUDIO-DUE-NOW':"
               "'GAME-AUDIO-CLOCK-'+due+'-'+future+'-'+later})()",
               "<game-audio-due-now>", &result)
@@ -11703,13 +11773,15 @@ int main(int argc, char **argv)
         "sources[0].connect(__gameSynthGain).connect(context.destination);"
         "const firstMix=sources[0]._updateMix,otherMix=sources[1]._updateMix;"
         "let firstUpdates=0,otherUpdates=0;"
-        "sources[0]._updateMix=()=>firstUpdates++;"
-        "sources[1]._updateMix=()=>otherUpdates++;"
+        /* through the test seam: a page's own function on a source does
+           not stand in for the source's internal method */
+        "__tilefinchTestBrowserPatch(sources[0],'_updateMix',()=>firstUpdates++);"
+        "__tilefinchTestBrowserPatch(sources[1],'_updateMix',()=>otherUpdates++);"
         "__gameSynthGain.gain.value=.3;"
         "const mixFiltered=firstUpdates===1&&otherUpdates===0;"
         "const unrelatedTarget=sources[2]._target;let unrelatedVisits=0;"
-        "Object.defineProperty(sources[2],'_target',{configurable:true,"
-        "get(){unrelatedVisits++;return unrelatedTarget}});"
+        "__tilefinchTestBrowserPatch(sources[2],'_target',{"
+        "get(){unrelatedVisits++;return unrelatedTarget}},true);"
         "__gameSynthGain.gain.value=.31;"
         "const graphRetained=unrelatedVisits===0;"
         "Object.defineProperty(sources[2],'_target',{configurable:true,"
@@ -11721,7 +11793,8 @@ int main(int argc, char **argv)
         "sources[1].disconnect();firstUpdates=otherUpdates=0;"
         "__gameSynthGain.gain.value=.33;"
         "const graphDisconnected=firstUpdates===0&&otherUpdates===0;"
-        "sources[0]._updateMix=firstMix;sources[1]._updateMix=otherMix;"
+        "__tilefinchTestBrowserPatch(sources[0],'_updateMix',firstMix);"
+        "__tilefinchTestBrowserPatch(sources[1],'_updateMix',otherMix);"
         "let bounded=false;try{const extra=context.createBufferSource();"
         "extra.buffer=__gameAudioBuffer;extra.connect(context.destination);"
         "extra.start()}catch(error){bounded=error.name==='QuotaExceededError'}"
@@ -13643,13 +13716,13 @@ int main(int argc, char **argv)
         "'upgradeneeded',()=>firstOpen.result.createObjectStore('records'));"
         "const firstDb=await request(firstOpen);let versionchange=false,blocked="
         "false,upgraded=false;firstDb.addEventListener('versionchange',event=>{"
-        "versionchange=event.oldVersion===1&&event.newVersion===2;setTimeout("
-        "()=>firstDb.close(),0)});const secondOpen=indexedDB.open(upgradeName,2);"
+        "versionchange=event.oldVersion===1&&event.newVersion===2;queueMicrotask("
+        "()=>firstDb.close())});const secondOpen=indexedDB.open(upgradeName,2);"
         "secondOpen.addEventListener('blocked',()=>blocked=true);secondOpen."
         "addEventListener('upgradeneeded',()=>upgraded=true);const secondDb=await "
         "request(secondOpen);secondDb.close();await request(indexedDB.deleteDatabase("
         "upgradeName));globalThis.pocSummary=original==='one'&&remaining.length===1"
-        "&&remaining[0]==='two'&&versionchange&&blocked&&upgraded&&secondDb."
+        "&&remaining[0]==='two'&&versionchange&&!blocked&&upgraded&&secondDb."
         "version===2?'INDEXEDDB-QUERY-UPGRADE-OK':"
         "'INDEXEDDB-QUERY-UPGRADE-FAILED:'+JSON.stringify({original,remaining,"
         "versionchange,blocked,upgraded,version:secondDb.version})})().catch(error"
@@ -13751,9 +13824,13 @@ int main(int argc, char **argv)
         "'upgradeneeded',()=>doomedOpen.result.createObjectStore('items'));"
         "const doomedDb=await request(doomedOpen),doomedTx=doomedDb.transaction("
         "'items','readwrite'),doomedDone=finished(doomedTx).then(()=>'',error=>"
-        "error.name);doomedTx.objectStore('items').put('temporary',1);"
-        "const deleteLive=request(indexedDB.deleteDatabase("
-        "'tilefinch-delete-live'));const doomedName=await doomedDone;"
+        "error.name);const doomedWrite=request(doomedTx.objectStore('items')."
+        "put('temporary',1));let notice=false,blocked=false;"
+        "doomedDb.onversionchange=e=>notice=e.oldVersion===1&&e.newVersion===null;"
+        "const deleting=indexedDB.deleteDatabase('tilefinch-delete-live');"
+        "deleting.onblocked=()=>{blocked=true;doomedDb.close()};"
+        "const deleteLive=request(deleting);const doomedName=await doomedDone;"
+        "const doomedKey=await doomedWrite;"
         "await deleteLive;globalThis.pocSummary="
         "abortResults[0]===1"
         "&&abortResults[1]==='ConstraintError'&&abortResults[2]==='AbortError'"
@@ -13766,7 +13843,8 @@ int main(int argc, char **argv)
         "&&recoveredValue==='kept'"
         "&&badName==='AbortError'&&retryOld===1&&rolledBack"
         "&&persisted==='kept'&&__tilefinchIndexedDBStats.quotaErrors"
-        "===beforeQuota+1&&currentVersion===2&&doomedName==='AbortError'"
+        "===beforeQuota+1&&currentVersion===2&&doomedName===''&&doomedKey===1"
+        "&&notice&&blocked"
         "&&__tilefinchIndexedDBStats.records===0"
         "&&__tilefinchIndexedDBStats.bytes===0"
         "?'INDEXEDDB-FAILURES-OK':'INDEXEDDB-FAILURES-FAILED:'"
@@ -13944,18 +14022,27 @@ int main(int argc, char **argv)
         "seedStore=seed.objectStore('items');await Promise.all(["
         "request(seedStore.add({id:1,email:'same@example.test'})),"
         "request(seedStore.add({id:2,email:'same@example.test'})),seedDone]);"
-        "existingDb.close();let createName='';const upgrade=indexedDB.open(name,2);"
-        "upgrade.addEventListener('upgradeneeded',()=>{try{upgrade.transaction."
+        "existingDb.close();let createName='',abortName='';"
+        "const upgrade=indexedDB.open(name,2);"
+        "upgrade.addEventListener('upgradeneeded',()=>{const tx=upgrade.transaction;"
+        "tx.addEventListener('abort',()=>abortName=tx.error&&tx.error.name);try{tx."
         "objectStore('items').createIndex('email','email',{unique:true})}"
-        "catch(error){createName=error.name;upgrade.transaction.abort()}});"
+        "catch(error){createName=error.name}});"
         "const upgradeName=await request(upgrade).then(()=>'',error=>error.name);"
+        /* The duplicate population is what aborted the upgrade: the
+           transaction carries ConstraintError, the version and the schema
+           stay as they were. */
+        "const kept=await request(indexedDB.open(name)),keptVersion=kept.version,"
+        "keptIndex=kept.transaction('items').objectStore('items').indexNames."
+        "contains('email');kept.close();"
         "await request(indexedDB.deleteDatabase(name));"
         "globalThis.pocSummary=duplicateNames[0]==='ConstraintError'"
-        "&&duplicateNames[1]==='ConstraintError'&&createName==='ConstraintError'"
-        "&&upgradeName==='AbortError'&&duplicateBubbled?"
+        "&&duplicateNames[1]==='ConstraintError'&&createName===''"
+        "&&upgradeName==='AbortError'&&abortName==='ConstraintError'"
+        "&&keptVersion===1&&!keptIndex&&duplicateBubbled?"
         "'INDEXEDDB-UNIQUE-OK':"
         "'INDEXEDDB-UNIQUE-FAILED:'+JSON.stringify({duplicateNames,createName,"
-        "upgradeName});})().catch(error=>{globalThis.pocSummary="
+        "upgradeName,abortName,keptVersion,keptIndex});})().catch(error=>{globalThis.pocSummary="
         "'INDEXEDDB-UNIQUE-ERROR:'+String(error&&error.stack||error)});";
     bool indexeddb_unique_ok = script_runtime_evaluate_diagnostic(
         runtime, indexeddb_unique_probe, "<indexeddb-unique-probe>", &result);
@@ -13999,7 +14086,7 @@ int main(int argc, char **argv)
         "true});eventRequest.addEventListener('success',()=>eventCalls.push('abort'),"
         "{signal:abortListeners.signal});abortListeners.abort();const fourth=request("
         "eventRequest);source.value='after';let cloneName='',postCommitName='';"
-        "try{store.put(()=>{},4)}catch(error){cloneName=error.name}write.commit();"
+        "try{store.put(()=>{})}catch(error){cloneName=error.name}write.commit();"
         "try{store.get(1)}catch(error){postCommitName=error.name}await Promise.all("
         "[first,second,third,fourth,writeDone]);const read=db.transaction('items'),"
         "readDone=finished(read),readStore=read.objectStore('items');await Promise."

@@ -31,11 +31,11 @@ typedef struct {
     const char *origin;
     const char *key;
     const char *value;
+    size_t key_length;
     size_t value_length;
 } SiteStorageLocalView;
 bool site_storage_next_local(const BrowserSession *session, size_t *cursor,
                              SiteStorageLocalView *view);
-size_t site_storage_local_count(const BrowserSession *session);
 /* Replacing the RAM localStorage with a loaded snapshot: fits() checks
    limits and reserves everything adopt() needs, so adopt() cannot fail.
    Origins kept on the Memory Stick in target are skipped. */

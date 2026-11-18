@@ -6,7 +6,7 @@
  * Function.prototype.toString() text in the JavaScript heap
  * (JS_STRIP_SOURCE), kept in the page Budget outside the QuickJS heap so
  * toString() can still answer exactly (JS_SetExternalSourceHooks()). See
- * docs/ARCHITECTURE.md, "Function source outside the heap".
+ * docs/engineering/SCRIPT_MEMORY.md, "Function source outside the heap".
  *
  * Each script's text is split into SCRIPT_SOURCE_STORE_BLOCK_BYTES blocks,
  * each held either as a plain copy or as an independent LZ block
@@ -137,6 +137,10 @@ void script_source_store_balance(ScriptSourceStore *store,
 size_t script_source_store_relieve(ScriptSourceStore *store, size_t needed);
 /* Text bytes the entries hold (0 for NULL). */
 size_t script_source_store_text_bytes(const ScriptSourceStore *store);
+/* At most what script_source_store_relieve() could release now: the decode
+   buffers, the plain blocks not found incompressible, and the entries no
+   lease or uncompiled lazy function holds. */
+size_t script_source_store_reclaimable(const ScriptSourceStore *store);
 void script_source_store_stats(const ScriptSourceStore *store,
                                ScriptSourceStoreStats *stats);
 

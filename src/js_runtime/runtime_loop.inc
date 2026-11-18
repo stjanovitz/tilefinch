@@ -389,6 +389,9 @@ static bool runtime_install_private_json_observer(ScriptRuntime *runtime)
 {
     JSContext *context = runtime->context;
     if (JS_HasException(context)) return false;
+    /* The observer counts the page's calls, so it reads and replaces
+       JSON.parse as the page sees it, not the browser's snapshot of it. */
+    JS_SetEmbedderPageView(runtime->runtime, 1);
     JSValue global = JS_GetGlobalObject(context);
     JSValue json = JS_UNDEFINED, parse = JS_UNDEFINED;
     JSPropertyDescriptor json_property = {0}, parse_property = {0};
@@ -436,6 +439,7 @@ static bool runtime_install_private_json_observer(ScriptRuntime *runtime)
     JS_FreeAtom(context, json_name);
     JS_FreeAtom(context, parse_name);
     JS_FreeValue(context, global);
+    JS_SetEmbedderPageView(runtime->runtime, 0);
     if (!ok) {
         JSValue exception = JS_GetException(context);
         JS_FreeValue(context, exception);
@@ -936,15 +940,16 @@ static bool runtime_dispatch_media_capture(ScriptRuntime *runtime,
     if (ended != 0) {
         if (!JS_IsFunction(runtime->context,
                            runtime->media_capture_host_event)) return true;
-        /* The trusted-event marker goes with the call, so the module
-           never holds it. */
-        JSValue arguments[2] = {
+        /* Browser delivery uses the captured dispatcher, not the public
+           dispatchEvent method (which strips trust on redispatch). */
+        JSValue arguments[3] = {
             JS_NewUint32(runtime->context, ended),
-            runtime->host_trusted_event
+            runtime->host_trusted_event,
+            runtime->host_viewport_dispatch
         };
         bool ok = runtime_call_captured(
             runtime, runtime->media_capture_host_event,
-            "media capture ended", 2, arguments, NULL);
+            "media capture ended", 3, arguments, NULL);
         JS_FreeValue(runtime->context, arguments[0]);
         *dispatched = true;
         return ok;

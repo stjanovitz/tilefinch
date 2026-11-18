@@ -51,8 +51,6 @@ the script itself changes:
   before running the filter; it is the shortest loop for subsystem edits.
   `test` builds every executable-backed registered test plus the frontends
   that script-backed tests use, so a clean tree never reports `Not Run`.
-- Every helper tree uses the vendored Bellard QuickJS, so `test-release`,
-  `verify`, and the readiness workflow qualify the VM the PSP build ships.
 - Override the trees or job count with `PSP_BROWSER_BUILD_DIR`,
   `PSP_BROWSER_RELEASE_BUILD_DIR`, `PSP_BROWSER_SANITIZE_BUILD_DIR`, and
   `PSP_BROWSER_JOBS`; set `PSP_BROWSER_DEP_SOURCE_BUILD` when dependency
@@ -82,10 +80,10 @@ explicit gates rather than part of every edit.
 | `build-dev`, `build-release`, `build-dev-sanitize` | `scripts/dev.sh` | the edit loop |
 | `build-preset-psp-validation` | `cmake --preset psp -B ... -DTILEFINCH_PSP_VALIDATION_LOG=ON` | the PSP validation build every PPSSPP, PSPLink and device script runs ([below](#psp-validation-tree)) |
 
-All presets use the pinned Bellard QuickJS, disable the unrelated
-JavaScriptCore spike, and use a compiler cache when available; the host
-presets build the tests. `release`, `sanitize`, and `hostile` have matching
-build and test presets; the PSP build presets build `psp-browser-script`.
+All presets disable the macOS-only JavaScriptCore diagnostic runner and use
+a compiler cache when available; the host presets build the tests.
+`release`, `sanitize`, and `hostile` have matching build and test presets;
+the PSP build presets build `psp-browser-script`.
 
 **Validation** has one meaning in these docs: a *validation build* is a PSP
 build configured with `TILEFINCH_PSP_VALIDATION_LOG=ON`, normally the
@@ -331,14 +329,9 @@ voice component) or pass
 `-DPSP_BROWSER_POCKETSPHINX_SOURCE_DIR=/path/to/pocketsphinx-5.1.1`; see
 [Dependencies](#dependencies).
 
-The validation interpreter compiles in execution-census checks. Setting
-`validation_execution_census=0` stops the sampler but not the checks; for a
-device timing control, configure the same tree with
-`-DPSP_BROWSER_EXECUTION_CENSUS=OFF`, rebuild the named targets and the
-PSPLink PRX, keep the boot configuration, input script, and capture
-unchanged, and compare completed replies and final pixels. Restore `ON`
-before collecting family attribution. Shipping PSP builds never compile the
-hooks.
+The validation interpreter compiles in execution-census checks; their
+device timing control is in
+[Independent execution census](engineering/VALIDATION_RECORDS.md#independent-execution-census).
 
 Keep the runner and binary unchanged until PSPLink reports `Load/Start`: the
 runner prints the PRX's SHA-256 before loading and rejects a changed artifact
@@ -351,8 +344,9 @@ next variant only after the previous one is resident. The device loop is in
 
 On macOS every automated PPSSPP run goes through LaunchServices
 ([AGENTS.md](../AGENTS.md#the-psp-cross-build-is-a-separate-gate)). The
-input-script runner, its options, and scenario criteria are in the
-[input script reference](engineering/INPUT_SCRIPT_REFERENCE.md). Scenarios
+input-script runner and its options, including the emulated CPU clock and
+graphics backend, are in the
+[input script reference](engineering/INPUT_SCRIPT_REFERENCE.md#ppsspp). Scenarios
 that need local pages serve `tests/fixtures` on loopback:
 
 ```sh
@@ -362,48 +356,10 @@ scripts/run-ppsspp-input-script.sh --script runtime-input-live --runs 2 \
   --url http://127.0.0.1:8779/cooperative-runtime-input.html
 ```
 
-Live-page scenarios and what each must show:
-
-| Scenario | Start URL | Inspect |
-|---|---|---|
-| `section-disclosure-live` | `http://127.0.0.1:8779/cooperative-disclosure.html` | `before`, `expanded`, `collapsed` captures and `tilefinch-control-activation` while 200 paragraphs open and close with timers pending |
-| `wikipedia-article-section-live` | an article with a `#History` fragment | native pointer target `id=History`; the last `section-*` capture shows History prose, not just a focus box; at normal emulator speed, activation at most 1.25 s, flow layout at most 750 ms, and no resource-rebuilding relayout |
-| `youtube-results-focus-live` | a provider results page | `result-next`, `result-below-fold`, `results-filled`: the selected card and scroll move before thumbnails arrive and stay put afterward |
-| `youtube-detail-poster-live` | a watch page | `poster-ready`: the play card holds the downloaded poster after idle work; compare `tilefinch-adapter-commit` resource time apart from transport time (no video plays) |
-
-```sh
-scripts/run-ppsspp-input-script.sh --script wikipedia-article-section-live \
-  --url 'https://en.wikipedia.org/wiki/PlayStation_Portable#History' --runs 2
-```
-
-A receiver golden proves input delivery and script completion, not visual
-correctness, so read the captures. Live layouts change: update a cursor
-route only after inspecting the page, and keep raw journey logs outside the
-repository. A zero layout-phase counter can mean instrumentation is
-unavailable, not that the work was free. The host-only
-`TILEFINCH_DISABLE_ANCESTOR_CACHE=1` disables layout-scoped selector caches
-for timing comparisons.
-
-`tilefinch-focus-feedback` measures an accepted focus publication from the
-frame's input sample, including a repaint that finishes in later render
-slices; it requires a newer completed frame, the same navigation generation,
-and a successful display publication, and reports a superseded input as
-incomplete. A later marked screenshot includes runtime and frame scheduling
-and is not that latency.
-
-`TILEFINCH_PPSSPP_CPU_MHZ=166` or `111` gives a deterministic pressure
-bracket (the default `0` is normal emulation); the runner writes PPSSPP's
-`[CPU] CPUSpeed` setting, so check the run's generated `ppsspp.ini` before
-trusting a new clock experiment.
-
-If a background PPSSPP launch hangs before PSP boot on macOS, check PPSSPP's
-own log for a fresh `Booted` line before blaming the EBOOT, and retry with
-`TILEFINCH_PPSSPP_GRAPHICS=vulkan` (default `opengl`); the OpenGL path can
-block while the window is occluded. The runner sets both the command-line
-option and `GraphicsBackend` in the appended configuration, so confirm Vulkan
-initialization in PPSSPP's log rather than trusting the variable. Keep the
-backend identical across A/B captures. This is an emulator-window workaround,
-not a PSP rendering change.
+Pass criteria for every committed scenario, including the live-page ones,
+are in [Input scenarios](engineering/INPUT_SCENARIOS.md). A receiver golden
+proves input delivery and script completion, not visual correctness, so read
+the captures.
 
 ### Canvas and WebGL game qualification
 
@@ -440,22 +396,9 @@ of its pre-soak value after collection.
 The synthetic pages in `tests/fixtures/canvas-webgl-games/` contain no
 third-party game code and run in the host lab and the isolated PPSSPP
 localhost harness. PPSSPP proves lifecycle, rendering, and cleanup, but its
-software timing does not replace device qualification.
-
-Device WebGL cadence runs use `tests/input-scripts/webgl-game-cadence.txt`
-with Prism's `?qualification=ordinary`, `?qualification=heavy`, and
-`?qualification=profile` URLs. The first mark resets validation-only counters
-after warm-up. The profile mode splits the example's JavaScript cost into
-update, geometry, upload, command setup, and HUD work. The terminal report
-separates author callback time from native WebGL time and records
-canvas-presentation median, p95, maximum, and 60/30 Hz deadline counts. These
-probes are absent from shipping builds and expose no finer clock to pages.
-
-#### Treadline visual QA: camera track and recorded gameplay
-
-The camera-track sweep, recorded PPSSPP gameplay, reference screenshots, and
-milestone review are in
-[Treadline Arena qualification](../examples/treadline-arena/QUALIFICATION.md#treadline-visual-qa-camera-track-and-recorded-gameplay).
+software timing does not replace device qualification. Device cadence runs
+use the `webgl-game-cadence` script
+([criteria](engineering/INPUT_SCENARIOS.md#webgl-game-cadence)).
 
 ### Optional PSP components
 
@@ -525,24 +468,11 @@ an update expects a different one, the update UI warns **Decoder rebuild
 needed**, and all three files are replaced together. A version change alone
 needs no rebuild.
 
-The decoder PRX lives in user-partition memory outside the browser heap. When
-the add-on is installed, the browser leaves 4 MiB of the partition outside its
-heap instead of 2 MiB at startup (`src/psp_heap_reserve.c`), so the heap is
-2 MiB smaller; without it nothing changes. Install or remove the add-on with
-the browser closed. The validation boot line reports
-`heap-threshold=4096KB swdec-reserve=1`.
-
-Loading the component charges the page nothing. A software-decoded stream's
-open charges its working set: the picture arena, sized for the reference
-pictures the stream's SPS declares (at least 4, at most 16, and 16 when the
-SPS cannot be read; a later SPS declaring more ends playback with a
-reference-frame message), the 25-slot picture ring, the audio arena, and a
-512 KiB playback packet. When the page holds too much, it gives memory back a
-step at a time and the open is retried after each: optional memory first
-(staged fonts, a collected script heap, caches, resident tiles), then the
-page's scripts. The page keeps its DOM and position and, when the player
-closes, says **PAGE SCRIPTS STOPPED: NOT ENOUGH MEMORY**. Stream buffering
-stays in RAM.
+The browser detects the add-on at startup and makes its heap 2 MiB smaller
+to leave room for it, so install or remove it with the browser closed. The
+validation boot line reports `heap-threshold=4096KB swdec-reserve=1`; how
+the decoder's memory is charged is in
+[Media pipeline](engineering/MEDIA_PIPELINE.md#software-path).
 
 Checking, profiling, and comparing the decoder are in
 [Software-decoder diagnostics](engineering/SWDEC_DIAGNOSTICS.md).
@@ -649,22 +579,14 @@ Host builds and PSP validation builds compile a read-only heap walk,
 `JS_ComputeMemoryDetail` (`CONFIG_TILEFINCH_HEAP_DETAIL`, set in
 `cmake/TilefinchDependencies.cmake`; a shipping PSP image never compiles it).
 On the PSP it runs only from the memory report, with boot key
-`validation_js_heap_detail=1`, and prints the compact form
-(see [Memory make-up](engineering/VALIDATION_RECORDS.md#memory-make-up)).
-`TILEFINCH_TRACE_JS_HEAP_DETAIL=1` prints a census of a realm at the first
-safe point after its allocator refuses a request, at every 4 MiB high-water
-step (`TILEFINCH_TRACE_JS_HEAP_DETAIL_STEP_KB`), and with each memory report.
-It covers allocator arenas and large blocks, every class with its property
-arrays and payload, each script's bytecode, lazy stubs, line tables and
-retained source, closures, instances per prototype, strings by size band,
-atoms, shapes, pending jobs, `Function.prototype.toString` calls, the Budget
-categories, and the refused request. `=gc` also collects after an OOM census
-and censuses again, answering whether a collection would have freed enough.
-`=compact` prints the bounded form the PSP log uses: no `tostring` row, the
-twelve largest prototypes, and one `kind=file-total` row summing every
-script plus the eight largest scripts.
-Summarise a run directory (one subdirectory per page with `lab.log` and
-`lab.err`):
+`validation_js_heap_detail=1`, and prints the compact form (see
+[Memory make-up](engineering/VALIDATION_RECORDS.md#memory-make-up)). On the
+host, `TILEFINCH_TRACE_JS_HEAP_DETAIL=1` prints a census of a realm after an
+allocator refusal, at each high-water step, and with each memory report; `=gc`
+adds a census after a forced collection and `=compact` prints the PSP log's
+bounded form. The [switch's row](DIAGNOSTIC_SWITCHES.md#trace) lists every row
+the census prints. Summarise a run directory (one subdirectory per page with
+`lab.log` and `lab.err`):
 
 ```sh
 TILEFINCH_TRACE_JS_HEAP_DETAIL=1 ./build-preset-release/psp-browser-interactive-lab \

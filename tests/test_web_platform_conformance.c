@@ -746,9 +746,188 @@ static int test_adopted_sheets(void)
     return 0;
 }
 
-int main(void)
+static const char fetch_value_probe[] =
+    PROBE_PRELUDE
+    "t('null Request init',()=>new Request('/').method==='GET'"
+    "&&new Request('/',null).method==='GET');"
+    "t('null Response init',()=>new Response(null,null).status===200"
+    "&&Response.json(4,null).status===200);"
+    "t('valid status text',()=>new Response(null,{statusText:'All\\tOK'}).statusText"
+    "==='All\\tOK');"
+    "t('invalid status text',()=>['a\\nb','a\\rb','a\\0b','a\\x7fb','a\\u0100']"
+    ".every(statusText=>throwsName(()=>new Response(null,{statusText}),'TypeError')));"
+    "t('non-JSON values',()=>[undefined,Symbol('s'),()=>{}]"
+    ".every(x=>throwsName(()=>Response.json(x),'TypeError')));"
+    "const h=new Headers({a:'1',c:'3'}), iter=h.entries();"
+    "const first=iter.next().value;h.set('b','2');h.set('c','new');"
+    "t('live Headers iterator',()=>first.join()==='a,1'"
+    "&&iter.next().value.join()==='b,2'&&iter.next().value.join()==='c,new'"
+    "&&iter.next().done);"
+    "h.set('d','4');t('exhausted remains done',()=>iter.next().done);"
+    "const visits=[];h.forEach((v,k)=>{visits.push(k+v);"
+    "if(k==='a')h.set('ab','inserted');});"
+    "t('live Headers forEach',()=>visits.join()==='a1,abinserted,b2,cnew,d4');"
+    "const c=new Headers(), firstCookie='a=1; Expires=Wed, 09 Jun 2027 10:18:14 GMT';"
+    "c.append('Set-Cookie',firstCookie);c.append('set-cookie','b=2');"
+    "t('separate cookie entries',()=>typeof c.getSetCookie==='function'"
+    "&&c.getSetCookie().join('|')===firstCookie+'|b=2'"
+    "&&JSON.stringify(Array.from(c))===JSON.stringify([['set-cookie',firstCookie],"
+    "['set-cookie','b=2']])&&c.get('set-cookie')===firstCookie+', b=2');"
+    "t('defensive cookie copies',()=>{const copy=new Headers(c),values=c.getSetCookie();"
+    "values[0]='not stored';c.set('set-cookie','c=3');"
+    "return c.getSetCookie().join()==='c=3'&&copy.getSetCookie().join('|')===firstCookie+'|b=2'"
+    "&&(copy.delete('Set-Cookie'),copy.getSetCookie().length===0);});"
+    "t('no-cors guard still excludes cookie entries',()=>{"
+    "const guarded=new Request('/',{mode:'no-cors',headers:c}).headers;"
+    "guarded.append('Set-Cookie','untouched=true');"
+    "return guarded.getSetCookie().length===0&&!guarded.has('set-cookie');});"
+    "t('separate cookies count toward quota',()=>{const quota=new Headers();"
+    "for(let i=0;i<256;i++)quota.append('set-cookie','a=1');"
+    "return throwsName(()=>quota.append('set-cookie','a=2'),'RangeError')"
+    "&&throwsName(()=>quota.set('x','z'),'RangeError')"
+    "&&(quota.set('set-cookie','b=1'),quota.set('x','z'),quota.getSetCookie().length===1);});"
+    "const xhr=new XMLHttpRequest();let opened=0;"
+    "xhr.onreadystatechange=()=>opened++;xhr.open('GET','/first');"
+    "xhr.open('GET','/second');"
+    "t('reopen does not emit unchanged readyState',()=>opened===1&&xhr.readyState===1);"
+    "xhr.responseType='json';"
+    "t('invalid xhr enum ignored',()=>{xhr.responseType='invalid';return xhr.responseType==='json'});"
+    "t('sync Window open cannot retain typed response',()=>throwsName("
+    "()=>xhr.open('GET','/sync',false),'InvalidAccessError')&&xhr.responseType==='json'"
+    "&&opened===1);"
+    "xhr.responseType='';xhr.open('GET','/sync',null);"
+    "t('sync Window xhr rejects responseType',()=>throwsName("
+    "()=>xhr.responseType='json','InvalidAccessError'));"
+    PROBE_SUMMARY("FETCH-VALUES-OK");
+
+static const char fetch_form_body_probe[] =
+    PROBE_PRELUDE
+    "(async()=>{try{"
+    "const failureName=async(p)=>p.then(()=>'',e=>e.name);"
+    "const form=new FormData();form.append('same','first');form.append('same','second');"
+    "form.append('meta;tag','value\\nsecond');"
+    "form.append('upload',new File([new Uint8Array([0,255,13,10])],"
+    "'packed.bin',{type:'application/octet-stream'}));"
+    "for(const [label,body] of [['request',new Request('/form',{method:'POST',body:form})],"
+    "['response',new Response(form)]]){"
+    "try{const parsed=await body.formData(),upload=parsed.get('upload');"
+    "const bytes=Array.from(new Uint8Array(await upload.arrayBuffer()));"
+    "t(label+' multipart round trip',()=>parsed.getAll('same').join()==='first,second'"
+    "&&parsed.get('meta;tag')==='value\\r\\nsecond'&&upload instanceof File"
+    "&&upload.name==='packed.bin'&&upload.type==='application/octet-stream'"
+    "&&bytes.join()==='0,255,13,10'&&body.bodyUsed);"
+    "const twice=await failureName(body.formData());"
+    "t(label+' consumed body rejects',()=>twice==='TypeError');"
+    "}catch(e){failures.push(label+' multipart round trip:'+e)}}"
+    "const urlEncoded=new Response('?q=y',{headers:{"
+    "'content-type':'Application/X-WWW-Form-Urlencoded; charset=UTF-8'}});"
+    "try{const decoded=await urlEncoded.formData();"
+    "t('exact case-insensitive MIME type',()=>decoded.get('?q')==='y');}"
+    "catch(e){failures.push('exact case-insensitive MIME type:'+e)}"
+    "const prefix=new Response('a=x',{headers:{"
+    "'content-type':'application/x-www-form-urlencoded-oops'}});"
+    "const prefixError=await failureName(prefix.formData());"
+    "t('reject MIME prefixes and consume',()=>prefixError==='TypeError'&&prefix.bodyUsed);"
+    "const typed=(body,boundary='short')=>new Response(body,{headers:{"
+    "'content-type':'Multipart/Form-Data; unused=\"x;y\"; boundary=\"'+boundary+'\"'}});"
+    "const wire='--short\\r\\nContent-Disposition: form-data; name=\"item\"\\r\\n\\r\\n'"
+    "+'a\\r\\n--shorter\\r\\nb\\r\\n--short--';"
+    "try{const parsed=await typed(wire).formData();"
+    "t('quoted boundary, closing EOF and exact marker',()=>parsed.get('item')"
+    "==='a\\r\\n--shorter\\r\\nb');}catch(e){failures.push('quoted boundary:'+e)}"
+    "try{const empty=await new Response(new FormData()).formData();"
+    "t('empty multipart',()=>Array.from(empty).length===0);}"
+    "catch(e){failures.push('empty multipart:'+e)}"
+    "const truncated=await failureName(typed(wire.slice(0,-9)).formData());"
+    "t('multipart missing close',()=>truncated==='TypeError');"
+    "const largeHeader=await failureName(typed('--short\\r\\nUnneeded: '+"
+    "'x'.repeat(8192)+'\\r\\nContent-Disposition: form-data; name=x\\r\\n\\r\\nx'"
+    "+'\\r\\n--short--').formData());"
+    "t('multipart header scan stays bounded',()=>largeHeader==='TypeError');"
+    "const tooMany=await failureName(typed(('"
+    "--short\\r\\nContent-Disposition: form-data; name=x\\r\\n\\r\\nx\\r\\n').repeat(257)"
+    "+'--short--').formData());"
+    "t('multipart entries stay bounded',()=>tooMany==='RangeError');"
+    "}catch(e){failures.push('aborted:'+e)}"
+    PROBE_SUMMARY("FETCH-FORM-BODY-OK") "})();";
+
+static const char fetch_worker_api_probe[] =
+    "const src=\"const x=new XMLHttpRequest();"
+    "x.open('GET','https://conformance.test/unused',false);x.responseType='json';"
+    "const h=new Headers();h.append('set-cookie','a=1');h.append('set-cookie','b=2');"
+    "let rejected=false;try{Response.json(undefined)}catch(e){rejected=e.name==='TypeError'}"
+    "postMessage(x.responseType==='json'&&h.getSetCookie().join()==='a=1,b=2'"
+    "&&h.getSetCookie() instanceof Array&&rejected&&Response.json(4,null).status===200)\","
+    "url=URL.createObjectURL(new Blob([src])),w=new Worker(url);"
+    "w.onerror=()=>globalThis.pocSummary='FAIL worker API exception';"
+    "w.onmessage=e=>{globalThis.pocSummary=e.data?'FETCH-WORKER-OK':'FAIL worker mismatch';"
+    "w.terminate();URL.revokeObjectURL(url);};";
+
+static int test_fetch_api_edges(void)
+{
+    puts("test: Fetch/Headers/XHR value and transition edge cases");
+    int failed = !run_probe("fetch API values", fetch_value_probe, "FETCH-VALUES-OK");
+    failed += !run_probe("fetch form body", fetch_form_body_probe, "FETCH-FORM-BODY-OK");
+    failed += !run_probe("fetch Worker API", fetch_worker_api_probe, "FETCH-WORKER-OK");
+    return failed;
+}
+
+/* ---- Live Range limits and replace-all mutations ---- */
+
+/* A page that keeps many Ranges got QuotaExceededError from new Range()
+   past 256; the oldest now stop following mutations instead. textContent
+   and innerHTML move boundaries inside the replaced children to (parent,
+   0) even without a MutationObserver, which no longer snapshots child
+   lists for Ranges alone (its 256-child cap left a boundary in a removed
+   child beyond it). */
+static const char live_ranges_probe[] =
+    PROBE_PRELUDE
+    "const p=document.getElementById('p'),text=p.firstChild;"
+    "const keep=[];let thrown=null;"
+    "try{for(let i=0;i<5000;i++)keep.push(i&1?new Range():"
+    "document.createRange())}catch(e){thrown=e}"
+    "t('no quota error',()=>thrown===null&&keep.length===5000);"
+    "const newest=keep[4999];newest.setStart(text,2);newest.setEnd(text,4);"
+    "text.insertData(0,'ab');"
+    "t('newest live',()=>newest.startOffset===4&&newest.endOffset===6);"
+    "t('oldest readable',()=>keep[0].startContainer===document"
+    "&&keep[0].collapsed);"
+    "keep.length=0;"
+    "const box=document.createElement('div');document.body.appendChild(box);"
+    "const fill=()=>{box.textContent='';for(let i=0;i<300;i++){"
+    "const c=document.createElement('b');c.textContent='c'+i;"
+    "box.appendChild(c)}};"
+    "const check=(label,replace,observe)=>{fill();"
+    "const inner=new Range(),outer=new Range(),far=new Range();"
+    "inner.setStart(box.children[280].firstChild,1);inner.setEnd(box,290);"
+    "outer.setStart(box.children[2].firstChild,1);outer.setEnd(box,5);"
+    "far.setStart(text,1);far.setEnd(text,2);"
+    "const o=observe?new MutationObserver(()=>{}):null;"
+    "if(o)o.observe(box,{childList:true});replace();if(o)o.disconnect();"
+    "t(label+' inner',()=>inner.startContainer===box&&inner.startOffset===0"
+    "&&inner.endContainer===box&&inner.endOffset===0);"
+    "t(label+' outer',()=>outer.startContainer===box&&outer.startOffset===0"
+    "&&outer.collapsed);"
+    "t(label+' far',()=>far.startContainer===text&&far.startOffset===1"
+    "&&far.endOffset===2)};"
+    "check('textContent',()=>{box.textContent='x'},false);"
+    "check('innerHTML',()=>{box.innerHTML='<i>y</i>'},false);"
+    "check('observed textContent',()=>{box.textContent='x'},true);"
+    "check('observed innerHTML',()=>{box.innerHTML='<i>y</i>'},true);"
+    PROBE_SUMMARY("LIVE-RANGES-OK");
+
+static int test_live_ranges(void)
+{
+    puts("test: live Ranges past the tracking limit and replace-all edits");
+    CHECK(run_probe("live-ranges", live_ranges_probe, "LIVE-RANGES-OK"));
+    return 0;
+}
+
+int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
+    if (argc == 2 && !strcmp(argv[1], "--fetch-api-only"))
+        return test_fetch_api_edges() != 0;
     int failures = 0;
     failures += test_selector_syntax_table();
     failures += test_selector_errors();
@@ -765,6 +944,8 @@ int main(void)
     failures += test_legacy_events();
     failures += test_performance_buffers();
     failures += test_adopted_sheets();
+    failures += test_fetch_api_edges();
+    failures += test_live_ranges();
     if (failures != 0) return 1;
     puts("web platform conformance tests passed");
     return 0;

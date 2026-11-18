@@ -85,6 +85,64 @@ bool is_block_display(DisplayMode display)
            || display == DISPLAY_TABLE_ROW || display == DISPLAY_TABLE_CELL;
 }
 
+/* The common block has neither provisional bottom anchors nor clip paths.
+   Keep their retained-geometry fixups out of the hot Allegrex entry point. */
+__attribute__((noinline))
+static void layout_finish_bottom_fixups(LayoutContext *context, lxb_dom_node_t *node,
+                                        int padding_bottom)
+{
+    for (size_t i = 0; i < context->bottom_fixup_count;) {
+        if (context->bottom_fixups[i].containing_node != node) {
+            i++;
+            continue;
+        }
+        int dy = padding_bottom - context->bottom_fixups[i].assumed_bottom;
+        if (dy != 0) {
+            translate_node_subtree(context->layout,
+                                   context->bottom_fixups[i].node, 0, dy);
+        }
+        context->bottom_fixups[i] =
+            context->bottom_fixups[--context->bottom_fixup_count];
+    }
+}
+
+__attribute__((noinline))
+static void layout_finish_clip_path(LayoutContext *context, lxb_dom_node_t *node,
+    bool is_fixed, bool clip_path_empty, StyleOverflowClipBox clip_path_box,
+    size_t node_command_start)
+{
+    LayoutNodeBox *clip_box = layout_box_for_node_mutable(
+        context->layout, node);
+    if (clip_box != NULL) {
+        clip_box->clip_path_clip = 1;
+        layout_node_box_set_clip_geometry(clip_box,
+            layout_node_box_clip_radius(clip_box), 0,
+            clip_path_empty ? (StyleOverflowClipBox) LAYOUT_NODE_CLIP_EMPTY
+                            : clip_path_box);
+    }
+    /* clip-path is not a containing block for fixed descendants, but it
+       still clips them (CSS Masking 5.1). A viewport-fixed descendant
+       therefore shows only where this box's clip region is on screen,
+       and is retired once that region has scrolled away. A fixed clip
+       owner moves with its descendants, which the ordinary overflow
+       geometry of a fixed range already handles. */
+    if (clip_box != NULL && !is_fixed) {
+        int clip_bottom = layout_add_coordinate(
+            clip_box->y,
+            clip_box->height - (int) clip_box->clip_inset_top);
+        for (size_t i = 0; i < context->layout->fixed_count; i++) {
+            FixedRange *range = &context->layout->fixed_ranges[i];
+            if (range->command_start < node_command_start
+                || range->command_end > context->layout->count
+                || range->clip_node != NULL) continue;
+            range->clip_node = node;
+            if (clip_bottom < range->scroll_end) {
+                range->scroll_end = clip_bottom;
+            }
+        }
+    }
+}
+
 __attribute__((noinline))
 static int content_visibility_intrinsic_height(
     const Stylesheet *sheet, lxb_dom_node_t *node)
@@ -123,16 +181,28 @@ static int content_visibility_intrinsic_height(
    remaining main size. Require a provable zero box, including pseudo content;
    unknown/automatic content keeps the general conservative path. */
 static bool column_item_definitely_empty(LayoutContext *context,
-                                         const FlatItem *item)
+                                         const FlatItem *item,
+                                         bool check_outer_size)
 {
     const ComputedStyle *s = &item->style;
     if (item->anonymous_text || item->generated_pseudo != PSEUDO_NONE
-        || item->node == NULL || item->node->first_child != NULL
-        || s->display != DISPLAY_BLOCK || s->min_height != 0
+        || item->node == NULL || document_flat_first_child(item->node) != NULL
+        || s->display != DISPLAY_BLOCK || s->aspect_height > 0 || s->generated_image)
+        return false;
+    switch (item->node->local_name) {
+    case LXB_TAG_IMG: case LXB_TAG_IFRAME: case LXB_TAG_VIDEO:
+    case LXB_TAG_AUDIO: case LXB_TAG_SVG: case LXB_TAG_CANVAS:
+    case LXB_TAG_INPUT: case LXB_TAG_TEXTAREA: case LXB_TAG_SELECT:
+    case LXB_TAG_BUTTON: case LXB_TAG_HR:
+        return false;
+    default:
+        break;
+    }
+    if (check_outer_size && (s->min_height != 0
         || (s->has_height && (s->height != 0 || s->height_percent))
-        || s->aspect_height > 0 || s->padding.top || s->padding.bottom
+        || s->padding.top || s->padding.bottom
         || s->border.top || s->border.bottom || s->margin.top || s->margin.bottom
-        || s->margin_top_auto || s->margin_bottom_auto || s->generated_image)
+        || s->margin_top_auto || s->margin_bottom_auto))
         return false;
     if (style_node_pseudo_rules_may_affect_discovery(context->sheet, item->node)) {
         for (unsigned i = 0; i < 2; i++) {
@@ -762,6 +832,29 @@ typedef enum {
     LAYOUT_BLOCK_POSITIONED_OUT_OF_FLOW
 } LayoutBlockPositionedResult;
 
+static int positioned_axis(
+    int fallback, int containing, int size, bool has_start, bool has_end,
+    int start, int end, int start_margin, int end_margin,
+    bool start_auto, bool end_auto, bool horizontal, bool rtl)
+{
+    if (!has_start && !has_end) return fallback;
+    if (has_start && has_end && (start_auto || end_auto)) {
+        int free = containing - size - start - end - start_margin - end_margin;
+        if (start_auto) {
+            if (end_auto && horizontal && free < 0) {
+                if (!rtl) free = 0;
+            } else if (end_auto) {
+                free /= 2;
+            }
+            start_margin += free;
+        }
+        return layout_add_coordinate(start, start_margin);
+    }
+    if (has_start && (!has_end || !rtl))
+        return layout_add_coordinate(start, start_margin);
+    return containing - size - end - end_margin;
+}
+
 /* Final placement of an absolutely positioned, relative, sticky or fixed
    box once its size is known: inset translation, the provisional-bottom
    fix-up, and sticky and fixed range registration. */
@@ -775,37 +868,45 @@ static LayoutBlockPositionedResult layout_block_finalize_positioned(
     size_t node_command_start, size_t node_link_start,
     size_t node_control_start, size_t node_box_start)
 {
-    if (style->out_of_flow) {
-        /* CSS 10.3.7/10.6.4: the inset positions the margin edge, so the
-           border box lands at inset + margin.  Auto margins are stored as
-           zero, which matches the non-over-constrained resolution.  This
-           also honours the accessibility idiom of hiding a positioned
-           element with a large negative margin. */
-        int target_x = outer_x;
-        int target_y = outer_y;
-        if (style->has_left) {
-            target_x = positioned_box->x + resolved_left
-                       + style->margin.left;
-        } else if (style->has_right) {
-            target_x = positioned_box->x + positioned_box->width
-                       - outer_width - resolved_right - style->margin.right;
+    if (style->out_of_flow || style->fixed_position) {
+        bool viewport_fixed = style->fixed_position && !fixed_captured;
+        int cb_x = fixed_captured ? positioned_box->fixed_x
+            : viewport_fixed ? 0 : positioned_box->x;
+        int cb_y = fixed_captured ? positioned_box->fixed_y
+            : viewport_fixed ? 0 : positioned_box->y;
+        int cb_width = fixed_captured ? positioned_box->fixed_width
+            : viewport_fixed ? context->layout->width : positioned_box->width;
+        bool rtl = fixed_captured ? positioned_box->fixed_direction_rtl
+            : positioned_box->direction_rtl;
+        int target_x = cb_x + positioned_axis(
+            outer_x - cb_x, cb_width, outer_width,
+            style->has_left, style->has_right, resolved_left, resolved_right,
+            style->margin.left, style->margin.right,
+            style->margin_left_auto, style->margin_right_auto, true, rtl);
+        int target_y = cb_y + positioned_axis(
+            viewport_fixed ? 0 : outer_y - cb_y, positioning_height, border_height,
+            style->has_top, style->has_bottom, resolved_top, resolved_bottom,
+            style->margin.top, style->margin.bottom,
+            style->margin_top_auto, style->margin_bottom_auto, false, false);
+        layout_translate_range(context->layout, node_command_start,
+            node_link_start, node_control_start, node_box_start,
+            target_x - outer_x, viewport_fixed ? 0 : target_y - outer_y,
+            viewport_fixed ? "fixed" : "out-of-flow", node);
+        if (viewport_fixed) {
+            bool from_bottom = style->has_bottom && !style->has_top;
+            int inset = from_bottom ? resolved_bottom + style->margin.bottom : target_y;
+            if (!add_fixed_range(context->layout, node_command_start,
+                    context->layout->count, node_link_start, context->layout->link_count,
+                    node_control_start, context->layout->control_count, outer_y,
+                    content_bottom - outer_y, inset, from_bottom))
+                return LAYOUT_BLOCK_POSITIONED_FAILED;
+            return LAYOUT_BLOCK_POSITIONED_OUT_OF_FLOW;
         }
-        bool provisional_bottom = false;
-        if (style->has_top) {
-            target_y = positioned_box->y + resolved_top + style->margin.top;
-        } else if (style->has_bottom) {
-            target_y = positioned_box->y + positioning_height
-                       - border_height - resolved_bottom
-                       - style->margin.bottom;
-            provisional_bottom = (positioned_box->height <= 0
+        bool provisional_bottom = !fixed_captured && !style->has_top
+            && style->has_bottom && (positioned_box->height <= 0
                                   || positioned_box->height_provisional)
                 && positioned_box->node != NULL
                 && positioned_box->node != node;
-        }
-        layout_translate_range(context->layout, node_command_start, node_link_start,
-                        node_control_start, node_box_start,
-                        target_x - outer_x,
-                        target_y - outer_y, "out-of-flow", node);
         /* CSS 2.1 10.6.4: `bottom` refers to the containing block's final
            padding box. An auto-height block's bottom is not known yet;
            use the provisional bound above and correct it when the block
@@ -829,14 +930,8 @@ static LayoutBlockPositionedResult layout_block_finalize_positioned(
                         node_control_start, node_box_start,
                         dx, dy, "relative", node);
     }
-    /* A sticky box sticks vertically only against a non-auto `top` (CSS
-       Positioned Layout 3, 3.4): with `top:auto` it stays in flow like a
-       relative box. washingtonpost.com makes its whole <main> sticky with
-       no inset; treated as `top:0` the page froze under the header and
-       every page press showed the same screen. (`bottom` stickiness is not
-       modelled.) */
-    if (style->sticky_position && style->has_top) {
-        int sticky_top = resolved_top;
+    /* Auto insets do not pull the box to either scrollport edge. */
+    if (style->sticky_position && (style->has_top || style->has_bottom)) {
         const LayoutNodeBox *sticky_box = layout_box_for_node(
             context->layout, node);
         int sticky_origin_y = sticky_box == NULL
@@ -845,56 +940,10 @@ static LayoutBlockPositionedResult layout_block_finalize_positioned(
             sticky_origin_y,
             sticky_box == NULL ? border_height : sticky_box->height);
         if (!add_sticky_range(context->layout, node_command_start,
-                              context->layout->count, sticky_origin_y,
-                              sticky_top, sticky_bottom_y)) return LAYOUT_BLOCK_POSITIONED_FAILED;
-    }
-    if (style->fixed_position) {
-        if (fixed_captured) {
-            int target_x = outer_x;
-            int target_y = outer_y;
-            if (style->has_left) {
-                target_x = positioned_box->fixed_x + resolved_left
-                           + style->margin.left;
-            } else if (style->has_right) {
-                target_x = positioned_box->fixed_x
-                    + positioned_box->fixed_width - outer_width
-                    - resolved_right - style->margin.right;
-            }
-            if (style->has_top) {
-                target_y = positioned_box->fixed_y + resolved_top
-                           + style->margin.top;
-            } else if (style->has_bottom) {
-                target_y = positioned_box->fixed_y + positioning_height
-                    - border_height - resolved_bottom - style->margin.bottom;
-            }
-            layout_translate_range(
-                context->layout, node_command_start, node_link_start,
-                node_control_start, node_box_start,
-                target_x - outer_x, target_y - outer_y,
-                "fixed-containing-block", node);
-            return LAYOUT_BLOCK_POSITIONED_OUT_OF_FLOW;
-        }
-        int target_x = outer_x;
-        if (style->has_left) target_x = resolved_left;
-        else if (style->has_right) {
-            target_x = context->layout->width - outer_width - resolved_right;
-        }
-        if (target_x != outer_x) {
-            layout_translate_range(context->layout, node_command_start,
-                            node_link_start, node_control_start,
-                            node_box_start, target_x - outer_x, 0,
-                            "fixed", node);
-        }
-        bool from_bottom = style->has_bottom && !style->has_top;
-        int inset = from_bottom ? resolved_bottom
-                    : (style->has_top ? resolved_top : 0);
-        if (!add_fixed_range(context->layout, node_command_start,
-                             context->layout->count, node_link_start,
-                             context->layout->link_count, node_control_start,
-                             context->layout->control_count, outer_y,
-                             content_bottom - outer_y, inset,
-                             from_bottom)) return LAYOUT_BLOCK_POSITIONED_FAILED;
-        return LAYOUT_BLOCK_POSITIONED_OUT_OF_FLOW;
+                context->layout->count, node, sticky_origin_y, sticky_bottom_y,
+                style->has_top ? resolved_top : INT_MAX,
+                style->has_bottom ? resolved_bottom : INT_MAX))
+            return LAYOUT_BLOCK_POSITIONED_FAILED;
     }
     return LAYOUT_BLOCK_POSITIONED_IN_FLOW;
 }
@@ -924,7 +973,7 @@ static void layout_block_count_column_items(
                 column_growing_count++;
                 column_growing_tail = count_item.node;
             } else if (column_growing_tail != NULL
-                && !column_item_definitely_empty(context, &count_item)) {
+                && !column_item_definitely_empty(context, &count_item, true)) {
                 column_growing_tail = NULL;
             }
         }
@@ -980,6 +1029,137 @@ typedef struct LayoutBlockFlowState {
     bool after_pseudo_flowed_inline;
 } LayoutBlockFlowState;
 
+/* Resolve definite bases up front so descendants receive their final height
+   on the first layout. Auto bases that require a real content measurement
+   keep the streaming path instead of laying the whole column out twice. */
+__attribute__((noinline))
+static bool prepare_column_main(LayoutContext *context, LayoutBlockFlowState *flow,
+                               FlexOrderPlan *order, size_t count)
+{
+    if (!flow->definite_height || flow->style->flex_wrap ||
+        count == 0 || count > FLEX_MAIN_LIMIT) return false;
+    const int height = flow->declared_content_height, width = flow->content_width;
+    FlexMainItem *items = budget_malloc_category(order->budget,
+        BUDGET_CATEGORY_LAYOUT, count * sizeof(*items));
+    if (!items) return false;
+    FlexItemIterator it;
+    FlatItem item;
+    size_t i = 0;
+    flex_iterator_init(&it, context, flow->node, flow->style, order);
+    while (i < count && flex_iterator_next(&it, &item)) {
+        ComputedStyle *s = &item.style;
+        if (s->out_of_flow || s->fixed_position) continue;
+        if (item.anonymous_text || item.generated_pseudo != PSEUDO_NONE) break;
+        bool empty = column_item_definitely_empty(context, &item, false);
+        bool scrollable = s->overflow_y_scroll && !s->overflow_y_clip_only;
+        int basis = 0;
+        /* Content-keyword bases (sentinels at the top of the length range)
+           need a content measurement: keep the streaming path. */
+        if (s->has_flex_basis && s->flex_basis >= STYLE_LENGTH_FIT_CONTENT) break;
+        if (s->has_flex_basis && s->flex_basis >= 0) {
+            basis = resolve_declared_length(context->sheet, s->flex_basis,
+                s->flex_basis_percent, height);
+        } else if (s->has_height && s->height != STYLE_LENGTH_NONE) {
+            basis = layout_block_style_resolved_height(context->sheet, s, width, height);
+        } else if (!empty) {
+            break;
+        }
+        if (s->min_height_auto && !empty && !scrollable) break;
+        resolve_padding(context->sheet, s, width);
+        resolve_margin(context->sheet, s, width);
+        int edge = s->padding.top + s->padding.bottom + s->border.top + s->border.bottom;
+        int margin = s->margin.top + s->margin.bottom;
+        int inner = s->box_sizing_border_box ? layout_subtract_coordinate(basis, edge) : basis;
+        if (inner < 0) inner = 0;
+        int box_offset = margin + (s->box_sizing_border_box ? 0 : edge);
+        int minimum = resolve_declared_length(context->sheet, s->min_height,
+            s->min_height_percent, height);
+        int maximum = LAYOUT_COORDINATE_LIMIT;
+        if (s->max_height != STYLE_LENGTH_NONE) {
+            int value;
+            if (resolve_computed_length(context->sheet, s->max_height,
+                    s->max_height_percent, height, &value))
+                maximum = layout_add_coordinate(value, box_offset);
+        }
+        minimum = layout_add_coordinate(minimum, box_offset);
+        if (minimum < edge + margin) minimum = edge + margin;
+        items[i++] = (FlexMainItem) {
+            .basis = layout_add_coordinate(inner, edge + margin), .inner = inner,
+            .minimum = minimum, .maximum = maximum,
+            .grow = s->flex_grow, .shrink = s->flex_shrink
+        };
+    }
+    if (i < count) {
+        budget_free(order->budget, items);
+        return false;
+    }
+    order->main_items = items;
+    int gaps = layout_clamp_coordinate((int64_t) flow->style->row_gap * (count - 1u));
+    flex_resolve_main(items, count, layout_subtract_coordinate(height, gaps));
+    return true;
+}
+
+__attribute__((noinline))
+static void assign_planned_column_height(LayoutContext *context, FlatItem *item,
+                                         int width, int outer_height)
+{
+    ComputedStyle *s = &item->style;
+    resolve_padding(context->sheet, s, width);
+    int height = outer_height - s->margin.top - s->margin.bottom;
+    if (!s->box_sizing_border_box)
+        height -= s->padding.top + s->padding.bottom + s->border.top + s->border.bottom;
+    context->assigned_flex_node = item->node;
+    context->assigned_flex_minimum = false;
+    context->assigned_flex_height = height > 0 ? height : -2;
+}
+
+__attribute__((noinline))
+static void align_column_item(LayoutContext *context, const LayoutBlockFlowState *flow,
+                              const FlatItem *item, AlignItems alignment)
+{
+    const LayoutNodeBox *box = layout_box_for_node(context->layout, item->node);
+    if (!box) return;
+    int left = item->style.margin.left, right = item->style.margin.right;
+    int free = flow->content_width - box->width - left - right;
+    bool trailing = (alignment == ALIGN_END) != computed_style_direction_rtl(flow->style);
+    int target = flow->content_x + left
+        + (alignment == ALIGN_CENTER ? free / 2 : trailing ? free : 0);
+    int dx = target - box->x;
+    if (dx) {
+        trace_flex_translation(context, "column-cross", flow->node, item->node,
+            alignment, flow->content_x, flow->content_width, box->x, box->width,
+            target, dx);
+        translate_node_subtree(context->layout, item->node, dx, 0);
+    }
+}
+
+__attribute__((noinline))
+static void align_positioned_flex_item(LayoutContext *context, const ComputedStyle *style,
+                                       const PositionedBox *parent, const FlatItem *item)
+{
+    const LayoutNodeBox *box = layout_box_for_node(context->layout, item->node);
+    if (!box) return;
+    int x = box->x, y = box->y;
+    if (!item->style.has_left && !item->style.has_right) {
+        JustifyContent align = style->justify_content;
+        if (align == JUSTIFY_CENTER || align == JUSTIFY_UNSAFE_CENTER
+            || align == JUSTIFY_SPACE_AROUND || align == JUSTIFY_SPACE_EVENLY) {
+            x = parent->x + (parent->width - box->width) / 2;
+        } else if (align == JUSTIFY_END || align == JUSTIFY_END_LOGICAL
+                   || align == JUSTIFY_RIGHT) {
+            x = parent->x + parent->width - box->width;
+        }
+    }
+    if (!item->style.has_top && !item->style.has_bottom) {
+        AlignItems align = item->style.align_self == ALIGN_SELF_STRETCH
+            ? style->align_items : flex_item_alignment(style, &item->style);
+        if (align == ALIGN_CENTER) y = parent->y + (parent->height - box->height) / 2;
+        else if (align == ALIGN_END) y = parent->y + parent->height - box->height;
+    }
+    int dx = x - box->x, dy = y - box->y;
+    if (dx || dy) translate_node_subtree(context->layout, item->node, dx, dy);
+}
+
 __attribute__((noinline))
 static bool layout_block_flow_children(LayoutContext *context,
                                        LayoutBlockFlowState *flow)
@@ -1020,10 +1200,13 @@ static bool layout_block_flow_children(LayoutContext *context,
     size_t column_in_flow_count = 0;
     size_t column_growing_count = 0;
     lxb_dom_node_t *column_growing_tail = NULL;
+    bool column_planned = false;
     if (column_flex) {
         layout_block_count_column_items(
             context, node, style, column_order, &column_in_flow_count,
             &column_growing_count, &column_growing_tail);
+        column_planned = prepare_column_main(context, flow, column_order,
+                                            column_in_flow_count);
     }
     FlexItemIterator *flow_iterator = &scratch->traversal.flex.iterator;
     FlatItem *flow_item = &scratch->traversal.flex.item;
@@ -1347,7 +1530,13 @@ static bool layout_block_flow_children(LayoutContext *context,
                 int saved_flex_height = context->assigned_flex_height;
                 bool saved_flex_minimum =
                     context->assigned_flex_minimum;
-                if (column_flex) {
+                if (column_planned && column_item_count < column_in_flow_count) {
+                    assign_planned_column_height(context, flow_item, flow->content_width,
+                        column_order->main_items[column_item_count].result);
+                } else if (column_flex) {
+                    bool content_basis = !flow->definite_height
+                        && flow_item->style.has_flex_basis
+                        && flow_item->style.flex_basis_percent;
                     bool growing_single_item =
                         column_in_flow_count == 1
                         && flow_item->style.flex_grow > 0
@@ -1362,6 +1551,11 @@ static bool layout_block_flow_children(LayoutContext *context,
                     bool definite_minimum =
                         !flow_item->style.has_height
                         && flow_item->style.min_height > 0;
+                    bool preserve_automatic_minimum = growing_single_item
+                        && !flow_item->style.has_height
+                        && flow_item->style.min_height_auto
+                        && (!flow_item->style.overflow_y_scroll
+                            || flow_item->style.overflow_y_clip_only);
                     int assigned_main = growing_tail_item
                         ? flow->declared_content_height - (child_y - column_flow_top)
                           - flow_item->style.margin.top
@@ -1383,7 +1577,8 @@ static bool layout_block_flow_children(LayoutContext *context,
                             tilefinch_mul_div_int(style->row_gap,
                                 trailing > INT_MAX ? INT_MAX : (int) trailing, 1));
                     }
-                    if (growing_tail_item && !flow_item->style.box_sizing_border_box) {
+                    if ((growing_tail_item || growing_single_item)
+                        && !flow_item->style.box_sizing_border_box) {
                         resolve_padding(context->sheet, &flow_item->style, flow->content_width);
                         assigned_main -= flow_item->style.padding.top
                             + flow_item->style.padding.bottom
@@ -1395,11 +1590,16 @@ static bool layout_block_flow_children(LayoutContext *context,
                         flow->declared_content_height, (int) column_in_flow_count,
                         (int) column_growing_count, (int) column_item_count,
                         flow_item->style.min_height_auto, assigned_main);
-                    if (assigned_main > 0) {
+                    if (content_basis) {
+                        context->assigned_flex_node = flow_item->node;
+                        context->assigned_flex_height = -1;
+                        context->assigned_flex_minimum = false;
+                    } else if (assigned_main > 0) {
                         context->assigned_flex_node = flow_item->node;
                         context->assigned_flex_height = assigned_main;
-                        context->assigned_flex_minimum = definite_minimum
-                            && !growing_single_item && !growing_tail_item;
+                        context->assigned_flex_minimum = preserve_automatic_minimum
+                            || (definite_minimum && !growing_single_item
+                                && !growing_tail_item);
                     }
                 }
                 bool child_ok = layout_block_with_float_output(
@@ -1465,33 +1665,11 @@ static bool layout_block_flow_children(LayoutContext *context,
             }
             if (column_flex
                 && (item_alignment == ALIGN_CENTER
-                    || item_alignment == ALIGN_END)
+                    || item_alignment == ALIGN_END
+                    || computed_style_direction_rtl(style))
                 && !flow_item->style.margin_left_auto
                 && !flow_item->style.margin_right_auto) {
-                const LayoutNodeBox *child_box = layout_box_for_node(
-                    context->layout, flow_item->node);
-                if (child_box != NULL) {
-                    int margin_width = flow_item->style.margin.left
-                                       + flow_item->style.margin.right;
-                    int target_x = item_alignment == ALIGN_CENTER
-                        ? flow->content_x
-                          + (flow->content_width - child_box->width
-                             - margin_width) / 2
-                          + flow_item->style.margin.left
-                        : flow->content_x + flow->content_width - child_box->width
-                          - flow_item->style.margin.right;
-                    int dx = target_x - child_box->x;
-                    if (dx != 0) {
-                        trace_flex_translation(context, "column-cross",
-                                               node, flow_item->node,
-                                               item_alignment, flow->content_x,
-                                               flow->content_width, child_box->x,
-                                               child_box->width, target_x,
-                                               dx);
-                        translate_node_subtree(context->layout,
-                                               flow_item->node, dx, 0);
-                    }
-                }
+                align_column_item(context, flow, flow_item, item_alignment);
             }
             line->y = child_bottom;
             /* Block layout returns an integer flow bottom. Any fractional
@@ -1644,7 +1822,7 @@ static bool layout_block_flow_children(LayoutContext *context,
                                    after_pseudo_flow.margin_bottom);
         }
     }
-    if (column_flex && flow->definite_height && column_item_count != 0) {
+    if (column_flex && !column_planned && flow->definite_height && column_item_count != 0) {
         line->y = layout_add_coordinate(line->y,
             layout_fit_column_scroller(context, node, style, column_order,
                                        flow->content_width, flow->declared_content_height));
@@ -1765,12 +1943,13 @@ static bool layout_block_flow_children(LayoutContext *context,
             }
         }
     }
-    if (column_flex && column_item_count != 0 && declared_height > 0) {
+    if (column_flex && !style->flex_wrap && column_item_count != 0 && declared_height > 0) {
+        JustifyContent justify = style_align_content_in_axis(style->justify_content, reverse_column);
         int used_height = line->y - column_flow_top;
         int free_height = declared_height - used_height;
-        if (free_height > 0
+        if ((free_height > 0 || justify == JUSTIFY_UNSAFE_CENTER)
             && (column_auto_main_margins != 0
-                || style->justify_content != JUSTIFY_START)) {
+                || justify != JUSTIFY_START)) {
             size_t item_index = 0;
             size_t auto_margin_seen = 0;
             FlexItemIterator *iterator = &scratch->traversal.flex.iterator;
@@ -1782,7 +1961,7 @@ static bool layout_block_flow_children(LayoutContext *context,
                     continue;
                 }
                 int offset = 0;
-                if (column_auto_main_margins != 0) {
+                if (column_auto_main_margins != 0 && free_height > 0) {
                     bool auto_before = reverse_column
                                        ? item->style.margin_bottom_auto
                                        : item->style.margin_top_auto;
@@ -1790,20 +1969,20 @@ static bool layout_block_flow_children(LayoutContext *context,
                     offset = tilefinch_mul_div_int(
                         free_height, auto_margin_seen,
                         column_auto_main_margins);
-                } else if (style->justify_content == JUSTIFY_CENTER) {
+                } else if (justify == JUSTIFY_CENTER || justify == JUSTIFY_UNSAFE_CENTER) {
                     offset = free_height / 2;
-                } else if (style->justify_content == JUSTIFY_END) {
+                } else if (justify == JUSTIFY_END) {
                     offset = free_height;
-                } else if (style->justify_content == JUSTIFY_SPACE_BETWEEN) {
+                } else if (justify == JUSTIFY_SPACE_BETWEEN) {
                     if (column_item_count > 1) {
                         offset = tilefinch_mul_div_int(
                             free_height, item_index, column_item_count - 1);
                     }
-                } else if (style->justify_content == JUSTIFY_SPACE_AROUND) {
+                } else if (justify == JUSTIFY_SPACE_AROUND) {
                     offset = tilefinch_mul_div_int(
                         free_height, 2 * item_index + 1,
                         2 * column_item_count);
-                } else if (style->justify_content == JUSTIFY_SPACE_EVENLY) {
+                } else if (justify == JUSTIFY_SPACE_EVENLY) {
                     offset = tilefinch_mul_div_int(
                         free_height, item_index + 1,
                         column_item_count + 1);
@@ -1876,6 +2055,30 @@ static bool layout_block_cut_can_move(const LayoutContext *context,
     return !stacks || style->has_transform || style->out_of_flow
         || style->fixed_position || style->sticky_position
         || (style->relative_position && style->inset_percent_mask != 0);
+}
+
+/* Keep the uncommon percentage/calc inset resolution out of the main
+   block-layout function. Relative insets use the normal-flow containing
+   block, unlike absolute descendants. */
+typedef struct { int left, right, top, bottom; } BlockInsets;
+
+__attribute__((noinline))
+static void layout_block_resolve_insets(const Stylesheet *sheet,
+    ComputedStyle *style, int width, int height, BlockInsets *insets)
+{
+    uint8_t mask = style->inset_percent_mask;
+    if (style->relative_position && height <= 0) {
+        if (mask & STYLE_INSET_TOP_PERCENT) style->has_top = false;
+        if (mask & STYLE_INSET_BOTTOM_PERCENT) style->has_bottom = false;
+    }
+    insets->left = layout_block_resolve_positioned_inset(
+        sheet, style->left, mask, STYLE_INSET_LEFT_PERCENT, width);
+    insets->right = layout_block_resolve_positioned_inset(
+        sheet, style->right, mask, STYLE_INSET_RIGHT_PERCENT, width);
+    insets->top = layout_block_resolve_positioned_inset(
+        sheet, style->top, mask, STYLE_INSET_TOP_PERCENT, height);
+    insets->bottom = layout_block_resolve_positioned_inset(
+        sheet, style->bottom, mask, STYLE_INSET_BOTTOM_PERCENT, height);
 }
 
 static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
@@ -1953,11 +2156,11 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         style->height = context->assigned_grid_height;
     }
     if (context->assigned_flex_node == node
-        && context->assigned_flex_height > 0
+        && context->assigned_flex_height != 0
         && !context->assigned_flex_minimum) {
-        style->has_height = true;
+        style->has_height = context->assigned_flex_height != -1;
         style->height_percent = false;
-        style->height = context->assigned_flex_height;
+        style->height = context->assigned_flex_height == -2 ? 0 : context->assigned_flex_height;
     }
     /* Percentage padding and margins refer to the width of the containing
        block. For an out-of-flow box that is its positioned ancestor's padding
@@ -2065,18 +2268,16 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
        Flex-assigned parents can have a definite used height without an
        authored height on those intermediate flow paths. */
     if (positioned) containing_height = positioning_height;
-    int resolved_left = layout_block_resolve_positioned_inset(
-        context->sheet, style->left, style->inset_percent_mask,
-        STYLE_INSET_LEFT_PERCENT, positioning_width);
-    int resolved_right = layout_block_resolve_positioned_inset(
-        context->sheet, style->right, style->inset_percent_mask,
-        STYLE_INSET_RIGHT_PERCENT, positioning_width);
-    int resolved_top = layout_block_resolve_positioned_inset(
-        context->sheet, style->top, style->inset_percent_mask,
-        STYLE_INSET_TOP_PERCENT, positioning_height);
-    int resolved_bottom = layout_block_resolve_positioned_inset(
-        context->sheet, style->bottom, style->inset_percent_mask,
-        STYLE_INSET_BOTTOM_PERCENT, positioning_height);
+    if (style->has_height && style->height_percent && containing_height <= 0)
+        context->unresolved_height_count++;
+    BlockInsets insets = {style->left, style->right, style->top, style->bottom};
+    if (style->inset_percent_mask != 0)
+        layout_block_resolve_insets(context->sheet, style,
+            style->relative_position ? percentage_basis : positioning_width,
+            style->relative_position ? containing_height : positioning_height,
+            &insets);
+    int resolved_left = insets.left, resolved_right = insets.right,
+        resolved_top = insets.top, resolved_bottom = insets.bottom;
     bool opposing_width = positioned && !style->has_width
                           && style->has_left && style->has_right;
     int opposing_outer_width = positioning_width - resolved_left
@@ -2164,6 +2365,17 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         margin_left += free_margin;
     }
     int outer_x = x + margin_left;
+    if (!flex_or_grid_item && parent != NULL
+        && computed_style_direction_rtl(parent)
+        && parent->display != DISPLAY_GRID && parent->display != DISPLAY_INLINE_GRID
+        && parent->display != DISPLAY_FLEX && parent->display != DISPLAY_INLINE_FLEX
+        && !style->out_of_flow && !style->fixed_position
+        && !style->margin_left_auto && !style->margin_right_auto
+        && style->float_mode == FLOAT_NONE
+        && style->display != DISPLAY_TABLE_CELL
+        && style->display != DISPLAY_TABLE_ROW) {
+        outer_x = layout_add_coordinate(x, sizing_width - outer_width - margin_right);
+    }
     if (outer_width < 8 && !assigned_width
         && !style->has_width && !has_maximum_width) {
         outer_width = 8;
@@ -2205,6 +2417,8 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
                         - content_border_right
                         - style->padding.left - style->padding.right;
     if (content_width < 0) content_width = 0;
+    int ratio_width = !style->has_height && style->box_sizing_border_box
+        && style->aspect_width > 0 ? outer_width : content_width;
     /* An auto block size laid out without the box's children: what a
        `size` container's queries read (size containment). -1: definite. */
     int contained_height = -1;
@@ -2213,7 +2427,7 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         && !(style->has_height && style->height != STYLE_LENGTH_NONE
              && (!style->height_percent || containing_height > 0))) {
         contained_height = style_content_height(
-            context->sheet, style, content_width, containing_height);
+            context->sheet, style, ratio_width, containing_height);
     }
     /* Before any descendant is styled: its container queries then answer
        against this box, not the previous pass's (style.h). */
@@ -2237,8 +2451,16 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
     int declared_content_height = opposing_height
         ? opposing_outer_height - style->padding.top - style->padding.bottom
           - content_border_top - content_border_bottom
-        : style_content_height(context->sheet, style, content_width,
+        : style_content_height(context->sheet, style, ratio_width,
                                containing_height);
+    if (context->assigned_flex_node == node && context->assigned_flex_minimum
+        && style->min_height_auto) {
+        int floor = context->assigned_flex_height;
+        if (style->box_sizing_border_box)
+            floor -= content_border_top + content_border_bottom
+                + style->padding.top + style->padding.bottom;
+        if (floor > declared_content_height) declared_content_height = floor;
+    }
     if (declared_content_height < 0) declared_content_height = 0;
     bool content_visibility_hidden = style->content_visibility
         == STYLE_CONTENT_VISIBILITY_HIDDEN;
@@ -2275,6 +2497,9 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
             declared_content_height = native_content_height;
         }
     }
+    bool assigned_minimum_basis = context->assigned_flex_node == node
+        && context->assigned_flex_minimum
+        && context->assigned_flex_height > 0 && containing_height > 0;
     bool definite_height = opposing_height || (style->has_height
         && style->height != STYLE_LENGTH_NONE
         && (!style->height_percent || containing_height > 0));
@@ -2282,6 +2507,11 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         style->row_gap, definite_height ? declared_content_height : 0);
     int child_containing_height = definite_height
                                   ? declared_content_height : 0;
+    if (assigned_minimum_basis) {
+        /* The used flex main size is a definite basis even when a larger
+           automatic minimum may let the item itself grow. */
+        child_containing_height = declared_content_height;
+    }
     /* Only an authored definite height propagates a percentage-height basis.
        Positioned descendants still use their separate initial containing
        block; an auto-height body is not itself the viewport. */
@@ -2292,6 +2522,8 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         || style->out_of_flow || style->fixed_position
         || layout_style_establishes_fixed_containing_block(style)) {
         descendant_positioned_box->node = node;
+        descendant_positioned_box->direction_rtl =
+            computed_style_direction_rtl(style);
         descendant_positioned_box->x = outer_x + style->border.left;
         descendant_positioned_box->y = layout_add_coordinate(
             outer_y, content_border_top);
@@ -2314,6 +2546,8 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
     }
     if (layout_style_establishes_fixed_containing_block(style)) {
         descendant_positioned_box->fixed_node = node;
+        descendant_positioned_box->fixed_direction_rtl =
+            computed_style_direction_rtl(style);
         descendant_positioned_box->fixed_x = outer_x + style->border.left;
         descendant_positioned_box->fixed_y = layout_add_coordinate(
             outer_y, content_border_top);
@@ -2694,51 +2928,8 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
                     false, &used_positioned_box, &positioned_bottom)) {
                 return false;
             }
-            if (item->style.fixed_position) continue;
-            const LayoutNodeBox *positioned_box_for_item =
-                layout_box_for_node(context->layout, item->node);
-            if (positioned_box_for_item == NULL) continue;
-            int target_x = positioned_box_for_item->x;
-            int target_y = positioned_box_for_item->y;
-            if (!item->style.has_left && !item->style.has_right) {
-                if (style->justify_content == JUSTIFY_CENTER
-                    || style->justify_content == JUSTIFY_SPACE_AROUND
-                    || style->justify_content == JUSTIFY_SPACE_EVENLY) {
-                    target_x = used_positioned_box.x
-                        + (used_positioned_box.width
-                           - positioned_box_for_item->width) / 2;
-                } else if (style->justify_content == JUSTIFY_END) {
-                    target_x = used_positioned_box.x
-                        + used_positioned_box.width
-                        - positioned_box_for_item->width;
-                }
-            }
-            bool static_cross_center =
-                item->style.align_self == ALIGN_SELF_CENTER
-                || ((item->style.align_self == ALIGN_SELF_AUTO
-                     || item->style.align_self == ALIGN_SELF_STRETCH)
-                    && style->align_items == ALIGN_CENTER);
-            bool static_cross_end =
-                item->style.align_self == ALIGN_SELF_END
-                || ((item->style.align_self == ALIGN_SELF_AUTO
-                     || item->style.align_self == ALIGN_SELF_STRETCH)
-                    && style->align_items == ALIGN_END);
-            if (!item->style.has_top && !item->style.has_bottom) {
-                if (static_cross_center) {
-                    target_y = used_positioned_box.y
-                        + (used_positioned_box.height
-                           - positioned_box_for_item->height) / 2;
-                } else if (static_cross_end) {
-                    target_y = used_positioned_box.y
-                        + used_positioned_box.height
-                        - positioned_box_for_item->height;
-                }
-            }
-            int dx = target_x - positioned_box_for_item->x;
-            int dy = target_y - positioned_box_for_item->y;
-            if (dx != 0 || dy != 0) {
-                translate_node_subtree(context->layout, item->node, dx, dy);
-            }
+            if (!item->style.fixed_position)
+                align_positioned_flex_item(context, style, &used_positioned_box, item);
         }
     }
     LayoutBlockFlowState flow = {
@@ -2775,7 +2966,10 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         .first_flow_content = first_flow_content,
         .flow_bottom_margin = flow_bottom_margin
     };
+    uint32_t unresolved_before = context->unresolved_height_count;
     if (!layout_block_flow_children(context, &flow)) return false;
+    if (own_table_tracks != NULL)
+        table_expand_row_spans(context, own_table_tracks, style);
     flow_bottom_margin = flow.flow_bottom_margin;
     int natural_content_height = flow.natural_content_height;
     bool after_pseudo_flowed_inline = flow.after_pseudo_flowed_inline;
@@ -2971,6 +3165,8 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
     if (client_height < 0) client_height = 0;
     if (content_height < client_height) content_height = client_height;
     int scroll_width = client_width;
+    bool scroll_rtl = style->overflow_x_scroll && !style->overflow_x_clip_only
+        && computed_style_direction_rtl(style);
     /* Node boxes are appended in DOM post-order. Scan them backwards so a
        clipping descendant is seen before its children and can suppress that
        child's otherwise-visible overflow from the ancestor scroll extent.
@@ -2993,9 +3189,13 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         }
         int child_width = child_box->clips_x
                           ? child_box->width : child_box->content_width;
-        int right = child_box->x + child_width - outer_x
-                    + style->padding.right;
-        if (right > scroll_width) scroll_width = right;
+        int extent = scroll_rtl
+            ? outer_x + outer_width - content_border_right - child_box->x
+                + style->padding.left
+                + (child_box->scroll_rtl && !child_box->clips_x
+                    ? child_width - child_box->client_width : 0)
+            : child_box->x + child_width - outer_x + style->padding.right;
+        if (extent > scroll_width) scroll_width = extent;
         if (child_box->clips_x) {
             clipped_subtree_start = child_box->command_start;
         }
@@ -3137,62 +3337,31 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
                       overflow_clip_inset_left, overflow_clip_inset_top,
                       clip_only_x, clip_only_y,
                       positioned_ancestor_distance,
-                      positioned_ancestor_distance == 0,
+                      positioned_ancestor_distance == 0
+                      || (style->out_of_flow && style->has_top
+                          && positioned_ancestor_distance != UINT8_MAX)
+                      || (style->out_of_flow && !style->has_transform
+                          && ((style->has_left && style->has_right)
+                              || (style->has_top && style->has_bottom
+                                  && (style->margin_top_auto
+                                      || style->margin_bottom_auto)))),
                       node_command_start, context->layout->count,
                       scroll_command_start, scroll_command_end,
                       node_link_start, context->layout->link_count,
                       node_control_start, context->layout->control_count)) {
         return false;
     }
+    if (scroll_rtl) {
+        LayoutNodeBox *box = layout_box_for_node_mutable(context->layout, node);
+        if (box != NULL) box->scroll_rtl = true;
+    }
     layout_note_contained_height(context->layout, node, contained_height);
-    for (size_t i = 0; i < context->bottom_fixup_count;) {
-        if (context->bottom_fixups[i].containing_node != node) {
-            i++;
-            continue;
-        }
-        int padding_bottom = layout_subtract_coordinate(
-            layout_add_coordinate(outer_y, border_height),
-            style->border.bottom);
-        int dy = padding_bottom - context->bottom_fixups[i].assumed_bottom;
-        if (dy != 0) {
-            translate_node_subtree(context->layout,
-                                   context->bottom_fixups[i].node, 0, dy);
-        }
-        context->bottom_fixups[i] =
-            context->bottom_fixups[--context->bottom_fixup_count];
-    }
-    if (clip_path_type != STYLE_CLIP_PATH_NONE) {
-        LayoutNodeBox *clip_box = layout_box_for_node_mutable(
-            context->layout, node);
-        if (clip_box != NULL) {
-            clip_box->clip_path_clip = 1;
-            layout_node_box_set_clip_geometry(clip_box,
-                layout_node_box_clip_radius(clip_box), 0,
-                clip_path_empty ? (StyleOverflowClipBox) LAYOUT_NODE_CLIP_EMPTY
-                                : clip_path_box);
-        }
-        /* clip-path is not a containing block for fixed descendants, but it
-           still clips them (CSS Masking 5.1). A viewport-fixed descendant
-           therefore shows only where this box's clip region is on screen,
-           and is retired once that region has scrolled away. A fixed clip
-           owner moves with its descendants, which the ordinary overflow
-           geometry of a fixed range already handles. */
-        if (clip_box != NULL && !style->fixed_position) {
-            int clip_bottom = layout_add_coordinate(
-                clip_box->y,
-                clip_box->height - (int) clip_box->clip_inset_top);
-            for (size_t i = 0; i < context->layout->fixed_count; i++) {
-                FixedRange *range = &context->layout->fixed_ranges[i];
-                if (range->command_start < node_command_start
-                    || range->command_end > context->layout->count
-                    || range->clip_node != NULL) continue;
-                range->clip_node = node;
-                if (clip_bottom < range->scroll_end) {
-                    range->scroll_end = clip_bottom;
-                }
-            }
-        }
-    }
+    if (context->bottom_fixup_count != 0)
+        layout_finish_bottom_fixups(context, node, layout_subtract_coordinate(
+            layout_add_coordinate(outer_y, border_height), style->border.bottom));
+    if (clip_path_type != STYLE_CLIP_PATH_NONE)
+        layout_finish_clip_path(context, node, style->fixed_position,
+                                clip_path_empty, clip_path_box, node_command_start);
     if (parent != NULL
         && style->visibility_hidden != parent->visibility_hidden
         && !layout_record_visibility_range(
@@ -3234,11 +3403,14 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
        Their ranges are registered in post-order, so the current node is the
        first finalized containing box that can publish the lower boundary.
        Bind before registering this node's own sticky range. */
-    const LayoutNodeBox *sticky_containing_box = layout_box_for_node(
+    LayoutNodeBox *sticky_containing_box = layout_box_for_node_mutable(
         context->layout, node);
     if (sticky_containing_box != NULL) {
+        sticky_containing_box->unresolved_descendant_height =
+            context->unresolved_height_count != unresolved_before;
         layout_bound_sticky_ranges(
             context->layout, node_command_start, context->layout->count,
+            sticky_containing_box->y,
             layout_add_coordinate(sticky_containing_box->y,
                                   sticky_containing_box->height));
     }

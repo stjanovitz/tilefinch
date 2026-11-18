@@ -2833,6 +2833,7 @@ static void apply_values(Stylesheet *sheet, ComputedStyle *style,
         computed_style_set_grid_column_template_id(
             style, computed_style_grid_column_template_id(values));
         style->grid_min_column_width = values->grid_min_column_width;
+        computed_style_set_grid_auto_fill(style, computed_style_grid_auto_fill(values));
     }
     if (mask & S_FLEX_DIRECTION) style->flex_direction = values->flex_direction;
     if (mask & S_FLEX_WRAP) {
@@ -4388,4 +4389,14 @@ ComputedStyle style_for_layout_pseudo(const Stylesheet *sheet, lxb_dom_node_t *n
         sheet, node, pseudo, parent, true);
     style_class_tokens_scope_end(sheet);
     return style;
+}
+
+bool rule_fast_matches(const Stylesheet *sheet, const StyleRule *rule,
+                       const StyleMatchSubject *subject)
+{
+    if (!rule->has_fast_key) return true;
+    const char *fast_key = style_rule_fast_key(rule);
+    if (fast_key == NULL) return true;
+    return style_subject_key_matches(sheet, subject, rule->type, fast_key,
+                                     rule->fast_key_length);
 }

@@ -50,6 +50,158 @@
     defineProperty(NodeFilter, name, { __proto__: null, enumerable: true,
       value: nodeFilterConstants[name] });
   globalThis.NodeFilter = NodeFilter;
+  /* Script hit testing shares one paint-order path for both point APIs. */
+  const hitTestElements = (owner, x, y) => {
+    x = Number(x);
+    y = Number(y);
+    if (!Number.isFinite(x) || !Number.isFinite(y))
+      throw new TypeError("Coordinates must be finite");
+    if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return [];
+    const hits = [], ancestors = new Map();
+    const positioned = style => /^(?:relative|absolute|fixed|sticky)$/.test(style.position);
+    const placement = (node, style, order = 0) => {
+      const z = Number.parseInt(style.zIndex, 10) || 0;
+      const phase = z < 0 ? -1 : z > 0 || positioned(style) ? 1 : 0;
+      return {node, z, phase, order};
+    };
+    const insideClip = (clip, rect) => {
+      const match = /^inset\((.*?)\)$/i.exec(clip);
+      if (match) {
+        const parts = match[1].split(/\s+round\s+/i),
+          tokens = parts[0].trim().split(/\s+/);
+        if (tokens.length > 4 || !tokens.every(t => /^-?(?:\d+(?:\.\d+)?|\.\d+)(?:px|%)?$/.test(t)))
+          return true;
+        const [top, right = top, bottom = top, left = right] = tokens;
+        const pixels = (v, size) => parseFloat(v) * (v.endsWith("%") ? size / 100 : 1);
+        let l = pixels(left, rect.width), r = pixels(right, rect.width),
+          t = pixels(top, rect.height), b = pixels(bottom, rect.height);
+        if (l + r > rect.width) { l *= rect.width / (l + r); r = rect.width - l; }
+        if (t + b > rect.height) { t *= rect.height / (t + b); b = rect.height - t; }
+        const le = rect.left + l, to = rect.top + t,
+          ri = rect.right - r, bo = rect.bottom - b;
+        if (x < le || x >= ri || y < to || y >= bo) return false;
+        /* The raster uses a uniform radius for round inset corners. */
+        const radius = Math.min(parseFloat(parts[1]) || 0, (ri - le) / 2, (bo - to) / 2);
+        if (radius > 0) {
+          const dx = x - Math.max(le + radius, Math.min(ri - radius, x)),
+            dy = y - Math.max(to + radius, Math.min(bo - radius, y));
+          return dx * dx + dy * dy <= radius * radius;
+        }
+        return true;
+      }
+      if (/^circle\(/i.test(clip)) {
+        const dx = x - rect.left - rect.width / 2, dy = y - rect.top - rect.height / 2,
+          radius = Math.min(rect.width, rect.height) / 2;
+        return dx * dx + dy * dy <= radius * radius;
+      }
+      return true;
+    };
+    const paintPath = (element, own) => {
+      const path = [];
+      let containing = "";
+      for (let at = element, steps = 0; at && steps < 256;
+           at = at.parentElement, steps++) {
+        let info = ancestors.get(at);
+        if (!info) {
+          const style = at === element ? own : getComputedStyle(at),
+            clip = style.getPropertyValue("clip-path"),
+            transform = style.getPropertyValue("transform"),
+            opacity = style.getPropertyValue("opacity"),
+            context = (opacity && Number(opacity) < 1) || (transform && transform !== "none") ||
+              (clip && clip !== "none") || style.position === "fixed" || style.position === "sticky" ||
+              style.zIndex !== "auto" && positioned(style) || style.isolation === "isolate";
+          const clips = v => /^(?:hidden|clip|scroll|auto|overlay)$/.test(v);
+          info = {clip, key: context ? placement(at, style) : null,
+            clipX: clips(style.overflowX), clipY: clips(style.overflowY),
+            position: style.position, transformed: transform && transform !== "none",
+            overflowRect: null};
+          ancestors.set(at, info);
+        }
+        if (info.clip && info.clip !== "none" && !insideClip(info.clip, at.getBoundingClientRect()))
+          return null;
+        if (at !== element) {
+          if (info.transformed || containing === "absolute" && info.position !== "static")
+            containing = "";
+          if (!containing && (info.clipX || info.clipY) &&
+              at !== owner.documentElement && at !== owner.body) {
+            let edges = info.overflowRect;
+            if (!edges) {
+              const r = at.getBoundingClientRect(), sx = r.width / (at.offsetWidth || r.width || 1),
+                sy = r.height / (at.offsetHeight || r.height || 1),
+                left = r.left + at.clientLeft * sx, top = r.top + at.clientTop * sy;
+              info.overflowRect = edges = [left, top, left + at.clientWidth * sx,
+                top + at.clientHeight * sy];
+            }
+            if (info.clipX && (x < edges[0] || x >= edges[2]) ||
+                info.clipY && (y < edges[1] || y >= edges[3])) return null;
+          }
+        }
+        if (!containing && (info.position === "absolute" || info.position === "fixed"))
+          containing = info.position;
+        if (info.key && at !== element) path.push(info.key);
+      }
+      return path.reverse();
+    };
+    let sequence = 0;
+    for (const element of owner.querySelectorAll("*")) {
+      const style = getComputedStyle(element);
+      if (
+        style.display === "none" ||
+        style.visibility === "hidden" ||
+        style.pointerEvents === "none" ||
+        (!element.firstChild &&
+          !Number.isFinite(parseFloat(style.height)) &&
+          style.position === "static")
+      )
+        continue;
+      const rect = element.getBoundingClientRect();
+      let path;
+      const add = paintStyle => {
+        if (path === undefined) path = paintPath(element, style);
+        if (path) hits.push({element, path, key: placement(element, paintStyle, sequence++)});
+      };
+      if (
+        rect.width > 0 &&
+        rect.height > 0 &&
+        x >= rect.left &&
+        x <= rect.right &&
+        y >= rect.top &&
+        y <= rect.bottom
+      ) add(style);
+      for (const pseudo of ["::before", "::after"]) {
+        const pseudoStyle = getComputedStyle(element, pseudo);
+        if (
+          pseudoStyle.content === "none" ||
+          pseudoStyle.display === "none" ||
+          pseudoStyle.visibility === "hidden" ||
+          pseudoStyle.pointerEvents === "none"
+        )
+          continue;
+        const width = parseFloat(pseudoStyle.width),
+          height = parseFloat(pseudoStyle.height);
+        if (!(width > 0 && height > 0)) continue;
+        const left = rect.left + (parseFloat(pseudoStyle.left) || 0),
+          top = rect.top + (parseFloat(pseudoStyle.top) || 0);
+        if (
+          x >= left &&
+          x <= left + width &&
+          y >= top &&
+          y <= top + height
+        ) add(pseudoStyle);
+      }
+    }
+    hits.sort((left, right) => {
+      const count = Math.min(left.path.length, right.path.length);
+      let index = 0;
+      while (index < count && left.path[index].node === right.path[index].node) index++;
+      const a = left.path[index] || left.key, b = right.path[index] || right.key;
+      if (a.node === b.node)
+        return left.path.length - right.path.length || a.order - b.order;
+      return a.phase - b.phase || a.z - b.z ||
+        (a.node.compareDocumentPosition(b.node) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1);
+    });
+    return [...new Set(hits.reverse().map(hit => hit.element))];
+  };
   {
     const nativeTraverse = __tilefinchTraverse,
       traversalStepLimit = 1 << 20,
@@ -463,6 +615,7 @@
         if (reference) state.reference = reference;
       };
     globalThis.__tilefinchSetNodeIteratorHooks?.({
+      hitTestElements,
       active: () => liveIterators.length > 0,
       /* Called after a removal with the removed nodes (a contiguous run,
          removed in order) and the siblings around the run. */

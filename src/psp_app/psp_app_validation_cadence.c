@@ -283,7 +283,8 @@ static void psp_snapshot_copy_probe(void)
     images.canvas_held[0].bytes = ROW * HEIGHT;
     for (unsigned kind = 0; kind < 2; kind++) {
         size_t source_stride = kind == 0 ? ROW : 512u * 4u;
-        image.canvas_native_surface = kind == 0 ? NULL : &native;
+        image.canvas_native = kind == 0 ? (ImageCanvasNativeSurface) {0}
+                                        : native;
         memset(destination, 0xa5, (ROW + 64u) * HEIGHT);
         errors |= psp_display_validation_probe_pixel_copy(destination, ROW + 64u,
             sources[kind], source_stride, ROW, HEIGHT);

@@ -490,9 +490,8 @@ for the script language and deterministic frontend golden.
 Run `meminfo` before loading the PRX and compare partition 2 `MAXFREE` with the
 browser's `free-mem`, `max-free`, and `heap-capacity-lower-bound` boot lines.
 The last value is the bounded admission sample taken before the aligned Media
-Engine pool is reserved; validation deliberately does not exhaust the now-
-fragmented heap a second time. PSPLink's
-resident modules are kernel modules when `psplink.ini` keeps `pluser=0`, so
+Engine pool is reserved; validation deliberately does not exhaust the
+fragmented heap a second time. PSPLink's resident modules are kernel modules when `psplink.ini` keeps `pluser=0`, so
 the user partition should retain the expanded PSP-3000 heap apart from the PRX
 image itself. If it does not, check `pluser`, remove user modules from
 `modload.ini`, or lower that validation run's `limit=`; do not change the

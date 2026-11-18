@@ -1,5 +1,10 @@
 # PSP media session state
 
+This page is for engineers changing the native player's lifecycle: the
+media-session state machine, its resource invariants, and its validation
+contract. Sources, demuxing and decoders are in
+[Media pipeline](MEDIA_PIPELINE.md).
+
 The PSP media session uses a shallow hierarchical state machine instead of
 independently-added control flags. The state machine is the shipping lifecycle
 authority. Decoder, demux, transport, DMA, presentation, and buffer ownership
@@ -324,6 +329,42 @@ the next, which appears as a flash across the bottom chrome.
 This is a presentation-order rule, not another lifecycle flag. The UI helper
 classifies whether an intent has meaningful pre-dispatch pixels; it never
 predicts the reducer's next state.
+
+## Supervised media opens
+
+A media open runs under the loading-UI supervisor
+([UI during page work](UI_DURING_PAGE_WORK.md#the-loading-ui-supervisor)),
+which draws a copy of the player state from the callback thread. That copy
+points at the session's presentation: the track and chapter labels, the
+caption row, the queue and the rotation. Three rules keep the two threads
+from disagreeing about it.
+
+- **Writers take the fence for the store alone.** The session installs the
+  supervisor's presentation fence as that presentation's `fence`
+  (`PspMediaSessionPlatform.fence_acquire`). The `psp_ui_media_set_*` setters
+  shape text before taking it and skip it when nothing changed, and the
+  session prepares track, chapter and queue rows aside before storing them in
+  one step.
+- **The supervisor never writes the presentation.** A press that would change
+  it (the track menu, Auto next, the caption toggle's memory) first moves the
+  supervisor's copy onto a private copy of the presentation
+  (`psp_ui_media_update_detached`), so the press shows at once and the menu it
+  opened takes Circle.
+- **Every press reaches the player once.** Every press the copy takes is
+  queued, whether it moved the copy or not (`psp_ui_media_supervisor_press`).
+  The browser thread applies the queued presses to its own player state at the
+  next refresh of the copy or at the scope's end, derives their actions there,
+  and the refreshed copy borrows the presentation again. The actions wait in a
+  two-slot mailbox (`psp_ui_media_press_queue_settle`): the newest timeline
+  action (preview, seek, play/pause) goes to the session at each refresh, and
+  the newest other action (a queue entry, a track, rotation, close) at the
+  scope's end, so a timeline press after a command cannot replace it. Because
+  the scope spans browser-loop frames, that loop takes no button edges from
+  the pad or the latch while it is up (`psp_input_loop_edges`), only the stick
+  and held buttons.
+
+The declarations and their contracts are in `include/tilefinch/psp_ui.h`
+beside `psp_ui_media_update_detached`.
 
 ## Network impairment contract
 

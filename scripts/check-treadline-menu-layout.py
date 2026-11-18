@@ -120,14 +120,11 @@ PROBE = (
     "return 1})()")
 # A label may need one pixel more than its shrink-to-fit button reports: the
 # probe and the button round a fractional text width (Arial digits at 11 px)
-# to different whole pixels. Boxes are compared with half-pixel slack. The
-# lab reports the panel's box without its own translate(-50%,-50%)
-# (descendants include it), so the panel box is re-centred here. Hidden
-# descendants report 0x1 boxes.
+# to different whole pixels. Boxes are compared with half-pixel slack.
+# The panel rect already includes its own translate(-50%,-50%), just like
+# the descendant rects. Hidden descendants report 0x1 boxes.
 MEASURE = (
-    "(()=>{const P=document.getElementById('panel'),q=P.getBoundingClientRect(),bad=[];"
-    "const p={left:q.left-q.width/2,top:q.top-q.height/2,"
-    "right:q.left+q.width/2,bottom:q.top+q.height/2};"
+    "(()=>{const P=document.getElementById('panel'),p=P.getBoundingClientRect(),bad=[];"
     "const name=e=>(e.id||e.tagName)+':'+String(e.textContent).trim().slice(0,18);"
     "if(p.left<0||p.top<0||p.right>480.5||p.bottom>272.5)bad.push('panel-offscreen');"
     "for(const [e,parts] of __probes){const c=getComputedStyle(e);"

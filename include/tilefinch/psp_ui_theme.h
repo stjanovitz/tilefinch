@@ -28,10 +28,16 @@ typedef struct {
     uint16_t on_accent;
     uint16_t ok;
     uint16_t warn;
+    /* Destructive actions: Clear, Delete, Remove, Reset. A theme file that
+       predates it (format 1), or a format 2 file that omits it, gets a red
+       derived from its own panel and focused-row surface. */
+    uint16_t danger;
 } PspUiThemePalette;
 
 enum {
-    PSP_UI_THEME_FORMAT_VERSION = 1,
+    /* Format 2 added `danger`; format 1 files still load unchanged. */
+    PSP_UI_THEME_FORMAT_VERSION = 2,
+    PSP_UI_THEME_FORMAT_OLDEST = 1,
     PSP_UI_THEME_FILE_LIMIT = 2048,
     PSP_UI_THEME_LINE_LIMIT = 96,
     PSP_UI_THEME_FIELD_LIMIT = 24,

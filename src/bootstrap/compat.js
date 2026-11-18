@@ -42,6 +42,7 @@
     trustedWeakMapGet = Function.call.bind(WeakMap.prototype.get),
     trustedWeakMapSet = Function.call.bind(WeakMap.prototype.set),
     trustedWeakMapHas = Function.call.bind(WeakMap.prototype.has),
+    trustedWeakMapDelete = Function.call.bind(WeakMap.prototype.delete),
     trustedWeakSetAdd = Function.call.bind(WeakSet.prototype.add),
     trustedWeakSetHas = Function.call.bind(WeakSet.prototype.has),
     trustedWeakRefDeref = Function.call.bind(WeakRef.prototype.deref),
@@ -211,7 +212,8 @@
   {
     const anchorLocation = (node) => {
       try {
-        return new URL(node.getAttribute("href") || "", location.href);
+        const value = node.getAttribute("href");
+        return value === null ? null : new URL(value, node.ownerDocument?.baseURI || location.href);
       } catch {
         return null;
       }
@@ -491,6 +493,8 @@
       state.cancelable = !!cancelable;
       state.defaultPrevented = false;
       state.initialized = true;
+      state.trusted = false;
+      state.target = null;
       state.stopped = false;
       state.immediateStopped = false;
     }
@@ -616,8 +620,8 @@
   };
   document.createEvent = createEvent;
   Document.prototype.createEvent = createEvent;
-  const trustedEvent = (event) => {
-    eventState(event).trusted = true;
+  const trustedEvent = (event, trusted = true) => {
+    eventState(event).trusted = trusted;
     return event;
   };
   /* Events the browser itself fires: built with a captured interface object
@@ -883,6 +887,19 @@
       this.submitter = options.submitter ?? null;
     }
   };
+  const TrustedFormData = globalThis.FormData;
+  const FormDataEventInterface = globalThis.FormDataEvent = class FormDataEvent extends EventInterface {
+    constructor(type, init) {
+      const data = init?.formData;
+      if (!(data instanceof TrustedFormData))
+        throw new TypeError("FormDataEvent requires formData");
+      super(type, init);
+      eventState(this).formData = data;
+    }
+    get [Symbol.toStringTag]() { return "FormDataEvent"; }
+  };
+  trustedDefineProperty(FormDataEventInterface.prototype,
+    "formData", eventField("formData", null, false));
   globalThis.TransitionEvent = class TransitionEvent extends Event {
     constructor(type, options = {}) {
       options ??= {};
@@ -1200,6 +1217,7 @@
     InputEvent,
     CompositionEvent,
     SubmitEvent,
+    FormDataEvent: FormDataEventInterface,
     TransitionEvent,
     ToggleEvent: ToggleEventInterface,
     ProgressEvent: progressEventConstructor,
@@ -1217,7 +1235,7 @@
     (value) => eventStateGet(value) !== undefined,
     browserInterfaces,
   );
-  const fileReaderDispatch = EventTarget.prototype.dispatchEvent;
+  const fileReaderDispatch = domShared.dispatchSimpleEvent;
   let fileReaderState;
   globalThis.FileReader = class FileReader extends EventTarget {
     #state;
@@ -1246,7 +1264,7 @@
           total,
         }),
       );
-      trustedFunctionApply(fileReaderDispatch, this, [event]);
+      fileReaderDispatch(this, event);
       try {
         const handler = this["on" + type];
         if (typeof handler === "function")
@@ -1664,7 +1682,11 @@
   HTMLDialogElement.prototype.show = function show() {
     if (!this.isConnected)
       throw new DOMException("Dialog is not connected", "InvalidStateError");
-    if (this.open) return;
+    if (this.open) {
+      if (this.hasAttribute("data-tilefinch-modal"))
+        throw new DOMException("Dialog is already modal", "InvalidStateError");
+      return;
+    }
     this.removeAttribute("data-tilefinch-modal");
     this.setAttribute("open", "");
   };
@@ -1686,14 +1708,14 @@
     if (value !== undefined) this.returnValue = value;
     this.removeAttribute("open");
     this.removeAttribute("data-tilefinch-modal");
-    this.dispatchEvent(trustedEvent(browserEvent(EventInterface, "close")));
+    dispatchNode(this, trustedEvent(browserEvent(EventInterface, "close")));
   };
   HTMLDialogElement.prototype.requestClose = function requestClose(value) {
     if (!this.open) return;
     const event = trustedEvent(
       browserEvent(EventInterface, "cancel", { cancelable: true }),
     );
-    if (this.dispatchEvent(event)) this.close(value);
+    if (dispatchNode(this, event)) this.close(value);
   };
   Object.defineProperty(HTMLDetailsElement.prototype, "open", Object.getOwnPropertyDescriptor({
     get open() {
@@ -1703,6 +1725,23 @@
       this.toggleAttribute("open", !!value);
     },
   }, "open"));
+  const detailsToggleTasks = new TrustedWeakMap();
+  domShared.detailsOpenChanged = (details, open) => {
+    let pending = trustedWeakMapGet(detailsToggleTasks, details);
+    const newState = open ? "open" : "closed";
+    if (pending) {
+      pending.newState = newState;
+      return;
+    }
+    pending = { oldState: open ? "closed" : "open", newState };
+    const timer = __tilefinchRealmGlobal.__tilefinchScheduleTask?.(() => {
+      trustedWeakMapDelete(detailsToggleTasks, details);
+      dispatchNode(details, trustedEvent(
+        browserEvent(ToggleEventInterface, "toggle", pending)));
+    });
+    /* A refused scheduler slot is not a permanently queued notification. */
+    if (timer) trustedWeakMapSet(detailsToggleTasks, details, pending);
+  };
   globalThis.__tilefinchDetailsDefault = (target) => {
     if (!(target instanceof HTMLSummaryElement)) return false;
     const details = target.parentElement;
@@ -1711,16 +1750,7 @@
       (child) => child instanceof HTMLSummaryElement,
     );
     if (first !== target) return false;
-    const wasOpen = details.open;
-    details.open = !wasOpen;
-    details.dispatchEvent(
-      trustedEvent(
-        browserEvent(ToggleEventInterface, "toggle", {
-          oldState: wasOpen ? "open" : "closed",
-          newState: wasOpen ? "closed" : "open",
-        }),
-      ),
-    );
+    details.open = !details.open;
     return true;
   };
   Object.defineProperties(HTMLLabelElement.prototype, {
@@ -1814,13 +1844,14 @@
     }
     if (!(target instanceof HTMLInputElement)) return null;
     if (type === "checkbox") {
-      const old = target.checked;
-      target.checked = !old;
+      const states = domShared.setChecked(target, !target.checked);
+      const indeterminate = target.indeterminate;
+      if (indeterminate) target.indeterminate = false;
       return {
         kind: "checkbox",
         target,
-        changed: true,
-        states: [[target, old]],
+        changed: states !== null,
+        states, indeterminate,
       };
     }
     if (type !== "radio") return null;
@@ -1829,23 +1860,10 @@
         kind: "radio",
         target,
         changed: false,
-        states: [[target, true]],
+        states: null,
       };
-    const form = target.closest("form"),
-      name = target.name,
-      peers = name
-        ? __tilefinchArrayFrom(document.querySelectorAll("input"))
-            .filter(
-              (item) =>
-                item instanceof HTMLInputElement &&
-                String(item.type).toLowerCase() === "radio" &&
-                item.name === name &&
-                item.closest("form") === form,
-            )
-        : [target],
-      states = peers.map((item) => [item, item.checked]);
-    for (const item of peers) item.checked = item === target;
-    return { kind: "radio", target, changed: true, states };
+    const states = domShared.setChecked(target, true);
+    return { kind: "radio", target, changed: states !== null, states };
   };
   globalThis.__tilefinchFinishControlDefault = (state, accepted) => {
     if (!state) return false;
@@ -1857,8 +1875,9 @@
         for (const [option, selected] of state.states)
           if (option.selected !== selected) option.selected = selected;
       } else if (state.kind === "range") state.target.value = state.value;
-      else
-        for (const [item, checked] of state.states) item.checked = checked;
+      else if (state.states) domShared.restoreChoices(state.states, true);
+      if (state.kind === "checkbox" && state.target.indeterminate !== state.indeterminate)
+        state.target.indeterminate = state.indeterminate;
       return true;
     }
     if (state.kind === "reset") {
@@ -1866,10 +1885,10 @@
       return true;
     }
     if (state.changed) {
-      state.target.dispatchEvent(
+      dispatchNode(state.target,
         trustedEvent(browserEvent(EventInterface, "input", { bubbles: true })),
       );
-      state.target.dispatchEvent(
+      dispatchNode(state.target,
         trustedEvent(browserEvent(EventInterface, "change", { bubbles: true })),
       );
     }
@@ -1899,10 +1918,10 @@
           newState,
         }),
       );
-    if (!target.dispatchEvent(before)) return current;
+    if (!dispatchNode(target, before)) return current;
     if (open) target.setAttribute("data-tilefinch-popover-open", "");
     else target.removeAttribute("data-tilefinch-popover-open");
-    target.dispatchEvent(
+    dispatchNode(target,
       trustedEvent(
         browserEvent(ToggleEventInterface, "toggle", { oldState, newState }),
       ),
@@ -1922,12 +1941,18 @@
         : !!force;
     return setPopoverState(this, open);
   };
+  let readDOMException;
   globalThis.DOMException = DOMException = class DOMException extends Error {
+    #state;
+    static {
+      readDOMException = value => #state in value ? value.#state : undefined;
+    }
     /* The browser throws these too: its String and code table, not the
        page's String or Object.prototype. */
     constructor(message = "", name = "Error") {
       super(TrustedString(message));
       this.name = TrustedString(name);
+      this.#state = { message: this.message, name: this.name };
       this.code =
         {
           __proto__: null,
@@ -1956,6 +1981,7 @@
         }[this.name] || 0;
     }
   };
+  domShared.readDOMException = readDOMException;
   /* dom.js, platform.js and custom-elements.js bind it now. */
   __tilefinchRealmGlobal.__tilefinchTrustedEventShare.defineDOMException(
     DOMException);
@@ -1988,6 +2014,584 @@
   })) {
     Object.defineProperty(DOMException, name, { value: code });
     Object.defineProperty(DOMException.prototype, name, { value: code });
+  }
+  {
+    const { Array, DOMRect, Element, document } = globalThis;
+    /* Past the limit the oldest ranges stop following mutations (their
+       boundaries keep their last values) instead of a new one throwing. */
+    const liveRanges = [],
+      liveRangeLimit = 4096,
+      liveRangeDrop = 256,
+      indexOf = Function.call.bind(Array.prototype.indexOf),
+      push = Function.call.bind(Array.prototype.push),
+      domPosition = Function.call.bind(Node.prototype.compareDocumentPosition),
+      contains = Function.call.bind(Node.prototype.contains),
+      has = Function.call.bind(Set.prototype.has),
+      add = Function.call.bind(Set.prototype.add);
+    const visitRanges = (visit) => {
+      let kept = 0;
+      for (let i = 0; i < liveRanges.length; i++) {
+        const points = trustedWeakRefDeref(liveRanges[i]);
+        if (!points) continue;
+        liveRanges[kept++] = liveRanges[i];
+        if (visit) {
+          visit(points.start);
+          visit(points.end);
+        }
+      }
+      liveRanges.length = kept;
+      if (!kept)
+        domShared.rangeMutation = domShared.rangeSplit =
+          domShared.rangeMerge = domShared.rangeReplace = null;
+    };
+    /* textContent and innerHTML are about to replace every child of
+       `parent`: a boundary inside one moves to (parent, 0), without the
+       child lists MutationObservers need. */
+    const replaceRanges = (parent) => {
+      let last, inside;
+      visitRanges((point) => {
+        if (point.node !== parent) {
+          /* Boundaries share nodes: ask the DOM once per node. */
+          if (point.node !== last)
+            inside = contains(parent, last = point.node);
+          if (!inside) return;
+          point.node = parent;
+        }
+        point.offset = 0;
+      });
+    };
+    const adjustRanges = (target, type, added, removed, previous, next,
+                          oldValue, offset, count, length) => {
+      if (type === "characterData") {
+        count ??= oldValue?.length ?? 0;
+        length ??= target.data.length;
+        visitRanges((point) => {
+          if (point.node !== target || point.offset <= offset) return;
+          point.offset = point.offset <= offset + count
+            ? offset : point.offset + length - count;
+        });
+      } else if (type === "childList" && (added.length || removed.length)) {
+        let index, removedSet;
+        const mutationIndex = () => {
+          if (index !== undefined) return index;
+          const children = target.childNodes;
+          index = added.length ? indexOf(children, added[0]) : -1;
+          if (index < 0) {
+            index = next ? indexOf(children, next) : -1;
+            if (index < 0 && previous) index = indexOf(children, previous) + 1;
+            /* A move can already have reinserted the removed node in the
+               final list. Recover its removal position without that node. */
+            if (!added.length && removed.length === 1 && index > 0) {
+              const moved = indexOf(children, removed[0]);
+              if (moved >= 0 && moved < index) index--;
+            }
+          }
+          if (index < 0) index = 0;
+          return index;
+        };
+        let last, lastRemoved;
+        const wasRemoved = (node) => node === last ? lastRemoved
+          : (lastRemoved = removedFrom(last = node));
+        const removedFrom = (node) => {
+          if (removed.length === 1) return contains(removed[0], node);
+          if (!removedSet) {
+            removedSet = new Set();
+            for (let i = 0; i < removed.length; i++)
+              add(removedSet, removed[i]);
+          }
+          for (let at = node, depth = 0; at && depth < ancestorLimit;
+               at = at.parentNode, depth++)
+            if (has(removedSet, at)) return true;
+          return false;
+        };
+        visitRanges((point) => {
+          if (point.node !== target) {
+            if (removed.length && wasRemoved(point.node)) {
+              point.node = target;
+              point.offset = mutationIndex();
+            }
+          } else if (point.offset > 0) {
+            const at = mutationIndex();
+            if (point.offset > at) {
+              point.offset = Math.max(at, point.offset - removed.length);
+              if (point.offset > at) point.offset += added.length;
+            }
+          }
+        });
+      }
+    };
+    const splitRanges = (node, offset, tail, parent) => {
+      const index = indexOf(parent.childNodes, tail);
+      visitRanges((point) => {
+        if (point.node === node && point.offset > offset) {
+          point.node = tail;
+          point.offset -= offset;
+        } else if (point.node === parent && point.offset === index) {
+          point.offset++;
+        }
+      });
+    };
+    const mergeRanges = (node, previous, offset, parent) => {
+      let index;
+      visitRanges((point) => {
+        if (point.node === node) {
+          point.node = previous;
+          point.offset += offset;
+        } else if (point.node === parent &&
+            point.offset === (index ??= indexOf(parent.childNodes, node))) {
+          point.node = previous;
+          point.offset = offset;
+        }
+      });
+    };
+    const nodeExtent = (node) => isCharacterDataNode(node)
+      ? node.data.length : node?.childNodes?.length || 0;
+    const boundedOffset = (node, value) => {
+      value = Number(value);
+      if (
+        !node ||
+        !Number.isInteger(value) ||
+        value < 0 ||
+        value > nodeExtent(node)
+      )
+        throw new DOMException("Invalid range offset", "IndexSizeError");
+      return value;
+    };
+    const ancestor = (left, right) => {
+      const seen = new Set();
+      for (
+        let at = left, steps = 0;
+        at && steps < ancestorLimit;
+        at = at.parentNode, steps++
+      )
+        seen.add(at);
+      for (
+        let at = right, steps = 0;
+        at && steps < ancestorLimit;
+        at = at.parentNode, steps++
+      )
+        if (seen.has(at)) return at;
+      return document;
+    };
+    /* Whether boundary point (node, offset) is after (other, otherOffset), or
+       in another tree (a range across trees collapses as if it were). */
+    const boundaryAfter = (node, offset, other, otherOffset) =>
+      node !== other &&
+        node.compareDocumentPosition(other) & Node.DOCUMENT_POSITION_DISCONNECTED
+        ? true
+        : compareBoundaryPoints(node, offset, other, otherOffset) > 0;
+    const isTextNode = (node) =>
+      node?.nodeType === Node.TEXT_NODE ||
+      node?.nodeType === Node.CDATA_SECTION_NODE;
+    /* The next node in tree order after `node` and its descendants. */
+    const followingNode = (node) => {
+      for (let at = node, steps = 0; at && steps < ancestorLimit; steps++) {
+        if (at.nextSibling) return at.nextSibling;
+        at = at.parentNode;
+      }
+      return null;
+    };
+    /* DOM's boundary-point comparison: -1 before, 0 equal, 1 after. */
+    const compareBoundaryPoints = (node, offset, otherNode, otherOffset) => {
+      if (node === otherNode)
+        return offset === otherOffset ? 0 : offset < otherOffset ? -1 : 1;
+      const position = node.compareDocumentPosition(otherNode);
+      if (position & Node.DOCUMENT_POSITION_PRECEDING)
+        return -compareBoundaryPoints(otherNode, otherOffset, node, offset);
+      if (position & Node.DOCUMENT_POSITION_CONTAINED_BY) {
+        let child = otherNode;
+        for (let steps = 0; child && child.parentNode !== node &&
+             steps < ancestorLimit; steps++)
+          child = child.parentNode;
+        const index = Array.prototype.indexOf.call(node.childNodes, child);
+        return index < offset ? 1 : -1;
+      }
+      return -1;
+    };
+    /* The DOM standard's "extract" and "clone the contents" of a range.
+       Partially contained ancestors are cloned shallowly and filled from a
+       subrange; contained children are moved (or deep-cloned). chatgpt.com's
+       streaming renderer extracts ranges that start and end in different
+       elements to commit an answer's final text. */
+    const isCharacterDataNode = (node) =>
+        node?.nodeType === Node.TEXT_NODE ||
+        node?.nodeType === Node.CDATA_SECTION_NODE ||
+        node?.nodeType === Node.COMMENT_NODE ||
+        node?.nodeType === Node.PROCESSING_INSTRUCTION_NODE,
+      rangeNodeLength = (node) =>
+        isCharacterDataNode(node) ? node.data.length : node.childNodes.length,
+      inclusiveAncestor = (ancestorNode, node) =>
+        ancestorNode === node || !!ancestorNode?.contains?.(node),
+      rangeContents = (range, extract, depth) => {
+        if (depth > ancestorLimit)
+          throw new DOMException("Range is too deeply nested",
+                                 "NotSupportedError");
+        const start = range.startContainer, startOffset = range.startOffset,
+          end = range.endContainer, endOffset = range.endOffset,
+          owner = start.ownerDocument || document,
+          fragment = owner.createDocumentFragment();
+        if (range.collapsed) return fragment;
+        if (start === end && isCharacterDataNode(start)) {
+          const clone = start.cloneNode(false);
+          clone.data = start.data.substring(startOffset, endOffset);
+          fragment.appendChild(clone);
+          if (extract) start.deleteData(startOffset, endOffset - startOffset);
+          return fragment;
+        }
+        let common = start;
+        for (let steps = 0; !inclusiveAncestor(common, end); steps++) {
+          if (!common.parentNode || steps > ancestorLimit)
+            throw new DOMException("Range has no common ancestor",
+                                   "NotSupportedError");
+          common = common.parentNode;
+        }
+        const children = [...common.childNodes];
+        const firstPartial = inclusiveAncestor(start, end) ? null
+          : children.find((child) => inclusiveAncestor(child, start)) || null;
+        const lastPartial = inclusiveAncestor(end, start) ? null
+          : children.find((child) => inclusiveAncestor(child, end)) || null;
+        const contained = children.filter((child, index) =>
+          compareBoundaryPoints(common, index, start, startOffset) >= 0 &&
+          compareBoundaryPoints(common, index + 1, end, endOffset) <= 0 &&
+          child !== firstPartial && child !== lastPartial);
+        if (contained.some((child) => child.nodeType === Node.DOCUMENT_TYPE_NODE))
+          throw new DOMException("Range contains a doctype",
+                                 "HierarchyRequestError");
+        let newNode = start, newOffset = startOffset;
+        if (extract && !inclusiveAncestor(start, end)) {
+          let reference = start;
+          for (let steps = 0; reference.parentNode &&
+               !inclusiveAncestor(reference.parentNode, end) &&
+               steps < ancestorLimit; steps++)
+            reference = reference.parentNode;
+          newNode = reference.parentNode;
+          newOffset = Array.prototype.indexOf.call(newNode.childNodes,
+                                                   reference) + 1;
+        }
+        if (extract) {
+          range.setStart(newNode, newOffset);
+          range.setEnd(newNode, newOffset);
+        }
+        const partial = (child, fromStart) => {
+          if (isCharacterDataNode(child)) {
+            const clone = child.cloneNode(false);
+            if (fromStart) {
+              clone.data = start.data.substring(startOffset);
+              if (extract)
+                start.deleteData(startOffset, start.data.length - startOffset);
+            } else {
+              clone.data = end.data.substring(0, endOffset);
+              if (extract) end.deleteData(0, endOffset);
+            }
+            fragment.appendChild(clone);
+            return;
+          }
+          const clone = child.cloneNode(false), sub = new Range();
+          fragment.appendChild(clone);
+          if (fromStart) {
+            sub.setStart(start, startOffset);
+            sub.setEnd(child, rangeNodeLength(child));
+          } else {
+            sub.setStart(child, 0);
+            sub.setEnd(end, endOffset);
+          }
+          clone.appendChild(rangeContents(sub, extract, depth + 1));
+        };
+        if (firstPartial) partial(firstPartial, true);
+        for (const child of contained)
+          fragment.appendChild(extract ? child : child.cloneNode(true));
+        if (lastPartial) partial(lastPartial, false);
+        return fragment;
+      };
+    const Range = domShared.Range = __tilefinchRealmGlobal.Range = class Range {
+      #points;
+      constructor() {
+        if (liveRanges.length >= liveRangeLimit) visitRanges(null);
+        if (liveRanges.length >= liveRangeLimit) {
+          const kept = liveRanges.length - liveRangeDrop;
+          for (let i = 0; i < kept; i++)
+            liveRanges[i] = liveRanges[i + liveRangeDrop];
+          liveRanges.length = kept;
+        }
+        this.#points = {
+          start: { node: document, offset: 0 },
+          end: { node: document, offset: 0 },
+        };
+        push(liveRanges, new TrustedWeakRef(this.#points));
+        domShared.rangeMutation = adjustRanges;
+        domShared.rangeSplit = splitRanges;
+        domShared.rangeMerge = mergeRanges;
+        domShared.rangeReplace = replaceRanges;
+      }
+      get startContainer() { return this.#points.start.node; }
+      get startOffset() { return this.#points.start.offset; }
+      get endContainer() { return this.#points.end.node; }
+      get endOffset() { return this.#points.end.offset; }
+      #setStart(node, offset) {
+        this.#points.start.node = node;
+        this.#points.start.offset = offset;
+      }
+      #setEnd(node, offset) {
+        this.#points.end.node = node;
+        this.#points.end.offset = offset;
+      }
+      get collapsed() {
+        return (
+          this.startContainer === this.endContainer &&
+          this.startOffset === this.endOffset
+        );
+      }
+      get commonAncestorContainer() {
+        return ancestor(this.startContainer, this.endContainer);
+      }
+      /* A start after the end (or in another tree) collapses the range to
+         it, and an end before the start likewise. */
+      setStart(node, offset) {
+        offset = boundedOffset(node, offset);
+        this.#setStart(node, offset);
+        if (boundaryAfter(node, offset, this.endContainer, this.endOffset)) {
+          this.#setEnd(node, offset);
+        }
+      }
+      setEnd(node, offset) {
+        offset = boundedOffset(node, offset);
+        this.#setEnd(node, offset);
+        if (boundaryAfter(this.startContainer, this.startOffset, node, offset)) {
+          this.#setStart(node, offset);
+        }
+      }
+      setStartBefore(node) {
+        this.setStart(
+          node.parentNode,
+          Array.prototype.indexOf.call(node.parentNode.childNodes, node),
+        );
+      }
+      setStartAfter(node) {
+        this.setStart(
+          node.parentNode,
+          Array.prototype.indexOf.call(node.parentNode.childNodes, node) + 1,
+        );
+      }
+      setEndBefore(node) {
+        this.setEnd(
+          node.parentNode,
+          Array.prototype.indexOf.call(node.parentNode.childNodes, node),
+        );
+      }
+      setEndAfter(node) {
+        this.setEnd(
+          node.parentNode,
+          Array.prototype.indexOf.call(node.parentNode.childNodes, node) + 1,
+        );
+      }
+      collapse(toStart = false) {
+        if (toStart) {
+          this.#setEnd(this.startContainer, this.startOffset);
+        } else {
+          this.#setStart(this.endContainer, this.endOffset);
+        }
+      }
+      selectNodeContents(node) {
+        this.#setStart(node, 0);
+        this.#setEnd(node, nodeExtent(node));
+      }
+      cloneRange() {
+        const copy = new Range();
+        copy.#setStart(this.startContainer, this.startOffset);
+        copy.#setEnd(this.endContainer, this.endOffset);
+        return copy;
+      }
+      extractContents() {
+        return rangeContents(this, true, 0);
+      }
+      deleteContents() {
+        rangeContents(this, true, 0);
+      }
+      cloneContents() {
+        return rangeContents(this, false, 0);
+      }
+      /* DOM Parsing: parse with the start node (or its parent element) as
+         the fragment parser's context, <body> for none or <html>. Unlike
+         innerHTML, the scripts stay unstarted and script-inserted, so they
+         run, under CSP, once the fragment is connected. Reddit's bundles
+         build markup this way. */
+      createContextualFragment(markup) {
+        markup = String(markup);
+        const node = this.startContainer,
+          type = node?.nodeType,
+          owner =
+            type === Node.DOCUMENT_NODE ? node : node?.ownerDocument || document;
+        let element =
+          type === Node.ELEMENT_NODE
+            ? node
+            : type === Node.TEXT_NODE ||
+                type === Node.CDATA_SECTION_NODE ||
+                type === Node.COMMENT_NODE
+              ? node.parentElement
+              : null,
+          name = String(element?.localName || "").toLowerCase();
+        if (
+          !element ||
+          (name === "html" &&
+            element.namespaceURI === "http://www.w3.org/1999/xhtml")
+        )
+          name = "body";
+        if (owner !== document) {
+          /* A script-side DOMParser/createHTMLDocument document: its own
+             bounded innerHTML copy. XML fragment parsing is not provided. */
+          if (owner.contentType !== "text/html")
+            throw new DOMException(
+              "XML fragment parsing is not supported",
+              "NotSupportedError",
+            );
+          const holder = owner.createElement(name),
+            result = owner.createDocumentFragment();
+          holder.innerHTML = markup;
+          for (const child of [...holder.childNodes]) result.appendChild(child);
+          return result;
+        }
+        const result = document.createDocumentFragment();
+        if (!__tilefinchSetInnerHTML(result.__handle, markup, name))
+          throw new DOMException(
+            "Contextual fragment exceeds bounded parsing",
+            "NotSupportedError",
+          );
+        return result;
+      }
+      selectNode(node) {
+        const parent = node?.parentNode;
+        if (!parent)
+          throw new DOMException("Node has no parent", "InvalidNodeTypeError");
+        const index = Array.prototype.indexOf.call(parent.childNodes, node);
+        this.#setStart(parent, index);
+        this.#setEnd(parent, index + 1);
+      }
+      compareBoundaryPoints(how, source) {
+        how = Number(how);
+        if (!(source instanceof Range)) throw new TypeError("Range required");
+        if (!(how >= 0 && how <= 3 && Number.isInteger(how)))
+          throw new DOMException("Invalid comparison", "NotSupportedError");
+        const ownEnd = how === 1 || how === 2,
+          sourceEnd = how === 2 || how === 3;
+        return compareBoundaryPoints(
+          ownEnd ? this.endContainer : this.startContainer,
+          ownEnd ? this.endOffset : this.startOffset,
+          sourceEnd ? source.endContainer : source.startContainer,
+          sourceEnd ? source.endOffset : source.startOffset,
+        );
+      }
+      comparePoint(node, offset) {
+        if (node?.getRootNode?.() !== this.startContainer.getRootNode?.())
+          throw new DOMException("Node is in another tree", "WrongDocumentError");
+        offset = boundedOffset(node, offset);
+        if (compareBoundaryPoints(node, offset, this.startContainer,
+                                  this.startOffset) < 0) return -1;
+        return compareBoundaryPoints(node, offset, this.endContainer,
+                                     this.endOffset) > 0 ? 1 : 0;
+      }
+      isPointInRange(node, offset) {
+        if (node?.getRootNode?.() !== this.startContainer.getRootNode?.())
+          return false;
+        return this.comparePoint(node, offset) === 0;
+      }
+      intersectsNode(node) {
+        if (!(node instanceof Node)) throw new TypeError("Node required");
+        if (domPosition(node, this.startContainer) &
+            Node.DOCUMENT_POSITION_DISCONNECTED) return false;
+        const parent = node.parentNode;
+        if (!parent) return true;
+        const offset = Array.prototype.indexOf.call(parent.childNodes, node);
+        return (
+          compareBoundaryPoints(parent, offset, this.endContainer,
+                                this.endOffset) < 0 &&
+          compareBoundaryPoints(parent, offset + 1, this.startContainer,
+                                this.startOffset) > 0
+        );
+      }
+      insertNode(node) {
+        if (!(node instanceof Node)) throw new TypeError("Node required");
+        const container = this.startContainer,
+          offset = this.startOffset,
+          split = isTextNode(container),
+          parent = split ? container.parentNode : container;
+        if (!parent || node === container ||
+            (!split && isCharacterDataNode(container)))
+          throw new DOMException("Invalid range insertion", "HierarchyRequestError");
+        let reference = split ? container : container.childNodes[offset] || null;
+        __tilefinchValidatePreInsert(parent, node, reference);
+        if (split) reference = container.splitText(offset);
+        if (node === reference) reference = node.nextSibling;
+        const count = node instanceof DocumentFragment ? node.childNodes.length : 1;
+        let end = reference
+          ? Array.prototype.indexOf.call(parent.childNodes, reference)
+          : parent.childNodes.length;
+        if (node.parentNode === parent &&
+            Array.prototype.indexOf.call(parent.childNodes, node) < end)
+          end--;
+        parent.insertBefore(node, reference);
+        if (this.collapsed)
+          this.#setEnd(parent, Math.min(end + count, parent.childNodes.length));
+      }
+      surroundContents(newParent) {
+        if (!(newParent instanceof Node)) throw new TypeError("Node required");
+        const common = this.commonAncestorContainer;
+        for (const endpoint of [this.startContainer, this.endContainer]) {
+          for (let at = endpoint, depth = 0; at && at !== common &&
+               depth < ancestorLimit; at = at.parentNode, depth++) {
+            if (!isTextNode(at))
+              throw new DOMException("Range partly contains a non-Text node",
+                                     "InvalidStateError");
+          }
+        }
+        if (newParent.nodeType === Node.DOCUMENT_NODE ||
+            newParent.nodeType === Node.DOCUMENT_TYPE_NODE ||
+            newParent.nodeType === Node.DOCUMENT_FRAGMENT_NODE)
+          throw new DOMException("Invalid range container", "InvalidNodeTypeError");
+        const fragment = this.extractContents();
+        if (newParent.firstChild) newParent.replaceChildren();
+        this.insertNode(newParent);
+        newParent.appendChild(fragment);
+        this.selectNode(newParent);
+      }
+      /* The text of the Text nodes between the boundary points, with the
+         start and end Text nodes cut at their offsets. */
+      toString() {
+        const start = this.startContainer, end = this.endContainer,
+          startOffset = this.startOffset, endOffset = this.endOffset;
+        if (start === end && isTextNode(start))
+          return start.data.substring(startOffset, endOffset);
+        let text = isTextNode(start) ? start.data.substring(startOffset) : "",
+          at = isCharacterDataNode(start)
+            ? followingNode(start)
+            : start.childNodes[startOffset] ?? followingNode(start);
+        const stop = isCharacterDataNode(end)
+          ? end
+          : end.childNodes[endOffset] ?? followingNode(end);
+        for (; at && at !== stop; at = at.firstChild || followingNode(at))
+          if (isTextNode(at)) text += at.data;
+        if (isTextNode(end) && end !== start)
+          text += end.data.substring(0, endOffset);
+        return text;
+      }
+      getBoundingClientRect() {
+        const node = this.commonAncestorContainer;
+        return node instanceof Element
+          ? node.getBoundingClientRect()
+          : node?.parentElement?.getBoundingClientRect() || new DOMRect();
+      }
+      getClientRects() {
+        const rect = this.getBoundingClientRect();
+        return domShared.rectList(rect.width && rect.height ? rect : null);
+      }
+      detach() {}
+    };
+    ["START_TO_START", "START_TO_END", "END_TO_END", "END_TO_START"].forEach(
+      (name, value) => {
+        const constant = { value, enumerable: true };
+        Object.defineProperty(Range, name, constant);
+        Object.defineProperty(Range.prototype, name, constant);
+      },
+    );
   }
   {
     const sameNode = (left, right) =>
@@ -2177,6 +2781,12 @@
           value instanceof Node ? value : owner.createTextNode(String(value)),
         );
       if (nodes.length === 0) return;
+      /* A single node has no temporary fragment in the DOM algorithm;
+         moving it through one fires disconnection too early. */
+      if (nodes.length === 1) {
+        parent.insertBefore(nodes[0], prepend ? parent.firstChild : null);
+        return;
+      }
       let insertion = nodes[0];
       if (nodes.length > 1) {
         insertion = owner.createDocumentFragment();
@@ -2381,31 +2991,6 @@
       installContainer = (container) => {
         markupAccessor(container);
         Object.defineProperties(container, {
-          addEventListener: {
-            configurable: true,
-            writable: true,
-            /* As in browsers, EventTarget's methods read when called, so a
-               page's patch of them (zone.js) still sees the call; the
-               prototype itself and the call are taken before author code. */
-            value: function addEventListener(type, callback, options = false) {
-              return trustedFunctionApply(
-                containerEventTarget.addEventListener,
-                this, [type, callback, options]);
-            },
-          },
-          removeEventListener: {
-            configurable: true,
-            writable: true,
-            value: function removeEventListener(
-              type,
-              callback,
-              options = false,
-            ) {
-              return trustedFunctionApply(
-                containerEventTarget.removeEventListener,
-                this, [type, callback, options]);
-            },
-          },
           dispatchEvent: {
             configurable: true,
             writable: true,
@@ -2414,7 +2999,7 @@
                 this,
                 (at) => at.__tilefinchDetachedParent || at.parentNode,
               );
-              globalThis.__tilefinchPrepareEvent(event, this, path);
+              globalThis.__tilefinchPrepareEvent(event, this, path, true);
               for (
                 let at = path.length - 1;
                 at >= 1 && !event.__stopped;
@@ -3083,8 +3668,7 @@
             __tilefinchReportUncaught(error, "AbortSignal algorithm");
           }
         /* EventTarget's own dispatch, never a page's replacement. */
-        trustedFunctionApply(fileReaderDispatch, current,
-          [browserEvent(EventInterface, "abort")]);
+        fileReaderDispatch(current, trustedEvent(browserEvent(EventInterface, "abort")));
         current = next;
       }
     };
@@ -3294,13 +3878,17 @@
   };
   const forbiddenMethod = (method) =>
     ["CONNECT", "TRACE", "TRACK"].includes(String(method).toUpperCase());
+  const normalizeMethod = (method) => {
+    const upper = method.toUpperCase();
+    return /^(DELETE|GET|HEAD|OPTIONS|POST|PUT)$/.test(upper) ? upper : method;
+  };
   const normalizeXhrMethod = (method) => {
     method = String(method);
     if (!isHttpToken(method))
       throw new DOMException("Invalid HTTP method", "SyntaxError");
     if (forbiddenMethod(method))
       throw new DOMException("Forbidden HTTP method", "SecurityError");
-    return method;
+    return normalizeMethod(method);
   };
   const normalizeXhrHeader = (name, value) => {
     name = String(name);
@@ -3324,18 +3912,64 @@
     };
   };
   const headerStorage = new TrustedWeakMap(),
+    immutableHeaderMaps = new WeakSet(),
+    headerRevision = Symbol(),
+    copyHeaderValues = (source) => {
+      const copy = [];
+      for (let i = 0; i < source.length; i++) copy[i] = source[i];
+      return copy;
+    },
+    joinHeaderValues = Function.call.bind(Array.prototype.join),
+    headerEntryLimit = 256,
     headerMap = (headers) => {
       if (!trustedWeakMapHas(headerStorage, headers))
         throw new TrustedTypeError("Illegal invocation");
       return trustedWeakMapGet(headerStorage, headers);
     },
+    writableHeaderMap = (headers) => {
+      const map = headerMap(headers);
+      if (trustedWeakSetHas(immutableHeaderMaps, map))
+        throw new TrustedTypeError("Headers are immutable");
+      return map;
+    },
     sortedHeaderEntries = (headers) => {
       const entries = [];
-      for (const pair of trustedMapEntries(headerMap(headers)))
-        entries.push([pair[0], pair[1]]);
+      for (const [name, value] of trustedMapEntries(headerMap(headers))) {
+        if (name === "set-cookie") {
+          for (let i = 0; i < value.length; i++)
+            entries.push([name, value[i]]);
+        } else entries.push([name, value]);
+      }
       trustedArraySort(entries, (left, right) =>
         left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0);
       return entries;
+    },
+    checkHeaderEntryLimit = (map) => {
+      /* Ordinary repeated names share one slot. Cookie entries cannot be
+         combined, so count every field against the same existing limit. */
+      const cookies = trustedMapGet(map, "set-cookie");
+      if (trustedMapSize(map) + (cookies ? cookies.length - 1 : 0) >=
+          headerEntryLimit)
+        throw new RangeError("Header entry limit exceeded");
+    },
+    headerChanged = (map) => {
+      if (map[headerRevision] !== undefined) map[headerRevision]++;
+    },
+    headerIterator = (headers, mode) => {
+      const map = headerMap(headers);
+      if (map[headerRevision] === undefined) map[headerRevision] = 0;
+      let revision = -1, entries;
+      return (function* () {
+        for (let index = 0; index < headerEntryLimit; index++) {
+          if (revision !== map[headerRevision]) {
+            entries = sortedHeaderEntries(headers);
+            revision = map[headerRevision];
+          }
+          if (index >= entries.length) return;
+          const pair = entries[index];
+          yield mode < 0 ? pair : pair[mode];
+        }
+      })();
     };
   /* A no-cors Request's headers have Fetch's "request-no-cors" guard: they
      silently keep only no-CORS-safelisted request-headers (Accept,
@@ -3359,15 +3993,17 @@
       const headers = new Headers();
       trustedWeakMapSet(noCorsHeaderMaps, headerMap(headers), true);
       for (const [key, value] of trustedMapEntries(headerMap(source)))
-        headers.set(key, value);
+        if (key !== "set-cookie") headers.set(key, value);
       return headers;
     };
   class Headers {
     constructor(init = {}) {
-      trustedWeakMapSet(headerStorage, this, new Map());
+      const map = new Map();
+      trustedWeakMapSet(headerStorage, this, map);
       if (init instanceof Headers) {
         for (const [key, value] of trustedMapEntries(headerMap(init)))
-          this.set(key, value);
+          trustedMapSet(map, key,
+            key === "set-cookie" ? copyHeaderValues(value) : value);
       } else if (typeof init === "string") {
         for (const line of init.split("\n")) {
           if (!line) continue;
@@ -3379,7 +4015,7 @@
                  && typeof init?.[Symbol.iterator] === "function") {
         let count = 0;
         for (const pair of init) {
-          if (++count > 256)
+          if (++count > headerEntryLimit)
             throw new RangeError("Header entry limit exceeded");
           if (pair === null || pair === undefined
               || typeof pair[Symbol.iterator] !== "function")
@@ -3396,7 +4032,7 @@
         }
       } else if (init && typeof init === "object") {
         const keys = Object.keys(init);
-        if (keys.length > 256)
+        if (keys.length > headerEntryLimit)
           throw new RangeError("Header entry limit exceeded");
         for (const key of keys) this.set(key, init[key]);
       }
@@ -3404,54 +4040,65 @@
     append(name, value) {
       name = normalizeHeaderName(name);
       value = normalizeHeaderValue(value);
-      const map = headerMap(this),
-        combined = trustedMapHas(map, name)
-          ? trustedMapGet(map, name) + ", " + value : value;
+      const map = writableHeaderMap(this),
+        old = trustedMapGet(map, name);
+      if (name === "set-cookie") {
+        if (trustedWeakMapHas(noCorsHeaderMaps, map)) return;
+        checkHeaderEntryLimit(map);
+        if (old) old[old.length] = value;
+        else trustedMapSet(map, name, [value]);
+        headerChanged(map);
+        return;
+      }
+      const combined = old === undefined ? value : old + ", " + value;
       if (trustedWeakMapHas(noCorsHeaderMaps, map)
           && !noCorsSafelisted(name, combined)) return;
-      if (!trustedMapHas(map, name)
-          && trustedMapSize(map) >= 256)
-        throw new RangeError("Header entry limit exceeded");
+      if (old === undefined) checkHeaderEntryLimit(map);
       trustedMapSet(map, name, combined);
+      headerChanged(map);
     }
     set(name, value) {
       name = normalizeHeaderName(name);
       value = normalizeHeaderValue(value);
-      const map = headerMap(this);
+      const map = writableHeaderMap(this);
       if (trustedWeakMapHas(noCorsHeaderMaps, map)
           && !noCorsSafelisted(name, value)) return;
-      if (!trustedMapHas(map, name)
-          && trustedMapSize(map) >= 256)
-        throw new RangeError("Header entry limit exceeded");
-      trustedMapSet(map, name, value);
+      if (!trustedMapHas(map, name)) checkHeaderEntryLimit(map);
+      trustedMapSet(map, name, name === "set-cookie" ? [value] : value);
+      headerChanged(map);
     }
     get(name) {
-      return trustedMapGet(headerMap(this), normalizeHeaderName(name)) ?? null;
+      name = normalizeHeaderName(name);
+      const value = trustedMapGet(headerMap(this), name);
+      return value === undefined ? null :
+        name === "set-cookie" ? joinHeaderValues(value, ", ") : value;
+    }
+    getSetCookie() {
+      const values = trustedMapGet(headerMap(this), "set-cookie");
+      return values ? copyHeaderValues(values) : [];
     }
     has(name) {
       return trustedMapHas(headerMap(this), normalizeHeaderName(name));
     }
     delete(name) {
-      trustedMapDelete(headerMap(this), normalizeHeaderName(name));
+      name = normalizeHeaderName(name);
+      const map = writableHeaderMap(this);
+      if (trustedMapDelete(map, name)) headerChanged(map);
     }
     forEach(callback, thisArg) {
       if (typeof callback !== "function")
         throw new TrustedTypeError("Headers callback must be a function");
-      for (const [key, value] of sortedHeaderEntries(this))
+      for (const [key, value] of headerIterator(this, -1))
         trustedFunctionApply(callback, thisArg, [value, key, this]);
     }
     entries() {
-      return sortedHeaderEntries(this)[Symbol.iterator]();
+      return headerIterator(this, -1);
     }
     keys() {
-      const keys = [];
-      for (const [key] of sortedHeaderEntries(this)) keys.push(key);
-      return keys[Symbol.iterator]();
+      return headerIterator(this, 0);
     }
     values() {
-      const values = [];
-      for (const [, value] of sortedHeaderEntries(this)) values.push(value);
-      return values[Symbol.iterator]();
+      return headerIterator(this, 1);
     }
     [Symbol.iterator]() {
       return this.entries();
@@ -3636,9 +4283,122 @@
         },
       });
     };
+  /* Body consumers keep the existing byte ceiling, and reuse FormData's
+     256-entry limit. A multipart part has an additional 8 KiB header cap;
+     decoding and delimiter scanning never stringify the full binary body. */
+  const bodyByteIndexOf = Function.call.bind(Uint8Array.prototype.indexOf),
+    mimeEssence = (value) => value.split(";", 1)[0].trim().toLowerCase(),
+    mimeParameter = (value, name) => {
+      /* Skip quoted semicolons and unescape MIME quoted-pairs. First
+         occurrence wins. All callers pass a bounded header value. */
+      const parameter = /;\s*([^;=\s]+)\s*=\s*(?:"((?:[^"\\]|\\.)*)"[ \t]*|([^;]*))(?=;|$)/g;
+      for (let match; (match = parameter.exec(value)) !== null;) {
+        if (match[1].toLowerCase() !== name) continue;
+        if (match[2] !== undefined) return match[2].replace(/\\(.)/g, "$1");
+        const token = match[3].trim();
+        return isHttpToken(token) ? token : null;
+      }
+      return null;
+    },
+    parseMultipartBody = (bytes, boundary, decoder, data) => {
+      const invalid = () => new TypeError("Invalid multipart form body"),
+        /* Undo the encoder's escapes (Fetch's multipart/form-data parser). */
+        unescapeName = (value) => value === null ? null : value.replace(/%(0A|0D|22)/g,
+          (_, code) => code === "0A" ? "\n" : code === "0D" ? "\r" : '"');
+      if (!boundary || boundary.length > 70 ||
+          !/^[0-9a-zA-Z'()+_,.\/:=? -]*[0-9a-zA-Z'()+_,.\/:=?-]$/.test(boundary))
+        throw invalid();
+      const marker = new TextEncoder().encode("--" + boundary),
+        size = trustedTypedArrayByteLength(bytes),
+        buffer = trustedTypedArrayBuffer(bytes),
+        baseOffset = trustedTypedArrayByteOffset(bytes),
+        span = (start, end) =>
+          new Uint8ArrayCtor(buffer, baseOffset + start, end - start),
+        limitSteps = 256,
+        delimiterAt = (offset) => {
+          if (offset > size - marker.length || bytes[offset] !== 45)
+            return null;
+          for (let i = 1; i < marker.length; i++)
+            if (bytes[offset + i] !== marker[i]) return null;
+          let end = offset + marker.length;
+          const closing = bytes[end] === 45 && bytes[end + 1] === 45;
+          if (closing) end += 2;
+          while (end < size && (bytes[end] === 32 || bytes[end] === 9)) end++;
+          if (closing && end === size) return { at: offset, next: end, closing };
+          if (bytes[end] !== 13 || bytes[end + 1] !== 10) return null;
+          return { at: offset, next: end + 2, closing };
+        },
+        nextDelimiter = (start) => {
+          for (let at = start; at < size;) {
+            const end = bodyByteIndexOf(bytes, 13, at);
+            if (end < 0) return null;
+            if (bytes[end + 1] === 10) {
+              const delimiter = delimiterAt(end + 2);
+              if (delimiter) return delimiter;
+            }
+            at = end + 1;
+          }
+          return null;
+        };
+      let delimiter = delimiterAt(0) || nextDelimiter(0);
+      if (!delimiter) throw invalid();
+      for (let part = 0; !delimiter.closing && part <= limitSteps; part++) {
+        if (part === limitSteps)
+          throw new RangeError("FormData entry limit exceeded");
+        const start = delimiter.next,
+          headerEndLimit = Math.min(size - 3, start + 8192);
+        let headerEnd = start;
+        for (; headerEnd < headerEndLimit; headerEnd++)
+          if (bytes[headerEnd] === 13 && bytes[headerEnd + 1] === 10 &&
+              bytes[headerEnd + 2] === 13 && bytes[headerEnd + 3] === 10)
+            break;
+        if (headerEnd >= headerEndLimit) throw invalid();
+        const headers = decoder.decode(span(start, headerEnd)).split("\r\n");
+        let disposition = null, type = null;
+        for (const line of headers) {
+          const colon = line.indexOf(":");
+          if (colon <= 0 || !isHttpToken(line.slice(0, colon))) throw invalid();
+          const key = line.slice(0, colon).toLowerCase();
+          if (key === "content-disposition" && disposition === null)
+            disposition = line.slice(colon + 1).trim();
+          if (key === "content-type" && type === null)
+            type = line.slice(colon + 1).trim();
+        }
+        if (!disposition || mimeEssence(disposition) !== "form-data")
+          throw invalid();
+        const name = unescapeName(mimeParameter(disposition, "name")),
+          filename = unescapeName(mimeParameter(disposition, "filename")),
+          contentStart = headerEnd + 4;
+        if (name === null) throw invalid();
+        delimiter = nextDelimiter(contentStart);
+        if (!delimiter) throw invalid();
+        const content = span(contentStart, delimiter.at - 2);
+        data.append(name, filename === null ? decoder.decode(content) :
+          new File([content], filename, { type: type || "text/plain" }));
+      }
+      return data;
+    },
+    parseFormBody = (bytes, headers) => {
+      const type = headers.get("content-type") || "";
+      if (type.length > 8192) throw new TypeError("Form data MIME type exceeds bound");
+      const essence = mimeEssence(type);
+      if (essence !== "application/x-www-form-urlencoded" &&
+          essence !== "multipart/form-data")
+        throw new TypeError("Unsupported form data encoding");
+      const data = new FormData(), decoder = new TextDecoder("utf-8", { ignoreBOM: true });
+      if (essence === "multipart/form-data")
+        return parseMultipartBody(bytes, mimeParameter(type, "boundary"), decoder, data);
+      /* URLSearchParams skips a leading '?'; a body is not a URL query
+         suffix and must preserve it as part of the field name. */
+      const text = decoder.decode(bytes);
+      for (const [name, value] of new URLSearchParams(text.startsWith("?") ? "&" + text : text))
+        data.append(name, value);
+      return data;
+    };
   let Response;
   class Request {
     constructor(input, init = {}) {
+      init ??= {};
       const prior = input instanceof Request ? input : null;
       const initBody = init.body,
         inheritsBody = prior && (initBody === undefined || initBody === null),
@@ -3657,7 +4417,7 @@
       );
       if (!isHttpToken(method) || forbiddenMethod(method))
         throw new TypeError("Invalid HTTP method");
-      const normalizedMethod = method.toUpperCase(),
+      const normalizedMethod = normalizeMethod(method),
         initHeaders = new Headers(
         init.headers === undefined
           ? prior
@@ -3818,22 +4578,14 @@
           }));
     }
     formData() {
-      return this.text().then((text) => {
-        const type = this.headers.get("content-type") || "";
-        if (!type.startsWith("application/x-www-form-urlencoded"))
-          throw new TypeError("Unsupported form data encoding");
-        const data = new FormData();
-        for (const [name, value] of new URLSearchParams(text))
-          data.append(name, value);
-        return data;
-      });
+      return consumeRequestBody(this).then((bytes) => parseFormBody(bytes, this.headers));
     }
     clone() {
       if (this.bodyUsed || this.body?.locked)
         throw new TypeError("Body has already been consumed");
       if (this.body === null) return new Request(this);
       const state = requestBodyState(this),
-        branches = this.body.tee();
+        branches = this.body.tee(true);
       state.body = branches[0];
       state.bytes = null;
       return new Request(this, { body: branches[1], duplex: "half" });
@@ -4089,6 +4841,16 @@
       if (!nativeForbiddenHeader(name)) lines.push(name + ": " + value);
     }
     return lines.join("\n");
+  };
+  const headersFromTransport = (raw) => {
+    const headers = new Headers(raw.headers ||
+      "content-type: " + raw.contentType + "\n");
+    /* Native strips these fields before publishing a response header block.
+       Keep that boundary for every transport result, including replay. */
+    const map = headerMap(headers);
+    trustedMapDelete(map, "set-cookie");
+    trustedMapDelete(map, "set-cookie2");
+    return headers;
   };
   const serializeRequestBody = (request) => {
     if (request instanceof Request) {
@@ -4476,6 +5238,9 @@
     responseMetadata = new WeakMap(),
     responseBodyStorage = new TrustedWeakMap(),
     responseOwnedBytesToken = {},
+    immutableResponseToken = {},
+    immutableResponse = (body, init) =>
+      new Response(body, init, immutableResponseToken),
     responseByteStream = (holder) => new ReadableStream({
       pull(controller) {
         const bytes = holder.bytes;
@@ -4496,19 +5261,22 @@
       return trustedWeakMapGet(responseBodyStorage, response);
     };
   Response = class Response {
-    constructor(body = null, init = {}) {
+    constructor(body = null, init = {}, token = null) {
+      init ??= {};
+      const immutable = token === immutableResponseToken;
       const status = Number(init.status === undefined ? 200 : init.status);
       if (
-        status !== 0 &&
+        !(immutable && status === 0) &&
         (!Number.isInteger(status) || status < 200 || status > 599)
       )
         throw new RangeError("Invalid response status");
       if (body !== null && body !== undefined &&
           [101, 204, 205, 304].includes(status))
         throw new TypeError("Response status cannot have a body");
-      const headers = init.headers instanceof Headers
-        ? new Headers(init.headers)
-        : new Headers(init.headers);
+      const statusText = String(init.statusText === undefined ? "" : init.statusText);
+      if (statusText && /[^\t\x20-\x7e\x80-\xff]/.test(statusText))
+        throw new TypeError("Invalid response status text");
+      const headers = new Headers(init.headers);
       const streamBody = body instanceof ReadableStream ? body : null;
       if (
         streamBody &&
@@ -4530,12 +5298,11 @@
         : streamBody ? null : snapshotRequestBody(body, headers);
       if (suppliedBodyBytes && bytes === null)
         throw new TypeError("Response bodyBytes must be a BufferSource");
-      const bodyState = { body: null, buffered: null };
+      if (immutable) trustedWeakSetAdd(immutableHeaderMaps, headerMap(headers));
+      const bodyState = { body: null, buffered: null, immutable };
       trustedWeakMapSet(responseBodyStorage, this, bodyState);
       this.status = status;
-      this.statusText = String(
-        init.statusText === undefined ? "" : init.statusText,
-      );
+      this.statusText = statusText;
       this.url = String(init.url === undefined ? "" : init.url);
       this.headers = headers;
       trustedWeakSetAdd(responseBrands, this);
@@ -4612,15 +5379,7 @@
         }));
     };
     Response.prototype.formData = function formData() {
-      const type = this.headers.get("content-type") || "";
-      if (!type.startsWith("application/x-www-form-urlencoded"))
-        return Promise.reject(new TypeError("Unsupported form data encoding"));
-      return this.text().then((text) => {
-        const data = new FormData();
-        for (const [name, value] of new URLSearchParams(text))
-          data.append(name, value);
-        return data;
-      });
+      return takeBytes(this).then((bytes) => parseFormBody(bytes, this.headers));
     };
     Response.prototype.clone = function clone() {
       if (this.bodyUsed || this.body?.locked)
@@ -4634,28 +5393,33 @@
         type: this.type,
       };
       const state = responseBodyState(this);
-      if (this.body === null) return new Response(null, init);
-      const [first, second] = this.body.tee();
+      const token = state.immutable ? immutableResponseToken : null;
+      if (this.body === null) return new Response(null, init, token);
+      const [first, second] = this.body.tee(true);
       state.body = first;
       state.buffered = null;
-      return new Response(second, init);
+      return new Response(second, init, token);
     };
     Response.error = () =>
-      new Response(null, { status: 0, statusText: "", type: "error" });
+      immutableResponse(null, { status: 0, statusText: "", type: "error" });
     Response.redirect = (url, status = 302) => {
       status = Number(status);
       if (![301, 302, 303, 307, 308].includes(status))
         throw new RangeError("Invalid redirect status");
-      return new Response(null, {
+      return immutableResponse(null, {
         status,
         headers: { location: new URL(String(url), location.href).href },
       });
     };
     Response.json = (data, init = {}) => {
+      init ??= {};
+      const serialized = JSON.stringify(data);
+      if (serialized === undefined)
+        throw new TypeError("Response data cannot be serialized as JSON");
       const headers = new Headers(init.headers);
       if (!headers.has("content-type"))
         headers.set("content-type", "application/json");
-      return new Response(JSON.stringify(data), { ...init, headers });
+      return new Response(serialized, { ...init, headers });
     };
     const trustedResponseArrayBuffer = Response.prototype.arrayBuffer,
       trustedHeadersGet = Headers.prototype.get;
@@ -4751,7 +5515,7 @@
               return;
             }
             resolve(
-              new Response(method === "HEAD" ? null : local.bodyBytes, {
+              immutableResponse(method === "HEAD" ? null : local.bodyBytes, {
                 status: local.status,
                 url: local.url,
                 headers: new Headers(local.headers),
@@ -4765,7 +5529,7 @@
          only-if-cached to avoid the network and return a 504 on a cache miss;
          every request is therefore a deterministic miss. */
       if (request.cache === "only-if-cached")
-        return Promise.resolve(new Response(null, {
+        return Promise.resolve(immutableResponse(null, {
           status: 504,
           statusText: "Gateway Timeout",
           url,
@@ -4815,16 +5579,13 @@
                   raw.type === "opaque" || raw.type === "opaqueredirect" ||
                   [101, 204, 205, 304].includes(responseStatus);
               resolve(
-                new Response(nullBody ? null : raw.body, {
+                immutableResponse(nullBody ? null : raw.body, {
                   status: responseStatus,
                   url: raw.url,
                   headers:
                     raw.type === "opaqueredirect" || raw.type === "opaque"
                       ? new Headers()
-                      : new Headers(
-                          raw.headers ||
-                            "content-type: " + raw.contentType + "\n",
-                        ),
+                      : headersFromTransport(raw),
                   bodyBytes: nullBody ? undefined : raw.bodyBytes,
                   __tilefinchOwnedBytesToken: responseOwnedBytesToken,
                   redirected: !!raw.redirected,
@@ -5184,7 +5945,10 @@
       } else {
         eventSources.delete(Number(id));
         source._nativeId = 0;
-        source._failAndReconnect();
+        if (kind === "terminal") {
+          source.close();
+          source._emit(browserEvent(EventInterface, "error"));
+        } else source._failAndReconnect();
       }
       return true;
     };
@@ -5616,7 +6380,7 @@
         );
       }
       addRemoteCode(code) {
-        if (!this._nativeId || this.readyState === "closed") return false;
+        if (!this._nativeId || this.readyState !== "connecting") return false;
         return !!__tilefinchMultiplayerAddRemoteCode(
           this._nativeId, String(code || ""),
         );
@@ -5818,11 +6582,12 @@
       xhrSetPublic(this, "responseURL", "");
       xhrSetPublic(this, "responseXML", null);
       this.onreadystatechange = null;
-      this.timeout = 0;
-      this.withCredentials = false;
+      xhrSetPublic(this, "timeout", 0);
+      xhrSetPublic(this, "withCredentials", false);
       xhrSetPublic(this, "upload", new XMLHttpRequestUpload());
       this.#privateState = {
         async: true,
+        worker: false,
         done: true,
         generation: 0,
         headers: new Headers(),
@@ -5850,17 +6615,22 @@
       return xhrPrivateState(this).responseType;
     }
     set responseType(value) {
-      value = String(value || "");
+      const state = xhrPrivateState(this);
+      value = String(value);
       if (
         !["", "text", "json", "arraybuffer", "blob", "document"].includes(value)
       )
-        throw new DOMException("Unsupported response type", "SyntaxError");
-      if (this.readyState === 3 || this.readyState === 4)
+        return;
+      if (!state.async && !state.worker)
+        throw new DOMException("Response type is unavailable for synchronous Window XHR",
+          "InvalidAccessError");
+      const readyState = xhrPublicState(this).readyState;
+      if (readyState === 3 || readyState === 4)
         throw new DOMException(
           "Response type cannot change now",
           "InvalidStateError",
         );
-      xhrPrivateState(this).responseType = value;
+      state.responseType = value;
     }
     get responseText() {
       const state = xhrPrivateState(this);
@@ -5876,6 +6646,12 @@
     }
     open(method, url, async = true) {
       const state = xhrPrivateState(this);
+      const nextMethod = normalizeMethod(String(method)),
+        nextURL = String(url), synchronous = !async;
+      if (synchronous && !state.worker &&
+          (xhrPublicState(this).timeout !== 0 || state.responseType !== ""))
+        throw new DOMException("Timeout and response type are unavailable for synchronous Window XHR",
+          "InvalidAccessError");
       if (!state.done && state.requestId)
         cancelNetwork(
           state.requestId,
@@ -5885,28 +6661,21 @@
       if (state.timeoutId) __tilefinchRealmGlobal.__tilefinchCancelTimer(state.timeoutId);
       state.timeoutId = 0;
       state.generation += 1;
-      state.method = String(method).toUpperCase();
-      state.url = String(url);
-      state.async = !!async;
-      xhrSetPublic(this, "status", 0);
-      xhrSetPublic(this, "statusText", "");
-      xhrSetPublic(this, "response", null);
-      xhrSetPublic(this, "responseURL", "");
-      xhrSetPublic(this, "responseXML", null);
-      state.responseHeaders = new Headers();
+      state.method = nextMethod;
+      state.url = nextURL;
+      state.async = !synchronous;
+      xhrResetResponse(this);
       state.headers = new Headers();
-      state.responseText = "";
       state.requestId = 0;
-      state.responseBytes = 0;
-      state.responseLengthComputable = false;
       state.done = true;
       state.sent = false;
       state.uploadBytes = 0;
       state.uploadComplete = false;
       state.uploadStarted = false;
+      const opening = xhrPublicState(this).readyState !== 1;
       xhrSetPublic(this, "readyState", 1);
       if (testProbes) state.stateTrace = [1];
-      xhrEmit(this, "readystatechange");
+      if (opening) xhrEmit(this, "readystatechange");
     }
     setRequestHeader(name, value) {
       const state = xhrPrivateState(this);
@@ -5961,9 +6730,7 @@
       xhrSetPublic(this, "status", Number(raw.status) || 0);
       xhrDiagnosticAdd(state, 1, Number(raw.status) || 0, true);
       xhrSetPublic(this, "responseURL", raw.url || state.url);
-      state.responseHeaders = new Headers(
-        raw.headers || "content-type: " + raw.contentType + "\n",
-      );
+      state.responseHeaders = headersFromTransport(raw);
       xhrSetPublic(this, "readyState", 2);
       xhrTracePhase(state, 2);
       yield [this, "readystatechange", 0, 0, false];
@@ -5972,20 +6739,31 @@
           raw.bodyBytes instanceof ArrayBuffer
             ? new Uint8Array(raw.bodyBytes)
             : null,
+        responseMime = state.mimeType ||
+          state.responseHeaders.get("content-type") || "",
         needsText =
           state.responseType === "" ||
           state.responseType === "text" ||
           state.responseType === "json" ||
           state.responseType === "document" ||
-          /(?:xml|html)/i.test(
-            state.mimeType ||
-              state.responseHeaders.get("content-type") ||
-              "",
-          );
+          /(?:xml|html)/i.test(responseMime),
+        charset = /(?:^|;)\s*charset\s*=\s*(?:"([^"]*)"|'([^']*)'|([^;\s]*))/i
+          .exec(responseMime),
+        textBytes = supplied || new Uint8Array();
+      let decodedText = "";
+      if (needsText && raw.body === undefined) {
+        try {
+          decodedText = new TextDecoder(
+            charset ? charset[1] || charset[2] || charset[3] : "utf-8",
+          ).decode(textBytes);
+        } catch (_) {
+          decodedText = new TextDecoder().decode(textBytes);
+        }
+      }
       state.responseText = needsText
         ? raw.body !== undefined
           ? String(raw.body)
-          : new TextDecoder().decode(supplied || new Uint8Array())
+          : decodedText
         : "";
       xhrDiagnosticAdd(state, 3, state.responseText.length, true);
       xhrSetPublic(this, "readyState", 3);
@@ -6024,11 +6802,7 @@
         }));
       } else if (state.responseType === "document") {
         const mime =
-          /xml/i.test(
-            state.mimeType ||
-              state.responseHeaders.get("content-type") ||
-              "",
-          )
+          /xml/i.test(responseMime)
             ? "text/xml"
             : "text/html";
         xhrSetPublic(this, "response", new DOMParser().parseFromString(
@@ -6038,13 +6812,9 @@
       } else xhrSetPublic(this, "response", null);
       if (
         state.responseType === "" &&
-        /(?:xml|html)/i.test(
-          state.mimeType ||
-            state.responseHeaders.get("content-type") ||
-            "",
-        )
+        /(?:xml|html)/i.test(responseMime)
       ) {
-        const mime = /xml/i.test(state.mimeType || "") ? "text/xml" : "text/html";
+        const mime = /xml/i.test(responseMime) ? "text/xml" : "text/html";
         xhrSetPublic(this, "responseXML", new DOMParser().parseFromString(
           state.responseText,
           mime,
@@ -6308,10 +7078,20 @@
         return state[name];
       },
       set(value) {
-        xhrPrivateState(this);
+        const request = xhrPrivateState(this);
         const state = xhrPublicState(this);
         if (!state) throw new TypeError("Illegal invocation");
-        state[name] = value;
+        if (name === "timeout") {
+          const timeout = +value >>> 0;
+          if (!request.async && !request.worker)
+            throw new DOMException("Timeout is unavailable for synchronous Window XHR",
+              "InvalidAccessError");
+          state.timeout = timeout;
+        } else {
+          if (state.readyState > 1 || request.sent)
+            throw new DOMException("Request is already sending", "InvalidStateError");
+          state.withCredentials = !!value;
+        }
       },
     });
   Object.defineProperty(
@@ -6358,7 +7138,7 @@
       else if (type === "progress") xhrDiagnosticAdd(state, 8);
       else if (type === "load") xhrDiagnosticAdd(state, 9);
       if (complete) xhrCheckpointDispatch(target, event, complete);
-      else target.dispatchEvent(event);
+      else fileReaderDispatch(target, event);
     },
     xhrEmit = (xhr, type, loaded = 0, total = 0) =>
       xhrEmitTarget(xhr, type, loaded, total),
@@ -6480,6 +7260,17 @@
       if (testProbes && type !== "error")
         globalThis.__tilefinchXHRLastError = previous;
     };
+  const constructXHRForWorker = Reflect.construct;
+  trustedDefineProperty(globalThis, "__tilefinchCreateWorkerXHR", {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value(newTarget) {
+      const xhr = constructXHRForWorker(TilefinchXMLHttpRequest, [], newTarget);
+      xhrPrivateState(xhr).worker = true;
+      return xhr;
+    },
+  });
   /* A dedicated worker may be terminated while one of its owner-backed XHR
      transports is still pending.  Abort that transport without dispatching
      callbacks into the retired Worker realm.  The public abort() algorithm is

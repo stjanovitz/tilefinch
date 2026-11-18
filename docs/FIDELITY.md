@@ -478,7 +478,7 @@ where a pixel score cannot identify which layout boundary moved. See the
 tool's `--help` output for the versioned JSON schema and complete threshold
 set.
 
-## Known evidence limits
+## Registered custom properties
 
 `CSS.registerProperty` and `@property` apply one set of registration rules
 within the existing 256-property and custom-value bounds: a custom property
@@ -493,6 +493,8 @@ override same-name `@property` rules, and are not reused across documents.
 The callable is lazy so unused registration support does not consume a
 JavaScript wrapper in small realms. This is not full Properties and Values
 API coverage.
+
+## Known evidence limits
 
 A fidelity score covers visual structure only, within these limits:
 

@@ -39,11 +39,12 @@ HTTPS page with a same-origin Web App Manifest. Tilefinch reads the manifest's
 name, short name, start URL, scope, icon metadata, theme color, and display
 mode. Theme colors use the engine's CSS color parser. Display is
 limited to `browser`, `minimal-ui`, `standalone`, and `fullscreen`; unknown
-values use `browser`. Tilefinch stores a 16×16 decoded icon for the native
-Saved list, serializes the current live document, and
-packages the same-origin resource bodies that the current page has already
-loaded. Reopening the item restores those bodies with their original typed
-resource or module authority before parsing the saved document under its
+values use `browser`. Tilefinch stores a 16×16 icon for the native Saved
+list, decoded from the manifest's PNG, JPEG or WebP icon or rasterized from an
+SVG one, serializes the current live document, and packages the same-origin
+resource bodies that the current page has already loaded. Reopening the
+item restores those bodies with their original typed resource or module
+authority before parsing the saved document under its
 original origin. A cached script therefore does not become executable merely
 because it was written to disk.
 
@@ -51,8 +52,27 @@ because it was written to disk.
 script, including game images prepared through `decode()` or
 `createImageBitmap()`, when their response is still present in the HTTP cache
 at preview time. Installation does not inspect JavaScript objects or
-crawl guessed URLs; the response cache remains the single authority and size
-boundary.
+crawl guessed URLs; apart from the files below, the response cache is the
+single authority and size boundary.
+
+A page's scripts and stylesheets are a special case. The page compiles its
+scripts and lets their sources go, so a loaded script stays only in the
+memory cache, and a game larger than the **Memory cache** setting has lost
+some of its files by the time it is installed. The preview therefore finds
+the external classic scripts and stylesheets the document declares
+(`<script src>` and `<link rel=stylesheet>`, including ones the page wrote or
+inserted and kept) on the page's own origin that the cache no longer holds,
+and downloads each again as the page requested it: with the page's request
+mode, credentials, Content Security Policy and content blocker. The status
+line shows **DOWNLOADING 2 OF 6 APP FILES  O STOP**, and Circle stops the
+preview. The downloads count toward the snapshot limits below and the page
+Budget. The memory cache limit is raised just enough to hold them until the
+install finishes or the preview is cancelled, then returns to the setting.
+Cross-origin files are never downloaded. A declared same-origin script or
+stylesheet that still cannot be captured (its download failed, it is a module
+script, or it passes a limit) is added to the preview's unavailable count, so
+the preview warns that the app may still need a network connection. A script
+the page inserted and then removed from the document is not found this way.
 
 Installation is a two-step user action. The first pass builds and immediately
 discards a candidate snapshot, then shows its estimated payload size, captured
@@ -75,10 +95,10 @@ compiles each script once.
 
 The snapshot is capped at 1 MiB of document markup, 1.5 MiB of response
 bodies, 32 resources, up to 1 MiB of optional classic-script bytecode compiled
-from at most 1 MiB of source, and one fixed-size icon thumbnail. Only
-responses the live memory cache still holds can be captured, so a large game
-may need a larger **Memory cache** setting while it is loaded for
-installation. The resource pack is streamed to and from the Memory Stick:
+from at most 1 MiB of source, and one fixed-size icon thumbnail. Images,
+fonts and data the page requested are captured only while the memory cache
+still holds them, so a game with many such assets may need a larger **Memory
+cache** setting while it is loaded for installation. The resource pack is streamed to and from the Memory Stick:
 installing does not hold a second copy of it in memory, and launching holds
 one member at a time beside the restored cache entries. Reinstalling the same
 source publishes a new payload generation and updates the index before
@@ -210,7 +230,10 @@ work, and write straight to `.part` files, renaming a complete stream into
 place. After an app or power interruption, restarting converts an
 in-progress record to Paused and reconciles the file sizes, so Resume
 fetches a fresh, expiring YouTube URL and continues from the saved byte
-offset.
+offset. The saved bytes are kept only when the fresh URL names the same
+encoded video (`<id>.video.identity`); a re-encoded video starts again from
+zero. A download paused on 0.1.52, which kept no such record, continues when
+the video's format and lengths are unchanged.
 
 **Menu → Settings → Video → Resume saves** is off by default. When it is on,
 Tilefinch opens the offline index after the first page is ready and resumes
@@ -261,8 +284,13 @@ and one-active-download limit. At least 8 MiB of free space is reserved. The
 transport ring has a fixed size, whatever the file size. A completed stream is
 flushed and its completed length recorded before publication.
 
-Resume requires a matching strong ETag or Last-Modified validator and an
-exact Content-Range. A server that returns a fresh complete response starts
+Resume requires a matching strong ETag or Last-Modified validator, an exact
+Content-Range, and the same final address after redirects. Under a strong
+ETag only the scheme, host and path must match, so a signed download link
+that redirects with a new signature and expiry on each try still resumes;
+under a Last-Modified date the whole address, query included, must match. A
+`.file.meta` written by 0.1.52 has no address record, so that file restarts.
+A server that returns a fresh complete response starts
 over safely rather than appending it. Without a validator, Retry restarts the
 file. HTML responses without an explicit attachment disposition, HTTP errors,
 unverifiable partial responses, over-limit
@@ -330,8 +358,8 @@ remains so the remaining contents can be inventoried and removed on a retry.
 Each new installation includes an 80-byte, corruption-checked
 `.tilefinch-homebrew` ownership receipt containing only its folder name and
 local installation ID—not its source URL or credentials. An `APP-` folder's
-receipt is 208 bytes and adds the name the manager shows; versions before
-it do not list such an app (they could not install one). ZIPs cannot supply
+receipt is 208 bytes and adds the name the manager shows; a release that
+reads only 80-byte receipts does not list such an app. ZIPs cannot supply
 that reserved root file. Installations without a valid receipt, such as ones
 you copied yourself, are never offered for removal. The manager supports at
 most 64 installations and examines at most 512 GAME directory entries. Removal
@@ -346,8 +374,18 @@ when possible and reports an incomplete removal instead of claiming success.
 The index is limited to 32 KiB and written through a temporary file. A prior
 complete generation remains in `library.bin.bak`; startup validates the
 primary, temporary, and backup generations in that order, then republishes a
-recovered copy without first destroying the surviving generation. Replaced
-articles retain the matching previous payload until the new index is durable,
+recovered copy without first destroying the surviving generation. A
+temporary file loaded because the primary is missing is the end of an
+interrupted save, the newest generation, and counts as no loss. If a newer
+generation exists but is damaged, recovery from an older one records in
+`library.bin.recovered` the highest ID that owns a file: unlisted files up to
+that ID were known only to the lost generation, so they remain available for
+manual recovery and new items take higher IDs. Orphans above it are still
+deleted. Once a complete directory pass finds no unlisted file at or below
+it (for example after you remove them over USB), the marker is deleted and
+the next boot sweeps normally. A temporary read or memory refusal
+does not trigger fallback or replacement. Replaced articles retain the
+matching previous payload until the new index is durable,
 and article reads accept that backup only when its recorded length and
 checksum match the active index. Article payloads are corruption-checked;
 media chunks require an exact HTTPS response length and completed files must

@@ -1,5 +1,9 @@
 # PSP network lifecycle supervisor
 
+This page is for engineers changing how the PSP app brings networking up and
+down: the supervisor's states, leases, and teardown order. The transport the
+leases protect is in [PSP transport](PSP_TRANSPORT.md).
+
 The PSP network supervisor is the outer lifecycle owner for Tilefinch's
 network stack. It does not replace `PspNetworkStatus`: the existing bounded
 profile/module/init/association ladder remains intact and is invoked as the

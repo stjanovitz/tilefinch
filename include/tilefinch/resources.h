@@ -223,8 +223,11 @@ typedef struct {
     bool active;
 } ExternalFontLoader;
 
+/* A borrowed native canvas surface. It is held by value in its resource, so
+   a table or resource copied to new storage keeps a valid record; the table
+   holds no record a resource could point into. pixels is NULL when the
+   resource has none. */
 typedef struct ImageCanvasNativeSurface {
-    lxb_dom_node_t *node;
     const unsigned char *pixels;
     size_t stride;
     uint32_t epoch;
@@ -273,9 +276,10 @@ typedef struct ImageResource {
     uint32_t canvas_translucent_pixel;
     /* A PSP WebGL surface may remain authoritative in EDRAM until normal
        painting consumes it. The page-owned RGBA allocation remains the
-       bounded fallback/readback store; this borrowed pointer is never freed
-       by ImageResources and is trusted only for its matching display epoch. */
-    ImageCanvasNativeSurface *canvas_native_surface;
+       bounded fallback/readback store; the borrowed pixels are never freed
+       by ImageResources and are trusted only for their matching display
+       epoch. */
+    ImageCanvasNativeSurface canvas_native;
     /* WebGL only (images_canvas_frame_hold): a frame is being drawn, flushed
        in parts inside one task. Until the flush that ends it, painters show
        canvas_held_frame instead of the drawing buffer: the last complete
@@ -461,7 +465,6 @@ typedef struct ImageResources {
         int width;
         int height;
     } canvas_depth[2];
-    ImageCanvasNativeSurface canvas_native[2];
     /* The last complete WebGL frame per canvas (canvas_held_frame), kept
        for reuse while the canvas lives. */
     struct {

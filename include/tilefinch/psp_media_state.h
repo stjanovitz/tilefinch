@@ -239,6 +239,20 @@ enum {
 };
 
 PspMediaMachine psp_media_machine_initial(void);
+/* End is an edge once per pass, including replay of the same queue item. */
+static inline bool psp_media_playlist_end_edge(bool ended, bool *handled)
+{
+    bool edge = ended && !*handled;
+    *handled = ended;
+    return edge;
+}
+
+static inline bool psp_media_subtitle_can_retry(
+    bool has_document, bool resolving, bool fetching, bool attempted)
+{
+    return !has_document && !resolving && !fetching && attempted;
+}
+
 PspMediaDecision psp_media_machine_transition(
     const PspMediaMachine *machine, const PspMediaEvent *event);
 uint32_t psp_media_machine_violations(const PspMediaMachine *machine);

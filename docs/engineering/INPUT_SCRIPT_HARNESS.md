@@ -9,11 +9,6 @@ This page is an index. The harness documentation lives in three pages:
 - [Validation records](VALIDATION_RECORDS.md): what each validation log
   record means, and the attribution tools that read them.
 
-## Independent execution census
-
-Moved to
-[Validation records](VALIDATION_RECORDS.md#independent-execution-census).
-
 ## PSPLink live loop
 
 Live device runs of the `-live` scenarios use

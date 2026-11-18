@@ -913,6 +913,7 @@ static ScriptRuntime *navigation_create_runtime(
         .maximum_script_file_bytes = session->document_scripts_enabled
             ? session->maximum_script_file_bytes : 0,
         .defer_document_scripts = defer_document_scripts,
+        .expect_navigation_layout = true,
         .game_audio_internal_slots = session->game_audio_internal_slots,
         .dynamic_code_disabled = !tilefinch_csp_allows_dynamic_code(
             &document->content_security_policy),

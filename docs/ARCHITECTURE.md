@@ -1,5 +1,14 @@
 # Architecture
 
+This page is for contributors who need the shape of Tilefinch before changing
+it: what owns what, the rules every subsystem keeps, and why. Each section
+gives a rule or invariant, the reason it exists, and a link to where the
+detail lives. It names only major entry points (a header or a top-level
+module) and only the numbers that define behaviour. Mechanism, thresholds,
+helper functions, diagnostics, and examples belong in the
+[engineering manuals](engineering/README.md) or in code comments, and the page
+describes the system as it is, without measurements or history.
+
 Tilefinch is a web browser for the Sony PSP, written in C11. Its target has a
 333 MHz single-core MIPS CPU, 64 MiB of RAM, no virtual memory, and a
 480×272 RGB565 screen: less memory, in total, than a desktop browser gives a
@@ -113,11 +122,12 @@ flowchart TD
 
 ### 1. One ledger owns page memory
 
-Every page-pipeline allocation goes through `Budget`: DOM, styles, scripts,
-resources, layout, display lists, tiles, session state, and allocator
-metadata. The PSP profiles set 16 MiB (`strict`) and 32 MiB (`realistic`, the
-app's own, shared with voice) content ceilings. These are admission limits,
-not estimates of whatever heap happens to remain.
+Every page-pipeline allocation goes through `Budget`
+(`include/tilefinch/budget.h`): DOM, styles, scripts, resources, layout,
+display lists, tiles, session state, and allocator metadata. The PSP profiles
+set 16 MiB (`strict`) and 32 MiB (`realistic`, the app's own, shared with
+voice) content ceilings. These are admission limits, not estimates of
+whatever heap happens to remain.
 
 Budget categories record where memory went; they do not carve out stranded
 sub-heaps. Fixed-capacity concurrent pools and inline session tables are
@@ -125,13 +135,12 @@ represented by reservations against the same ceiling. Process-lifetime state
 that no page can own, such as the CA bundle and the cross-navigation TLS
 session store, is bounded separately and counted in the device reserve.
 
-Page JavaScript is layered. QuickJS carves every object of up to 504 bytes
-(objects, shapes, property arrays, strings, closures, var refs) from its own
-4 KiB arenas, whose 8-byte block header is also the reference count and GC
-tag. The QuickJS pool (`budget_quickjs_pool_*`) charges only those arenas and
-the engine's larger blocks to the Budget as `BUDGET_CATEGORY_JAVASCRIPT`. A
-per-object allocator change therefore belongs in the engine's arena code, not
-in the pool.
+Page JavaScript is layered. QuickJS carves its small objects from its own
+arenas, and the QuickJS pool charges only those arenas and the engine's
+larger blocks to the Budget as JavaScript memory. A per-object allocator
+change therefore belongs in the engine's arena code, not in the pool
+([Arenas and the QuickJS pool](engineering/JS_RUNTIME.md#arenas-and-the-quickjs-pool);
+[what the page budget counts](engineering/PSP_ENVELOPE.md#what-the-page-budget-counts)).
 
 A refused allocation is a normal result. Parser checkpoints, candidate pages,
 layout jobs, cache insertion, and script admission all have rollback or
@@ -159,7 +168,7 @@ genuinely runs concurrently:
 | DMA | framebuffer staging transfer | completion for the exact slot generation |
 | audio | PSP audio submission | consumed PCM position |
 | voice | optional recognizer job | bounded recognition result |
-| microphone | one `sceAudioInput` transfer pair while a page captures (a pair whose last transfer was never seen to end is kept and reused, never freed) | samples into a fixed single-producer ring the browser thread reads; an atomic level and run state |
+| microphone | one `sceAudioInput` transfer pair while a page captures | samples into a fixed single-producer ring; an atomic level and run state |
 | clock/watchdog | platform timing or liveness observation | atomics and fixed records |
 
 These are operating-system threads. A page's Web Workers are not: each
@@ -179,71 +188,20 @@ The rule is enforced, not only described. The `Budget` intrusive list is
 deliberately unlocked, so a build with `TILEFINCH_OWNER_CHECKS` binds each
 ledger to the first thread that mutates it and reports any other thread that
 allocates, frees, reserves, or reallocates through it; a worker reaching into
-page state is caught at the allocation, not later through a corrupted list. A
-worker that needs page-charged memory uses a `BudgetConcurrentPool` (parent
-reservation on the owning thread, its own small lock for worker allocations),
-and an intentional handoff calls `budget_adopt_current_thread()`. On the host
-the check is on wherever tests are built and a violation aborts the test. On
-the PSP, where every worker in the table lives, a qualification build opts in
-and its exit report prints `tilefinch-owner-checks: budget-violations=N`;
-ordinary validation builds leave it off, because a thread-identity syscall on
-every allocation would distort the timing they measure.
+page state is caught at the allocation, not later through a corrupted list.
+A worker that needs page-charged memory uses a `BudgetConcurrentPool`, and an
+intentional handoff adopts the ledger explicitly. Host test builds check by
+default, and a violation aborts the test; on the PSP only a qualification build
+opts in, because a thread-identity syscall on every allocation would distort
+the timing validation builds measure.
 
-The loading-UI supervisor, which draws chrome from the callback thread while
-page work runs, is the case the check exists for. Its glyph cache is filled
-on the owning thread when faces are bound (every printable ASCII glyph at each
-UI scale in use), a miss on any other thread draws the built-in bitmap for
-that tick, and binding and filling hold the supervisor's presentation fence.
-Every modal loop on the browser thread that samples the pad and presents by
-itself (a page's alert/confirm/prompt, the keyboard for the address bar, Find,
-page fields and the developer URL, a screenshot's capture) holds the same
-fence for its life, so the supervisor neither draws over it nor reads its
-presses.
-
-The supervisor draws a copy of the UI state taken when the scope began, and
-that copy still points at browser-thread data: the HOME, Library and Find
-views, and the Library item and profile strings its rows borrow. Each write
-to that data while a scope may be active holds the same fence for the write
-alone (a view rebuild, a Library replace, rename or removal, a bookmark or
-history edit), and any Memory Stick I/O it needs (an icon read, a
-fingerprint probe, the index save) runs outside it. The library takes the
-fence through its `fence_acquire`/`fence_release` hooks. Appending a Library
-item needs none, since no row points past the count its list was built
-with. The Tabs view needs none either: no scope begins while Tabs is the
-screen, because it pauses page work and frame pumps and an action chosen
-there closes it first.
-
-A preview sheet (an offline-app preview or recompile offer, a file offer, a
-ZIP install) is freed when it is answered, and the copy can still show it: a
-pending load's navigation pump begins its scope again over whatever screen is
-up once another scope (the sheet's own preparation, say) has retired it. The
-offline store calls its `release_view` hook just before freeing a preview,
-and the PSP browser's hook takes the fence and drops the sheet from the copy,
-which then shows the page until the scope ends.
-
-A media open's scope copies the player state the same way, and that copy
-points at the session's presentation: the track and chapter labels, the
-caption row, the queue and the rotation. The session installs the fence as
-that presentation's `fence` (`PspMediaSessionPlatform.fence_acquire`), and
-each writer takes it for the store alone: the `psp_ui_media_set_*` setters
-shape text before taking it and skip it when nothing changed, and the
-session prepares track, chapter and queue rows aside before storing them in
-one step. The supervisor never writes that presentation. A press that would
-change it (the track menu, Auto next, the caption toggle's memory) first
-moves the supervisor's copy onto a private copy of the presentation
-(`psp_ui_media_update_detached`), so the press shows at once and the menu
-it opened takes Circle. Every press the copy takes is queued, whether it
-moved the copy or not (`psp_ui_media_supervisor_press`). The browser thread
-applies the queued presses to its own player state at the next refresh of
-the copy or at the scope's end, derives their actions there, and the
-refreshed copy borrows the presentation again. The actions wait in a
-two-slot mailbox (`psp_ui_media_press_queue_settle`): the newest timeline
-action (preview, seek, play/pause) goes to the session at each refresh, and
-the newest other action (a queue entry, a track, rotation, close) at the
-scope's end, so a timeline press after a command cannot replace it. Because the scope spans
-browser-loop frames, that loop takes no button edges from the pad or the
-latch while it is up (`psp_input_loop_edges`), only the stick and held
-buttons, so one press reaches the player once.
+The loading-UI supervisor is the case the check exists for: it draws chrome
+from the firmware callback thread while a load or a media open runs, from a
+private copy of the UI state, and never reads the engine. One presentation
+fence orders it against the browser thread: a modal loop holds the fence for
+its life, and every write to data the copy borrows holds it for the store
+alone, with Memory Stick I/O outside it
+([UI during page work](engineering/UI_DURING_PAGE_WORK.md#the-loading-ui-supervisor)).
 
 ### 3. Commit complete state, never partial state
 
@@ -286,81 +244,60 @@ rasterization, screenshots, offline saves, and installation all run as
 bounded pumps. The main loop spends a quota, presents progress the user can
 see, and resumes from an owned continuation. A pending navigation pumps again
 within a frame while each pump makes progress of its own, for at most a 12 ms
-slice (`frame_navigation_slice_continue`); the frame still ends in its vblank
-wait, so the lower-priority I/O threads keep the rest of the interval. Parser-blocking classic scripts
-are the bounded exception: they stay synchronous, with cooperative
-checkpoints, inside the limits described in [Script admission](#script-admission).
+slice, so the frame still ends in its vblank wait and the lower-priority I/O
+threads keep the rest of the interval. Parser-blocking classic scripts are
+the bounded exception: they stay synchronous, with cooperative checkpoints,
+inside the limits described in [Script admission](#script-admission).
 
 #### Optional pumps are admitted by one declared table
 
 The pipeline stages of a frame (input, navigation, runtime, media, raster,
 present) have fixed positions in the PSP resident loop. The optional work
-between them (preconnect, update installation, screenshots, offline
-downloads, site-data restoration, provider pre-resolution, page idle work,
-deferred images, and baseline fonts) has no private predicate at each call
-site. It is admitted by one constant policy table in `src/frame_pumps.c`,
-whose entries are in loop order and state which frame facts refuse a pump,
-which pumps it yields to, and which contended resources (the Memory Stick, a
-long idle slice) one of its slices claims.
+between them (preconnect, update installation, screenshots, offline downloads,
+site-data restoration, provider pre-resolution, page idle work, deferred
+images, and baseline fonts) has no private predicate at each call site, apart
+from two declared site-data restoration sites (the navigation gate and exit
+cleanup) named in `include/tilefinch/frame_pumps.h`. It is admitted by one
+constant policy table in `src/frame_pumps.c`, whose entries are in loop order
+and state which frame facts refuse a pump, which pumps it yields to, and which
+contended resources (the Memory Stick, a long idle slice) one of its slices
+claims.
 
-- *Readiness* ("do I have work?") stays with the pump's owner, and is read
-  from that owner at the moment of admission, never inferred from an earlier
-  sample.
+- *Readiness* ("do I have work?") stays with the pump's owner and is read at
+  the moment of admission.
 - *Admission* ("may I run, given everything else?") is answered only by
-  `frame_pumps_admit()`. The frontend (`src/psp_app/psp_app_frame_pumps.c`)
-  samples only the facts that pump's entry names, just before asking, so a
-  condition is never stale and an idle frame pays for no predicate a declared
-  relation does not need.
+  `frame_pumps_admit()`, from facts sampled just before asking.
 
-Every site asks for admission and records the slice it then consumes (the
-navigation gate and exit cleanup, which must restore site data, are the named
-exceptions). The loop is single-threaded, so pumps never race, but they do
-contend: as a rule a frame performs at most one long idle slice and one
-optional Memory Stick operation. `tests/test_frame_pumps.c` enumerates every
-workload against every distinct refusal set and pins, each with a written
-reason, the pump pairs that can still claim one resource in a frame, so a new
-pump, a dropped yield, or a new resource claim fails until the author decides
-the overlap. The table's comments and `include/tilefinch/frame_pumps.h` record
-each decision; what a run reports is described with the
-[`site-restore` scenario](engineering/INPUT_SCENARIOS.md#site-restore).
+The loop is single-threaded, so pumps never race, but they do contend: as a
+rule a frame performs at most one long idle slice and one optional Memory
+Stick operation. `tests/test_frame_pumps.c` enumerates every workload against
+every distinct refusal set and pins, each with a written reason, the pump
+pairs that can still claim one resource in a frame, so a new pump, a dropped
+yield, or a new resource claim fails until the author decides the overlap.
+`include/tilefinch/frame_pumps.h` records each decision.
 
 #### Resumable jobs
 
 The authoritative layout is a `LayoutBuildJob` with explicit phases: flow,
 compaction, visibility and focus, paint order, spatial indexing, scroll
 metadata, and finalization. Partial display lists stay private to the job
-until `layout_build_job_take()` publishes a complete result.
-
-Container queries get at most one measured probe followed by one
-authoritative rebuild. The probe records each container's content box as soon
-as block layout knows it and logs every container-query evaluation; when
-every logged result still holds against the measured geometry, the probe is
-exactly what the rebuild would produce and the rebuild is skipped. Early
-answers (a flex item measured before its box is final), a dropped log,
-container-relative units, or a DOM change take the rebuild, and while a probe
-logs, nothing that consulted a container query is taken from the reuse cache.
-The bounded retained-selector cache can serve container-query sheets because
-it rechecks each rule's container condition against current geometry on every
-replay; allocation refusal declines it and leaves ordinary style resolution.
+until `layout_build_job_take()` publishes a complete result. Container
+queries get at most one measured probe followed by one authoritative rebuild,
+and the rebuild is skipped only when every answer the probe logged still
+holds against the measured geometry
+([container queries](engineering/STYLE_INVALIDATION.md#container-queries)).
 
 #### Input during long scripts
 
-Post-load PSP runtime work arms a lazy, **owner-thread-only** cooperative UI
-scope. At a checkpoint after 8 ms, the scope keeps the last completed engine
-frame and copies the UI state; it then samples input at most once every
-16 ms. Direction and activation presses enter the existing four-entry queue,
-with visible queued-input feedback, and replay once the task returns; Circle
-requests cancellation. Neither the callback-thread presenter nor
-resource-worker hooks can enter the scope, native WebGL synchronizes its GE
-list before returning to a checkpoint, no controller or DOM action runs
-inside a suspended mutation, and no framebuffer ownership changes hands.
-Page-controls capture bypasses this path so a game keeps its own input loop.
-
-This is cooperation, not preemption: a native call with no checkpoints can
-still block feedback, and page actions wait for a safe task boundary.
-Validation reports the first checkpoint gap, input-to-presentation latency,
-and every call of 100 ms or more that serviced no checkpoint; a queued press
-alone is not a time-to-interactive pass.
+Post-load runtime work on the PSP arms a cooperative UI scope on the owner
+thread. Once a task has run for 8 ms, a checkpoint keeps the last completed
+frame, samples input at most every 16 ms, queues direction and activation
+presses with visible feedback for replay when the task returns, and lets
+Circle request cancellation. No controller or DOM action runs inside a
+suspended mutation, and no framebuffer changes hands. This is cooperation,
+not preemption: a native call with no checkpoints still blocks feedback, and
+a queued press alone is not a time-to-interactive pass
+([UI during page work](engineering/UI_DURING_PAGE_WORK.md#owner-thread-cooperative-scope)).
 
 #### Fast paths
 
@@ -388,7 +325,7 @@ how performance is judged.
 
 A *validation build* in these documents is a PSP build configured with
 `TILEFINCH_PSP_VALIDATION_LOG=ON` (the `build-preset-psp-validation` tree);
-the legacy `psp-validation/` EBOOT is unrelated
+the separate `psp-validation/` EBOOT is unrelated
 ([presets and build trees](DEVELOPMENT.md#presets-and-build-trees)).
 
 ## Navigation and first paint
@@ -410,79 +347,44 @@ The resource scanner starts stylesheets and eligible scripts while later HTML
 is still arriving. A preview paint is attempted only when the parsed prefix
 can produce visible pixels: eligible pages can paint before parser-blocking
 scripts run, while pages that depend on scripts keep the correct blocking
-order. Stylesheet suffixes preserve the selector compiler's and index's state,
-and `@font-face` rules are discovered during the main CSS parse rather than in
-a second walk. A sheet larger than its per-file cap is not discarded: the
-buffered bytes are cut back to the last complete top-level rule (an
-allocation-free scan that skips strings, comments, escapes, and `url()`
-bodies), so no half rule is applied, and the truncation stays visible in the
-resource counters.
+order. A stylesheet cut at its per-file cap keeps only its complete top-level
+rules, so no half rule is applied
+([stylesheet input](engineering/STYLE_INVALIDATION.md#stylesheet-input)).
 
 The fetch scheduler caps active page slots, response bytes, callback work,
 and elapsed pump time, and it pauses curl delivery when its bounded handoff
 buffer is full. The candidate owns every continuation, so replacing or
 cancelling it retires the whole pipeline without a callback reaching the next
-page.
+page. The parser, provisional layouts, and finalization are in
+[Streaming navigation](engineering/STREAMING_NAVIGATION.md).
 
 ### Declarative refresh
 
 `<meta http-equiv="refresh">` and the `Refresh` response header follow the
-HTML Standard's shared declarative refresh steps, with or without JavaScript
-(`src/declarative_refresh.c` parses; `src/navigation/declarative_refresh.inc`
-owns the rest). Only a document's first refresh counts: the header, adopted
-when the document is created, wins; otherwise the first connected HTML
-`<meta>` in tree order whose content parses, in the head or the body, never
-inside `<template>`, and inside `<noscript>` only when the page was parsed
-with scripting off. A meta that page script inserts or changes later is
-noticed through the mutation bridge and counts from that moment. The URL
-resolves against the document base; no URL means the document itself.
+HTML Standard's shared declarative refresh steps, with or without JavaScript.
+Only a document's first refresh counts. Its timer runs on the page clock from
+the first runtime advance after commit, so it pauses whenever page work does,
+and a due refresh is followed like a page-script navigation that replaces the
+current history entry. Any other navigation, unloading the page, or the user
+editing a field cancels it, and a refresh in a child frame does nothing, so
+no frame can move the top-level page.
 
-The timer is page state on the page clock: it starts on the first runtime
-advance after commit (after the load event) and pauses whenever page work
-does (menus, the keyboard, media). A due refresh is followed exactly like a
-page-script navigation. Non-deferring owners such as the lab load it inside
-the runtime advance; the PSP app, which defers page navigations
-(`browser_engine_set_defer_script_navigation`), takes it with
-`browser_engine_take_refresh_navigation` after any pending script navigation
-(which wins) as an ordinary cancellable navigation job. The document is the
-referrer, there is no user activation, the request passes the ordinary
-top-level request policy, and the load replaces the current history entry.
-
-Any other navigation of the page (even a failed one), unloading it, or the
-user editing a form field (`browser_engine_insert_text`,
-`browser_engine_replace_text`, `browser_engine_backspace`) cancels a pending
-refresh. Non-HTTP(S) targets are never followed but still are the document's
-refresh, and a refresh in a child frame does nothing, so no frame can move the
-top-level page. Two rules keep a refresh from taking the page away from the
-user:
-
-- `NAVIGATION_REFRESH_CHAIN_LIMIT` (5) bounds unattended refreshes: the sixth
-  consecutive refresh navigation with no user input is stopped, the page
-  stays, and the PSP status line says `AUTO-REFRESH STOPPED`. A button press,
-  a typed or bookmarked address, or a user-activated link resets the count.
-- A refresh to another URL is a redirect and is followed at any delay, but a
-  same-URL refresh (an auto-reload or a fragment-only target) is followed only
-  while the page is untouched. After any button press since load
-  (`browser_engine_note_user_input`), it becomes `NAVIGATION_REFRESH_OFFERED`:
-  `browser_engine_take_refresh_navigation` reports it once, and the PSP shows
-  the non-modal note `PAGE WANTS TO RELOAD  SQUARE RELOADS`
-  (`PSP_UI_STATUS_RELOAD_OFFER`), Square being the page's reload action. A
-  reload would otherwise discard the page someone is reading at the cost of a
-  full PSP load, while an unattended page still refreshes.
+Two rules keep a refresh from taking the page away from the user. At most
+`NAVIGATION_REFRESH_CHAIN_LIMIT` (5) consecutive refreshes run with no user
+input. A same-URL refresh after any button press since load becomes an offer
+the user takes with Square, because a reload would discard the page someone
+is reading. Which refresh counts, the PSP handoff, and the status lines are in
+[Page-initiated navigations](engineering/PAGE_NAVIGATIONS.md#declarative-refresh).
 
 ### Script navigations and history
 
 A top-level navigation requested by page script keeps or replaces the current
 history entry as the HTML Standard's history handling says.
-`location.replace()` replaces it: the loaded document takes the entry, so
-back skips the page that redirected (the same mechanism as a followed
-refresh, `navigation_arm_history_replace`). The arming belongs to the next
-navigation that starts, whichever it is, and only that navigation's load or
-direct commit (a site adapter's page) uses it.
-`location.assign()`, assigning `location.href` or a URL part, and following a
-link push a new entry. `location.reload()` and a fragment-only `replace()`
-keep the entry they are on, and `history.replaceState()` renames the current
-entry in place without loading anything.
+`location.replace()` replaces it, so back skips the page that redirected;
+`location.assign()`, assigning to `location`, and following a link push a
+new entry; `location.reload()`, a fragment-only `replace()`, and
+`history.replaceState()` keep the entry they are on
+([script navigations](engineering/PAGE_NAVIGATIONS.md#script-navigations-and-history)).
 
 ## JavaScript
 
@@ -491,29 +393,27 @@ heap limit and the shared page budget. The sections below follow a script's
 path: the platform bootstrap every realm starts from; the realms a page can
 own and the one scheduler that runs their tasks; how platform objects and DOM
 nodes keep their identity; the vendored engine; and how page scripts,
-webpack bundles, and WebAssembly are admitted.
+webpack bundles, and WebAssembly are admitted. The mechanism behind each is
+in [JavaScript runtime](engineering/JS_RUNTIME.md) and
+[Script memory](engineering/SCRIPT_MEMORY.md).
 
 ### Bootstrap without spending the realm at startup
 
 The platform bootstrap is generated as uncompressed QuickJS bytecode and
-restored directly from read-only program data with `JS_READ_OBJ_ROM_DATA`,
-with no per-navigation inflate buffer or duplicate copy. Features are split
-into modules that activate lazily within fixed bounds: core DOM and event
-semantics are available immediately, and larger facilities install when a
-page first reaches their surface (the `Intl` polyfill, for example, on first
-access to `Intl`). The committed bytecode is stripped of source text, line
-tables, and local-variable names, which QuickJS would otherwise copy into
-every realm's heap, and a generated manifest proves it matches the authored
+restored directly from read-only program data, with no per-navigation inflate
+buffer or duplicate copy. Features are split into modules that activate
+lazily within fixed bounds: core DOM and event semantics are available
+immediately, and larger facilities install when a page first reaches their
+surface (the `Intl` polyfill, for example, on first access to `Intl`). The
+committed bytecode carries no source text or debug tables, which every realm
+would otherwise copy, and a generated manifest proves it matches the authored
 sources ([regenerating the bootstrap](../src/bootstrap/README.md#regenerating)).
-`TILEFINCH_TRACE_JS_STARTUP=1` prints the heap each module's evaluation
-retained, by QuickJS category, so growth is attributed before the footprint
-guard test trips.
 
 ### Realms, workers, and frames
 
-Every script realm a page owns runs on the browser thread. A page can own
-three kinds of realm, and none adds a mutator; the fourth row is the
-`SharedWorker` shell, which creates no realm:
+Every script realm a page owns runs on the browser thread, so none adds a
+mutator. A page can own three kinds of realm; the last row is the
+`SharedWorker` shell, which creates none:
 
 | Realm | Bound | Isolation | Communicates by |
 |---|---|---|---|
@@ -522,129 +422,38 @@ three kinds of realm, and none adds a mutator; the fourth row is the
 | loaded child document (`<iframe>` navigation) | 4 per page | its own `ScriptRuntime`, document, and image set | a generation-tagged, sequence-numbered message queue pumped by the owner |
 | shared worker | none: `SharedWorker` is a constructor shell that creates no realm | — | — (construction throws `NotSupportedError`) |
 
-`SharedWorker` exists so feature detection sees a current browser, and every
-construction throws a `NotSupportedError` `DOMException` before allocating
-anything. Some sites read a missing `window.SharedWorker` as an old browser
-and load much larger legacy bundles; sites that really use shared workers
-catch the throw and take their fallback, as in browsers without it. The shell
-is defined eagerly in `compat.js`, not behind the lazy Worker group, so a page
-that only probes the constructor does not pay for that group. Like the
-platform, the interface is exposed to windows only.
-
 A Web Worker is concurrency in the page's programming model, not in the
-engine: `postMessage` crosses a structured-clone boundary into another
-context, and the worker's turn runs when the single event loop reaches its
-task. Its global inherits from `DedicatedWorkerGlobalScope.prototype`; names
-it does not define resolve, read-only, through a fallback to the owner's
-platform implementations, so each realm stays small instead of instantiating
-the platform again. Values a worker API returns are created in the worker's
-realm, so `instanceof` and brand checks hold there.
+engine: its messages cross a structured-clone boundary and run as tasks of
+the single event loop. A loaded child document is its own document, shown in
+its parent only as an opaque pixel snapshot, so the parent never reads the
+child's DOM. A same-origin frame's WindowProxy and realm are created only
+when script reads them, so frames no script touches cost no realm.
+`SharedWorker` exists only so feature detection sees a current browser
+([shared workers](engineering/JS_RUNTIME.md#shared-workers)).
 
-A loaded child document is parsed, styled, laid out, and scripted as its own
-document (`SCRIPT_DOCUMENT_SCOPE_CHILD_FRAME`) and shown in its parent as an
-opaque pixel snapshot at the iframe's box; the parent never reads the child's
-DOM. A child mutation marks the snapshot dirty for the owner tick to refresh
-(retrying after a refused allocation), and trusted input in a child notifies
-user activation on that realm and every ancestor before dispatch. A frame
-whose element has no box in its parent's complete layout (`display:none`, on
-it or an ancestor) is laid out at its default size, so its script sees the
-same viewport, but no pixels are drawn; the owner tick draws it once the
-element has a box. A child realm returns its allocator's cached free blocks to
-the page after its bootstrap and again once its document has loaded, and, like
-every realm, allocates its mutation journal only at its first connected
-mutation.
-
-An `<iframe>` that is not connected has no content navigable:
-`contentWindow` and `contentDocument` are null until it is inserted.
-Every connected `<iframe>` and `<frame>` is a child navigable, loaded or not:
-`window.length`, `window[i]`, and `window[name]` answer the same WindowProxy
-`contentWindow` returns, but a WindowProxy and its realm are created only
-when read, so hidden frames no script touches (such as consent-management
-locator frames) cost no realm. A same-origin frame evaluates in a persistent
-QuickJS context whose global `this` is the child WindowProxy, and QuickJS
-itself owns global and lexical bindings, so no source-scanning or
-declaration-copying pass runs per evaluation. The realm's own `eval` is the
-frame's `window.eval` for every caller: in frame code `eval(source)` is a
-direct eval that sees the calling function's bindings, and a parent's
-`contentWindow.eval(source)` is an indirect eval in the frame realm under the
-frame's dynamic-code policy (reading it prepares the realm's intrinsics).
-The frame's global inherits the embedding page's global names from a native
-object (`frame_realm_inherit_page_global`), not a Proxy, so a name neither
-global defines is unresolvable: reading it throws a `ReferenceError` and it
-is absent from `in`. The WindowProxy reports the page window's names, as
-taken when author code starts, as the frame's own
-(`Object.getOwnPropertyNames`, descriptors); they are the page's objects, not
-per-frame copies. The installer lives in
-`frames.js`, which `platform.js` calls with its private helpers and deletes.
-
-Frames and workers share one retirement boundary. A failed setup or
-construction releases its quota slot; eviction or termination retires the
-realm before releasing its native reference, so retained functions keep their
-storage alive but cannot run, pending jobs are discarded during normal bounded
-draining, settled fetches remove their abort listeners, and microtasks and
-delayed import retries check that the worker is still active.
+Frames and workers share one retirement boundary: eviction or termination
+retires the realm before releasing its native reference, so retained
+functions keep their storage alive but cannot run
+([realms](engineering/JS_RUNTIME.md#realms)).
 
 ### Tasks, timers, and activation
 
-One scheduler owns every queued callback, and it makes the same distinction
-the platform does. *Timers* (`setTimeout` and `setInterval`, in pages and
-workers alike) run the HTML timer algorithm, with a nesting level inherited
-from the scheduling timer and the 4 ms clamp beyond the fifth level, for
-intervals and mixed chains too. *Platform tasks* (IndexedDB steps,
-promise-returning platform operations, performance-observer delivery, worker
-and `MessagePort` messages) share the bounded queue and quota but never enter
-the timer algorithm, so a page's timer chain can neither delay browser
-bookkeeping nor be reset by it.
+One scheduler owns every queued callback: timers run the HTML timer
+algorithm, platform tasks share its bounded queue without entering that
+algorithm, and the page clock follows wall time
+([scheduler and page clock](engineering/JS_RUNTIME.md#scheduler-and-page-clock)).
 
-The page's clock follows wall time. Each runtime advance moves the timer and
-animation-frame clock by the real time since the previous advance, at most one
-16 ms tick, so a faster loop cannot run timers early and a long frame lets
-them fall behind instead of bunching. Frames still begin with the vblank wait
-even when page work is runnable, because replacing it with a short yield
-starves the lower-priority I/O threads on the device; that yield is only an
-opt-in validation setting (`page_task_yield=1`).
+Page input events describe the press the user made, in browser order, and are
+all trusted. X on a highlighted element is the Enter key of a TV or console
+browser, key events around a keyboard-style `click`; X with the analog cursor
+showing is a mouse button; on-screen keyboard text arrives as one
+composition, as a phone keyboard's does
+([input events](engineering/JS_RUNTIME.md#input-events)).
 
-A `MessagePort` delivers one message per task through the listener microtask
-checkpoint and schedules the next only after that one finishes, which keeps an
-endpoint's messages in order even when a listener posts back synchronously.
-Author-dispatched events remain synchronous.
-
-Page input events describe the press the user made, in browser order, and
-are all trusted. X on a highlighted element is the Enter key of a TV or
-console browser: `keydown` and `keypress` (key `Enter`, keyCode 13) at the
-focused element, then the keyboard-style `click` (a `PointerEvent` with
-`pointerId` -1, an empty `pointerType` and `detail` 0, no coordinates), then
-`keyup` after the press's defaults such as a form's `submit`. A cancelled
-`keydown` or `keypress` cancels the activation. A highlighted element that
-cannot take focus receives the click, and the keys go to the body rather than
-to a field focused earlier. Enter in a text field (Start, or the keyboard's
-Done on a form's only field) is the same press around implicit submission;
-outside a form it is the keys alone. X with the analog cursor showing is a
-mouse button instead: `pointerdown`/`mousedown` on the press and
-`pointerup`/`mouseup` on the release at the cursor (`pointerType` `mouse`),
-then the pointer's `click` with `detail` 1, and no key events. Text from the
-on-screen keyboards arrives as a phone keyboard's does. The keyboard
-session's Done commits one composition: `keydown` (key `Unidentified`, keyCode
-229), `compositionstart`, `beforeinput` (`insertCompositionText`,
-`isComposing`, not cancelable), `compositionupdate`, the change,
-`compositionend`, `input`, `keyup`. Done with the text unchanged fires
-nothing. The desktop lab's typed text is a plain commit (keydown 229,
-`textInput`, cancelable `beforeinput` `insertText`, `input`, keyup), and
-Backspace is its own key (keyCode 8, `deleteContentBackward`; its keydown can
-cancel the deletion). Each edit leaves the caret after the text and fires a
-trusted `selectionchange`, bubbling from an `input` or `textarea` and at the
-document for contenteditable. `scheduler.js` builds these sequences;
-`src/controller.c` orders them around the native defaults.
-
-User activation is a timed realm state, not a flag held during one dispatch.
-Trusted input opens a five-second transient window and sets a sticky "has been
-active" bit, both exposed through `navigator.userActivation`.
-Activation-gated native operations (fullscreen, resuming game audio, page
-controls, starting multiplayer) ask the realm whether the window is open, and
-fullscreen consumes it. A script-initiated navigation snapshots the state when
-it is requested, because the host may act on it a turn later; that snapshot,
-not the presence of a referrer, is what request context and Fetch Metadata
-report as user-activated.
+User activation is a timed realm state, not a flag held during one dispatch;
+activation-gated native operations ask the realm, and a script-initiated
+navigation snapshots it when requested
+([user activation](engineering/JS_RUNTIME.md#user-activation)).
 
 ### Platform objects keep private identity
 
@@ -666,47 +475,60 @@ global that is deleted immediately, and `Event.isTrusted` is a
 non-configurable own accessor backed by the same private state. New Web API
 surface is expected to follow this pattern.
 
-One check is not written per member. Web IDL makes every operation and
-attribute throw a `TypeError` for a receiver that does not implement the
-interface, and pages (sign-in security checks among them) call prototype
-members on `{}` to tell a browser's own functions from patched ones. The
-engine holds two object flags for this: after the eager bootstrap, and before
-any page script, the host marks the prototype of every constructor on the
-global as an interface prototype and each function among its members as an
-interface member (`runtime_mark_platform_interfaces`, QuickJS
-`JS_MarkPlatformInterfaces`). Calling a marked member with a receiver that has
-no interface prototype on its prototype chain, or that is one, throws
-"Illegal invocation" before the member runs. The same pass gives each
-interface prototype its class string (`@@toStringTag`). What stays as the
-bootstrap wrote it: promise-returning operations, which reject instead; the
-`on*` handler attributes of Window, Document and the element interfaces,
-which share their accessors and answer as `[LegacyLenientThis]` does; and a
-value iterator's `keys`, `values` and `entries`. The check accepts an object
-that merely inherits from an interface prototype
-(`Object.create(Node.prototype)`), and a Proxy; the members' own private
-checks above still apply there. A lazy module's interfaces and members are
-marked when it loads, and only what the module itself defined: before it
-runs, the host snapshots the global's constructors and the functions on the
-marked prototypes (`JS_SnapshotPlatformInterfaces`), and afterwards marks
-only what is new (`runtime_platform_window_open` and `_close`). A page's
-class on the global, or a method or native a page put on an interface
-(`NodeList.prototype.each = Array.prototype.map`), was there before and stays
-as it is, however it was compiled: a large ES module and restored bytecode
-keep no source text, so a function's form says nothing about its owner. A
-module whose interfaces a factory builds after it loads (the CSSOM rules)
-has its ensure native run that step in the same window.
+Web IDL receiver checks are one engine mechanism, not code per member. Before
+any page script, the host marks every interface prototype on the global and
+its member functions, and calling a marked member with a receiver that has no
+interface prototype on its chain throws "Illegal invocation" before the
+member runs. A lazy module's interfaces are marked when it loads, and only
+what the module itself defined, so what a page adds to an interface is never
+marked ([receiver checks](engineering/JS_RUNTIME.md#web-idl-receiver-checks)).
 
 WeakMap values must not retain their own keys, because this collector cannot
-reclaim that ephemeron cycle. Attr and NamedNodeMap caches and generic
-EventTarget listener tables therefore live in a private field on their owning
-node or target, so dropping the whole graph permits ordinary cycle
-collection. Namespace mirrors are the exception. `setAttributeNS`, and
-`setAttribute` on a non-HTML element, record the attribute's namespace,
-prefix and qualified name as written in a WeakMap keyed by the element,
-because the native attribute is written through by qualified name alone and
-keeps no namespace or prefix. Each record names its element, so an element
-with a nonempty mirror keeps its wrapper until the realm ends; storing that
-data natively would remove the cycle.
+reclaim that ephemeron cycle; state that refers back to its owner lives in a
+private field on the owner
+([WeakMap cycles](engineering/JS_RUNTIME.md#weakmap-cycles-and-namespace-mirrors)).
+
+### Interface snapshot
+
+The bootstrap shares its realm with page scripts, and a page may replace
+any built-in: `Array.prototype.push`, the array iterator's `next`,
+`Map.prototype.get`, `Function.prototype.call`, `Object.keys`,
+`Element.prototype.remove`. The bootstrap calls these at run time. It is
+kept apart from the page's changes by the engine, not by how its source is
+written.
+
+When a realm's start-up script ends, the engine marks the interfaces as
+they are: the class prototypes, the functions the global object holds with
+their prototypes and methods, and the namespace objects. Marking sets one
+bit per object and allocates nothing. The rules that follow from it:
+
+- **Copy on the page's first change.** The first change page code makes to
+  a marked object copies that object's own properties and prototype to a
+  private twin. The page keeps the object it changed; browser code
+  continues its lookups in the twin.
+- **A member the page changed stays the page's.** A later change by browser
+  code (a lazy module adding members) reaches the object and its twin,
+  except for a member the page has changed since: that change is made in
+  the twin alone.
+- **Pinned global bindings.** Page code that names, assigns, declares,
+  redefines or deletes a global holding an object gets a variable reference
+  of its own; bootstrap functions keep theirs. A later browser change to a
+  global the page changed is made in the browser's view alone, and a
+  browser script after the snapshot declares no global.
+- **Platform members are not shadowed.** A function the page puts on an
+  instance or defines in a subclass does not stand in for a member the
+  browser defined further up the prototype chain when browser code reads
+  it.
+- **Steered writes.** A change browser code makes to an ECMAScript
+  prototype is the browser's own only while a module loads or outside any
+  script; any other is copied on like a page's.
+
+Twins and the page's own variable references are page heap, charged like
+any other object; a refused one fails the page's write with an ordinary
+out-of-memory exception. `boot.cfg`'s `interface_snapshot=0` builds realms
+without the snapshot, for comparing the two on one binary. Whose code is
+running, what the snapshot does not cover, the test seam and the tests are
+in [Interface snapshot](engineering/JS_RUNTIME.md#interface-snapshot).
 
 ### DOM node handles
 
@@ -715,17 +537,9 @@ slot number plus a generation, so a slot can be reused after its node is
 destroyed or its detached wrapper is collected without an old wrapper ever
 naming the new node. A live connected node keeps its slot even without a
 wrapper, because bootstrap state (listeners, observers) is keyed by handle.
-Such a wrapper can die and be remade, unless it carries an expando or is a
-WeakMap key: each collection holds those of connected nodes, so script reaches
-that state through the element. Nothing is held between collections.
-A top-level document's table starts at 1,024 slots and a child frame's at 256
-(`SCRIPT_DOM_HANDLE_SLOT_INITIAL_*`), and the table doubles when every slot is
-live, up to 8,192 slots (16,352 under the realistic profile). Below 8,192 a
-full table grows at once, so no page collects garbage for handles earlier
-than it would with a table of that size; at 8,192 dead wrappers are reclaimed
-first and only a table that is genuinely live grows. Growth is Budget-admitted
-like any page allocation, and a refusal is the same clean `RangeError` a full
-table reports.
+Growth is Budget-admitted like any page allocation, and a refusal is the same
+clean `RangeError` a full table reports
+([table sizes](engineering/JS_RUNTIME.md#dom-handle-table)).
 
 ### Computed style is one generated registry
 
@@ -735,24 +549,11 @@ block, and an unsupported name is absent rather than answered from a table of
 initial values. A single X-macro list, `COMPUTED_STYLE_PROPERTIES` in
 `src/js_computed_style.c`, generates the property table, the identifiers the
 getter dispatches on, and per-row flags, so no value can resolve for an
-unlisted property. Values are serialized from `ComputedStyle` fields, never
-from authored text, so `inherit`, `var()`, relative units, and `!important`
-are settled first; geometry properties are used values against the real
-containing block, and where the cascade keeps less than CSS allows, the
-serialization is exact for what is kept, which is also what is painted. A
-checked-in dump of every registered property across a fixture page
-(`tests/fixtures/computed-style-dump.*`) turns any change into a reviewable
-diff.
-
-Resolved styles are retained between reads and between entries into
-JavaScript, keyed on `ComputedStyleInputs` (`src/js_runtime_internal.h`).
-Script's own DOM writes drop only the subtrees they can restyle; every other
-change that can alter a cascade (native DOM writes, parser input, stylesheet
-and viewport changes, the colour scheme, container geometry, the fullscreen
-element) moves the host style generation (`document_style_generation()`) or
-a keyed input, which empties the cache. Removed nodes are evicted, so a
-destroyed node's address cannot answer for a new one, and used geometry is
-never retained.
+unlisted property. Values are serialized from the resolved style, never from
+authored text, so what script reads is what is painted. Resolved styles are
+retained between reads, and every change that can alter a cascade drops what
+it can reach
+([retention](engineering/JS_RUNTIME.md#computed-style-retention)).
 
 ### QuickJS is vendored and changed in place
 
@@ -771,238 +572,88 @@ allocation sites upstream never checks, interruptible compilation, Latin-1
 string storage, and in-place appends to a sole-owned string, so the `s += x`
 loops common in minified decoders amortize instead of copying.
 
-**Lazy functions and the validating preparser.** A function whose source is at
-least 128 bytes gets no bytecode when its script compiles; its body is
-compiled on first call. At load time a preparser that builds nothing checks
-the body, following the real parser's token decisions and early-error rules,
-so a script with a syntax error anywhere is still rejected before any of it
-runs, and records which enclosing variables the body may capture. Anything it
-does not model falls back to the full parser, and a first-call compile whose
-captures disagree with that record fails loudly rather than reading the wrong
-binding.
-
-**Build.** The PSP image is optimized for size, except QuickJS, which is built
-at `-O2` because the larger engine is faster on the device despite the
-instruction cache. Release builds add profile-guided optimization trained
-under PPSSPP on a recorded chat-application session
-(`scripts/train-quickjs-pgo.sh`). The profile is fingerprinted on the
-engine's sources, headers, compiler, and flags, configure refuses a stale one
-(which would make the engine larger and slower than none), and
-`scripts/cut-release.sh` requires an explicit choice.
-
-**Compact arrays.** A dense `Array` built only from one-character Latin-1
-strings, bytes, or signed 16-bit integers is stored packed in a string-shaped
-backing store, one or two bytes per element instead of a boxed value, which
-keeps a decoder's or bytecode interpreter's working arrays inside a PSP script
-heap. The representation is invisible to the language, and its invariants are
-the ones every packed representation here must keep:
-
-- the backing store belongs to the array alone: anything that would hand it
-  to JavaScript (`join('')`) returns a copy, and mutation is copy-on-write
-  whenever the store is shared or interned;
-- a value the representation cannot hold widens it in place or converts the
-  array to boxed elements, checked first against the device-profile array
-  ceiling, since packed storage admits up to eight times more elements under
-  the same byte cap;
-- re-packing is only an optimization, and a refused allocation leaves the
-  boxed array and the append untouched.
+Two changes shape how page code is held. Long functions compile on their first
+call, but a validating preparser still checks every body at load, so a script
+with a syntax error anywhere is rejected before any of it runs
+([lazy functions](engineering/JS_RUNTIME.md#lazy-functions)). Dense arrays of
+small values are stored packed, invisibly to the language
+([compact arrays](engineering/JS_RUNTIME.md#compact-arrays)). The PSP build
+favours the engine's speed over its size and trains it with profile-guided
+optimization for releases
+([engine representations](engineering/JS_RUNTIME.md#engine-representations)).
 
 ### Script admission
 
 Page scripts are admitted by source size, count, heap, time, and callback
 work, and interrupt checks cover QuickJS execution and native callback
 boundaries. The PSP app admits a script by the memory its compile needs
-rather than by its size ([PSP envelope](engineering/PSP_ENVELOPE.md#memory-profiles);
-`include/tilefinch/script_admission.h`).
+rather than by its size (`include/tilefinch/script_admission.h`).
 
 - **Blocking scripts stay synchronous.** Parser-blocking classic scripts run
-  synchronously and in source order, including `document.write()` insertion
-  checkpoints. Their cumulative source work draws on the live realm's finite
-  source allowance (clamped by the realm, raised by memory-based realm growth
-  only within its hard ceiling), and fetched or validated bodies count even if
-  execution fails. This is bounded synchronous execution with cooperative
-  checkpoints, not resumable evaluation or a worker thread.
-- **Size is not suspicion.** Large cross-origin classic scripts are treated
-  like same-origin application bundles: size, loops, or dynamic-code tokens
-  alone do not prove they should be refused. A lexical scan of their content
-  is watchdog telemetry, not an admission oracle; per-file and count limits,
-  working-set and presentation-reserve admission, the shared heap, and the
-  compile/execution watchdog decide.
-- **Doomed inline scripts are dropped while they stream.** Every script
-  compile (inline, external, module, module import, inserted) is admitted by
-  the heap it can really reach (`script_runtime_heap_reachable`: the free
-  page Budget backs both the current limit and any growth, so they are not
-  added), so one that cannot compile is refused before compiling, not after
-  the compile runs out of memory. For an inline classic script the parser
-  asks the same rule as the text arrives
-  (`script_inline_source_admissible`, through
-  `document_parser_set_inline_script_admit_callback`) and drops the text of a
-  script it can no longer admit, since more text only needs more; the
-  element is then empty and the refusal is reported as pressure.
-- **A large unit needs room for the expensive case.** Only the source size
-  is known before a compile, and units of 1 MiB or more compile either near
-  their source size or at 7-10 times it (cnn.com's 2.3 MB inline bundle,
-  ign.com's 1.4 MB application chunk). Such a unit is compiled only when the
-  heap it can obtain now (`script_runtime_heap_obtainable`) is at least 4
-  times its source (`script_admission_large_unit_heap`), so a compile that
-  would fail after seconds of PSP time is refused instead; a bytecode
-  restore keeps only the floor.
-- **Inline text is compiled in place.** A script of one text child (every
-  parsed script) compiles from the DOM's own NUL-terminated text, so its
-  compile needs no second copy of the source; nothing can change or free that
-  text before the compile returns, and QuickJS keeps no pointer into it after.
-  A script of several text children (built by DOM calls) is assembled into a
-  copy, which its admission counts.
-- **Large raw text is handed over, not copied.** The tokenizer gathers a
-  script's or style's whole text in its own buffer before the tree builder
-  sees it. For a parsed `<script>` or `<style>` of at least 64 KiB, the
-  parser (`document_parser_adopt_raw_text`) gives that buffer to the
-  document's text arena as the node's storage (`lexbor_mraw_adopt`, a
-  Tilefinch Lexbor patch) and gives the tokenizer a fresh small buffer, so the
-  text exists once instead of twice while the script waits to compile.
-  Shorter text, text the tokenizer has already handed back to the network
-  buffer, and any refused step take Lexbor's ordinary copy, which produces the
-  same node.
-- **Data, not code.** Inert JSON script types stay DOM data. A narrow
-  classic-script subset (`window`, `globalThis`, `var`, or bare global
-  assignments of strict JSON) installs its data without compiling bytecode or
-  consuming executable quota.
+  synchronously and in source order within the realm's finite source
+  allowance: bounded synchronous execution with cooperative checkpoints, not
+  resumable evaluation or a worker thread.
+- **Size is not suspicion.** Size, loops, or dynamic-code tokens alone never
+  refuse a script; per-file and count limits, memory admission, the shared
+  heap, and the compile/execution watchdog decide.
+- **A compile that cannot fit is refused before it runs.** Every compile is
+  admitted against the heap it can really reach, and an inline script is
+  checked as its text streams, so a doomed script never costs a compile.
+- **Source exists once.** Parsed script text compiles in place from the DOM,
+  and large raw text is handed to the document rather than copied.
+- **Data, not code.** Inert JSON script types stay DOM data, and a narrow
+  subset of classic scripts that only assign strict JSON installs its data
+  without compiling bytecode.
 - **No `nomodule` fallback.** Because the engine supports modules, classic
-  `nomodule` scripts are rejected before preload, quota admission, or
-  dynamic-script scheduling, and a module failure never enables the legacy
+  `nomodule` scripts never run, and a module failure never enables the legacy
   alternative.
-- **Hydration rollback.** Before the first parser-blocking author callback,
-  the stream keeps at most one complete, visibly useful snapshot of the body.
-  If later hydration fails or runs out of quota and collapses that content,
-  commit restores the snapshot transactionally; a useful replacement that
-  succeeds stays authoritative.
+- **Hydration rollback.** If later hydration fails or runs out of quota and
+  collapses the body, commit restores one complete, visibly useful snapshot
+  taken before the first parser-blocking author callback.
 - **Circuit breaker.** One navigation's parser stage may spend at most the
-  realm's source allowance in source work, twenty seconds across its blocking
-  checkpoints (the PSP shows "PAGE SCRIPTS NS OF 20S" once a load has spent
-  three), or three consecutive scripts that fail in a way that says the realm
-  is in trouble: out of memory, a watchdog interrupt, a compile admission
-  refusal, a refused mutation checkpoint, or another engine failure. A
-  script's own exception (a throw, or a SyntaxError) goes to the window
-  `error` event and the page goes on, as in Chromium, which has no such
-  breaker: it neither counts nor resets the run (a healthy script resets
-  it), and the time and work bounds already cap what failing scripts cost.
-  Transport, CSP, SRI and memory-admission skips never reached the
-  evaluator and do not count either. When a bound trips, the remaining
-  blocking scripts are soft-skipped, parsing continues, the page is marked
-  Limited, and the author realm is retired for that document so queued
-  deferred, asynchronous, and dynamic work cannot resume the abandoned
-  hydration (no element event fires for the skipped scripts: no realm is
-  left to observe one). The validation log and the host's
-  `TILEFINCH_TRACE_SCRIPT_FAILURES` trace print a `tilefinch-script-breaker`
-  line with the reason; the lab's parser-checkpoint line counts the author
-  exceptions the breaker left uncounted (`author-exceptions=`).
+  realm's source allowance, twenty seconds across its blocking checkpoints,
+  or three consecutive scripts that fail in a way that says the realm is in
+  trouble; a script's own exception is not such a failure. When a bound
+  trips, the remaining blocking scripts are skipped, parsing continues, the
+  page is marked Limited, and the author realm is retired for that document
+  ([circuit breaker](engineering/SCRIPT_MEMORY.md#circuit-breaker)).
 
-Compiled scripts are reused, never trusted. ES modules and classic scripts
-each have a bounded session table of bytecode keyed by the response, the
-top-level site, compile options, and the SHA-256 of the exact source,
-consulted only after every fetch check and evicted by the page Budget before
-it refuses any allocation; an opt-in tier keeps the records on the Memory
-Stick across launches ([Storage](STORAGE.md#compiled-script-caches)).
-Modules of 8 KiB or more are compiled without their source text, so their
-functions' `toString()` returns the native-code form. The only other
-compiler artifact written to storage belongs to an installed offline app:
-bytecode bound to its retained source and to a dedicated QuickJS bytecode
-ABI, with launch compiling the source whenever restoration fails.
+Compiled scripts are reused, never trusted: bytecode is keyed by the
+response, the top-level site, compile options, and the digest of the exact
+source, and is consulted only after every fetch check
+([compiled-script reuse](engineering/SCRIPT_MEMORY.md#compiled-script-reuse)).
+Each rule's thresholds and diagnostics are in
+[Script memory](engineering/SCRIPT_MEMORY.md#admission).
 
 ### Lazy webpack bundles
 
-A classic script shaped like a webpack chunk registration
-(`(self.webpackChunkX=self.webpackChunkX||[]).push([[ids],{key:factory,...}])`,
-whose factories are most of its bytes) is not compiled whole. The planner
-(`src/script_lazy.c`) finds the factories with a bounded lexer pass;
-registration replaces each with a small native trampoline and keeps its exact
-source compressed (`src/js_lazy_webpack.c`); a factory is compiled the first
-time it runs and its bytecode is dropped after the call, so the many factories
-a page never runs cost no compile. The functions a factory leaves behind read
-their text from that compressed copy rather than keeping their own in the
-heap ([Function source outside the heap](#function-source-outside-the-heap)). Anything the planner does not take, and any
-bundle whose plan fails or whose registration does not compile, goes through
-the ordinary eager path, one compile of the whole script. A bundle record
-([Storage](STORAGE.md#compiled-script-caches)) lets a later load of the same
-bytes skip the planner.
+A classic script shaped like a webpack chunk registration is not compiled
+whole. A bounded planner finds its factories, registration keeps each one's
+exact source compressed, and a factory is compiled the first time it runs, so
+the many factories a page never runs cost no compile. Anything the planner
+does not take goes through the ordinary eager path.
 
-**Syntax errors: a deliberate deviation.** A factory's syntax is checked when
-it first runs, not before. An error in a factory that never runs is never
-reported; one in a factory that runs makes that call (webpack's `require`)
-throw a `SyntaxError` naming the bundle's URL and the error's position, which
-reaches the page's error reporting like any exception, and the other
-factories, some of which may already have run, keep working. Chrome would
-have rejected the whole file. The justification is cost against risk:
-checking every factory up front is most of a lazy bundle's load cost, mostly
-for factories that never run, and a bundle that does not parse is broken in
-every browser. The planner, whose wrong cut could turn valid code into a
-runtime `SyntaxError`, is checked token for token against the census corpora
-and by `tests/test_script_lazy.c`, and a plan that does not cover the whole
-registration takes the eager path. `TILEFINCH_LAZY_WEBPACK_PREFLIGHT=1`
-restores the up-front check for A/B measurement.
+This is a deliberate deviation: a factory's syntax is checked when it first
+runs, not at load, so an error in a factory that never runs is never
+reported, where Chrome would reject the whole file. Checking every factory up
+front is most of a lazy bundle's load cost, a bundle that does not parse is
+broken in every browser, and a plan that does not cover the whole
+registration takes the eager path
+([lazy webpack bundles](engineering/SCRIPT_MEMORY.md#lazy-webpack-bundles)).
 
 ### Function source outside the heap
 
 QuickJS keeps every function's source text for
-`Function.prototype.toString()`, and a lazily compiled function compiles from
-it on its first call; for a large classic script that is a second copy of the
-script in the realm heap. A classic page script (inline or external) of at
-least 8 KiB therefore compiles with `JS_STRIP_SOURCE`, and its text goes to
-the realm's function-source store (`src/js_source_store.c`) in the page
-Budget, counted as JavaScript memory. Each function records only where its
-text is (`JS_SetExternalSourceHooks`, `third_party/quickjs/README.md`).
-`toString()` returns what it returned before, a lazy function reads its body
-from the store on its first call, and stacks keep file:line:col. Modules
-(which keep no text at 8 KiB or more), eval, `Function`, and worker scripts
-are unchanged.
-
-A [lazy-webpack](#lazy-webpack-bundles) factory of 1 KiB or more compiles
-the same way, but its text does not go to the store: the lazy tier already
-keeps it compressed, for as long as the bundle lives. Its functions read a
-plain copy of it (the compile's own program text, kept) or, once that copy
-is gone, decode the compressed copy from its start up to what they need
-into a new plain copy. Plain factory text follows the store's rule below
-(it counts against the same quarter of the room, after the store's own
-plain text) and is the first to go when the realm's growth would be
-refused, since dropping it costs no compression. The text itself is never
-dropped, so a factory's `toString()` never falls back to `[native code]`.
-
-The key rules:
-
-- **Plain first, compressed under pressure.** The store holds 16 KiB blocks,
-  plain while the page has room. Once plain text passes a quarter of the room
-  above the realm's growth reserve, the oldest blocks are compressed with the
-  LZ4-compatible codec shared with the lazy-webpack tier
-  (`src/script_text_lz.c`); a read decodes only the start of the block it
-  needs and keeps it for the next read. A block that does not compress stays
-  plain.
-- **Never the reason a page runs out of memory.** When growth would be
-  refused, cached script bodies give way first, then plain text is
-  compressed, then whole scripts that no uncompiled lazy function needs are
-  dropped, least recently read first. Text an uncompiled lazy function needs,
-  or a compile or bytecode restore holds a lease on, is never dropped.
-  `toString()` of a function whose text was dropped returns the
-  `[native code]` form without allocating.
-- **Admission sees the text as if it were in the heap.** The compile floor,
-  the loader's pressure gate, and the heavy-page estimate subtract the stored
-  text, and factory text read from the lazy tier, from their room, so a page
-  admits the same scripts and the freed room goes to the scripts it already
-  runs.
-- **A failed lazy compile is bounded.** A lazily compiled function that cannot
-  compile at the wall fails its call uncatchably and stays uncompiled; inside
-  a promise reaction the checkpoint ends at that job and the rest of the queue
-  runs on a later turn. Code that catches the out-of-memory error and retries
-  is stopped once one entry into JavaScript has had 256 allocations refused.
-- **The bytecode cache stores offsets, not text.** A restore names the script
-  text (its digest is the cache key) and the store copies it only if restored
-  functions refer to it, before the script runs. Bytecode whose lazy functions
-  would have no text does not restore; the script compiles from source.
-
-`TILEFINCH_JS_SOURCE_STORE` (lab builds) selects other policies for A/B
-measurement, `TILEFINCH_LAZY_WEBPACK_FACTORY_TEXT=heap` keeps factory text
-in the heap, `tilefinch-js-bench --only source_store,tostring` measures the
-copy, encode, compile, and `toString()` costs, and the census prints a
-`census source-store` line per realm.
+`Function.prototype.toString()` and for lazy first-call compiles, which for a
+large classic script is a second copy of the script in the realm heap. Large
+classic scripts therefore compile without it, and their text lives in a
+function-source store in the page Budget, counted as JavaScript memory: plain
+while the page has room, compressed and then dropped under pressure. The
+store is never the reason a page runs out of memory, text an uncompiled lazy
+function needs is never dropped, and admission counts stored text as if it
+were in the heap, so a page admits the same scripts either way
+([function-source store](engineering/SCRIPT_MEMORY.md#function-source-outside-the-heap);
+[store rules](engineering/SCRIPT_MEMORY.md#store-rules)).
 
 ### WebAssembly
 
@@ -1018,43 +669,18 @@ or transport policy.
 ## DOM mutations and style invalidation
 
 DOM mutations are journaled and coalesced before they trigger style and
-layout. The journal is bounded (256 records a turn, with a shared pool for the
-class tokens a write changes). When it fills, the engine keeps up to 16
-subtree roots that hold the unrecorded changes and restyles those, falling
-back to a full reset only when a root cannot be named.
+layout. The journal is bounded per turn; when it fills, the engine restyles
+the few subtree roots that hold the unrecorded changes, and falls back to a
+full reset only when a root cannot be named.
 
-Invalidation is scoped by what the sheet's rules can read. A class, id, or
-attribute change restyles the element plus the elements that carry the
-subject key of a rule reading it from elsewhere (siblings included); focus
-moves and inline custom-property writes are scoped by keyed `:focus-within`
-rules and by which retained styles read which custom properties. A changed
-child list restyles the parent and its children unless a sibling test reaches
-their descendants, and an append after the last sibling (or removal of the
-last element child) restyles only the parent and that subtree when no sibling
-test counting from the end can see it. Each record also says whether it can
-move a `:has()` answer: the sheet's `:has()` rules are classified once (where
-the anchor lies relative to the subject, which region the argument reads,
-which keys each must carry, at most 2048 occurrences), so a relational change
-drops only the cached styles those answers can reach
-(`src/style_has_invalidation.c`).
-
-Computed styles are retained in a table that grows by powers of two from 1024
-to 4096 entries when a full walk is about to cover more elements or a build
-evicted more than a sixteenth of it, provided the budget keeps 2 MiB to spare.
-The table has to cover the walk: a document-order walk through a smaller LRU
-table evicts each entry before the next build reaches it.
-
-A journal whose every change stays inside content that renders nothing (a
-consent stub's `display:none` locator `<iframe>`, a script appended to
-`<body>`, writes inside a closed menu) skips the relayout altogether
-(`navigation_mutations_are_hidden_only`). Each record must lie inside an
-element that computes `display:none` now and rendered nothing before, and
-must not be able to restyle anything outside it through `:empty`, sibling
-position, or `:has()`. Paths through `<head>`, inline SVG, form option lists,
-media and picture sources, plugins, and image maps never skip, nor does a
-hidden list item, because layout numbers list items whether or not they
-render. A head `<script>` is inert only when no `:has()` anchored at `<head>`
-or `<html>` can see it (`stylesheet_head_change_reaches_outside`).
+Invalidation is scoped by what the sheet's rules can read: a change restyles
+the elements whose matching it can alter (siblings and `:has()` anchors
+included) and nothing else, and a journal whose every change stays inside
+content that renders nothing skips the relayout altogether. Retained computed
+styles live in a table that grows to cover a whole document-order walk,
+because a smaller LRU table evicts each entry before the next build reaches
+it. Each scoping rule and its exclusions are in
+[Style invalidation](engineering/STYLE_INVALIDATION.md).
 
 ## Rendering and presentation
 
@@ -1078,13 +704,10 @@ visual line order, and logical-to-visual glyph sidecars that painting, links,
 controls, focus, and find all share
 ([Bidirectional page text](TEXT_BIDI.md)).
 
-Simple focus changes update retained paint instead of laying the page out:
-up to 64 rounded controls reserve one inset-ring command during layout whose
-color, opacity, and thickness focus then changes in place with bounded damage,
-after a dry run proves every old and new focus target and with layer order
-and geometry fixed. Complex or changing shadows, background clipping,
-inherited or relational effects, and exhausted slots fall back to
-authoritative layout, and expanding a section is always a layout operation.
+Simple focus changes recolor a ring reserved in retained paint instead of
+laying the page out, within a fixed number of slots and with layer order and
+geometry fixed; anything else falls back to authoritative layout
+([retained focus paint](engineering/STYLE_INVALIDATION.md#retained-focus-paint)).
 
 Web content and native chrome are separate layers. The browser frame stays
 stable while menus, find, the keyboard, loading status, and player controls
@@ -1120,11 +743,10 @@ complex shadows to one offset sample so blur work never grows with page
 input. Drawing crosses into native code in bounded batches, and all drawing
 in a turn coalesces into one dirty rectangle whose rows are copied into the
 snapshot, invalidating only the affected tiles, so a same-size animation
-rebuilds no style, layout, or display list. Animation-frame callbacks run at
-most once per presented tick and skip elapsed frames rather than replaying a
-backlog; native surfaces, the media player, and suspend drive Page Visibility
-at a task checkpoint, preserving a suspend/resume pair even when both edges
-arrive before JavaScript resumes. Authored dimensions are scaled down to the
+rebuilds no style, layout, or display list. Animation frames and Page
+Visibility follow the presented screen
+([animation frames](engineering/JS_RUNTIME.md#animation-frames-and-visibility)).
+Authored dimensions are scaled down to the
 PSP surface envelope, and deep clip stacks or excess raster work fail softly
 while the rest of the page stays usable.
 
@@ -1136,10 +758,10 @@ trusted Play click calls `navigator.tilefinch.requestPageControls()`, which
 shows a native exit notice and suppresses the activating face button until it
 is released. Native input authority is a small, generation-bearing capture
 record: navigation, native media, or suspend disconnects the controller and
-returns control to the browser. Identical physical samples do not cross into
-QuickJS, button and axis objects are reused across polls, and cross-origin
-child frames never receive the snapshot. The held chord always returns
-control, and the firmware HOME callback sits outside page capture.
+returns control to the browser, and cross-origin child frames never receive
+the snapshot. The held chord always returns control, and the firmware HOME
+callback sits outside page capture. Polling reuses the button and axis
+objects ([gamepad polling](engineering/JS_RUNTIME.md#gamepad-polling)).
 
 The page Fullscreen API is a single top-level presentation state. A trusted
 activation commits the element's identity before native chrome is hidden;
@@ -1211,7 +833,7 @@ optional network work before queuing the candidate document, so thumbnails,
 fonts, scripts, and page fetches cannot hold every worker descriptor ahead of
 the link the user just activated. The incumbent DOM and last frame stay intact
 for rollback, but superseded requests are not restarted if the candidate
-fails: a deliberate responsiveness tradeoff until the transport has a
+fails: a deliberate responsiveness tradeoff while the transport has no
 separate authoritative-priority lane.
 
 The release owns its curl, Mbed TLS, and nghttp2 chain. Archives are
@@ -1225,24 +847,17 @@ WebSockets reuse the same curl worker, TLS state, cookie authority, and
 `connect-src`, mixed-content, and Private Network Access decisions instead of
 a second network stack. A socket holds one bounded receive message and bounded
 outbound data, a single published receive event provides backpressure, and
-all of it is charged to the page `Budget`. A socket's connect-only curl
-handle stays in the worker's multi until the socket closes, because removing
-it closes the connection. The host build keeps the native duplex lane
-unavailable and tests the JavaScript lifecycle through an injectable seam;
-`tilefinch-websocket-loopback-tests` compiles the worker's WebSocket code
-against a host build of the pinned curl and drives it over loopback, and
-only the Allegrex build ships curl's WS/WSS framing.
+all of it is charged to the page `Budget`. Only the Allegrex build ships
+curl's WS/WSS framing; the host tests the JavaScript lifecycle through an
+injectable seam and the worker's WebSocket code over loopback.
 
 Installed offline games have a separate, explicitly user-activated direct
-multiplayer lane, resembling the message portion of `RTCDataChannel`, with
-bounded LAN discovery, STUN endpoint discovery, numeric-code exchange, and
-host approval. The PSP worker owns DNS and UDP behind fixed command and event
-rings; one session, small datagrams, and fixed deadlines keep it inside the
-page `Budget` and the network supervisor. Ordinary pages cannot open it,
-launching an offline app does not request Wi-Fi, leaving the document
-cancels the worker and its lease, and there is no relay, background lobby,
-or general page UDP API
-([Direct multiplayer](MULTIPLAYER.md)).
+multiplayer lane, resembling the message portion of `RTCDataChannel`. The PSP
+worker owns DNS and UDP behind fixed command and event rings, and one
+session, small datagrams, and fixed deadlines keep it inside the page
+`Budget` and the network supervisor. Ordinary pages cannot open it, launching
+an offline app does not request Wi-Fi, leaving the document cancels the
+worker and its lease, and there is no relay or general page UDP API ([Direct multiplayer](MULTIPLAYER.md)).
 
 ### Provider caches
 
@@ -1278,11 +893,9 @@ and event contract is in
 
 `Ready` means the PSP stack is associated and has an address, not that the
 access network grants Internet service. Captive-portal discovery is a
-separate, user-initiated frontend operation: one bounded probe may open an
-ephemeral tab and session authority, then re-probe and restore the incumbent
-tab. It adds no portal guessing to the network reducer and never relaxes TLS
-globally. The isolation and origin rules are in the
-[security model](SECURITY_MODEL.md#captive-portal-sign-in).
+separate, user-initiated frontend operation that adds no portal guessing to
+the network reducer and never relaxes TLS globally
+([captive-portal sign-in](SECURITY_MODEL.md#captive-portal-sign-in)).
 
 ### Media session
 
@@ -1292,34 +905,16 @@ Transitions produce commands; codec drain, DMA join, transport cancellation,
 and pipeline release return completion events. No state that owns a pipeline
 can jump directly to a resource-free terminal state.
 
-The player has one packet pipeline, whatever the source. The built-in provider
-supplies resolved split or progressive streams, offline downloads supply
-bounded local files, and compatible page `<video>` and `<audio>` elements
-supply authorized progressive MP4/M4A or HLS URLs. Every source keeps its
-response authority and feeds the same decoder, buffering, clock, and
-presentation services, and media bytes stay in RAM. Presentation follows
-media timestamps, uses bounded startup preroll and adaptive rebuffering, and
-records claimed, staged, and displayed identities instead of treating an
-attempted present as success.
-
-- **Decoder choice.** The stream's actual SPS picks the backend before any
-  decoder is built. Baseline and Main within PSP bounds use the firmware
-  bridge, whose generation-tagged surfaces discard stale completions and
-  quarantine a surface whose reader timed out rather than hand it back to a
-  writer. Compatible High-profile streams use an optional, user-built
-  software decoder outside the A/B slots, which keeps its allocations in one
-  admitted arena and, once it owns the Media Engine, keeps every later route
-  until suspend or exit.
-- **Sources.** MP4 probes with one standard Range request; HLS keeps a bounded
-  live-edge window and one video and one audio MPEG-TS source, and refuses
-  variants it cannot play as unsupported rather than as decoder failures.
-  Audio-only playback is a routing choice that never builds video machinery.
-- **Tracks, subtitles, and page data.** Track catalogs are bounded, an audio
-  change is a generation-safe reopen at the current position, and subtitles
-  are optional presentation data that never change playback state. Media found
-  in page data comes from bounded, allocation-free scans that still pass URL
-  resolution, CSP, request authority, and media probing, and never override
-  authored media or handlers.
+The player has one packet pipeline, whatever the source. Provider streams,
+offline downloads, and compatible page `<video>` and `<audio>` elements each
+keep their response authority and feed the same decoder, buffering, clock, and
+presentation services, and media bytes stay in RAM. The stream's actual SPS
+picks the decoder before any is built: the firmware bridge for Baseline and
+Main within PSP bounds, an optional user-built software decoder for compatible
+High-profile streams and for Baseline/Main streams the firmware would refuse
+([Route selection](engineering/MEDIA_PIPELINE.md#route-selection)).
+Presentation follows media timestamps and records claimed, staged, and
+displayed identities instead of treating an attempted present as success.
 
 The control contract is in
 [PSP media session](engineering/PSP_MEDIA_SESSION_STATE.md); sources, decoder
@@ -1339,18 +934,16 @@ The frontend separates ownership from control:
 | `PspExitPlan` | tagged reason and handoff | teardown obligations |
 | `PspShutdownReport` | independent retained/quarantined obligations | user intent |
 
-`psp_app_run_interactive()` is the resident loop: a cold driver that sets up a
-`PspLoop` (what one frame leaves for the next, plus the borrowed owners), calls
-`psp_loop_frame()` once per frame, and tears down. A frame is a fixed sequence
-of steps whose order is load-bearing (frame pumps admit work by position).
-Work a frame does not always do lives in named `psp_loop_*` steps behind the
-check that guards it: suspend/resume, update checks, a navigation's end, the
-offline download slice, and the validation-only drivers. Steps a page or media
-frame runs every time are hot boundaries measured together by the build (see
-[the PSP envelope](engineering/PSP_ENVELOPE.md)); a new feature that runs every
-frame joins those sets, and one that does not becomes a step behind its own
-check. `psp_browser_close()` first drives the media and network machines to
-safe terminal states, then frees only the resources their reports mark
+`psp_app_run_interactive()` is the resident loop: a cold driver that sets up
+the loop state, calls `psp_loop_frame()` once per frame, and tears down. A
+frame is a fixed sequence of steps whose order is load-bearing (frame pumps
+admit work by position). Work a frame does not always do lives in named steps
+behind the check that guards it; steps a page or media frame runs every time
+are hot boundaries measured together by the build (see
+[the PSP envelope](engineering/PSP_ENVELOPE.md)), so a new feature that runs
+every frame joins those sets, and one that does not becomes a step behind its
+own check. `psp_browser_close()` first drives the media and network machines
+to safe terminal states, then frees only the resources their reports mark
 releasable. Owners release resources; machines decide when release is safe.
 
 ### Boot and HOME
@@ -1393,12 +986,11 @@ into the cleared store.
 Manifest-backed offline apps extend the same library rather than adding a
 second runtime. Installation serializes the committed document and a bounded
 view of the live same-origin HTTP cache that keeps typed resource grants and
-module provenance; launch restores that view before committing the saved
-document under its original URL. Installation may precompile a bounded
-number of classic scripts without running them, but their source always
-remains authoritative. The design supports small self-contained games
-without Service Workers, background execution, or an offline-only
-authorization bypass ([Offline library](OFFLINE_LIBRARY.md)).
+module provenance, and launch restores that view before committing the saved
+document under its original URL. Precompiled scripts never replace their
+source as the authority, and there are no Service Workers, background
+execution, or offline-only authorization bypass
+([Offline library](OFFLINE_LIBRARY.md)).
 
 The updater uses a stable launcher and A/B browser slots. A compact binary
 manifest signs the release sequence, exact file sizes, and digests, and the

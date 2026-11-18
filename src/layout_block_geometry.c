@@ -5,6 +5,14 @@
 #include "layout_block_internal.h"
 #include "tilefinch/integer_math.h"
 
+int tilefinch_mul_div_int_wide(int value, int multiplier, int denominator)
+{
+    int64_t wide = (int64_t) value * multiplier / denominator;
+    if (wide > INT_MAX) return INT_MAX;
+    if (wide < INT_MIN) return INT_MIN;
+    return (int) wide;
+}
+
 bool resolve_computed_length(const Stylesheet *sheet, int value,
                                     bool percent, int reference,
                                     int *resolved)

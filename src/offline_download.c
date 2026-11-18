@@ -2,13 +2,16 @@
 #include "tilefinch/file_download.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 
 #include "tilefinch/media_http.h"
 #include "tilefinch/platform.h"
+#include "tilefinch/sha256.h"
 #include "tilefinch/update.h"
+#include "tilefinch/url.h"
 
 #include "tilefinch/user_agent.h"
 #define OFFLINE_DOWNLOAD_USER_AGENT TILEFINCH_BROWSER_USER_AGENT
@@ -18,6 +21,87 @@ static uint64_t offline_file_size(const char *path)
     struct stat status;
     return path != NULL && stat(path, &status) == 0 && status.st_size >= 0
         ? (uint64_t) status.st_size : 0;
+}
+
+static size_t download_query_field(const TilefinchUrl *url, const char *name,
+                                   const char **value)
+{
+    size_t key = strlen(name);
+    const char *at = url->value + url->query_offset;
+    const char *end = at + url->query_length;
+    while (at < end) {
+        const char *stop = memchr(at, '&', (size_t) (end - at));
+        if (stop == NULL) stop = end;
+        if ((size_t) (stop - at) > key + 1u && at[key] == '='
+            && !memcmp(at, name, key)) {
+            *value = at + key + 1u;
+            return (size_t) (stop - *value);
+        }
+        at = stop == end ? end : stop + 1;
+    }
+    return 0;
+}
+
+/* Bind bytes to immutable media identity, not an expiring delivery token.
+   The provider's object ID and last-modified revision identify the encoded
+   asset; xtags also distinguishes tracks. If absent, require the exact URL. */
+static void download_hash_representation(TilefinchSha256 *hash, const char *url)
+{
+    TilefinchUrl parsed;
+    const char *id = "", *revision = "", *tags = "";
+    if (tilefinch_url_parse_long(url, &parsed) && parsed.has_query) {
+        size_t id_len = download_query_field(&parsed, "id", &id);
+        size_t rev_len = download_query_field(&parsed, "lmt", &revision);
+        if (id_len && rev_len) {
+            size_t tags_len = download_query_field(&parsed, "xtags", &tags);
+            (void) tilefinch_sha256_update(hash, (const uint8_t *) "I", 2);
+            (void) tilefinch_sha256_update(hash, (const uint8_t *) id, id_len);
+            (void) tilefinch_sha256_update(hash, (const uint8_t *) "", 1);
+            (void) tilefinch_sha256_update(hash, (const uint8_t *) revision, rev_len);
+            (void) tilefinch_sha256_update(hash, (const uint8_t *) "", 1);
+            (void) tilefinch_sha256_update(hash, (const uint8_t *) tags, tags_len);
+            (void) tilefinch_sha256_update(hash, (const uint8_t *) "", 1);
+            return;
+        }
+    }
+    (void) tilefinch_sha256_update(hash, (const uint8_t *) "U", 2);
+    (void) tilefinch_sha256_update(hash, (const uint8_t *) url, strlen(url) + 1u);
+}
+
+static bool download_identity_write(const char *path,
+                                    const uint8_t identity[32])
+{
+    FILE *file = fopen(path, "wb");
+    if (file == NULL) return false;
+    bool ok = fwrite(identity, 1, TILEFINCH_SHA256_DIGEST_BYTES, file)
+        == TILEFINCH_SHA256_DIGEST_BYTES;
+    return fclose(file) == 0 && ok;
+}
+
+typedef enum {
+    DOWNLOAD_RECEIPT_MATCH,
+    DOWNLOAD_RECEIPT_ABSENT,
+    DOWNLOAD_RECEIPT_OTHER /* another identity, damaged or unreadable */
+} DownloadReceipt;
+
+static DownloadReceipt download_identity_read(const char *path,
+                                              const uint8_t identity[32])
+{
+    FILE *file = fopen(path, "rb");
+    if (file == NULL)
+        return errno == ENOENT ? DOWNLOAD_RECEIPT_ABSENT
+                               : DOWNLOAD_RECEIPT_OTHER;
+    uint8_t recorded[TILEFINCH_SHA256_DIGEST_BYTES];
+    bool ok = fread(recorded, 1, sizeof(recorded), file) == sizeof(recorded)
+        && fgetc(file) == EOF && !ferror(file)
+        && !memcmp(recorded, identity, sizeof(recorded));
+    return fclose(file) == 0 && ok ? DOWNLOAD_RECEIPT_MATCH
+                                   : DOWNLOAD_RECEIPT_OTHER;
+}
+
+static bool download_remove_stale(const char *path)
+{
+    return path[0] != '\0' && (remove(path) == 0 || errno == ENOENT);
 }
 
 bool offline_download_parse_decimal(const char *text, uint64_t *value)
@@ -336,10 +420,8 @@ static bool download_begin_part(
             manager->library, manager->active_id, part_suffix,
             path, sizeof(path))) return false;
     uint64_t offset = offline_file_size(path);
-    if (offset > total) {
-        (void) remove(path);
-        offset = 0;
-    }
+    /* Longer than the stream cannot be its prefix: "wb" starts it again. */
+    if (offset > total) offset = 0;
     manager->output = fopen(path, offset == 0 ? "wb" : "ab");
     if (manager->output == NULL) return false;
     manager->part_offset = offset;
@@ -424,6 +506,27 @@ static bool download_resolve(OfflineDownloadManager *manager)
     return download_finish_resolve(manager, resolved, error);
 }
 
+static void download_mark_ready(OfflineDownloadManager *manager,
+                                OfflineLibraryItem *item)
+{
+    if (item == NULL) return;
+    item->downloaded_bytes = item->content_bytes + item->audio_bytes;
+    item->state = OFFLINE_ITEM_READY;
+    item->failure_reason[0] = '\0';
+    if (!offline_library_save(manager->library)) {
+        item->state = OFFLINE_ITEM_PAUSED;
+        snprintf(manager->error, sizeof(manager->error),
+                 "completed download metadata could not be saved");
+        return;
+    }
+    /* No further append can occur after READY. Keep the receipt until
+       both files and the index are committed, not for each saved video. */
+    char path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
+    if (offline_library_item_path(manager->library, manager->active_id,
+                                  ".video.identity", path, sizeof(path)))
+        (void) remove(path);
+}
+
 bool offline_download_manager_adopt_resolved(
     OfflineDownloadManager *manager, const YoutubeStream *resolved)
 {
@@ -475,25 +578,57 @@ bool offline_download_manager_adopt_resolved(
             manager->library, manager->active_id, ".audio.mp4",
             audio_final, sizeof(audio_final))
         ? offline_file_size(audio_final) : 0;
-    if ((item->content_bytes != 0
-         && item->content_bytes != stream->content_length)
-        || (item->audio_bytes != 0
-            && item->audio_bytes != stream->audio_content_length)
+    char identity_path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
+    TilefinchSha256 hash;
+    uint8_t identity[TILEFINCH_SHA256_DIGEST_BYTES];
+    tilefinch_sha256_init(&hash);
+    download_hash_representation(&hash, stream->media_url);
+    if (stream->split_streams) download_hash_representation(&hash, stream->audio_url);
+    bool identity_path_ok = tilefinch_sha256_final(&hash, identity)
+        && offline_library_item_path(manager->library, manager->active_id,
+                                     ".video.identity", identity_path, sizeof(identity_path));
+    DownloadReceipt receipt = identity_path_ok
+        ? download_identity_read(identity_path, identity)
+        : DOWNLOAD_RECEIPT_OTHER;
+    bool index_matches = item->content_bytes == stream->content_length
+        && item->audio_bytes == stream->audio_content_length
+        && item->itag == stream->itag && item->audio_itag == stream->audio_itag
+        && item->split_streams == stream->split_streams;
+    /* 0.1.52 wrote no receipt: it resumed when the index's lengths and
+       itags matched the resolved stream. Accept that same evidence once
+       for bytes without a receipt, then bind them with one below. A
+       receipt naming another representation still resets. */
+    bool unreceipted = receipt == DOWNLOAD_RECEIPT_ABSENT && index_matches;
+    if (!index_matches
+        || (receipt != DOWNLOAD_RECEIPT_MATCH && !unreceipted)
         || existing_video > stream->content_length
         || existing_audio > stream->audio_content_length
         || (final_video != 0 && final_video != stream->content_length)
         || (final_audio != 0
             && final_audio != stream->audio_content_length)) {
-        if (video_part[0] != '\0') (void) remove(video_part);
-        if (audio_part[0] != '\0') (void) remove(audio_part);
-        if (video_final[0] != '\0') (void) remove(video_final);
-        if (audio_final[0] != '\0') (void) remove(audio_final);
+        /* Never publish the new identity until all old bytes are gone. */
+        if (!identity_path_ok || !download_remove_stale(video_part)
+            || !download_remove_stale(audio_part)
+            || !download_remove_stale(video_final)
+            || !download_remove_stale(audio_final)
+            || !download_identity_write(identity_path, identity)) {
+            download_set_state(manager, OFFLINE_ITEM_PAUSED,
+                               "stale download data could not be reset");
+            download_reset_active(manager);
+            return false;
+        }
         existing_video = 0;
         existing_audio = 0;
         final_video = 0;
         final_audio = 0;
         item->downloaded_bytes = 0;
     } else {
+        if (unreceipted && !download_identity_write(identity_path, identity)) {
+            download_set_state(manager, OFFLINE_ITEM_PAUSED,
+                               "download metadata could not be saved");
+            download_reset_active(manager);
+            return false;
+        }
         if (final_video == stream->content_length && existing_video != 0) {
             (void) remove(video_part);
             existing_video = 0;
@@ -535,10 +670,7 @@ bool offline_download_manager_adopt_resolved(
     if (final_video == stream->content_length
         && (!stream->split_streams
             || final_audio == stream->audio_content_length)) {
-        item->downloaded_bytes = required;
-        item->state = OFFLINE_ITEM_READY;
-        item->failure_reason[0] = '\0';
-        (void) offline_library_save(manager->library);
+        download_mark_ready(manager, item);
         download_reset_active(manager);
         return true;
     }
@@ -664,16 +796,7 @@ static bool download_advance_part(OfflineDownloadManager *manager)
     }
     OfflineLibraryItem *item = offline_library_find_mutable(
         manager->library, manager->active_id);
-    if (item != NULL) {
-        item->downloaded_bytes = item->content_bytes + item->audio_bytes;
-        item->state = OFFLINE_ITEM_READY;
-        item->failure_reason[0] = '\0';
-        if (!offline_library_save(manager->library)) {
-            item->state = OFFLINE_ITEM_PAUSED;
-            snprintf(manager->error, sizeof(manager->error),
-                     "completed download metadata could not be saved");
-        }
-    }
+    download_mark_ready(manager, item);
     download_reset_active(manager);
     return true;
 }

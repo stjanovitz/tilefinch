@@ -121,6 +121,49 @@ int main(void)
     CHECK(youtube_playlist_failed(q) && !youtube_playlist_loading(q));
     CHECK(!youtube_playlist_pump(q, NULL));
     youtube_playlist_destroy(q);
+    /* While playback is ended, optional prefetch is disabled. An explicit
+       retry must still pump without changing or reopening the current item. */
+    q = youtube_playlist_begin(&budget, &session, url, 10, false, NULL);
+    CHECK(q); make_page(&page, 0, 12, true);
+    CHECK(youtube_playlist_accept_page(q, &page));
+    CHECK(youtube_playlist_take_video(q, video, sizeof(video)));
+    make_page(&page, 13, 1, false);
+    CHECK(!youtube_playlist_accept_page(q, &page)
+        && youtube_playlist_can_retry(q) && !youtube_playlist_selecting(q)
+        && !youtube_playlist_should_pump(q, false));
+    youtube_playlist_retry(q);
+    CHECK(youtube_playlist_should_pump(q, false)
+        && youtube_playlist_loading(q) && !youtube_playlist_selecting(q));
+    /* A refusal during the explicit retry must end the loading state and
+       allow another attempt. No network is needed for this transition. */
+    size_t saved_limit = budget.limit;
+    budget.limit = budget.current;
+    CHECK(youtube_playlist_pump(q, NULL) && youtube_playlist_can_retry(q)
+        && !youtube_playlist_loading(q) && !youtube_playlist_should_pump(q, false));
+    budget.limit = saved_limit;
+    youtube_playlist_retry(q);
+    make_page(&page, 12, 1, false);
+    const char *request = "https://www.youtube.com/playlist?list=PLfixture&tilefinch_base=12";
+    TilefinchRequestContext retry_authority = {
+        .target_url = "https://m.youtube.com/playlist?list=PLfixture",
+        .top_level_url = request, .method = "GET",
+        .mode = TILEFINCH_REQUEST_MODE_NAVIGATE,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .destination = TILEFINCH_DESTINATION_DOCUMENT,
+        .top_level_navigation = true, .user_activated = true
+    };
+    CHECK(browser_session_site_adapter_document_cache_put(&session,
+        "youtube-playlist-facts", request, 0, &retry_authority, &page,
+        sizeof(page), 0, 1, 200, "", "", tilefinch_platform_monotonic_time_ns()));
+    CHECK(youtube_playlist_should_pump(q, false)
+        && youtube_playlist_pump(q, NULL)
+        && !youtube_playlist_should_pump(q, false)
+        && !youtube_playlist_loading(q) && youtube_playlist_position(q) == 10
+        && !youtube_playlist_take_video(q, video, sizeof(video))
+        && youtube_playlist_view(q, view, 6) == 3);
+    browser_session_site_adapter_document_cache_remove(
+        &session, "youtube-playlist-facts", request);
+    youtube_playlist_destroy(q);
     /* A failed continuation remains retryable. A newer queue choice must
        replace a ready video rather than publishing the old selection. */
     q = youtube_playlist_begin(&budget, &session, url, 11, false, NULL);

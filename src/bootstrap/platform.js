@@ -141,6 +141,9 @@
     ),
     trustedWeakMapGet = Function.call.bind(WeakMap.prototype.get),
     trustedWeakMapSet = Function.call.bind(WeakMap.prototype.set),
+    trustedWeakSetHas = Function.call.bind(WeakSet.prototype.has),
+    trustedWeakSetAdd = Function.call.bind(WeakSet.prototype.add),
+    trustedWeakSetDelete = Function.call.bind(WeakSet.prototype.delete),
     trustedUint8ArraySet = Function.call.bind(Uint8Array.prototype.set),
     trustedObjectKeys = Object.keys,
     trustedObjectPrototype = Object.getPrototypeOf,
@@ -270,7 +273,7 @@
     __tilefinchRealmGlobal.__tilefinchAssertSelector = (value) => {
       value = String(value);
       if (value === lastValidSelector) return value;
-      if (!selectorSyntaxNative(value))
+      if (!selectorSyntaxNative(value, true))
         throw new DOMException("Invalid selector", "SyntaxError");
       return (lastValidSelector = value);
     };
@@ -963,16 +966,11 @@
       paramSteps.append.call(this, decodeURLParam(key), decodeURLParam(value));
     }
     _replace(query) {
-      this.items.length = 0;
+      /* Parsing can refuse the entry bound. Do not leave an already-live
+         URLSearchParams half replaced when that happens. */
+      const staged = new TilefinchURLSearchParams(query);
+      this.items = staged.items;
       this._text = null;
-      for (const part of String(query).replace(/^\?/, "").split("&")) {
-        if (!part) continue;
-        const at = part.indexOf("=");
-        paramSteps.appendDecoded.call(this, 
-          at < 0 ? part : part.slice(0, at),
-          at < 0 ? "" : part.slice(at + 1),
-        );
-      }
     }
     append(key, value) {
       key = tilefinchUSVString(key);
@@ -987,7 +985,7 @@
     }
     delete(key, value) {
       key = tilefinchUSVString(key);
-      const matchValue = arguments.length > 1,
+      const matchValue = value !== undefined,
         wanted = matchValue ? tilefinchUSVString(value) : "";
       for (let index = this.items.length - 1; index >= 0; index--)
         if (this.items[index][0] === key
@@ -1009,7 +1007,7 @@
     }
     has(key, value) {
       key = tilefinchUSVString(key);
-      const matchValue = arguments.length > 1,
+      const matchValue = value !== undefined,
         wanted = matchValue ? tilefinchUSVString(value) : "";
       return this.items.some((item) => item[0] === key
         && (!matchValue || item[1] === wanted));
@@ -1038,8 +1036,10 @@
       paramSteps.notify.call(this, );
     }
     forEach(callback, thisArg) {
-      for (const pair of this.items)
+      for (let i = 0; i < this.items.length; i++) {
+        const pair = this.items[i];
         callback.call(thisArg, pair[1], pair[0], this);
+      }
     }
     entries() {
       return urlParamIterator(this, 0);
@@ -1332,7 +1332,9 @@
       return this._href;
     }
     set href(value) {
-      const next = new TilefinchURL(value, this._href);
+      const input = tilefinchURLTrim(value);
+      if (!tilefinchURLScheme(input)) throw new TypeError("Invalid URL");
+      const next = new TilefinchURL(input);
       urlSteps.set.call(this, next._href);
     }
     get protocol() { return this._protocol; }
@@ -1370,6 +1372,11 @@
       if (this._opaque) return;
       value = tilefinchUSVString(value);
       if (!value || /[\s\/?#@]/.test(value)) return;
+      const colon = value.indexOf(":", value.startsWith("[")
+        ? value.indexOf("]") + 1 : 0);
+      if (colon === value.length - 1) value = value.slice(0, -1);
+      if ((colon < 0 || colon === value.length) && this._port)
+        value += ":" + this._port;
       urlSteps.setCandidate.call(this, this._protocol + "//" + value + this._pathname +
         this._search + this._hash);
     }
@@ -1402,8 +1409,8 @@
     }
     set search(value) {
       const search = tilefinchURLSearch(value);
-      this._search = search;
       if (this._searchParams) paramSteps.replace.call(this._searchParams, search);
+      this._search = search;
       if (this._href)
         this._href = this._prefix + this._pathname + search + this._hash;
     }
@@ -1935,8 +1942,9 @@
     },
     nativeFormOwner = (control) => {
       const explicit = control?.getAttribute?.("form");
-      if (explicit) {
-        const candidate = control.ownerDocument?.getElementById(explicit);
+      if (explicit != null && control.isConnected) {
+        const candidate = explicit
+          ? control.getRootNode()?.getElementById?.(explicit) : null;
         return candidate instanceof HTMLFormElement ? candidate : null;
       }
       return parserFormOwner(control) || control?.closest?.("form") || null;
@@ -1948,7 +1956,7 @@
        reads form.elements.namedItem() on every update). */
     listedControlSelector =
       "button,fieldset,input,object,output,select,textarea",
-    formControls = (form) => {
+    formControls = (form, imageSubmitter = null) => {
     const values = [],
       seen = new Set(),
       fieldsetOwner = form instanceof HTMLFieldSetElement,
@@ -1964,18 +1972,13 @@
             return null;
           }
         }
-        if (__tilefinchRealmGlobal.__tilefinchFormAssociatedCustomElement?.(child)) {
-          const formAttribute = child.getAttribute?.("form");
-          return formAttribute
-            ? document.getElementById(formAttribute)
-            : child.closest?.("form");
-        }
         return nativeFormOwner(child);
       },
       listed = (child) => {
         const tag = String(child.localName || "").toLowerCase();
         if (tag === "input")
-          return String(child.getAttribute("type") || "").toLowerCase() !==
+          return child === imageSubmitter ||
+            String(child.getAttribute("type") || "").toLowerCase() !==
             "image";
         return tag === "button" || tag === "fieldset" || tag === "object" ||
           tag === "output" || tag === "select" || tag === "textarea" ||
@@ -2045,6 +2048,7 @@
     cachedFormControls = (form) =>
       formControlEntry(form)?.values ?? formControls(form);
   /* Set below, once the select helpers it captures exist. */
+  domShared.formOwner = nativeFormOwner;
   let formCollections;
   Object.defineProperties(HTMLFormElement.prototype, {
     elements: {
@@ -2194,18 +2198,22 @@
       const dirty = controlStateGet(optionSelectedState, option);
       return dirty !== undefined ? dirty : option.hasAttribute("selected");
     },
+    optionDisabledForSelection = (option) => {
+      if (option.hasAttribute("disabled")) return true;
+      const group = option.parentElement;
+      return group?.localName === "optgroup" && group.hasAttribute("disabled");
+    },
+    defaultSelectedOption = (select, options) =>
+      Number(select.getAttribute("size")) > 1 ? null
+        : options.find(option => !optionDisabledForSelection(option)),
     computeSelectedOptions = (select, options) => {
       if (select.multiple) return options.filter(rawOptionSelected);
       const explicit = options.filter(rawOptionSelected);
-      return explicit.length
-        ? [explicit[explicit.length - 1]]
-        : options.some((option) =>
-            controlStateHas(optionSelectedState, option),
-          )
-          ? []
-        : options.length
-          ? [options[0]]
-          : [];
+      if (explicit.length) return [explicit[explicit.length - 1]];
+      if (options.some(option => controlStateHas(optionSelectedState, option)))
+        return [];
+      const fallback = defaultSelectedOption(select, options);
+      return fallback ? [fallback] : [];
     };
   /* One select's options and selection, reused while neither the DOM (the
      native version moves with every script mutation and parser growth) nor
@@ -2324,6 +2332,17 @@
     for (const peer of options) markOptionSelected(peer, peer === chosen);
     syncSelectedContent(select);
   };
+  domShared.selectMultipleRemoved = (select) => {
+    const options = selectOptions(select);
+    let kept = false;
+    for (let i = options.length - 1; i >= 0; i--) {
+      const option = options[i];
+      if (!rawOptionSelected(option)) continue;
+      if (kept) markOptionSelected(option, false);
+      else kept = true;
+    }
+    syncSelectedContent(select);
+  };
   /* The SameObject selectedOptions collection lives on the select wrapper
      (it closes over it): a handle-keyed table would pin the wrapper and so
      the node for the life of the page. */
@@ -2398,6 +2417,7 @@
       MapType: Map,
       WeakMapType: WeakMap,
       ProxyType: Proxy,
+      DateType: Date,
       objectCreate: Object.create,
       defineProperty: Object.defineProperty,
       defineProperties: Object.defineProperties,
@@ -2437,7 +2457,7 @@
       },
       set(value) {
         this.toggleAttribute("multiple", !!value);
-        syncSelectedContent(this);
+        if (value) syncSelectedContent(this);
       },
     },
     selectedIndex: {
@@ -2530,6 +2550,7 @@
     );
   __tilefinchRealmGlobal.__tilefinchSetTextAreaValue = (textarea, value) => {
     const text = value === null ? "" : String(value);
+    controlStateDelete(userEditedValues, textarea);
     controlStateSet(textareaValues, textarea, text);
     __tilefinchSetControlValue(textarea.__handle, text);
   };
@@ -2581,74 +2602,129 @@
       time: /^\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/,
       "datetime-local": /^\d{4,}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/,
     };
+  const floatingPointInput = /^-?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$/,
+    trimInputSpace = (value) => value.replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, ""),
+    isCalendarDate = (value) => {
+      const year = value.slice(0, -6), month = Number(value.slice(-5, -3)),
+        day = Number(value.slice(-2));
+      if (!/[1-9]/.test(year) || month < 1 || month > 12 || day < 1)
+        return false;
+      /* A Gregorian cycle repeats every 400 years, even outside Date's range. */
+      const cycle = Number(year.slice(-4));
+      return day <= (month === 2
+        ? (cycle % 4 === 0 && (cycle % 100 !== 0 || cycle % 400 === 0) ? 29 : 28)
+        : (month === 4 || month === 6 || month === 9 || month === 11 ? 30 : 31));
+    },
+    inputNumber = value => value !== null && floatingPointInput.test(value) &&
+      Number.isFinite(Number(value)) ? Number(value) : NaN,
+    constraintNumber = (type, value) => {
+      const pattern = dateValuePatterns[type];
+      return !pattern ? inputNumber(value) : pattern.test(value)
+        ? formCollections().calendarNumber(type, value, isCalendarDate) : NaN;
+    },
+    sanitizeInputValue = (input, type, value) => {
+      if (type === "text" || type === "search" || type === "tel" ||
+          type === "password")
+        return /[\r\n]/.test(value) ? value.replace(/[\r\n]/g, "") : value;
+      if (type === "email" || type === "url") {
+        value = value.replace(/[\r\n]/g, "");
+        return type === "email" && input.multiple
+          ? value.split(",").map(trimInputSpace).join(",") : trimInputSpace(value);
+      }
+      if (dateValuePatterns[type])
+        return dateValuePatterns[type].test(value) &&
+          (type === "date" ? isCalendarDate(value) :
+            Number.isFinite(constraintNumber(type, value)))
+          ? value : "";
+      if (type === "number")
+        return floatingPointInput.test(value) && Number.isFinite(Number(value))
+          ? value : "";
+      if (type === "range") return formCollections().rangeValue(input, value, inputNumber);
+      if (type === "color")
+        return /^#[0-9a-f]{6}$/i.test(value) ? trustedStringLower(value) : "#000000";
+      return value;
+    };
+  const inputType = (raw) => {
+    raw = trustedStringLower(raw || "");
+    return inputTypes.has(raw) ? raw : "text";
+  };
+  const inputValueMode = (type) =>
+    type === "file" ? 2
+      : type === "checkbox" || type === "radio" || type === "hidden" ||
+        type === "button" || type === "submit" || type === "reset" || type === "image"
+        ? 1 : 0;
   __tilefinchRealmGlobal.__tilefinchControlType = (control) => {
     const tag = String(control.tagName).toLowerCase(),
       raw = String(control.getAttribute("type") || "").toLowerCase();
     if (tag === "button")
       return ["submit", "reset", "button"].includes(raw) ? raw : "submit";
-    return inputTypes.has(raw) ? raw : "text";
+    return inputType(raw);
   };
-  const inputValues = controlStateTable();
+  const inputValues = controlStateTable(), userEditedValues = controlStateTable();
   __tilefinchRealmGlobal.__tilefinchInputValue = (input) => {
     const type = __tilefinchControlType(input),
       attribute = input.getAttribute("value");
     if (type === "file") return "";
-    if (type === "checkbox" || type === "radio")
-      return attribute === null ? "on" : attribute;
+    if (inputValueMode(type) === 1)
+      return attribute ?? (type === "checkbox" || type === "radio" ? "on" : "");
     const dirty = controlStateGet(inputValues, input);
     if (dirty !== undefined) return dirty;
-    if (type === "range" && attribute === null) return "50";
-    if (type === "color" && attribute === null) return "#000000";
-    return attribute || "";
+    return sanitizeInputValue(input, type, attribute || "");
   };
   __tilefinchRealmGlobal.__tilefinchSetInputValue = (input, value) => {
     const type = __tilefinchControlType(input);
-    if (type === "checkbox" || type === "radio") {
+    if (inputValueMode(type) === 1) {
       input.setAttribute("value", value === null ? "" : String(value));
       return;
     }
     if (type === "file") {
-      if (value === null || String(value) === "") return;
-      if (value !== null && String(value) !== "")
-        throw new DOMException(
-          "File input values may only be cleared",
-          "InvalidStateError",
-        );
+      if (value === null || String(value) === "") {
+        inputFileLists.delete(input);
+        return;
+      }
+      throw new DOMException(
+        "File input values may only be cleared", "InvalidStateError");
     }
-    let text = value === null ? "" : String(value);
-    if (textValueTypes.has(type)) text = text.replace(/[\r\n]/g, "");
-    else if (dateValuePatterns[type] && !dateValuePatterns[type].test(text))
-      text = "";
-    else if (
-      type === "number" &&
-      (text.trim() === "" || !Number.isFinite(Number(text)))
-    )
-      text = "";
-    else if (type === "range") {
-      const numeric = Number(text),
-        minimum = Number(input.getAttribute("min")),
-        maximum = Number(input.getAttribute("max")),
-        min =
-          Number.isFinite(minimum) && input.getAttribute("min") !== null
-            ? minimum
-            : 0,
-        max =
-          Number.isFinite(maximum) && input.getAttribute("max") !== null
-            ? maximum
-            : 100;
-      text = String(
-        Number.isFinite(numeric)
-          ? Math.min(max, Math.max(min, numeric))
-          : (min + max) / 2,
-      );
-    } else if (type === "color" && !/^#[0-9a-f]{6}$/i.test(text))
-      text = "#000000";
+    const text = sanitizeInputValue(input, type, value === null ? "" : String(value));
+    controlStateDelete(userEditedValues, input);
     controlStateSet(inputValues, input, text);
     __tilefinchSetControlValue(input.__handle, text);
   };
   const resetInputValue = (input) => {
+    if (__tilefinchControlType(input) === "file") inputFileLists.delete(input);
+    controlStateDelete(userEditedValues, input);
     controlStateDelete(inputValues, input);
     __tilefinchSetControlValue(input.__handle, __tilefinchInputValue(input));
+  };
+  domShared.inputAttributeChanged = (input, name, oldValue, value) => {
+    if (oldValue === value) return;
+    if (name === "type") {
+      const oldType = inputType(oldValue), type = inputType(value);
+      if (oldType === type) return;
+      const selects = /^(text|search|tel|url|password)$/;
+      if (selects.test(type) && !selects.test(oldType)) {
+        input.__selectionStart = input.__selectionEnd = 0;
+        input.__selectionDirection = "none";
+      }
+      const oldMode = inputValueMode(oldType), mode = inputValueMode(type);
+      if (oldMode !== mode) {
+        if (oldMode === 0 && mode === 1) {
+          const previous = controlStateGet(inputValues, input) ??
+            sanitizeInputValue(input, oldType, input.getAttribute("value") || "");
+          if (previous !== "") input.setAttribute("value", previous);
+        }
+        if (oldMode === 2 || mode === 2) inputFileLists.delete(input);
+        resetInputValue(input);
+      } else if (mode === 0) {
+        const dirty = controlStateGet(inputValues, input);
+        if (dirty !== undefined)
+          controlStateSet(inputValues, input, sanitizeInputValue(input, type, dirty));
+        __tilefinchSetControlValue(input.__handle, __tilefinchInputValue(input));
+      }
+    }
+    if (name === "type" || name === "name" || name === "form" ||
+        (name === "checked" && oldValue === null))
+      domShared.radioGroupChanged(input);
   };
   __tilefinchRealmGlobal.__tilefinchSyncNativeControlValue = (control, value) => {
     const tag = String(control?.localName || control?.tagName).toLowerCase();
@@ -2656,8 +2732,10 @@
       controlStateSet(inputValues, control, String(value ?? ""));
     else if (tag === "textarea")
       controlStateSet(textareaValues, control, String(value ?? ""));
-    if (tag === "input" || tag === "textarea")
+    if (tag === "input" || tag === "textarea") {
+      controlStateSet(userEditedValues, control, true);
       __tilefinchSetControlValue(control.__handle, String(value ?? ""));
+    }
   };
   /* A page fullscreen state is deliberately singular and presentation-only.
      Native code owns the viewport/chrome transition; JavaScript retains the
@@ -2740,13 +2818,15 @@
   });
 
   const indeterminateState = controlStateTable(),
-    checkedDefaultState = controlStateTable();
+    detachedCheckedState = new WeakMap(),
+    nativeCheckedState = __tilefinchRealmGlobal.__tilefinchControlChecked;
+  delete __tilefinchRealmGlobal.__tilefinchControlChecked;
   __tilefinchRealmGlobal.__tilefinchRegisterNativeNodeStateCleanup?.((handle) => {
     controlStateRetire(optionSelectedState, handle);
     controlStateRetire(textareaValues, handle);
     controlStateRetire(inputValues, handle);
+    controlStateRetire(userEditedValues, handle);
     controlStateRetire(indeterminateState, handle);
-    controlStateRetire(checkedDefaultState, handle);
   });
   delete __tilefinchRealmGlobal.__tilefinchRegisterNativeNodeStateCleanup;
   Object.defineProperty(HTMLInputElement.prototype, "indeterminate", {
@@ -2766,7 +2846,8 @@
       const tag = String(from.localName || "").toLowerCase();
       if (tag === "input") {
         to.value = from.value;
-        to.checked = from.checked;
+        const state = checkedState(from);
+        if (state >= 0) checkedState(to, state);
         to.indeterminate = from.indeterminate;
       } else if (tag === "textarea") {
         to.value = from.value;
@@ -2787,50 +2868,116 @@
         copyControl(fromControls[index], toControls[index]);
     }
   };
-  __tilefinchRealmGlobal.__tilefinchSetChecked = (input, checked) => {
-    if (!(input instanceof HTMLInputElement)) {
-      input.toggleAttribute("checked", checked);
-      return;
-    }
-    if (!controlStateHas(checkedDefaultState, input))
-      controlStateSet(
-        checkedDefaultState,
-        input,
-        input.hasAttribute("checked"),
-      );
-    if (checked && __tilefinchControlType(input) === "radio") {
-      const form = input.closest("form"),
-        name = input.name;
-      if (name) {
-        const peers = document.querySelectorAll("input");
-        for (let index = 0; index < peers.length; index++) {
-          const peer = peers[index];
-          if (
-            peer !== input &&
-            peer instanceof HTMLInputElement &&
-            __tilefinchControlType(peer) === "radio" &&
-            peer.name === name &&
-            peer.closest("form") === form
-          )
-            peer.removeAttribute("checked");
+  /* Native layout, selectors and the controller share the live state.
+     The content attribute remains the default exactly as authored. */
+  const checkedState = (input, state = undefined) => {
+    const handle = input.__handle;
+    if (handle !== undefined)
+      return state === undefined ? nativeCheckedState(handle)
+        : nativeCheckedState(handle, state);
+    if (state === undefined) return detachedCheckedState.get(input) ?? -1;
+    if (state < 0) detachedCheckedState.delete(input);
+    else detachedCheckedState.set(input, state);
+    return true;
+  },
+    isChecked = (input) => {
+      const state = checkedState(input);
+      return state < 0 ? input.hasAttribute("checked") : (state & 1) !== 0;
+    },
+    radioPeers = function* (input) {
+      const name = input.name, root = input.getRootNode();
+      if (!name || root === input) return;
+      const owner = nativeFormOwner(input), peers = root?.querySelectorAll("input");
+      for (let index = 0; peers && index < peers.length; index++) {
+        const peer = peers[index];
+        if (peer !== input && peer instanceof HTMLInputElement &&
+            __tilefinchControlType(peer) === "radio" && peer.name === name &&
+            nativeFormOwner(peer) === owner)
+          yield peer;
+      }
+    },
+    restoreChoices = (states, cancelled = false) => {
+      for (let index = 0; index < states.length; index++) {
+        const [item, state, wasChecked] = states[index];
+        /* Cancellation rolls back the live toggle, not an authored change
+           to the checked attribute in the click handler. The clicked
+           control also remains dirty, like any other activation. */
+        checkedState(item, cancelled && index === 0
+          ? (wasChecked ? 3 : 2)
+          : cancelled && state < 0 && item.defaultChecked !== wasChecked
+            ? Number(wasChecked) : state);
+      }
+      /* A radio the handler checked meanwhile gives way to the restored one. */
+      if (cancelled)
+        for (let index = 1; index < states.length; index++)
+          domShared.radioGroupChanged(states[index][0]);
+    },
+    setChecked = (input, checked, authored = false, keepState = false) => {
+      const original = checkedState(input),
+        states = [[input, original, original < 0 ? input.defaultChecked : !!(original & 1)]];
+      /* Prepare the rollback records before any shared state is changed. */
+      if (checked && __tilefinchControlType(input) === "radio") {
+        for (const peer of radioPeers(input)) {
+          if (!isChecked(peer)) continue;
+          states.push([peer, checkedState(peer), true]);
         }
       }
-    }
-    input.toggleAttribute("checked", checked);
+      if (!keepState &&
+          !checkedState(input, authored ? -1 : (checked ? 3 : 2))) return null;
+      for (let index = 1; index < states.length; index++) {
+        const [peer, prior] = states[index];
+        if (!checkedState(peer, prior >= 2 ? 2 : 0)) {
+          for (let rollback = 0; rollback < index; rollback++) {
+            const [item, old] = states[rollback];
+            checkedState(item, old);
+          }
+          return null;
+        }
+      }
+      return states;
+    };
+  domShared.setChecked = setChecked;
+  domShared.isChecked = isChecked;
+  domShared.restoreChoices = restoreChoices;
+  const apply = Reflect.apply, readAttribute = Element.prototype.getAttribute,
+    queryOne = Element.prototype.querySelector,
+    queryAll = Element.prototype.querySelectorAll,
+    GROUPED = "input[name][type=radio i],details[open][name]";
+  domShared.radioGroupChanged = (input) => {
+    if (inputType(apply(readAttribute, input, ["type"])) === "radio" && isChecked(input))
+      setChecked(input, true, false, true);
   };
-  /* The default checkedness: the checked attribute until script or the
-     user first sets checkedness, then the value latched at that moment
-     (checkedness itself lives in the attribute, which native layout,
-     selectors and the controller read). */
-  const defaultCheckedOf = (input) =>
-    controlStateHas(checkedDefaultState, input)
-      ? !!controlStateGet(checkedDefaultState, input)
-      : input.hasAttribute("checked");
+  /* A script insertion's node and descendants join their radio groups and
+     details name groups (the inserted node itself, when a details, dom.js
+     handles). It runs between the insertion and its mutation records: the
+     bootstrap's own queries, one native match to skip a subtree with
+     neither (no list built), and nothing thrown into the insertion. */
+  domShared.groupsInserted = (node) => {
+    try {
+      if (node instanceof HTMLInputElement) domShared.radioGroupChanged(node);
+      else if (node instanceof Element && apply(queryOne, node, [GROUPED]) !== null) {
+        const items = apply(queryAll, node, [GROUPED]);
+        for (let index = 0; index < items.length; index++)
+          if (items[index] instanceof HTMLInputElement)
+            domShared.radioGroupChanged(items[index]);
+          else domShared.enforceDetailsGroup(items[index], false);
+      }
+    } catch (_) {}
+  };
   const resetChecked = (input) => {
-    input.checked = defaultCheckedOf(input);
-    controlStateDelete(checkedDefaultState, input);
+    setChecked(input, input.defaultChecked, true);
   };
   Object.defineProperties(HTMLInputElement.prototype, {
+    list: {
+      configurable: true, enumerable: true,
+      get() {
+        const id = this.getAttribute("list");
+        if (!id || /^(hidden|password|checkbox|radio|file|submit|image|reset|button)$/
+          .test(inputType(this.getAttribute("type")))) return null;
+        const match = this.getRootNode().getElementById?.(id);
+        return match?.localName === "datalist" ? match : null;
+      },
+    },
     /* Reflects the value attribute; a control the user or script has not
        edited shows it at once. */
     defaultValue: {
@@ -2849,23 +2996,45 @@
       configurable: true,
       enumerable: true,
       get() {
-        return defaultCheckedOf(this);
+        return this.hasAttribute("checked");
       },
       set(value) {
-        value = !!value;
-        /* Before checkedness is dirty it follows the default. */
-        if (controlStateHas(checkedDefaultState, this))
-          controlStateSet(checkedDefaultState, this, value);
-        else this.toggleAttribute("checked", value);
+        this.toggleAttribute("checked", !!value);
       },
     },
   });
-  __tilefinchRealmGlobal.ValidityState = class ValidityState {
-    constructor(fields) {
-      Object.assign(this, fields);
+  const validityToken = {}, validityObjects = new WeakMap();
+  let validityOwner;
+  class ValidityState {
+    #control;
+    constructor(token, control) {
+      if (token !== validityToken) throw new TypeError("Illegal constructor");
+      this.#control = control;
     }
+    static {
+      validityOwner = (state) => state.#control;
+    }
+  }
+  __tilefinchRealmGlobal.ValidityState = ValidityState;
+  for (const key of ["valueMissing", "typeMismatch", "patternMismatch",
+    "tooLong", "tooShort", "rangeUnderflow", "rangeOverflow", "stepMismatch",
+    "badInput", "customError", "valid"]) {
+    Object.defineProperty(ValidityState.prototype, key, {
+      configurable: true, enumerable: true,
+      get() { return controlValidity(validityOwner(this), key)[key]; },
+    });
+  }
+  const liveValidity = function validity() {
+    let value = trustedWeakMapGet(validityObjects, this);
+    if (!value) {
+      value = new ValidityState(validityToken, this);
+      trustedWeakMapSet(validityObjects, this, value);
+    }
+    return value;
   };
-  const reflectedInteger = (name, fallback) => ({
+  const htmlEmailPattern =
+      /^[a-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/i,
+    reflectedInteger = (name, fallback) => ({
       configurable: true,
       get() {
         const value = this.getAttribute(name);
@@ -2880,51 +3049,53 @@
       const type = String(control.type || "text").toLowerCase();
       return !["hidden", "button", "reset", "submit", "image"].includes(type);
     },
-    controlValidity = (control) => {
+    /* One ValidityState flag computes only its own check (`only`); valid
+       and the form methods compute them all. */
+    controlValidity = (control, only = "valid") => {
       const value = String(control.value || ""),
         type = String(control.type || "text").toLowerCase(),
-        required = control.required;
+        all = only === "valid",
+        required = (all || only === "valueMissing") && control.required;
       let valueMissing = false;
-      if (required) {
-        if (type === "checkbox") valueMissing = !control.checked;
-        else if (type === "radio") {
-          const form = control.closest("form"),
-            name = control.name,
-            peers = document.querySelectorAll("input");
-          let groupChecked = false;
-          for (let index = 0; index < peers.length; index++) {
-            const item = peers[index];
-            if (
-              item instanceof HTMLInputElement &&
-              String(item.type).toLowerCase() === "radio" &&
-              item.name === name &&
-              item.closest("form") === form &&
-              item.checked
-            ) {
-              groupChecked = true;
-              break;
-            }
+      if (!all && only !== "valueMissing") {
+      } else if (type === "radio") {
+        if (!isChecked(control)) {
+          let groupRequired = required, groupChecked = false;
+          for (const item of radioPeers(control)) {
+            if (isChecked(item)) { groupChecked = true; break; }
+            if (item.required) groupRequired = true;
           }
-          valueMissing = !groupChecked;
-        } else valueMissing = value === "";
+          valueMissing = groupRequired && !groupChecked;
+        }
+      } else if (required) {
+        if (type === "checkbox") valueMissing = !control.checked;
+        else valueMissing = value === "";
       }
       let patternMismatch = false;
-      const pattern = control.getAttribute("pattern");
-      if (value && pattern !== null) {
+      const pattern = all || only === "patternMismatch" ? control.getAttribute("pattern") : null;
+      if (value && pattern !== null && textValueTypes.has(type)) {
         try {
-          patternMismatch = !new RegExp("^(?:" + pattern + ")$", "u").test(
-            value,
-          );
+          const regex = new RegExp("^(?:" + pattern + ")$", "u");
+          patternMismatch = type === "email" && control.multiple
+            ? value.split(",").some(address => !regex.test(address))
+            : !regex.test(value);
         } catch (_) {}
       }
-      const minimumLength = control.minLength,
-        maximumLength = control.maxLength,
+      const checkLength = (all || only === "tooShort" || only === "tooLong") &&
+          (control instanceof HTMLTextAreaElement || textValueTypes.has(type)) &&
+          controlStateHas(userEditedValues, control),
+        minimumLength = checkLength ? control.minLength : -1,
+        maximumLength = checkLength ? control.maxLength : -1,
         tooShort =
-          value !== "" && minimumLength >= 0 && value.length < minimumLength,
-        tooLong = maximumLength >= 0 && value.length > maximumLength;
+          checkLength && value !== "" && minimumLength >= 0 && value.length < minimumLength,
+        tooLong = checkLength && maximumLength >= 0 && value.length > maximumLength;
       let typeMismatch = false;
-      if (value && type === "email")
-        typeMismatch = !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(value);
+      if (!all && only !== "typeMismatch") {
+      } else if (value && type === "email") {
+        typeMismatch = control.multiple
+          ? value.split(",").some(address => !htmlEmailPattern.test(address))
+          : !htmlEmailPattern.test(value);
+      }
       else if (value && type === "url") {
         try {
           new URL(value);
@@ -2932,36 +3103,35 @@
           typeMismatch = true;
         }
       }
-      const numeric = Number(value),
-        minimum = Number(control.getAttribute("min")),
-        maximum = Number(control.getAttribute("max")),
-        hasMinimum =
-          control.getAttribute("min") !== null && Number.isFinite(minimum),
-        hasMaximum =
-          control.getAttribute("max") !== null && Number.isFinite(maximum),
-        rangeUnderflow =
-          value !== "" &&
-          Number.isFinite(numeric) &&
-          hasMinimum &&
-          numeric < minimum,
-        rangeOverflow =
-          value !== "" &&
-          Number.isFinite(numeric) &&
-          hasMaximum &&
-          numeric > maximum;
+      const numeric = value && numberValueTypes.has(type) && (all ||
+          only === "rangeUnderflow" || only === "rangeOverflow" || only === "stepMismatch")
+          ? constraintNumber(type, value) : NaN,
+        bounded = Number.isFinite(numeric),
+        minimum = bounded ? constraintNumber(type, control.getAttribute("min")) : NaN,
+        maximum = bounded ? constraintNumber(type, control.getAttribute("max")) : NaN,
+        hasMinimum = Number.isFinite(minimum),
+        hasMaximum = Number.isFinite(maximum),
+        periodic = type === "time" && hasMinimum && hasMaximum && maximum < minimum,
+        periodicGap = periodic && numeric > maximum && numeric < minimum,
+        rangeUnderflow = periodic ? periodicGap : hasMinimum && numeric < minimum,
+        rangeOverflow = periodic ? periodicGap : hasMaximum && numeric > maximum;
       let stepMismatch = false;
-      const step = Number(control.getAttribute("step"));
+      const stepUnit = type === "date" ? 86400000 : type === "week" ? 604800000
+        : type === "time" || type === "datetime-local" ? 1000 : 1,
+        rawStep = bounded ? control.getAttribute("step") : null,
+        parsedStep = inputNumber(rawStep),
+        defaultStep = type === "time" || type === "datetime-local" ? 60 : 1,
+        step = !bounded || rawStep?.toLowerCase() === "any" ? NaN
+          : (parsedStep > 0 ? parsedStep : defaultStep) * stepUnit;
       if (
         value !== "" &&
         Number.isFinite(numeric) &&
         Number.isFinite(step) &&
         step > 0
       ) {
-        const valueAttribute = Number(control.getAttribute("value")),
-          hasValueBase =
-            control.getAttribute("value") !== null &&
-            Number.isFinite(valueAttribute),
-          base = hasMinimum ? minimum : hasValueBase ? valueAttribute : 0;
+        const valueAttribute = constraintNumber(type, control.getAttribute("value")),
+          base = hasMinimum ? minimum : Number.isFinite(valueAttribute) ? valueAttribute
+            : type === "week" ? -259200000 : 0;
         stepMismatch =
           Math.abs(
             (numeric - base) / step - Math.round((numeric - base) / step),
@@ -2981,7 +3151,7 @@
           customError ||
           badInput
         );
-      return new ValidityState({
+      return {
         valueMissing,
         typeMismatch,
         patternMismatch,
@@ -2993,7 +3163,7 @@
         badInput,
         customError,
         valid,
-      });
+      };
     },
     validationDescriptors = {
       form: {
@@ -3050,9 +3220,7 @@
       },
       validity: {
         configurable: true,
-        get() {
-          return controlValidity(this);
-        },
+        get: liveValidity,
       },
       validationMessage: {
         configurable: true,
@@ -3090,7 +3258,7 @@
       this.__customValidity = String(message);
     };
     prototype.checkValidity = function checkValidity() {
-      if (!this.willValidate || this.validity.valid) return true;
+      if (!this.willValidate || controlValidity(this).valid) return true;
       browserDispatch(this,
         trustedEvent(newEvent("invalid", { cancelable: true })));
       return false;
@@ -3100,9 +3268,7 @@
   Object.defineProperties(HTMLFieldSetElement.prototype, {
     validity: {
       configurable: true,
-      get() {
-        return controlValidity(this);
-      },
+      get: liveValidity,
     },
     validationMessage: validationDescriptors.validationMessage,
     willValidate: {
@@ -3258,33 +3424,39 @@
       get() {
         const type = __tilefinchControlType(this);
         if (!numberValueTypes.has(type) || this.value === "") return NaN;
-        const number = Number(this.value);
-        return Number.isFinite(number) ? number : NaN;
+        return constraintNumber(type, this.value);
       },
       set(value) {
         const number = Number(value);
-        if (!Number.isFinite(number))
+        if (!Number.isFinite(number) && !Number.isNaN(number))
           throw new TypeError("valueAsNumber requires a finite number");
-        if (!numberValueTypes.has(__tilefinchControlType(this)))
+        const type = __tilefinchControlType(this);
+        if (!numberValueTypes.has(type))
           throw new DOMException(
             "valueAsNumber does not apply to this input type",
             "InvalidStateError",
           );
-        this.value = String(number);
+        if (Number.isNaN(number)) this.value = "";
+        else if (dateValuePatterns[type])
+          this.value = formCollections().dateInputString(type, number);
+        else this.value = String(number);
       },
     },
     valueAsDate: {
       configurable: true,
       get() {
-        if (!dateValueTypes.has(__tilefinchControlType(this)) || !this.value)
+        const type = __tilefinchControlType(this);
+        if (!dateValueTypes.has(type) || !this.value)
           return null;
-        const date = new Date(this.value);
+        const n = constraintNumber(type, this.value);
+        const date = formCollections().calendarDate(type, n);
         return Number.isFinite(date.getTime()) ? date : null;
       },
       set(value) {
         if (value !== null && !(value instanceof Date))
           throw new TypeError("valueAsDate requires a Date or null");
-        if (!dateValueTypes.has(__tilefinchControlType(this)))
+        const type = __tilefinchControlType(this);
+        if (!dateValueTypes.has(type))
           throw new DOMException(
             "valueAsDate does not apply to this input type",
             "InvalidStateError",
@@ -3293,86 +3465,15 @@
           this.value = "";
           return;
         }
-        const iso = value.toISOString();
-        this.value =
-          __tilefinchControlType(this) === "time"
-            ? iso.slice(11, 19)
-            : __tilefinchControlType(this) === "month"
-              ? iso.slice(0, 7)
-              : __tilefinchControlType(this) === "week"
-                ? ""
-                : iso.slice(0, 10);
+        this.value = formCollections().dateInputString(type,
+          type === "month" ? (value.getUTCFullYear() - 1970) * 12 + value.getUTCMonth()
+            : type === "time" ? ((value.getTime() % 86400000) + 86400000) % 86400000
+            : value.getTime());
       },
     },
   });
-  const decimalPlaces = (value) => {
-    const text = String(value).toLowerCase(),
-      exponentAt = text.indexOf("e"),
-      exponent =
-        exponentAt < 0 ? 0 : Number.parseInt(text.slice(exponentAt + 1), 10),
-      mantissa = exponentAt < 0 ? text : text.slice(0, exponentAt),
-      point = mantissa.indexOf("."),
-      fraction = point < 0 ? 0 : mantissa.length - point - 1;
-    return Math.min(9, Math.max(0, fraction - (exponent || 0)));
-  };
-  const stepInput = (input, count) => {
-    const type = __tilefinchControlType(input);
-    if (type !== "number" && type !== "range")
-      throw new DOMException(
-        "Stepping does not apply to this input type",
-        "InvalidStateError",
-      );
-    const stepAttribute = input.getAttribute("step");
-    if (String(stepAttribute).toLowerCase() === "any")
-      throw new DOMException(
-        "Stepping is unavailable when step is any",
-        "InvalidStateError",
-      );
-    const parsedStep = Number(stepAttribute),
-      step =
-        stepAttribute !== null && Number.isFinite(parsedStep) && parsedStep > 0
-          ? parsedStep
-          : 1,
-      parsedMin = Number(input.getAttribute("min")),
-      parsedMax = Number(input.getAttribute("max")),
-      hasMin =
-        input.getAttribute("min") !== null && Number.isFinite(parsedMin),
-      hasMax =
-        input.getAttribute("max") !== null && Number.isFinite(parsedMax),
-      valueAttribute = Number(input.getAttribute("value")),
-      hasValueBase =
-        input.getAttribute("value") !== null &&
-        Number.isFinite(valueAttribute),
-      base = hasMin ? parsedMin : hasValueBase ? valueAttribute : 0;
-    count = Math.trunc(Number(count) || 0);
-    let value = Number(input.value);
-    if (!Number.isFinite(value)) value = hasMin ? parsedMin : base;
-    const precision = Math.max(
-        decimalPlaces(step),
-        decimalPlaces(base),
-        decimalPlaces(value),
-        hasMin ? decimalPlaces(parsedMin) : 0,
-        hasMax ? decimalPlaces(parsedMax) : 0,
-      ),
-      scale = 10 ** precision,
-      stepUnits = Math.max(1, Math.round(step * scale)),
-      baseUnits = Math.round(base * scale);
-    let valueUnits = Math.round(value * scale),
-      remainder = (valueUnits - baseUnits) % stepUnits;
-    if (remainder < 0) remainder += stepUnits;
-    if (count > 0 && remainder !== 0) {
-      valueUnits += stepUnits - remainder;
-      count--;
-    } else if (count < 0 && remainder !== 0) {
-      valueUnits -= remainder;
-      count++;
-    }
-    valueUnits += count * stepUnits;
-    value = valueUnits / scale;
-    if (hasMin && value < parsedMin) value = parsedMin;
-    if (hasMax && value > parsedMax) value = parsedMax;
-    input.value = String(value);
-  };
+  const stepInput = (input, count) =>
+    formCollections().stepInput(input, __tilefinchControlType(input), count, inputNumber);
   HTMLInputElement.prototype.stepUp = function stepUp(count = 1) {
     stepInput(this, count);
   };
@@ -3410,7 +3511,7 @@
   };
   HTMLFormElement.prototype.reportValidity =
     HTMLFormElement.prototype.checkValidity;
-  const resetForm = (form, deferCustomCallbacks = false) => {
+  const performFormReset = (form, deferCustomCallbacks) => {
     const event = trustedEvent(
       newEvent("reset", { bubbles: true, cancelable: true }),
     );
@@ -3427,8 +3528,10 @@
         const options = selectOptions(control);
         for (const option of options)
           markOptionSelected(option, option.hasAttribute("selected"));
-        if (!control.multiple && !selectedOptionSet(control).length
-            && options.length) markOptionSelected(options[0], true);
+        if (!control.multiple && !selectedOptionSet(control).length) {
+          const fallback = defaultSelectedOption(control, options);
+          if (fallback) markOptionSelected(fallback, true);
+        }
         syncSelectedContent(control);
       } else if (control instanceof HTMLOutputElement) {
         control.value = control.defaultValue;
@@ -3457,6 +3560,16 @@
     else invokeCustomCallbacks();
     return true;
   };
+  const activeFormResets = new WeakSet();
+  const resetForm = (form, deferCustomCallbacks = false) => {
+    if (trustedWeakSetHas(activeFormResets, form)) return false;
+    trustedWeakSetAdd(activeFormResets, form);
+    try {
+      return performFormReset(form, deferCustomCallbacks);
+    } finally {
+      trustedWeakSetDelete(activeFormResets, form);
+    }
+  };
   HTMLFormElement.prototype.reset = function reset() {
     resetForm(this);
   };
@@ -3476,23 +3589,67 @@
     "formNoValidate",
     reflectBoolean("formNoValidate"),
   );
-  const constructingFormData = new WeakSet();
-  __tilefinchRealmGlobal.FormData = class FormData {
+  const constructingFormData = new WeakSet(),
+    nativeFormDirection = __tilefinchRealmGlobal.__tilefinchFormDirection,
+    directionInputTypes = new Set([
+      ...textValueTypes, "hidden", "submit", "reset", "button",
+    ]),
+    formDirection = (control, value) => {
+      for (let node = control, steps = 0; node && steps < ancestorLimit; steps++) {
+        const dir = node.dir;
+        if (dir === "rtl" || dir === "ltr") return dir;
+        if (dir === "auto" || node.localName === "bdi") {
+          const rtl = node === control
+            ? nativeFormDirection(0, value) : nativeFormDirection(node.__handle);
+          return rtl ? "rtl" : "ltr";
+        }
+        if (node instanceof HTMLInputElement && node.type === "tel")
+          return "ltr";
+        node = node.parentElement ?? node.parentNode?.host;
+      }
+      return "ltr";
+    };
+  delete __tilefinchRealmGlobal.__tilefinchFormDirection;
+  const FormData = __tilefinchRealmGlobal.FormData = class FormData {
+    #items = [];
     constructor(form, submitter) {
-      this.items = [];
       if (form !== undefined) {
         if (!(form instanceof HTMLFormElement))
           throw new TypeError("FormData constructor argument must be a form");
-        for (const control of formControls(form)) {
+        const imageSubmitter = domShared.validateFormSubmitter(form, submitter) === "image"
+          ? submitter : null;
+        if (constructingFormData.has(form))
+          throw new DOMException(
+            "The form's entry list is being constructed", "InvalidStateError");
+        constructingFormData.add(form);
+        try {
+          this.#collectForm(form, submitter, imageSubmitter);
+          /* Event listeners can edit the entry list before it is returned.
+             The event object retains a separate FormData after dispatch. */
+          const entries = new FormData();
+          entries.#items = this.#items;
+          browserDispatch(form, trustedEvent(newEvent("formdata", {
+            bubbles: true, formData: entries,
+          }, "FormDataEvent")));
+          this.#items = entries.#items.map(([name, value]) => [name, value]);
+        } finally {
+          constructingFormData.delete(form);
+        }
+      }
+    }
+    #collectForm(form, submitter, imageSubmitter) {
+        for (const control of formControls(form, imageSubmitter)) {
           const name = String(
             control.name || control.getAttribute?.("name") || "",
           );
-          if (
-            !name ||
-            control.disabled ||
-            control.hasAttribute?.("disabled")
-          )
+          if (control.disabled || control.hasAttribute?.("disabled")) continue;
+          if (control === imageSubmitter) {
+            const prefix = name ? name + "." : "";
+            this.append(prefix + "x", "0");
+            this.append(prefix + "y", "0");
             continue;
+          }
+          if (!name) continue;
           const internals =
             __tilefinchRealmGlobal.__tilefinchElementInternalsFor?.(control);
           if (internals) {
@@ -3506,7 +3663,7 @@
           const tag = String(control.tagName || "").toLowerCase(),
             type = String(control.type || "").toLowerCase();
           if (control === submitter && type !== "image") {
-            this.append(name, control.value);
+            this.#appendControl(name, control, tag, type);
             continue;
           }
           if (
@@ -3517,121 +3674,116 @@
             type === "submit" ||
             type === "button" ||
             type === "reset" ||
-            type === "image" ||
-            type === "file"
+            type === "image"
           )
             continue;
           if ((type === "checkbox" || type === "radio") && !control.checked)
             continue;
           if (tag === "select") {
             /* One selection read for the whole select, not one per option. */
-            const selection = selectionOf(control),
-              hasExplicit = selection.selected.length !== 0,
-              selected = selection.selected.filter(
-                (option) => !option.disabled,
-              );
-            if (!selected.length && !hasExplicit) {
-              const fallback = selection.options.find(
-                (option) => !option.disabled,
-              );
-              if (fallback) selected.push(fallback);
-            }
-            for (const option of selected)
-              this.append(
-                name,
-                option.hasAttribute("value")
-                  ? option.value
-                  : option.textContent,
-              );
+            for (const option of selectionOf(control).selected)
+              if (!optionDisabledForSelection(option))
+                this.append(name, option.value);
             continue;
           }
-          this.append(name, control.value);
+          if (type === "file") {
+            const files = control.files;
+            if (files?.length) {
+              for (const file of files) this.append(name, file);
+            } else this.append(name, new TilefinchFile([], "", {
+              type: "application/octet-stream",
+            }));
+            continue;
+          }
+          this.#appendControl(name, control, tag, type);
         }
-        /* The entry list is final only after `formdata` listeners have run
-           (HTML "constructing the entry list"): chatgpt.com adds its
-           session-observer token there. Re-entrant construction for the
-           same form is refused, as in browsers. */
-        if (constructingFormData.has(form))
-          throw new DOMException(
-            "The form's entry list is being constructed",
-            "InvalidStateError",
-          );
-        constructingFormData.add(form);
-        try {
-          const event = newEvent("formdata", { bubbles: true });
-          Object.defineProperty(event, "formData", {
-            configurable: true,
-            enumerable: true,
-            value: this,
-          });
-          browserDispatch(form, trustedEvent(event));
-        } finally {
-          constructingFormData.delete(form);
-        }
+    }
+    #appendControl(name, control, tag, type) {
+      const value = control.value;
+      this.append(name, value);
+      const dirname = control.getAttribute("dirname");
+      if (dirname && (tag === "textarea" ||
+          (tag === "input" && directionInputTypes.has(type))))
+        this.append(dirname, formDirection(control, value));
+    }
+    #entryValue(value, filename, named) {
+      const blob = trustedWeakMapGet(blobStates, value),
+        file = blob && trustedWeakMapGet(fileStates, value);
+      if (!blob) {
+        if (named) throw new TypeError("A filename requires a Blob");
+        return trustedStringToWellFormed(trustedWebIDLString(value));
       }
+      /* An explicit undefined filename is an omitted one (Web IDL). */
+      named &&= filename !== undefined;
+      if (file && !named) return value;
+      return new TilefinchFile([value],
+        named ? trustedStringToWellFormed(trustedWebIDLString(filename)) : "blob",
+        { type: blob.type, lastModified: file?.lastModified });
+    }
+    #append(name, value) {
+      if (this.#items.length >= 256)
+        throw new RangeError("FormData entry limit exceeded");
+      this.#items.push([name, value]);
     }
     append(name, value, filename) {
-      if (this.items.length >= 256)
-        throw new RangeError("FormData entry limit exceeded");
-      if (value instanceof Blob && (!(value instanceof File) || filename !== undefined))
-        value = new File([value], filename === undefined ? "blob" : String(filename), {
-          type: value.type,
-          lastModified: value instanceof File ? value.lastModified : Date.now(),
-        });
-      this.items.push([
-        String(name),
-        value instanceof Blob ? value : String(value),
-      ]);
+      if (arguments.length < 2) throw new TypeError("FormData.append requires two arguments");
+      this.#append(trustedStringToWellFormed(trustedWebIDLString(name)),
+        this.#entryValue(value, filename, arguments.length > 2));
     }
     delete(name) {
-      name = String(name);
-      this.items = this.items.filter((pair) => pair[0] !== name);
+      name = trustedStringToWellFormed(trustedWebIDLString(name));
+      this.#items = this.#items.filter((pair) => pair[0] !== name);
     }
     get(name) {
-      name = String(name);
-      const pair = this.items.find((item) => item[0] === name);
+      name = trustedStringToWellFormed(trustedWebIDLString(name));
+      const pair = this.#items.find((item) => item[0] === name);
       return pair ? pair[1] : null;
     }
     getAll(name) {
-      name = String(name);
-      return this.items
+      name = trustedStringToWellFormed(trustedWebIDLString(name));
+      return this.#items
         .filter((item) => item[0] === name)
         .map((item) => item[1]);
     }
     has(name) {
-      name = String(name);
-      return this.items.some((item) => item[0] === name);
+      name = trustedStringToWellFormed(trustedWebIDLString(name));
+      return this.#items.some((item) => item[0] === name);
     }
     set(name, value, filename) {
-      name = String(name);
-      if (value instanceof Blob && (!(value instanceof File) || filename !== undefined))
-        value = new File([value], filename === undefined ? "blob" : String(filename), {
-          type: value.type,
-          lastModified: value instanceof File ? value.lastModified : Date.now(),
-        });
-      else value = value instanceof Blob ? value : String(value);
+      if (arguments.length < 2) throw new TypeError("FormData.set requires two arguments");
+      name = trustedStringToWellFormed(trustedWebIDLString(name));
+      value = this.#entryValue(value, filename, arguments.length > 2);
       let found = false;
-      this.items = this.items.filter((pair) => {
-        if (pair[0] !== name) return true;
-        if (found) return false;
-        pair[1] = value;
-        found = true;
-        return true;
-      });
-      if (!found) this.append(name, value);
+      const next = [];
+      for (const pair of this.#items) {
+        if (pair[0] !== name) next.push(pair);
+        else if (!found) {
+          next.push([name, value]);
+          found = true;
+        }
+      }
+      if (found) this.#items = next;
+      else this.#append(name, value);
     }
-    entries() {
-      return this.items[Symbol.iterator]();
+    *entries() {
+      for (let index = 0; index < this.#items.length; index++) {
+        const pair = this.#items[index];
+        yield [pair[0], pair[1]];
+      }
     }
-    keys() {
-      return this.items.map((pair) => pair[0])[Symbol.iterator]();
+    *keys() {
+      for (let index = 0; index < this.#items.length; index++)
+        yield this.#items[index][0];
     }
-    values() {
-      return this.items.map((pair) => pair[1])[Symbol.iterator]();
+    *values() {
+      for (let index = 0; index < this.#items.length; index++)
+        yield this.#items[index][1];
     }
     forEach(callback, thisArg) {
-      for (const [name, value] of this.items)
+      for (let index = 0; index < this.#items.length; index++) {
+        const [name, value] = this.#items[index];
         callback.call(thisArg, value, name, this);
+      }
     }
     [Symbol.iterator]() {
       return this.entries();
@@ -3650,10 +3802,8 @@
       return null;
     const data = new FormData(form, submitter);
     const params = new URLSearchParams();
-    for (const [key, value] of data) {
-      if (value instanceof Blob) return null;
-      params.append(key, value);
-    }
+    for (const [key, value] of data)
+      params.append(key, trustedWeakMapGet(fileStates, value)?.name ?? value);
     return params.toString();
   };
   __tilefinchRealmGlobal.__tilefinchQueueFormSubmission = (form, submitter) => {
@@ -3693,15 +3843,8 @@
       return false;
     }
     const query = new URLSearchParams();
-    for (const [name, value] of new FormData(form)) {
-      if (value instanceof Blob) continue;
-      query.append(name, value);
-    }
-    const submitterName = String(
-      submitter?.name || submitter?.getAttribute?.("name") || "",
-    );
-    if (submitterName && !submitter.disabled)
-      query.append(submitterName, String(submitter.value || ""));
+    for (const [name, value] of new FormData(form, submitter))
+      query.append(name, trustedWeakMapGet(fileStates, value)?.name ?? value);
     const serialized = query.toString();
     frame.src =
       url._origin +
@@ -3786,7 +3929,7 @@
     : new TypeError(message);
   const workerCloneConstructorNames = Object.freeze([
       "Object", "Array", "ArrayBuffer", "DataView", "Date", "RegExp", "Promise",
-      "Blob", "File", "MessagePort",
+      "Blob", "File", "MessagePort", "DOMException",
       "Map", "Set", "Error", "EvalError", "RangeError", "ReferenceError",
       "SyntaxError", "TypeError", "URIError", "Boolean", "Number", "String",
       "Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array",
@@ -3992,6 +4135,11 @@
       }
       return copy;
     }
+    const exception = domShared.readDOMException?.(value);
+    if (exception) {
+      const Exception = intrinsics.DOMException || DOMException;
+      return remember(new Exception(exception.message, exception.name));
+    }
     const prototypeKind = ordinaryClonePrototypeKind(
       trustedObjectPrototype(value),
     );
@@ -4000,11 +4148,16 @@
     if (prototypeKind === 1 && trustedObjectTag(value) === "[object Error]") {
       const ErrorType = cloneErrorTypes(intrinsics)[trustedString(value.name)]
         || intrinsics.Error;
-      const copy = new ErrorType(trustedString(value.message));
+      const copy = remember(new ErrorType(trustedString(value.message)));
       try {
         if (typeof value.stack === "string") copy.stack = value.stack;
       } catch (_) {}
-      return remember(copy);
+      const cause = trustedObjectDescriptor(value, "cause");
+      if (cause && trustedObjectDescriptor(cause, "value"))
+        trustedDefineProperty(copy, "cause", {
+          configurable: true, writable: true, value: clone(cause.value),
+        });
+      return copy;
     }
     if (prototypeKind !== 0) {
       const copy = remember(new intrinsics.Object());
@@ -4714,20 +4867,7 @@
             },
           },
         });
-        /* As in browsers, these are EventTarget's methods read when called,
-           so a page's patch of them (zone.js) still sees the call; the
-           prototype itself and the call are taken before author code. */
         Object.assign(proto, {
-          addEventListener(type, callback, options = false) {
-            return trustedFunctionApply(
-              trustedEventTargetPrototype.addEventListener,
-              this, [type, callback, options]);
-          },
-          removeEventListener(type, callback, options = false) {
-            return trustedFunctionApply(
-              trustedEventTargetPrototype.removeEventListener,
-              this, [type, callback, options]);
-          },
           dispatchEvent(event) {
             const path = boundedAncestorPath(
               this,
@@ -5604,18 +5744,13 @@
     document.execCommand = (command) => {
       command = String(command).toLowerCase();
       if (command !== "copy" && command !== "cut") return false;
-      const control = __tilefinchRealmGlobal.__tilefinchSelectedControl;
-      if (!control || control.selectionStart === null) return false;
-      write(
-        String(control.value).slice(
-          control.selectionStart,
-          control.selectionEnd,
-        ),
-      );
-      if (command === "cut")
-        control.value =
-          String(control.value).slice(0, control.selectionStart) +
-          String(control.value).slice(control.selectionEnd);
+      const control = __tilefinchRealmGlobal.__tilefinchSelectedControl,
+        start = control?.selectionStart ?? control?.__selectionStart,
+        end = control?.selectionEnd ?? control?.__selectionEnd;
+      if (start == null || end == null) return false;
+      const value = String(control.value);
+      write(value.slice(start, end));
+      if (command === "cut") control.value = value.slice(0, start) + value.slice(end);
       return true;
     };
     const queryCommandSupported = (command) =>
@@ -5802,442 +5937,32 @@
     },
   });
   document.hasFocus = { hasFocus: () => true }.hasFocus;
-  const nodeExtent = (node) =>
-    node?.nodeType === Node.TEXT_NODE || node?.nodeType === Node.COMMENT_NODE
-      ? node.data.length
-      : node?.childNodes?.length || 0;
-  const boundedOffset = (node, value) => {
-    value = Number(value);
-    if (
-      !node ||
-      !Number.isInteger(value) ||
-      value < 0 ||
-      value > nodeExtent(node)
-    )
-      throw new DOMException("Invalid range offset", "IndexSizeError");
-    return value;
+  let selectionBackward = false;
+  const setSelection = (range, backward = false) => {
+    selection._range = range;
+    selectionBackward = backward;
+    selectionChanged();
   };
-  const ancestor = (left, right) => {
-    const seen = new Set();
-    for (
-      let at = left, steps = 0;
-      at && steps < ancestorLimit;
-      at = at.parentNode, steps++
-    )
-      seen.add(at);
-    for (
-      let at = right, steps = 0;
-      at && steps < ancestorLimit;
-      at = at.parentNode, steps++
-    )
-      if (seen.has(at)) return at;
-    return document;
-  };
-  /* Whether boundary point (node, offset) is after (other, otherOffset), or
-     in another tree (a range across trees collapses as if it were). */
-  const boundaryAfter = (node, offset, other, otherOffset) =>
-    node !== other &&
-      node.compareDocumentPosition(other) & Node.DOCUMENT_POSITION_DISCONNECTED
-      ? true
-      : compareBoundaryPoints(node, offset, other, otherOffset) > 0;
-  const isTextNode = (node) =>
-    node?.nodeType === Node.TEXT_NODE ||
-    node?.nodeType === Node.CDATA_SECTION_NODE;
-  /* The next node in tree order after `node` and its descendants. */
-  const followingNode = (node) => {
-    for (let at = node, steps = 0; at && steps < ancestorLimit; steps++) {
-      if (at.nextSibling) return at.nextSibling;
-      at = at.parentNode;
-    }
-    return null;
-  };
-  /* DOM's boundary-point comparison: -1 before, 0 equal, 1 after. */
-  const compareBoundaryPoints = (node, offset, otherNode, otherOffset) => {
-    if (node === otherNode)
-      return offset === otherOffset ? 0 : offset < otherOffset ? -1 : 1;
-    const position = node.compareDocumentPosition(otherNode);
-    if (position & Node.DOCUMENT_POSITION_PRECEDING)
-      return -compareBoundaryPoints(otherNode, otherOffset, node, offset);
-    if (position & Node.DOCUMENT_POSITION_CONTAINED_BY) {
-      let child = otherNode;
-      for (let steps = 0; child && child.parentNode !== node &&
-           steps < ancestorLimit; steps++)
-        child = child.parentNode;
-      const index = Array.prototype.indexOf.call(node.childNodes, child);
-      return index < offset ? 1 : -1;
-    }
-    return -1;
-  };
-  /* The DOM standard's "extract" and "clone the contents" of a range.
-     Partially contained ancestors are cloned shallowly and filled from a
-     subrange; contained children are moved (or deep-cloned). chatgpt.com's
-     streaming renderer extracts ranges that start and end in different
-     elements to commit an answer's final text. */
-  const isCharacterDataNode = (node) =>
-      node?.nodeType === Node.TEXT_NODE ||
-      node?.nodeType === Node.CDATA_SECTION_NODE ||
-      node?.nodeType === Node.COMMENT_NODE ||
-      node?.nodeType === Node.PROCESSING_INSTRUCTION_NODE,
-    rangeNodeLength = (node) =>
-      isCharacterDataNode(node) ? node.data.length : node.childNodes.length,
-    inclusiveAncestor = (ancestorNode, node) =>
-      ancestorNode === node || !!ancestorNode?.contains?.(node),
-    rangeContents = (range, extract, depth) => {
-      if (depth > ancestorLimit)
-        throw new DOMException("Range is too deeply nested",
-                               "NotSupportedError");
-      const start = range.startContainer, startOffset = range.startOffset,
-        end = range.endContainer, endOffset = range.endOffset,
-        owner = start.ownerDocument || document,
-        fragment = owner.createDocumentFragment();
-      if (range.collapsed) return fragment;
-      if (start === end && isCharacterDataNode(start)) {
-        const clone = start.cloneNode(false);
-        clone.data = start.data.substring(startOffset, endOffset);
-        fragment.appendChild(clone);
-        if (extract) start.deleteData(startOffset, endOffset - startOffset);
-        return fragment;
-      }
-      let common = start;
-      for (let steps = 0; !inclusiveAncestor(common, end); steps++) {
-        if (!common.parentNode || steps > ancestorLimit)
-          throw new DOMException("Range has no common ancestor",
-                                 "NotSupportedError");
-        common = common.parentNode;
-      }
-      const children = [...common.childNodes];
-      const firstPartial = inclusiveAncestor(start, end) ? null
-        : children.find((child) => inclusiveAncestor(child, start)) || null;
-      const lastPartial = inclusiveAncestor(end, start) ? null
-        : children.find((child) => inclusiveAncestor(child, end)) || null;
-      const contained = children.filter((child, index) =>
-        compareBoundaryPoints(common, index, start, startOffset) >= 0 &&
-        compareBoundaryPoints(common, index + 1, end, endOffset) <= 0 &&
-        child !== firstPartial && child !== lastPartial);
-      if (contained.some((child) => child.nodeType === Node.DOCUMENT_TYPE_NODE))
-        throw new DOMException("Range contains a doctype",
-                               "HierarchyRequestError");
-      let newNode = start, newOffset = startOffset;
-      if (extract && !inclusiveAncestor(start, end)) {
-        let reference = start;
-        for (let steps = 0; reference.parentNode &&
-             !inclusiveAncestor(reference.parentNode, end) &&
-             steps < ancestorLimit; steps++)
-          reference = reference.parentNode;
-        newNode = reference.parentNode;
-        newOffset = Array.prototype.indexOf.call(newNode.childNodes,
-                                                 reference) + 1;
-      }
-      const partial = (child, fromStart) => {
-        if (isCharacterDataNode(child)) {
-          const clone = child.cloneNode(false);
-          if (fromStart) {
-            clone.data = start.data.substring(startOffset);
-            if (extract)
-              start.deleteData(startOffset, start.data.length - startOffset);
-          } else {
-            clone.data = end.data.substring(0, endOffset);
-            if (extract) end.deleteData(0, endOffset);
-          }
-          fragment.appendChild(clone);
-          return;
-        }
-        const clone = child.cloneNode(false), sub = new Range();
-        fragment.appendChild(clone);
-        if (fromStart) {
-          sub.setStart(start, startOffset);
-          sub.setEnd(child, rangeNodeLength(child));
-        } else {
-          sub.setStart(child, 0);
-          sub.setEnd(end, endOffset);
-        }
-        clone.appendChild(rangeContents(sub, extract, depth + 1));
-      };
-      if (firstPartial) partial(firstPartial, true);
-      for (const child of contained)
-        fragment.appendChild(extract ? child : child.cloneNode(true));
-      if (lastPartial) partial(lastPartial, false);
-      if (extract) {
-        range.setStart(newNode, newOffset);
-        range.setEnd(newNode, newOffset);
-      }
-      return fragment;
-    };
-  __tilefinchRealmGlobal.Range = class Range {
-    constructor() {
-      this.startContainer = document;
-      this.startOffset = 0;
-      this.endContainer = document;
-      this.endOffset = 0;
-    }
-    get collapsed() {
-      return (
-        this.startContainer === this.endContainer &&
-        this.startOffset === this.endOffset
-      );
-    }
-    get commonAncestorContainer() {
-      return ancestor(this.startContainer, this.endContainer);
-    }
-    /* A start after the end (or in another tree) collapses the range to
-       it, and an end before the start likewise. */
-    setStart(node, offset) {
-      offset = boundedOffset(node, offset);
-      this.startContainer = node;
-      this.startOffset = offset;
-      if (boundaryAfter(node, offset, this.endContainer, this.endOffset)) {
-        this.endContainer = node;
-        this.endOffset = offset;
-      }
-    }
-    setEnd(node, offset) {
-      offset = boundedOffset(node, offset);
-      this.endContainer = node;
-      this.endOffset = offset;
-      if (boundaryAfter(this.startContainer, this.startOffset, node, offset)) {
-        this.startContainer = node;
-        this.startOffset = offset;
-      }
-    }
-    setStartBefore(node) {
-      this.setStart(
-        node.parentNode,
-        Array.prototype.indexOf.call(node.parentNode.childNodes, node),
-      );
-    }
-    setStartAfter(node) {
-      this.setStart(
-        node.parentNode,
-        Array.prototype.indexOf.call(node.parentNode.childNodes, node) + 1,
-      );
-    }
-    setEndBefore(node) {
-      this.setEnd(
-        node.parentNode,
-        Array.prototype.indexOf.call(node.parentNode.childNodes, node),
-      );
-    }
-    setEndAfter(node) {
-      this.setEnd(
-        node.parentNode,
-        Array.prototype.indexOf.call(node.parentNode.childNodes, node) + 1,
-      );
-    }
-    collapse(toStart = false) {
-      if (toStart) {
-        this.endContainer = this.startContainer;
-        this.endOffset = this.startOffset;
-      } else {
-        this.startContainer = this.endContainer;
-        this.startOffset = this.endOffset;
-      }
-    }
-    selectNodeContents(node) {
-      this.startContainer = node;
-      this.startOffset = 0;
-      this.endContainer = node;
-      this.endOffset = nodeExtent(node);
-    }
-    cloneRange() {
-      const copy = new Range();
-      copy.startContainer = this.startContainer;
-      copy.startOffset = this.startOffset;
-      copy.endContainer = this.endContainer;
-      copy.endOffset = this.endOffset;
-      return copy;
-    }
-    extractContents() {
-      return rangeContents(this, true, 0);
-    }
-    deleteContents() {
-      rangeContents(this, true, 0);
-    }
-    cloneContents() {
-      return rangeContents(this, false, 0);
-    }
-    /* DOM Parsing: parse with the start node (or its parent element) as
-       the fragment parser's context, <body> for none or <html>. Unlike
-       innerHTML, the scripts stay unstarted and script-inserted, so they
-       run, under CSP, once the fragment is connected. Reddit's bundles
-       build markup this way. */
-    createContextualFragment(markup) {
-      markup = String(markup);
-      const node = this.startContainer,
-        type = node?.nodeType,
-        owner =
-          type === Node.DOCUMENT_NODE ? node : node?.ownerDocument || document;
-      let element =
-        type === Node.ELEMENT_NODE
-          ? node
-          : type === Node.TEXT_NODE ||
-              type === Node.CDATA_SECTION_NODE ||
-              type === Node.COMMENT_NODE
-            ? node.parentElement
-            : null,
-        name = String(element?.localName || "").toLowerCase();
-      if (
-        !element ||
-        (name === "html" &&
-          element.namespaceURI === "http://www.w3.org/1999/xhtml")
-      )
-        name = "body";
-      if (owner !== document) {
-        /* A script-side DOMParser/createHTMLDocument document: its own
-           bounded innerHTML copy. XML fragment parsing is not provided. */
-        if (owner.contentType !== "text/html")
-          throw new DOMException(
-            "XML fragment parsing is not supported",
-            "NotSupportedError",
-          );
-        const holder = owner.createElement(name),
-          result = owner.createDocumentFragment();
-        holder.innerHTML = markup;
-        for (const child of [...holder.childNodes]) result.appendChild(child);
-        return result;
-      }
-      const result = document.createDocumentFragment();
-      if (!__tilefinchSetInnerHTML(result.__handle, markup, name))
-        throw new DOMException(
-          "Contextual fragment exceeds bounded parsing",
-          "NotSupportedError",
-        );
-      return result;
-    }
-    selectNode(node) {
-      const parent = node?.parentNode;
-      if (!parent)
-        throw new DOMException("Node has no parent", "InvalidNodeTypeError");
-      const index = Array.prototype.indexOf.call(parent.childNodes, node);
-      this.startContainer = this.endContainer = parent;
-      this.startOffset = index;
-      this.endOffset = index + 1;
-    }
-    compareBoundaryPoints(how, source) {
-      how = Number(how);
-      if (!(source instanceof Range)) throw new TypeError("Range required");
-      if (!(how >= 0 && how <= 3 && Number.isInteger(how)))
-        throw new DOMException("Invalid comparison", "NotSupportedError");
-      const ownEnd = how === 1 || how === 2,
-        sourceEnd = how === 2 || how === 3;
-      return compareBoundaryPoints(
-        ownEnd ? this.endContainer : this.startContainer,
-        ownEnd ? this.endOffset : this.startOffset,
-        sourceEnd ? source.endContainer : source.startContainer,
-        sourceEnd ? source.endOffset : source.startOffset,
-      );
-    }
-    comparePoint(node, offset) {
-      if (node?.getRootNode?.() !== this.startContainer.getRootNode?.())
-        throw new DOMException("Node is in another tree", "WrongDocumentError");
-      offset = boundedOffset(node, offset);
-      if (compareBoundaryPoints(node, offset, this.startContainer,
-                                this.startOffset) < 0) return -1;
-      return compareBoundaryPoints(node, offset, this.endContainer,
-                                   this.endOffset) > 0 ? 1 : 0;
-    }
-    isPointInRange(node, offset) {
-      if (node?.getRootNode?.() !== this.startContainer.getRootNode?.())
-        return false;
-      return this.comparePoint(node, offset) === 0;
-    }
-    intersectsNode(node) {
-      if (!(node instanceof Node)) throw new TypeError("Node required");
-      const parent = node.parentNode;
-      if (!parent) return true;
-      const offset = Array.prototype.indexOf.call(parent.childNodes, node);
-      return (
-        compareBoundaryPoints(parent, offset, this.endContainer,
-                              this.endOffset) < 0 &&
-        compareBoundaryPoints(parent, offset + 1, this.startContainer,
-                              this.startOffset) > 0
-      );
-    }
-    insertNode(node) {
-      if (!(node instanceof Node)) throw new TypeError("Node required");
-      const container = this.startContainer,
-        offset = this.startOffset,
-        isCharacterData =
-          container?.nodeType === Node.TEXT_NODE ||
-          container?.nodeType === Node.CDATA_SECTION_NODE ||
-          container?.nodeType === Node.COMMENT_NODE ||
-          container?.nodeType === Node.PROCESSING_INSTRUCTION_NODE;
-      if (isCharacterData) {
-        const parent = container.parentNode;
-        if (!parent)
-          throw new DOMException(
-            "Range boundary has no parent",
-            "HierarchyRequestError",
-          );
-        const suffix = container.data.slice(offset);
-        container.deleteData(offset, container.data.length - offset);
-        const split = container.ownerDocument.createTextNode(suffix);
-        parent.insertBefore(split, container.nextSibling);
-        parent.insertBefore(node, split);
-      } else {
-        container.insertBefore(node, container.childNodes[offset] || null);
-      }
-    }
-    surroundContents(newParent) {
-      if (!(newParent instanceof Node)) throw new TypeError("Node required");
-      const fragment = this.extractContents();
-      this.insertNode(newParent);
-      newParent.appendChild(fragment);
-      this.selectNodeContents(newParent);
-    }
-    /* The text of the Text nodes between the boundary points, with the
-       start and end Text nodes cut at their offsets. */
-    toString() {
-      const start = this.startContainer, end = this.endContainer,
-        startOffset = this.startOffset, endOffset = this.endOffset;
-      if (start === end && isTextNode(start))
-        return start.data.substring(startOffset, endOffset);
-      let text = isTextNode(start) ? start.data.substring(startOffset) : "",
-        at = isCharacterDataNode(start)
-          ? followingNode(start)
-          : start.childNodes[startOffset] ?? followingNode(start);
-      const stop = isCharacterDataNode(end)
-        ? end
-        : end.childNodes[endOffset] ?? followingNode(end);
-      for (; at && at !== stop; at = at.firstChild || followingNode(at))
-        if (isTextNode(at)) text += at.data;
-      if (isTextNode(end) && end !== start)
-        text += end.data.substring(0, endOffset);
-      return text;
-    }
-    getBoundingClientRect() {
-      const node = this.commonAncestorContainer;
-      return node instanceof Element
-        ? node.getBoundingClientRect()
-        : node?.parentElement?.getBoundingClientRect() || new DOMRect();
-    }
-    getClientRects() {
-      return domShared.rectList(this.getBoundingClientRect());
-    }
-    detach() {}
-  };
-  ["START_TO_START", "START_TO_END", "END_TO_END", "END_TO_START"].forEach(
-    (name, value) => {
-      const constant = { value, enumerable: true };
-      Object.defineProperty(Range, name, constant);
-      Object.defineProperty(Range.prototype, name, constant);
-    },
-  );
   const selection = {
     _range: null,
     get rangeCount() {
       return this._range ? 1 : 0;
     },
     get anchorNode() {
-      return this._range?.startContainer || null;
+      return (selectionBackward ? this._range?.endContainer
+                                : this._range?.startContainer) || null;
     },
     get anchorOffset() {
-      return this._range?.startOffset || 0;
+      return (selectionBackward ? this._range?.endOffset
+                                : this._range?.startOffset) || 0;
     },
     get focusNode() {
-      return this._range?.endContainer || null;
+      return (selectionBackward ? this._range?.startContainer
+                                : this._range?.endContainer) || null;
     },
     get focusOffset() {
-      return this._range?.endOffset || 0;
+      return (selectionBackward ? this._range?.startOffset
+                                : this._range?.endOffset) || 0;
     },
     get isCollapsed() {
       return !this._range || this._range.collapsed;
@@ -6246,9 +5971,9 @@
       return this._range ? (this._range.collapsed ? "Caret" : "Range") : "None";
     },
     addRange(range) {
-      if (!(range instanceof Range)) throw new TypeError("Range required");
-      this._range = range;
-      selectionChanged();
+      if (!(range instanceof domShared.Range)) throw new TypeError("Range required");
+      if (!this._range && range.startContainer.getRootNode() === document)
+        setSelection(range);
     },
     getRangeAt(index) {
       if (Number(index) !== 0 || !this._range)
@@ -6256,43 +5981,59 @@
       return this._range;
     },
     removeAllRanges() {
-      this._range = null;
-      selectionChanged();
+      if (this._range) setSelection(null);
     },
     empty() {
       this.removeAllRanges();
     },
     collapse(node, offset = 0) {
-      const range = new Range();
+      if (node === null) return this.removeAllRanges();
+      const range = new domShared.Range();
       range.setStart(node, offset);
+      if (node.getRootNode({ composed: true }) !== document) return;
       range.collapse(true);
-      this._range = range;
-      selectionChanged();
+      setSelection(range);
     },
     setPosition(node, offset = 0) {
       this.collapse(node, offset);
     },
     selectAllChildren(node) {
-      const range = new Range();
+      const range = new domShared.Range();
       range.selectNodeContents(node);
-      this._range = range;
-      selectionChanged();
+      setSelection(range);
+    },
+    setBaseAndExtent(anchorNode, anchorOffset, focusNode, focusOffset) {
+      if (!(anchorNode instanceof Node) || !(focusNode instanceof Node) ||
+          arguments.length < 4)
+        throw new TypeError("Two selection boundary points are required");
+      const anchorRoot = anchorNode.getRootNode();
+      if (anchorRoot !== focusNode.getRootNode() ||
+          anchorNode.getRootNode({ composed: true }) !== document)
+        return;
+      anchorOffset = Number(anchorOffset) >>> 0;
+      focusOffset = Number(focusOffset) >>> 0;
+      const range = new domShared.Range();
+      range.setStart(anchorNode, anchorOffset);
+      range.setEnd(focusNode, focusOffset);
+      const backward = range.startContainer !== anchorNode ||
+        range.startOffset !== anchorOffset;
+      if (backward) range.setEnd(anchorNode, anchorOffset);
+      setSelection(range, backward);
     },
     extend(node, offset = 0) {
-      if (!this._range) this.collapse(node, offset);
-      else {
-        this._range.setEnd(node, offset);
-        selectionChanged();
-      }
+      if (!this._range)
+        throw new DOMException("No selection to extend", "InvalidStateError");
+      this.setBaseAndExtent(this.anchorNode, this.anchorOffset, node, offset);
     },
     containsNode(node, allowPartial = false) {
-      if (!this._range) return false;
-      const root = this._range.commonAncestorContainer;
-      return (
-        root === node ||
-        (root instanceof Element && root.contains(node)) ||
-        (!allowPartial && node instanceof Element && node.contains(root))
-      );
+      if (!(node instanceof Node)) throw new TypeError("Node required");
+      const range = this._range;
+      if (!range || node.getRootNode() !== range.startContainer.getRootNode())
+        return false;
+      if (allowPartial) return range.intersectsNode(node);
+      const length = node instanceof CharacterData ? node.length : node.childNodes.length;
+      return range.comparePoint(node, 0) === 0 &&
+        range.comparePoint(node, length) === 0;
     },
     toString() {
       return this._range?.toString() || "";
@@ -6304,7 +6045,7 @@
     browserDispatch(control || document, trustedEvent(
       newEvent("selectionchange", { bubbles: !!control })));
   __tilefinchRealmGlobal.__tilefinchSelectionChanged = selectionChanged;
-  const createRange = () => new Range();
+  const createRange = () => new domShared.Range();
   document.createRange = createRange;
   /* A singleton the bootstrap keeps as a plain object (the selection,
      history, performance.timing) gets its interface: a constructor that
@@ -6899,11 +6640,12 @@
     type,
     callback,
     options = false,
+    target = null,
   ) => {
     const key = trustedString(type),
       capture = listenerCapture(options),
       once = typeof options === "object" && !!options?.once,
-      passive = typeof options === "object" && !!options?.passive,
+      explicitPassive = typeof options === "object" ? options?.passive : undefined,
       signal = typeof options === "object" ? options?.signal : null;
     if (!listenerCallable(callback)) return;
     if (signal !== null && signal !== undefined) {
@@ -6946,12 +6688,17 @@
       callback,
       capture,
       once,
-      passive,
+      passive: explicitPassive === undefined
+        ? (key === "touchstart" || key === "touchmove" || key === "wheel" ||
+           key === "mousewheel") && target !== null &&
+          (target === __tilefinchRealmGlobal || target === document ||
+           target === document.documentElement || target === document.body)
+        : !!explicitPassive,
       signal,
       abort: null,
       active: true,
     };
-    if (signal && typeof signal.addEventListener === "function") {
+    if (signal) {
       item.abort = () =>
         __tilefinchRealmGlobal.__tilefinchRemoveEventListener(map, key, callback, capture);
       __tilefinchRealmGlobal.__tilefinchAddAbortAlgorithm(signal, item.abort);
@@ -7091,12 +6838,13 @@
       if (event.__immediateStopped) break;
     }
   };
-  __tilefinchRealmGlobal.__tilefinchPrepareEvent = (event, target, path) => {
+  __tilefinchRealmGlobal.__tilefinchPrepareEvent = (event, target, path, author) => {
     if (!isEvent(event)) throw new TypeError("Event required");
-    if (!event.__initialized || !trustedString(event.type))
+    if (!event.__initialized)
       throw new DOMException("Event is not initialized", "InvalidStateError");
     if (event.__dispatching)
       throw new DOMException("Event is already dispatching", "InvalidStateError");
+    if (author) trustedEvent(event, false);
     event.__dispatching = true;
     event.type = trustedString(event.type);
     event.target = target;
@@ -7125,23 +6873,26 @@
       capture,
     );
   };
-  const dispatchDocument = document.dispatchEvent = (event) => {
+  const dispatchDocument = (event, author = false) => {
     const value = event,
-      path = [document, __tilefinchRealmGlobal];
-    __tilefinchRealmGlobal.__tilefinchPrepareEvent(value, document, path);
-    if (!value.__stopped)
+      /* No global on the path of a "load" (DOM "get the parent"). */
+      toWindow = value.type !== "load",
+      path = toWindow ? [document, __tilefinchRealmGlobal] : [document];
+    __tilefinchRealmGlobal.__tilefinchPrepareEvent(value, document, path, author);
+    if (toWindow && !value.__stopped)
       __tilefinchRealmGlobal.__tilefinchInvokeWindowEvent?.(value, true);
     if (!value.__stopped) {
       __tilefinchRealmGlobal.__tilefinchInvokeDocumentEvent(value, true);
       if (!value.__stopped)
         __tilefinchRealmGlobal.__tilefinchInvokeDocumentEvent(value, false);
     }
-    if (value.bubbles && !value.__stopped)
+    if (toWindow && value.bubbles && !value.__stopped)
       __tilefinchRealmGlobal.__tilefinchInvokeWindowEvent?.(value, false);
     __tilefinchRealmGlobal.__tilefinchFinishEventDispatch(value);
     __tilefinchRecordEvent();
     return !value.defaultPrevented;
   };
+  document.dispatchEvent = event => dispatchDocument(event, true);
   {
     /* The document's listeners live in the list the native dispatcher
        reads, so EventTarget.prototype's methods serve document (and window)
@@ -7155,6 +6906,10 @@
       if (target === document) return documentListeners;
       listenerSlot ||= createPrivateSlot();
       return listenerSlot.get(target) ?? listenerSlot.set(target, new TrustedMap());
+    };
+    domShared.observesLifecycle = (target, type) => {
+      const map = target === document ? documentListeners : listenerSlot?.get(target);
+      return map != null && (trustedMapGet(map, type)?.length || 0) !== 0;
     };
     __tilefinchRealmGlobal.__tilefinchInvokeEventTarget = (
       target,
@@ -7186,6 +6941,7 @@
       errorObserver,
       betweenPhases,
       complete,
+      onlyCapture = null,
     ) => {
       const map = mapFor(target);
       let live = trustedMapGet(map, trustedString(event.type)) || [],
@@ -7193,7 +6949,7 @@
         refreshBubbleListeners = false,
         pendingException = null;
       let completed = false,
-        listenerPhase = 0,
+        listenerPhase = onlyCapture === false ? 2 : 0,
         index = 0;
       const finish = () => {
           if (completed) return;
@@ -7260,7 +7016,7 @@
               return;
             }
             if (listenerPhase === 0) {
-              if (event.__stopped) {
+              if (event.__stopped || onlyCapture === true) {
                 finish();
                 return;
               }
@@ -7334,13 +7090,17 @@
       callback,
       options = false,
     ) {
-      if (this === __tilefinchRealmGlobal || this === document)
-        __tilefinchRealmGlobal.__tilefinchNoteTransitionListener?.(this, String(type));
+      if (this === __tilefinchRealmGlobal || this === document) {
+        type = trustedString(type);
+        if (this === __tilefinchRealmGlobal) domShared.prepareWindowHandler(type);
+        __tilefinchRealmGlobal.__tilefinchNoteTransitionListener?.(this, type);
+      }
       return __tilefinchRealmGlobal.__tilefinchAddEventListener(
         mapFor(this),
         type,
         callback,
         options,
+        this,
       );
     };
     EventTarget.prototype.removeEventListener = function removeEventListener(
@@ -7355,11 +7115,15 @@
         options,
       );
     };
-    EventTarget.prototype.dispatchEvent = function dispatchEvent(event) {
-      if (this === __tilefinchRealmGlobal) return dispatchWindowEvent(event);
+    const nativeEventDispatch = {};
+    const dispatchTarget = EventTarget.prototype.dispatchEvent =
+      function dispatchEvent(event, token = null) {
+      const author = token !== nativeEventDispatch;
+      if (this === __tilefinchRealmGlobal) return dispatchWindowEvent(event, author);
+      if (this === document) return dispatchDocument(event, author);
       const value = event,
         map = mapFor(this);
-      __tilefinchRealmGlobal.__tilefinchPrepareEvent(value, this, [this]);
+      __tilefinchRealmGlobal.__tilefinchPrepareEvent(value, this, [this], author);
       if (!value.__stopped) {
         value.currentTarget = this;
         value.eventPhase = 2;
@@ -7371,6 +7135,8 @@
       __tilefinchRecordEvent();
       return !value.defaultPrevented;
     };
+    domShared.dispatchSimpleEvent = (target, event) =>
+      trustedFunctionApply(dispatchTarget, target, [event, nativeEventDispatch]);
     /* Node inherits addEventListener/removeEventListener from
        EventTarget.prototype; only dispatch walks the node path. */
     Node.prototype.dispatchEvent = function dispatchEvent(event) {
@@ -7378,7 +7144,7 @@
         this,
         (at) => at.__tilefinchDetachedParent || at.parentNode,
       );
-      __tilefinchRealmGlobal.__tilefinchPrepareEvent(event, this, path);
+      __tilefinchRealmGlobal.__tilefinchPrepareEvent(event, this, path, true);
       for (let at = path.length - 1; at >= 1 && !event.__stopped; at--)
         __tilefinchRealmGlobal.__tilefinchInvokeEventTarget(
           path[at],
@@ -7895,6 +7661,11 @@
     },
     scrollRestoration: "auto",
     replaceState(state, title, url = undefined) {
+      /* Serialize before changing the URL or replacing the retained state.
+         A failed clone must leave the current entry completely untouched. */
+      if (state !== null && (typeof state === "object" ||
+          typeof state === "function" || typeof state === "symbol"))
+        state = cloneWorkerValue(state);
       if (url !== undefined && url !== null) {
         const next = new TilefinchURL(url, location.href);
         if (
@@ -7985,10 +7756,12 @@
   };
   /* window has no own dispatchEvent: EventTarget.prototype.dispatchEvent
      routes the Window target here, as browsers expose it. */
-  const dispatchWindowEvent = (event) => {
+  const dispatchWindowEvent = (event, author = false) => {
     const value = event,
       path = [__tilefinchRealmGlobal];
-    __tilefinchRealmGlobal.__tilefinchPrepareEvent(value, __tilefinchRealmGlobal, path);
+    __tilefinchRealmGlobal.__tilefinchPrepareEvent(
+      value, __tilefinchRealmGlobal, path, author);
+    domShared.prepareWindowHandler(value.type);
     if (!value.__stopped) {
       __tilefinchRealmGlobal.__tilefinchInvokeWindowEvent(value, true);
       if (!value.__stopped)
@@ -8004,7 +7777,8 @@
   function browserDispatch(target, event) {
     return target === document ? dispatchDocument(event)
       : target === __tilefinchRealmGlobal ? dispatchWindowEvent(event)
-      : dispatchNode(target, event);
+      : target instanceof Node ? dispatchNode(target, event)
+      : domShared.dispatchSimpleEvent(target, event);
   }
   domShared.browserDispatch = browserDispatch;
   __tilefinchRealmGlobal.__tilefinchDispatchWindowEventCheckpointed = (event) => {
@@ -8016,6 +7790,7 @@
         __tilefinchRecordEvent();
       },
       invokeHandler = () => {
+        if (value.type === "error" || value.type === "load") return;
         if (trustedMapHas(windowMessageHandlers, trustedString(value.type))) return;
         const handler = __tilefinchRealmGlobal["on" + value.type];
         if (typeof handler !== "function") return;
@@ -8880,15 +8655,26 @@
      toJSON. */
   class DOMRectReadOnly {
     constructor(x = 0, y = 0, width = 0, height = 0) {
-      this.x = Number(x);
-      this.y = Number(y);
-      this.width = Number(width);
-      this.height = Number(height);
-      this.left = this.x;
-      this.top = this.y;
-      this.right = this.x + this.width;
-      this.bottom = this.y + this.height;
+      /* Geometry queries return mutable DOMRects. Keep their coordinate
+         slots cheap; only a read-only instance needs descriptor writes. */
+      if (new.target === DOMRect || this instanceof DOMRect) {
+        this.x = Number(x);
+        this.y = Number(y);
+        this.width = Number(width);
+        this.height = Number(height);
+      } else {
+        Object.defineProperties(this, {
+          x: { value: Number(x), enumerable: true },
+          y: { value: Number(y), enumerable: true },
+          width: { value: Number(width), enumerable: true },
+          height: { value: Number(height), enumerable: true },
+        });
+      }
     }
+    get left() { return this.width < 0 ? this.x + this.width : this.x; }
+    get top() { return this.height < 0 ? this.y + this.height : this.y; }
+    get right() { return this.width < 0 ? this.x : this.x + this.width; }
+    get bottom() { return this.height < 0 ? this.y : this.y + this.height; }
     toJSON() {
       return {
         x: this.x,
@@ -8902,8 +8688,9 @@
       };
     }
   }
+  class DOMRect extends DOMRectReadOnly {}
   __tilefinchRealmGlobal.DOMRectReadOnly = DOMRectReadOnly;
-  __tilefinchRealmGlobal.DOMRect = class DOMRect extends DOMRectReadOnly {};
+  __tilefinchRealmGlobal.DOMRect = DOMRect;
   const
     /* The element's font size, read only for a value that has an em term
        to resolve: the read costs a cascade the value itself did not. */
@@ -10260,61 +10047,71 @@
     enumerable: true,
     configurable: true,
   });
+  /* Browser lifecycle dispatch has a checkpoint between callbacks, unlike
+     author dispatchEvent. Window's load event has Document as its legacy
+     target but its listener path contains only Window. */
+  const dispatchLifecycle = (type, bubbles, onWindow, complete) => {
+    const win = __tilefinchRealmGlobal;
+    if (onWindow) domShared.prepareWindowHandler(type);
+    /* Most documents have no lifecycle listeners. In particular, a
+       pressure-shed page needs no Event, path, or listener continuations
+       just to finalize its timing entry. */
+    if (!domShared.observesLifecycle(win, type) &&
+        (onWindow || !domShared.observesLifecycle(document, type))) {
+      __tilefinchRecordEvent();
+      complete();
+      return;
+    }
+    const value = trustedEvent(newEvent(type, { bubbles })),
+      path = onWindow ? [win] : [document, win],
+      invoke = win.__tilefinchInvokeEventTargetCheckpointed,
+      finish = () => {
+        win.__tilefinchFinishEventDispatch(value);
+        __tilefinchRecordEvent();
+        complete();
+      };
+    win.__tilefinchPrepareEvent(value, document, path);
+    if (onWindow) invoke(win, value, 2, null, null, finish);
+    else invoke(win, value, 1, null, null, () => {
+      if (value.__stopped) finish();
+      else invoke(document, value, 2, null, null, () => {
+        if (bubbles && !value.__stopped)
+          invoke(win, value, 3, null, null, finish, false);
+        else finish();
+      });
+    }, true);
+  };
+  let lifecycleStarted = false;
   __tilefinchRealmGlobal.__tilefinchDispatchDOMContentLoaded = () => {
-    if (document.readyState === "complete") return;
-    const navigationState =
-      requirePerformanceEntryState(navigationPerformanceEntry),
-      navigationTiming = navigationState.navigation,
-      domInteractive = __tilefinchPerformanceNow(3);
+    if (lifecycleStarted) return;
+    lifecycleStarted = true;
+    const nav = requirePerformanceEntryState(navigationPerformanceEntry),
+      timing = nav.navigation;
+    const mark = name => {
+      const value = __tilefinchPerformanceNow(3);
+      timing[name] = value;
+      performanceTimingState[name] = performanceTimeOrigin + value;
+      return value;
+    };
     documentReadyState = "interactive";
-    dispatchDocument(newEvent("readystatechange"));
-    navigationTiming.domInteractive = domInteractive;
-    performanceTimingState.domInteractive =
-      performanceTimeOrigin + domInteractive;
-    navigationTiming.domContentLoadedEventStart =
-      __tilefinchPerformanceNow(3);
-    performanceTimingState.domContentLoadedEventStart =
-      performanceTimeOrigin + navigationTiming.domContentLoadedEventStart;
-    dispatchDocument(newEvent("DOMContentLoaded", { bubbles: true }));
-    __tilefinchRealmGlobal.__tilefinchMaybeStartMotion?.(true);
-    const domContentLoadedEventEnd = __tilefinchPerformanceNow(3);
-    documentReadyState = "complete";
-    dispatchDocument(newEvent("readystatechange"));
-    const domComplete = __tilefinchPerformanceNow(3),
-      loadEventStart = __tilefinchPerformanceNow(3);
-    navigationTiming.domContentLoadedEventEnd = domContentLoadedEventEnd;
-    navigationTiming.domComplete = domComplete;
-    navigationTiming.loadEventStart = loadEventStart;
-    performanceTimingState.domContentLoadedEventEnd =
-      performanceTimeOrigin + domContentLoadedEventEnd;
-    performanceTimingState.domComplete = performanceTimeOrigin + domComplete;
-    performanceTimingState.loadEventStart =
-      performanceTimeOrigin + loadEventStart;
-    const loadEvent = newEvent("load");
-    /*
-     * HTMLBodyElement's onload handler reflects the Window load handler
-     * surface.  Programmatic `document.body.onload = ...` assignments are
-     * stored on the wrapped body, so invoke that property before dispatching
-     * the Window event. Markup and programmatic handlers share the same lazy,
-     * CSP-gated event-handler property path.
-     */
-    const bodyOnload = document.body?.onload;
-    if (typeof bodyOnload === "function")
-      try {
-        trustedFunctionApply(bodyOnload, __tilefinchRealmGlobal, [loadEvent]);
-      } catch (error) {
-        __tilefinchReportUncaught(error, "body onload");
-      }
-    dispatchWindowEvent(loadEvent);
-    const loadEventEnd = __tilefinchPerformanceNow(3);
-    navigationState.base[3] = Math.max(
-      0, loadEventEnd - navigationPerformanceEntry.startTime);
-    navigationTiming.loadEventEnd = loadEventEnd;
-    performanceTimingState.loadEventEnd = performanceTimeOrigin + loadEventEnd;
-    /* Navigation Timing queues the already-buffered navigation entry only
-       after the load lifecycle has completed. Observers registered while the
-       document was loading therefore receive exactly one finalized record. */
-    notifyPerformanceObservers(navigationPerformanceEntry);
+    mark("domInteractive");
+    dispatchLifecycle("readystatechange", false, false, () => {
+      mark("domContentLoadedEventStart");
+      dispatchLifecycle("DOMContentLoaded", true, false, () => {
+        __tilefinchRealmGlobal.__tilefinchMaybeStartMotion?.(true);
+        mark("domContentLoadedEventEnd");
+        documentReadyState = "complete";
+        mark("domComplete");
+        dispatchLifecycle("readystatechange", false, false, () => {
+          mark("loadEventStart");
+          dispatchLifecycle("load", false, true, () => {
+            nav.base[3] = Math.max(
+              0, mark("loadEventEnd") - navigationPerformanceEntry.startTime);
+            notifyPerformanceObservers(navigationPerformanceEntry);
+          });
+        });
+      });
+    });
   };
   if (__tilefinchRealmGlobal.__tilefinchRootCensus)
     Object.defineProperty(__tilefinchRealmGlobal.__tilefinchRootCensus, "frameWindows", {

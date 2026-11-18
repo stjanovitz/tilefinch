@@ -343,11 +343,67 @@ static bool decode_item(
 
 static bool offline_library_decode_index(
     const OfflineLibrary *library, const char *suffix,
-    OfflineLibrary *decoded, bool *exists, bool *newer);
+    OfflineLibrary *decoded, bool *exists, bool *newer, bool *unavailable);
 static bool offline_library_decode_index_with_buffer(
     const OfflineLibrary *library, const char *suffix,
     OfflineLibrary *decoded, bool *exists, bool *newer,
-    unsigned char *data);
+    bool *unavailable, unsigned char *data);
+
+/* library.bin.recovered holds recovery_floor as "%08x\n". Returns 1 with
+   *floor set, 0 when there is none, -1 when it cannot be read, and -2 when
+   it is malformed (an older one-byte marker included). */
+#define OFFLINE_RECOVERY_MARKER_BYTES 9u
+static int offline_recovery_marker_read(const OfflineLibrary *library,
+                                        uint32_t *floor)
+{
+    char path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 32u];
+    if (!offline_index_path(library, ".recovered", path, sizeof(path)))
+        return -1;
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) return errno == ENOENT ? 0 : -1;
+    char text[OFFLINE_RECOVERY_MARKER_BYTES + 1u] = {0};
+    size_t length = fread(text, 1, sizeof(text), file);
+    bool failed = ferror(file) != 0;
+    if (fclose(file) != 0) failed = true;
+    if (failed) return -1;
+    if (length != OFFLINE_RECOVERY_MARKER_BYTES
+        || text[OFFLINE_RECOVERY_MARKER_BYTES - 1u] != '\n') return -2;
+    uint32_t value = 0;
+    for (size_t at = 0; at + 1u < OFFLINE_RECOVERY_MARKER_BYTES; at++) {
+        char digit = text[at];
+        unsigned nibble = digit >= '0' && digit <= '9' ? (unsigned) (digit - '0')
+            : digit >= 'a' && digit <= 'f' ? (unsigned) (digit - 'a' + 10)
+            : 16u;
+        if (nibble == 16u) return -2;
+        value = (value << 4) | nibble;
+    }
+    if (value == 0 || value == UINT32_MAX) return -2;
+    *floor = value;
+    return 1;
+}
+
+/* Persist the floor before publishing an index that relies on it. */
+static bool offline_library_mark_recovered(const OfflineLibrary *library)
+{
+    uint32_t recorded = 0;
+    if (offline_recovery_marker_read(library, &recorded) == 1
+        && recorded == library->recovery_floor) return true;
+    char path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 32u];
+    if (!offline_index_path(library, ".recovered", path, sizeof(path)))
+        return false;
+    /* snprintf + fwrite: fprintf would link newlib's 13 KB FILE printf. */
+    char text[OFFLINE_RECOVERY_MARKER_BYTES + 1u];
+    if (snprintf(text, sizeof(text), "%08x\n",
+                 (unsigned) library->recovery_floor)
+        != (int) OFFLINE_RECOVERY_MARKER_BYTES) return false;
+    FILE *file = fopen(path, "wb");
+    if (file == NULL) return false;
+    bool okay = fwrite(text, 1, OFFLINE_RECOVERY_MARKER_BYTES, file)
+            == OFFLINE_RECOVERY_MARKER_BYTES
+        && fflush(file) == 0 && ferror(file) == 0;
+    if (fclose(file) != 0) okay = false;
+    return okay;
+}
 
 static bool offline_library_save_with_buffer(
     const OfflineLibrary *library, unsigned char *data)
@@ -358,6 +414,12 @@ static bool offline_library_save_with_buffer(
     if (library == NULL || !library->loaded
         || library->count > OFFLINE_LIBRARY_ITEM_LIMIT
         || !offline_directory_ready(library)) return false;
+    /* Check the current generation before touching .tmp: an I/O refusal
+       must not destroy a complete staged recovery index. */
+    bool primary_newer = false, primary_unavailable = false;
+    bool primary_valid = offline_library_decode_index_with_buffer(
+        library, "", NULL, NULL, &primary_newer, &primary_unavailable, data);
+    if (primary_newer || primary_unavailable) return false;
     size_t used = OFFLINE_INDEX_HEADER_BYTES;
     uint32_t version = 5u; /* Existing libraries remain readable by old apps. */
     for (size_t index = 0; index < library->count; index++)
@@ -391,19 +453,14 @@ static bool offline_library_save_with_buffer(
                                sizeof(temporary))
         || !offline_index_path(library, ".bak", backup,
                                sizeof(backup))) return false;
+    if (library->recovery_floor != 0
+        && !offline_library_mark_recovered(library)) return false;
     FILE *file = fopen(temporary, "wb");
     if (file == NULL) return false;
     bool okay = fwrite(data, 1, used, file) == used
         && fflush(file) == 0 && ferror(file) == 0;
     if (fclose(file) != 0) okay = false;
     if (!okay) {
-        remove(temporary);
-        return false;
-    }
-    bool primary_newer = false;
-    bool primary_valid = offline_library_decode_index_with_buffer(
-        library, "", NULL, NULL, &primary_newer, data);
-    if (primary_newer) {
         remove(temporary);
         return false;
     }
@@ -436,26 +493,38 @@ bool offline_library_save(const OfflineLibrary *library)
 static bool offline_library_decode_index_with_buffer(
     const OfflineLibrary *library, const char *suffix,
     OfflineLibrary *decoded, bool *exists, bool *newer,
-    unsigned char *data)
+    bool *unavailable, unsigned char *data)
 {
     static const unsigned char magic[8] = {
         'T', 'F', 'O', 'F', 'F', '0', '1', 0
     };
     if (exists != NULL) *exists = false;
     if (newer != NULL) *newer = false;
+    if (unavailable != NULL) *unavailable = false;
     if (library == NULL || suffix == NULL
-        || library->directory[0] == '\0') return false;
+        || library->directory[0] == '\0') {
+        if (unavailable != NULL) *unavailable = true;
+        return false;
+    }
     char path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 32u];
-    if (!offline_index_path(library, suffix, path, sizeof(path))) return false;
+    if (!offline_index_path(library, suffix, path, sizeof(path))) {
+        if (unavailable != NULL) *unavailable = true;
+        return false;
+    }
     FILE *file = fopen(path, "rb");
     if (file == NULL) {
         if (exists != NULL && errno != ENOENT) *exists = true;
+        if (unavailable != NULL && errno != ENOENT) *unavailable = true;
         return false;
     }
     if (exists != NULL) *exists = true;
     size_t length = fread(data, 1, OFFLINE_LIBRARY_INDEX_LIMIT, file);
-    bool okay = !ferror(file) && fgetc(file) == EOF;
-    if (fclose(file) != 0) okay = false;
+    bool read_error = ferror(file) != 0;
+    int trailing = fgetc(file);
+    read_error = read_error || ferror(file) != 0;
+    bool okay = trailing == EOF;
+    if (fclose(file) != 0) read_error = true;
+    if (read_error && unavailable != NULL) *unavailable = true;
     if (!okay || length < OFFLINE_INDEX_HEADER_BYTES
         || memcmp(data, magic, sizeof(magic)) != 0) return false;
     size_t used = sizeof(magic);
@@ -477,7 +546,7 @@ static bool offline_library_decode_index_with_buffer(
                length - OFFLINE_INDEX_HEADER_BYTES)) return false;
     if (decoded != NULL) {
         *decoded = *library;
-        decoded->loaded = true;
+        decoded->loaded = false;
         decoded->count = 0;
         decoded->next_id = 1;
     }
@@ -500,20 +569,28 @@ static bool offline_library_decode_index_with_buffer(
         }
     }
     if (used != length) return false;
+    if (decoded != NULL) decoded->loaded = true;
     return true;
 }
 
 static bool offline_library_decode_index(
     const OfflineLibrary *library, const char *suffix,
-    OfflineLibrary *decoded, bool *exists, bool *newer)
+    OfflineLibrary *decoded, bool *exists, bool *newer, bool *unavailable)
 {
-    if (library == NULL || library->budget == NULL) return false;
+    if (unavailable != NULL) *unavailable = false;
+    if (library == NULL || library->budget == NULL) {
+        if (unavailable != NULL) *unavailable = true;
+        return false;
+    }
     unsigned char *data = budget_malloc_category(
         library->budget, BUDGET_CATEGORY_SESSION,
         OFFLINE_LIBRARY_INDEX_LIMIT);
-    if (data == NULL) return false;
+    if (data == NULL) {
+        if (unavailable != NULL) *unavailable = true;
+        return false;
+    }
     bool decoded_ok = offline_library_decode_index_with_buffer(
-        library, suffix, decoded, exists, newer, data);
+        library, suffix, decoded, exists, newer, unavailable, data);
     budget_free(library->budget, data);
     return decoded_ok;
 }
@@ -559,6 +636,39 @@ static void offline_finish_file_tombstone(const OfflineLibrary *library,
     (void) remove(path);
 }
 
+/* After a newer generation is lost, its files must not be assigned to a
+   new item. Scan once for the highest id that owns a file, including
+   published downloads (<id>-name); refuse an inconclusive or unbounded
+   scan. */
+static bool offline_highest_file_id(const OfflineLibrary *library,
+                                    uint32_t *highest)
+{
+    *highest = 0;
+    DIR *directory = opendir(library->directory);
+    if (directory == NULL) return false;
+    bool complete = false;
+    for (size_t scanned = 0; scanned <= 4096u; scanned++) {
+        errno = 0;
+        struct dirent *entry = readdir(directory);
+        if (entry == NULL) {
+            complete = errno == 0;
+            break;
+        }
+        if (scanned == 4096u) break;
+        unsigned id = 0;
+        char separator = '\0';
+        if (sscanf(entry->d_name, "%8x%c", &id, &separator) != 2
+            || id == 0 || (separator != '.' && separator != '-')) continue;
+        if (id == UINT32_MAX) {
+            (void) closedir(directory);
+            return false;
+        }
+        if (id > *highest) *highest = id;
+    }
+    (void) closedir(directory);
+    return complete;
+}
+
 static bool offline_library_load_with_staged(
     OfflineLibrary *library, OfflineLibrary *staged)
 {
@@ -569,12 +679,20 @@ static bool offline_library_load_with_staged(
     library->newer_format = false;
     bool any_index = false;
     bool recovered = false;
+    /* Loading .tmp because the primary is absent is the end of an
+       interrupted save: .tmp is the newest generation and nothing is lost.
+       Only a newer generation that exists but is damaged can name files
+       the loaded one does not. */
+    bool lost_generation = false;
     for (size_t at = 0; at < sizeof(candidates) / sizeof(candidates[0]); at++) {
         bool exists = false;
         bool newer = false;
+        bool unavailable = false;
         if (offline_library_decode_index(
-                library, candidates[at], staged, &exists, &newer)) {
+                library, candidates[at], staged, &exists, &newer,
+                &unavailable)) {
             recovered = at != 0;
+            lost_generation = recovered && any_index;
             break;
         }
         if (newer) {
@@ -583,6 +701,7 @@ static bool offline_library_load_with_staged(
             library->newer_format = true;
             return false;
         }
+        if (unavailable) return false;
         any_index = any_index || exists;
     }
     if (!staged->loaded) {
@@ -592,6 +711,17 @@ static bool offline_library_load_with_staged(
         staged->count = 0;
         staged->next_id = 1;
     }
+    uint32_t floor = 0;
+    int marker = offline_recovery_marker_read(library, &floor);
+    if (marker == -1) return false;
+    if (lost_generation || marker == -2) {
+        uint32_t highest = 0;
+        if (!offline_highest_file_id(staged, &highest)) return false;
+        if (highest > floor) floor = highest;
+    }
+    if (floor == UINT32_MAX) return false;
+    staged->recovery_floor = floor;
+    if (floor >= staged->next_id) staged->next_id = floor + 1u;
     bool normalized = recovered;
     for (size_t index = 0; index < staged->count; index++) {
         OfflineLibraryItem *item = &staged->items[index];
@@ -682,27 +812,44 @@ static bool offline_library_load_with_staged(
     DIR *directory = opendir(library->directory);
     if (directory != NULL) {
         size_t scanned = 0;
-        struct dirent *entry = NULL;
-        while (scanned++ < OFFLINE_ORPHAN_SCAN_LIMIT
-               && (entry = readdir(directory)) != NULL) {
+        bool complete = false;
+        bool kept = false;
+        while (scanned++ < OFFLINE_ORPHAN_SCAN_LIMIT) {
+            errno = 0;
+            struct dirent *entry = readdir(directory);
+            if (entry == NULL) {
+                complete = errno == 0;
+                break;
+            }
             unsigned id = 0;
+            char separator = '\0';
+            if (sscanf(entry->d_name, "%8x%c", &id, &separator) != 2
+                || id == 0 || (separator != '.' && separator != '-')
+                || offline_library_find(library, id) != NULL)
+                continue;
             char suffix[24] = {0};
             char tail = '\0';
-            if (sscanf(entry->d_name, "%8x%23s%c", &id, suffix, &tail) != 2
-                || id == 0 || offline_library_find(library, id) != NULL)
-                continue;
-            if (strcmp(suffix, ".file.gone") == 0) {
+            bool owned_name = sscanf(entry->d_name, "%8x%23s%c", &id,
+                                     suffix, &tail) == 2;
+            if (owned_name && strcmp(suffix, ".file.gone") == 0) {
+                /* Written only after the user asked for the removal. */
                 char note[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
                 if (offline_library_item_path(library, id, ".file.gone",
                                               note, sizeof(note)))
                     offline_finish_file_tombstone(library, id, note);
                 continue;
             }
+            if (id <= library->recovery_floor) {
+                kept = true;
+                continue;
+            }
+            if (!owned_name) continue;
             static const char *owned[] = {
                 ".article.html", ".article.tmp", ".article.bak",
                 ".app.html", ".app.pack", ".app.icon",
                 ".app-html.tmp", ".app-pack.tmp", ".app-icon.tmp",
                 ".video.part", ".video.mp4", ".audio.part", ".audio.mp4",
+                ".video.identity",
                 ".file.part", ".file.meta", ".file.meta.tmp"
             };
             bool recognized = false;
@@ -717,6 +864,15 @@ static bool offline_library_load_with_staged(
                 (void) remove(path);
         }
         (void) closedir(directory);
+        /* No unlisted file of the lost generation is left (removed by
+           hand, or every one belonged to a listed item): any id is free
+           again, and the next load sweeps without a floor. */
+        char marker_path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 32u];
+        if (complete && !kept && (marker != 0 || library->recovery_floor != 0)
+            && offline_index_path(library, ".recovered", marker_path,
+                                  sizeof(marker_path))
+            && (remove(marker_path) == 0 || errno == ENOENT))
+            library->recovery_floor = 0;
     }
     return true;
 }
@@ -1516,9 +1672,10 @@ static void offline_app_snapshot_destroy(
 }
 
 /* Serialize the document and select the app's same-origin responses. The
-   selection can only contain what the session cache still holds, so the
-   live cache preference bounds what an install can capture; the package
-   limit itself is OFFLINE_LIBRARY_APP_RESOURCE_LIMIT. */
+   selection can only contain what the session cache holds; the preview
+   first downloads again the declared scripts and stylesheets it evicted
+   (psp_offline_store.c). The package limit is
+   OFFLINE_LIBRARY_APP_RESOURCE_LIMIT. */
 static bool offline_app_snapshot_collect(
     OfflineLibrary *library, PocDocument *document, BrowserSession *session,
     const char *source_url, OfflineAppSnapshot *snapshot,
@@ -2572,7 +2729,7 @@ bool offline_library_remove(OfflineLibrary *library, uint32_t id)
         ".article.html", ".article.bak", ".article.tmp",
         ".app.html", ".app.pack", ".app.icon",
         ".app-html.tmp", ".app-pack.tmp", ".app-icon.tmp",
-        ".video.mp4", ".audio.mp4",
+        ".video.mp4", ".audio.mp4", ".video.identity",
         ".video.part", ".audio.part", ".file.part", ".file.meta", ".file.meta.tmp"
     };
     char path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];

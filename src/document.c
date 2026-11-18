@@ -137,6 +137,7 @@ void document_style_attribute_set_cssom_authorized(lxb_dom_node_t *node,
    attribute holds a provenance pointer only native code can set, so author
    markup naming the same attribute is not a carrier. */
 static const char document_shadow_carrier_marker;
+static const char document_manual_shadow_carrier_marker;
 /* Carriers this process has ever marked: a fast path that keeps the
    per-element and per-text checks free on pages without shadow roots (it
    only ever gates, so sharing it between documents is harmless). */
@@ -175,7 +176,7 @@ size_t document_test_shadow_attribute_visits(void)
 #define DOCUMENT_SHADOW_CARRIER_ATTRIBUTE "data-tilefinch-shadow-root"
 #define DOCUMENT_SHADOW_SLOT_SEARCH_LIMIT 512u
 
-bool document_mark_shadow_carrier(lxb_dom_node_t *node)
+static bool document_mark_shadow_carrier_mode(lxb_dom_node_t *node, bool manual)
 {
     if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT) return false;
     lxb_dom_attr_t *attribute = lxb_dom_element_set_attribute(
@@ -184,11 +185,18 @@ bool document_mark_shadow_carrier(lxb_dom_node_t *node)
         sizeof(DOCUMENT_SHADOW_CARRIER_ATTRIBUTE) - 1u,
         (const lxb_char_t *) "", 0);
     if (attribute == NULL) return false;
-    attribute->node.user = (void *) &document_shadow_carrier_marker;
+    attribute->node.user = manual ? (void *) &document_manual_shadow_carrier_marker
+                                  : (void *) &document_shadow_carrier_marker;
     if (document_shadow_carriers_marked < SIZE_MAX)
         document_shadow_carriers_marked++;
     return true;
 }
+
+bool document_mark_shadow_carrier(lxb_dom_node_t *node)
+{
+    return document_mark_shadow_carrier_mode(node, false);
+}
+
 
 bool document_node_is_shadow_carrier(const lxb_dom_node_t *node)
 {
@@ -203,11 +211,31 @@ bool document_node_is_shadow_carrier(const lxb_dom_node_t *node)
 #if !defined(__PSP__)
         document_shadow_attribute_visits++;
 #endif
-        if (attribute->node.user == &document_shadow_carrier_marker)
+        if (attribute->node.user == &document_shadow_carrier_marker
+            || attribute->node.user == &document_manual_shadow_carrier_marker)
             return true;
     }
     return false;
 }
+
+static bool document_manual_shadow_enabled(const lxb_dom_node_t *node);
+
+static bool document_shadow_manual(const lxb_dom_node_t *carrier)
+{
+    if (!document_manual_shadow_enabled(carrier)) return false;
+    for (const lxb_dom_attr_t *attribute =
+             lxb_dom_interface_element((lxb_dom_node_t *) carrier)->first_attr;
+         attribute != NULL; attribute = attribute->next) {
+        if (attribute->node.user == &document_manual_shadow_carrier_marker) return true;
+        if (attribute->node.user == &document_shadow_carrier_marker) return false;
+    }
+    return false;
+}
+
+static lxb_dom_node_t *document_manual_slot_of(const lxb_dom_node_t *carrier,
+                                             lxb_dom_node_t *child);
+static lxb_dom_node_t *document_manual_slot_next(const lxb_dom_node_t *carrier,
+    const lxb_dom_node_t *slot, const lxb_dom_node_t *after);
 
 bool document_shadow_attribute_protected(const lxb_dom_node_t *node,
                                           const char *name, size_t length)
@@ -278,6 +306,7 @@ static lxb_dom_node_t *document_shadow_find_slot(
     const lxb_dom_node_t *carrier, lxb_dom_node_t *child, bool *bounded)
 {
     *bounded = false;
+    if (document_shadow_manual(carrier)) return document_manual_slot_of(carrier, child);
     size_t wanted_length = 0;
     const char *wanted = child->type == LXB_DOM_NODE_TYPE_ELEMENT
         ? document_attribute(child, "slot", &wanted_length) : NULL;
@@ -350,6 +379,19 @@ static lxb_dom_node_t *document_flat_light_carrier(const lxb_dom_node_t *node)
     return carrier == node ? NULL : carrier;
 }
 
+bool document_manual_shadow_excludes(const lxb_dom_node_t *node)
+{
+    if (!document_manual_shadow_enabled(node)) return false;
+    for (unsigned depth = 0; node != NULL && depth < 256u;
+         node = node->parent, depth++) {
+        lxb_dom_node_t *carrier = document_flat_light_carrier(node);
+        if (carrier != NULL && document_shadow_manual(carrier)
+            && document_manual_slot_of(carrier, (lxb_dom_node_t *) node) == NULL)
+            return true;
+    }
+    return false;
+}
+
 /* The light child of `host` after `from` (or its first one) assigned to
    `slot`, bounded by the host's child count. */
 static lxb_dom_node_t *document_flat_assigned_from(
@@ -385,8 +427,9 @@ lxb_dom_node_t *document_flat_first_child(lxb_dom_node_t *node)
     if (carrier != NULL) return carrier;
     carrier = document_flat_slot_carrier(node);
     if (carrier != NULL) {
-        lxb_dom_node_t *assigned = document_flat_assigned_from(
-            carrier, node, carrier->parent->first_child);
+        lxb_dom_node_t *assigned = document_shadow_manual(carrier)
+            ? document_manual_slot_next(carrier, node, NULL)
+            : document_flat_assigned_from(carrier, node, carrier->parent->first_child);
         if (assigned != NULL) return assigned;
     }
     return node->first_child;
@@ -405,6 +448,7 @@ lxb_dom_node_t *document_flat_next_sibling(lxb_dom_node_t *node)
     bool bounded = false;
     lxb_dom_node_t *slot = document_shadow_find_slot(carrier, node, &bounded);
     return slot == NULL ? NULL
+        : document_shadow_manual(carrier) ? document_manual_slot_next(carrier, slot, node)
         : document_flat_assigned_from(carrier, slot, node->next);
 }
 
@@ -475,7 +519,18 @@ struct DocumentNonceRegistry {
     size_t unlisted;
     bool hide;
     struct DocumentCssomSheets *cssom;
+    struct DocumentManualSlot *manual_slots;
+    /* This document has marked a manual-assignment shadow carrier, so its
+       flat-tree steps must look for the manual marker. */
+    bool manual_shadow;
 };
+
+typedef struct DocumentManualSlot {
+    struct DocumentManualSlot *next;
+    lxb_dom_node_t *slot;
+    size_t count;
+    lxb_dom_node_t *nodes[];
+} DocumentManualSlot;
 
 static DocumentNonceRegistry *document_nonce_registry(
     const lxb_dom_node_t *node)
@@ -484,6 +539,44 @@ static DocumentNonceRegistry *document_nonce_registry(
         || node->owner_document == NULL ? NULL : node->owner_document->user;
     return registry != NULL
         && registry->magic == DOCUMENT_NONCE_REGISTRY_MAGIC ? registry : NULL;
+}
+
+static bool document_manual_shadow_enabled(const lxb_dom_node_t *node)
+{
+    const DocumentNonceRegistry *registry = document_nonce_registry(node);
+    return registry != NULL && registry->manual_shadow;
+}
+
+static lxb_dom_node_t *document_manual_slot_of(const lxb_dom_node_t *carrier,
+                                             lxb_dom_node_t *child)
+{
+    DocumentNonceRegistry *registry = document_nonce_registry(carrier);
+    for (DocumentManualSlot *entry = registry == NULL ? NULL : registry->manual_slots;
+         entry != NULL; entry = entry->next) {
+        for (size_t i = 0; i < entry->count; i++)
+            if (entry->nodes[i] == child)
+                return document_shadow_carrier_containing(entry->slot) == carrier
+                    ? entry->slot : NULL;
+    }
+    return NULL;
+}
+
+static lxb_dom_node_t *document_manual_slot_next(const lxb_dom_node_t *carrier,
+    const lxb_dom_node_t *slot, const lxb_dom_node_t *after)
+{
+    DocumentNonceRegistry *registry = document_nonce_registry(carrier);
+    for (DocumentManualSlot *entry = registry == NULL ? NULL : registry->manual_slots;
+         entry != NULL; entry = entry->next) {
+        if (entry->slot != slot) continue;
+        for (size_t i = 0; i < entry->count; i++) {
+            lxb_dom_node_t *node = entry->nodes[i];
+            if (after == NULL && node->parent == carrier->parent && node != carrier)
+                return node;
+            if (node == after) after = NULL;
+        }
+        break;
+    }
+    return NULL;
 }
 
 /* Membership, not a magic read: node->user may be a copy Lexbor made while
@@ -513,8 +606,7 @@ struct DocumentControlState {
     bool default_value_known;
     int resized_width;
     int resized_height;
-    bool checked_default_known;
-    bool checked_default;
+    uint8_t checked_state;
     struct DocumentControlState *next;
 };
 
@@ -541,6 +633,16 @@ static DocumentControlState *document_control_state_of(
         || document_nonce_value_of(document_nonce_registry(node), node->user)
                != NULL) return NULL;
     return node->user;
+}
+
+/* The node's own live state: Lexbor copies node->user into clones, so a
+   pointer is the node's only when the record names it. */
+static DocumentControlState *document_control_state_live(
+    const lxb_dom_node_t *node)
+{
+    DocumentControlState *state = document_control_state_of(node);
+    return state != NULL && state->magic == DOCUMENT_CONTROL_STATE_MAGIC
+        && state->node == node ? state : NULL;
 }
 
 /* What node->user returns to when a control state is retired. */
@@ -809,6 +911,95 @@ static DocumentNonceRegistry *document_nonce_registry_ensure(
     return registry;
 }
 
+bool document_mark_manual_shadow_carrier(PocDocument *document,
+                                         lxb_dom_node_t *node)
+{
+    DocumentNonceRegistry *registry = document_nonce_registry_ensure(document);
+    if (registry == NULL) return false;
+    registry->manual_shadow = true;
+    return document_mark_shadow_carrier_mode(node, true);
+}
+
+static bool document_manual_node_dropped(const lxb_dom_node_t *node,
+    lxb_dom_node_t *const *nodes, size_t count, const lxb_dom_node_t *root)
+{
+    for (size_t i = 0; i < count; i++)
+        if (nodes[i] == node) return true;
+    return root != NULL && document_node_within(node, root);
+}
+
+/* One pass over the bounded lists: drops `slot`'s own entry, the listed
+   `nodes` from every other entry, and every slot and node inside `root`.
+   An emptied entry is freed. */
+static void document_manual_slots_compact(PocDocument *document,
+    const lxb_dom_node_t *slot, lxb_dom_node_t *const *nodes, size_t count,
+    const lxb_dom_node_t *root)
+{
+    DocumentManualSlot **link = &document->nonce_registry->manual_slots;
+    while (*link != NULL) {
+        DocumentManualSlot *entry = *link;
+        size_t kept = 0;
+        if (entry->slot != slot
+            && !document_manual_node_dropped(entry->slot, NULL, 0, root)) {
+            for (size_t i = 0; i < entry->count; i++)
+                if (!document_manual_node_dropped(entry->nodes[i], nodes, count, root))
+                    entry->nodes[kept++] = entry->nodes[i];
+        }
+        if (kept == 0) {
+            *link = entry->next;
+            budget_free(document->budget, entry);
+        } else {
+            entry->count = kept;
+            link = &entry->next;
+        }
+    }
+}
+
+bool document_shadow_assign_manually(PocDocument *document, lxb_dom_node_t *slot,
+                                     lxb_dom_node_t *const *nodes, size_t count)
+{
+    if (slot == NULL || slot->type != LXB_DOM_NODE_TYPE_ELEMENT ||
+        slot->local_name != LXB_TAG_SLOT || slot->ns != LXB_NS_HTML ||
+        count > DOCUMENT_MANUAL_SLOT_LIST_LIMIT || document == NULL ||
+        document->html == NULL || slot->owner_document != &document->html->dom_document)
+        return false;
+    DocumentNonceRegistry *registry = count == 0 ? document_nonce_registry(slot)
+        : document_nonce_registry_ensure(document);
+    if (registry == NULL) return count == 0;
+    size_t slots = 0, total = 0;
+    for (DocumentManualSlot *entry = registry->manual_slots;
+         entry != NULL; entry = entry->next) {
+        if (entry->slot == slot) continue;
+        slots++;
+        total += entry->count;
+    }
+    DocumentManualSlot *fresh = NULL;
+    if (count != 0) {
+        if (slots >= DOCUMENT_MANUAL_SLOT_LIMIT
+            || count > DOCUMENT_MANUAL_SLOT_NODE_LIMIT - total) return false;
+        BudgetAllocationOwner previous = document_allocation_owner_enter(document);
+        fresh = budget_malloc(document->budget, sizeof(*fresh) + count * sizeof(*nodes));
+        document_allocation_owner_leave(document, previous);
+        if (fresh == NULL) return false;
+        fresh->slot = slot;
+        /* A node is assigned once; a repeat would make the flat-tree
+           successor walk cycle. */
+        size_t unique = 0;
+        for (size_t i = 0; i < count; i++)
+            if (!document_manual_node_dropped(nodes[i], fresh->nodes, unique, NULL))
+                fresh->nodes[unique++] = nodes[i];
+        fresh->count = unique;
+    }
+    /* Allocation/validation finished. Remove previous ownership without
+       publishing a partially rewritten list on refusal. */
+    document_manual_slots_compact(document, slot, nodes, count, NULL);
+    if (fresh != NULL) {
+        fresh->next = registry->manual_slots;
+        registry->manual_slots = fresh;
+    }
+    return true;
+}
+
 struct DocumentCssomSheets *document_cssom_registry(const lxb_dom_node_t *node)
 {
     DocumentNonceRegistry *registry = document_nonce_registry(node);
@@ -836,6 +1027,11 @@ static void document_nonce_registry_destroy(PocDocument *document)
         DocumentNonceSlot *next = slot->next;
         budget_free(document->budget, slot);
         slot = next;
+    }
+    while (registry->manual_slots != NULL) {
+        DocumentManualSlot *entry = registry->manual_slots;
+        registry->manual_slots = entry->next;
+        budget_free(document->budget, entry);
     }
     registry->magic = 0;
     budget_free(document->budget, registry);
@@ -1280,14 +1476,29 @@ static lxb_status_t document_style_node_removed(lxb_dom_node_t *node,
         : document_style_tree_base->removed(node, old_parent);
 }
 
+static void document_control_checked_attribute_changed(lxb_dom_node_t *node);
+
+/* Shared by the four hooks below; kept out of line so each hook stays a
+   call and a tail call. */
+__attribute__((noinline))
+static void document_style_attribute_note(lxb_dom_element_t *element,
+                                          lxb_dom_attr_id_t name,
+                                          lxb_ns_id_t ns)
+{
+    document_style_note_write(lxb_dom_interface_node(element));
+    document_nonce_attribute_changed(element, name);
+    if (name == LXB_DOM_ATTR_CHECKED && ns == LXB_NS__UNDEF)
+        document_control_checked_attribute_changed(
+            lxb_dom_interface_node(element));
+}
+
 #define DOCUMENT_STYLE_ATTRIBUTE_HOOK(slot)                                  \
     static lxb_status_t document_style_attribute_##slot(                    \
         lxb_dom_element_t *element, lxb_dom_attr_id_t name,                 \
         const lxb_char_t *old_value, size_t old_length,                     \
         const lxb_char_t *value, size_t length, lxb_ns_id_t ns)             \
     {                                                                       \
-        document_style_note_write(lxb_dom_interface_node(element));         \
-        document_nonce_attribute_changed(element, name);                    \
+        document_style_attribute_note(element, name, ns);                   \
         return document_style_attr_base->slot == NULL ? LXB_STATUS_OK       \
             : document_style_attr_base->slot(element, name, old_value,      \
                                              old_length, value, length, ns); \
@@ -4449,6 +4660,23 @@ const char *document_element_name(lxb_dom_node_t *node, size_t *length)
         lxb_dom_interface_element(node), length);
 }
 
+bool document_element_name_is(lxb_dom_node_t *node, const char *wanted)
+{
+    size_t length = 0;
+    const char *name = document_element_name(node, &length);
+    return name != NULL && strlen(wanted) == length
+        && memcmp(name, wanted, length) == 0;
+}
+
+bool document_element_name_is_ignoring_case(lxb_dom_node_t *node,
+                                            const char *wanted)
+{
+    size_t length = 0;
+    const char *name = document_element_name(node, &length);
+    return name != NULL && strlen(wanted) == length
+        && strncasecmp(name, wanted, length) == 0;
+}
+
 const char *document_attribute(lxb_dom_node_t *node, const char *name,
                                size_t *length)
 {
@@ -4531,20 +4759,16 @@ const char *document_web_app_manifest_href(
 const char *document_control_value(lxb_dom_node_t *node, size_t *length)
 {
     if (length != NULL) *length = 0;
-    if (node == NULL) return NULL;
-    const DocumentControlState *state = document_control_state_of(node);
-    if (state == NULL || state->magic != DOCUMENT_CONTROL_STATE_MAGIC
-        || state->node != node) return NULL;
+    const DocumentControlState *state = document_control_state_live(node);
+    if (state == NULL) return NULL;
     if (length != NULL) *length = state->length;
     return state->value;
 }
 
 lxb_dom_node_t *document_control_parser_form_owner(lxb_dom_node_t *node)
 {
-    if (node == NULL) return NULL;
-    const DocumentControlState *state = document_control_state_of(node);
-    if (state == NULL || state->magic != DOCUMENT_CONTROL_STATE_MAGIC
-        || state->node != node) return NULL;
+    const DocumentControlState *state = document_control_state_live(node);
+    if (state == NULL) return NULL;
     lxb_dom_node_t *owner = state->parser_form_owner;
     return owner != NULL && owner->owner_document == node->owner_document
         ? owner : NULL;
@@ -4829,10 +5053,7 @@ bool document_control_checked_snapshot(
     snapshot->valid = true;
     snapshot->node = node;
     snapshot->state_present = state != NULL;
-    snapshot->default_known = state != NULL
-        && state->checked_default_known;
-    snapshot->default_checked = state != NULL
-        && state->checked_default;
+    snapshot->checked_state = state == NULL ? -1 : (int) state->checked_state - 1;
     return true;
 }
 
@@ -4852,8 +5073,8 @@ bool document_control_checked_restore(
         if (state->magic != DOCUMENT_CONTROL_STATE_MAGIC
             || state->node != node || state->parser_form_owner != NULL
             || state->value != NULL || state->default_value_known
-            || state->resized_width != 0 || state->resized_height != 0
-            || !state->checked_default_known) return false;
+            || state->resized_width != 0 || state->resized_height != 0)
+            return false;
         DocumentControlState **link = &document->control_states;
         while (*link != NULL && *link != state) link = &(*link)->next;
         if (*link != state) return false;
@@ -4868,13 +5089,7 @@ bool document_control_checked_restore(
     }
     if (state == NULL || state->magic != DOCUMENT_CONTROL_STATE_MAGIC
         || state->node != node) return false;
-    if (snapshot->default_known) {
-        if (!state->checked_default_known) return false;
-        state->checked_default = snapshot->default_checked;
-    } else {
-        state->checked_default_known = false;
-        state->checked_default = false;
-    }
+    state->checked_state = (uint8_t) (snapshot->checked_state + 1);
     return true;
 }
 
@@ -4911,23 +5126,46 @@ bool document_control_default_value(
     return true;
 }
 
-bool document_control_checked_default(
-    PocDocument *document, lxb_dom_node_t *node, bool authored_checked,
-    bool *default_checked)
+int document_control_checked_state(lxb_dom_node_t *node)
 {
-    if (document == NULL || node == NULL || default_checked == NULL
+    const DocumentControlState *state = document_control_state_live(node);
+    return state == NULL ? -1 : (int) state->checked_state - 1;
+}
+
+bool document_control_checked(lxb_dom_node_t *node)
+{
+    if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT) return false;
+    int state = document_control_checked_state(node);
+    return state >= 0 ? (state & 1) != 0
+        : lxb_dom_element_has_attribute(lxb_dom_interface_element(node),
+            (const lxb_char_t *) "checked", sizeof("checked") - 1u);
+}
+
+/* An authored checked attribute change only supersedes an undirtied override. */
+static void document_control_checked_attribute_changed(lxb_dom_node_t *node)
+{
+    DocumentControlState *state = document_control_state_live(node);
+    if (state != NULL && state->checked_state < 3) state->checked_state = 0;
+}
+
+bool document_control_checked_set(
+    PocDocument *document, lxb_dom_node_t *node, int checked_state)
+{
+    if (document == NULL || document->html == NULL || node == NULL
+        || checked_state < -1 || checked_state > 3
         || node->owner_document != &document->html->dom_document) return false;
+    if (checked_state < 0) {
+        DocumentControlState *state = document_control_state_live(node);
+        if (state != NULL) state->checked_state = 0;
+        return true;
+    }
     BudgetAllocationOwner previous = document_allocation_owner_enter(document);
     DocumentControlState *state = document_control_state_ensure(document, node);
     if (state == NULL) {
         document_allocation_owner_leave(document, previous);
         return false;
     }
-    if (!state->checked_default_known) {
-        state->checked_default_known = true;
-        state->checked_default = authored_checked;
-    }
-    *default_checked = state->checked_default;
+    state->checked_state = (uint8_t) (checked_state + 1);
     document_allocation_owner_leave(document, previous);
     return true;
 }
@@ -5067,6 +5305,10 @@ bool document_control_state_discard_subtree(
                document, root, false)) return false;
     if (!document_control_parser_owner_discard(
             document, root, true)) return false;
+    /* Manual slot lists never hold template contents (another owner
+       document), so one ancestry pass over them covers the subtree. */
+    if (document->nonce_registry != NULL)
+        document_manual_slots_compact(document, NULL, NULL, 0, root);
     visited = 0;
     return document_control_state_walk(
         document, root, 0, &visited, true);

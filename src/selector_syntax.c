@@ -13,6 +13,7 @@ typedef struct {
     size_t length;
     size_t at;
     unsigned depth;
+    bool forgiving;
 } SelectorScan;
 
 /* Argument grammars of functional pseudos, as the last character of a
@@ -245,6 +246,41 @@ static int parse_compound(SelectorScan *scan, bool allow_element,
 static bool parse_list(SelectorScan *scan, bool relative,
                        bool allow_element, bool in_has,
                        bool compound_context);
+static bool parse_complex(SelectorScan *scan, bool relative,
+                          bool allow_element, bool in_has,
+                          bool compound_context);
+
+/* Lexbor discards invalid entries in :is()/:where(). For DOM queries the
+   syntax pre-check must permit the same recovery without swallowing the
+   enclosing ')' or a comma escaped inside an invalid component. */
+static void skip_invalid_selector_entry(SelectorScan *scan)
+{
+    unsigned nested = 0;
+    while (scan->at < scan->length) {
+        int c = byte_at(scan, scan->at);
+        if (nested == 0 && (c == ',' || c == ')')) return;
+        if (c == '"' || c == '\'') {
+            if (!consume_string(scan)) return;
+            continue;
+        }
+        if (c == '\\') {
+            scan->at++;
+            if (scan->at < scan->length) scan->at++;
+            continue;
+        }
+        if (c == '/' && byte_at(scan, scan->at + 1) == '*') {
+            scan->at += 2;
+            while (scan->at < scan->length &&
+                   (byte_at(scan, scan->at) != '*' ||
+                    byte_at(scan, scan->at + 1) != '/')) scan->at++;
+            if (scan->at < scan->length) scan->at += 2;
+            continue;
+        }
+        if (c == '(' || c == '[' || c == '{') nested++;
+        else if ((c == ')' || c == ']' || c == '}') && nested != 0) nested--;
+        scan->at++;
+    }
+}
 
 static bool parse_attribute(SelectorScan *scan)
 {
@@ -297,11 +333,19 @@ static bool parse_argument(SelectorScan *scan, char grammar, bool in_has,
     case 'r':
         return parse_list(scan, true, false, in_has, compound_context);
     case 'f':
-        /* Forgiving in the standard, but the native matcher has no notion
-           of a dropped entry: only the empty list (which matches nothing)
-           is let through. */
-        return at_end(scan)
-            || parse_list(scan, false, false, in_has, compound_context);
+        if (!scan->forgiving)
+            return at_end(scan)
+                || parse_list(scan, false, false, in_has, compound_context);
+        while (!at_end(scan)) {
+            size_t start = scan->at;
+            if (!parse_complex(scan, false, false, in_has, compound_context)) {
+                scan->at = start;
+                skip_invalid_selector_entry(scan);
+            }
+            if (at_end(scan)) break;
+            if (byte_at(scan, scan->at++) != ',') return false;
+        }
+        return true;
     case 'c': {
         int kind = parse_compound(scan, false, in_has, true);
         skip_space(scan);
@@ -469,11 +513,12 @@ static bool parse_list(SelectorScan *scan, bool relative,
     return false;
 }
 
-bool selector_syntax_valid(const char *text, size_t length)
+bool selector_syntax_valid_mode(const char *text, size_t length, bool forgiving)
 {
     if (text == NULL) return false;
     SelectorScan scan = {
         .text = (const unsigned char *) text, .length = length,
+        .forgiving = forgiving,
     };
     return parse_list(&scan, false, true, false, false);
 }

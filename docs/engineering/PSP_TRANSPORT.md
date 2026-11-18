@@ -14,13 +14,14 @@ extraction. The owned libraries include only narrow PSP portability changes.
 Runtime initialization also checks the linked curl, TLS, and nghttp2
 provenance against the versions compiled into Tilefinch.
 
-The pinned Mbed TLS also carries narrow upstream 3.6.8 client safety fixes:
-invalid TLS 1.2 ServerHello version rejection, CertificateRequest length
-checks, serialized-session ID bounds, TLS 1.3 transform failure cleanup,
-and empty distinguished-name termination. Its public layouts and saved-session
-format are unchanged. The host behavioral safety test uses the same patch
-with synthetic handshake records and allocation refusal; its configurable
-allocator is host-test-only, not part of the PSP configuration.
+The pinned Mbed TLS also carries upstream 3.6.8 client safety fixes
+(`patches/mbedtls-3.6.7-client-safety.patch`): TLS 1.2 ServerHello version
+rejection, CertificateRequest length checks, serialized-session ID bounds,
+TLS 1.3 transform failure cleanup, and empty distinguished-name termination.
+The patch keeps the pinned version, the public structure layouts and the
+saved-session format. `tilefinch-mbedtls-client-safety-tests` drives the same
+patched library on the host with synthetic handshake records and allocation
+refusal; its configurable allocator exists only in that test.
 
 ## Build modes
 
@@ -87,58 +88,63 @@ may block in DNS, TCP, or TLS. It exposes bounded generation-bearing request
 slots:
 
 - ordinary page and resource lanes allocate 64 KiB response buffers lazily;
-  of the six response descriptors, page and resource requests take at most
-  five (three while a player holds the media reserve) and the sixth is kept
-  for a blocking request: a synchronous XHR, a module import or a document's
-  external script (parser-blocking, or async or deferred at the end of the
-  parse), whose thread pumps nothing else while it waits. Such a request
-  likewise takes the slot reserved past its scheduler's cap and past the
-  page domain's, so requests nobody takes meanwhile cannot hold it off; only
-  the byte pool is shared, and a synchronous XHR waits at most 2 s for it and
-  then fails. A parser-blocking script's speculative preload that is still
-  waiting for a descriptor is cancelled when the parser reaches the script,
-  which then fetches on the kept one. Scripts a page inserts are fetched
-  without blocking and stay on the ordinary lanes;
+  of the six response descriptors they take at most five (three while a
+  player holds the media reserve);
+- the sixth descriptor is kept for a blocking request, whose thread pumps
+  nothing else while it waits: a synchronous XHR, a module import, or a
+  document's external script (parser-blocking, or async or deferred at the
+  end of the parse). A blocking request also takes the slot reserved past
+  its scheduler's cap and the page domain's cap, so requests nobody is
+  waiting on cannot hold it off. Only the byte pool is shared; a synchronous
+  XHR waits at most 2 s for it and then fails. A parser-blocking script's
+  speculative preload that is still waiting for a descriptor is cancelled
+  when the parser reaches the script, which then fetches on the kept one.
+  Scripts a page inserts do not block and stay on the ordinary lanes;
 - media range requests use two 256 KiB windows;
 - two optional WebSocket lanes retain one 64 KiB receive message and one
   64 KiB outbound message each, with one browser-visible event of backpressure;
 - HOME preconnect owns a bodyless descriptor;
-- a request slot holds a body under 8 KiB and extra headers under 2 KiB
-  inline; a larger body (up to `FETCH_REQUEST_BODY_LIMIT`, 96 KiB) or header
-  block (up to 8 KiB) gets a Budget copy of its exact size that the browser
-  thread frees once the slot is done, so every request shape the validator
-  admits runs on the worker. A scheduler request the worker cannot take
-  fails instead of running curl on the browser thread, with the reason in
-  its error: its shape, its Cookie header, or a deadline that passed while
-  the worker started; or the worker itself unavailable ("network transport
-  worker unavailable (worker-off)" for a scheduler that does not use it,
-  `worker-start` when the worker did not start, `worker-chunk` when the
-  scheduler's 64 KiB handoff buffer was refused). Only while an HTTP trace
-  is captured or replayed, which the worker cannot do, does a scheduler run
-  curl on the browser thread. A refused start or chunk fails that request
-  only: the next request tries again, a worker start at most once a
-  second;
 - update traffic uses the same worker but retains updater-owned verification
   and installation state.
+
+A request slot holds a body under 8 KiB and extra headers under 2 KiB inline.
+A larger body (up to `FETCH_REQUEST_BODY_LIMIT`, 96 KiB) or header block (up
+to 8 KiB) gets an exact-size Budget copy that the browser thread frees when
+the slot is done, so every request shape the validator admits fits the
+worker.
+
+On the PSP every scheduler request runs on the worker or fails; none falls
+back to curl on the browser thread. A request the worker cannot take fails
+with the reason in its error: its shape, its Cookie header, a deadline that
+passed while the worker started, or the worker itself being unavailable
+(not used by that scheduler, not started, or the scheduler's 64 KiB handoff
+buffer refused). The one exception is HTTP trace capture and replay, which
+the worker cannot do. A refused worker start or handoff buffer fails only
+that request; the next one tries again, starting the worker at most once a
+second.
 
 The worker is a byte mover, not a browser-policy authority. It never touches
 the DOM, JavaScript runtime, page allocator, cookie jar, UI, profile, logger,
 or filesystem. The browser thread prepares and authorizes each request hop,
 then consumes immutable chunks through the ordinary fetch scheduler.
 
-Worker hops follow the scheduler's own timing (`FetchWorkerTiming`): a
-buffered request is bounded by its deadline, with a stall abort only when the
-caller asks for one; a stream's deadline bounds only the wait for its response
-headers, and afterwards the stream ends only when no byte arrives for its
-stall allowance (`scheduled_stall_seconds`). A stream's bytes are handed over
-when the slot holds the publication target or 50 ms after the last byte
-arrived, whichever comes first, so a slow stream is not held in the worker.
-A stream consumer that reports its room (`FetchStreamOptions.on_capacity`,
-as `EventSource` does for its 64 KiB buffer) is handed no more than that per
-pump; the rest stays published in the worker slot until script has taken
+Worker hops keep the scheduler's own timing (`FetchWorkerTiming` in
+`include/tilefinch/fetch.h`):
+
+- a buffered request is bounded by its deadline, with a stall abort only when
+  the caller asks for one;
+- a stream's deadline bounds only the wait for its response headers;
+  afterwards the stream ends only when no byte arrives for its stall
+  allowance;
+- other worker users keep the default: the deadline throughout, and a 6 s
+  stall once a status line has arrived.
+
+A stream's bytes are handed over when the slot holds the publication target
+or 50 ms after the last byte arrived, whichever comes first, so a slow stream
+is not held in the worker. A stream consumer that reports its room (as
+`EventSource` does for its 64 KiB buffer) is handed no more than that per
+pump; the rest stays published in the worker slot until script has consumed
 what it holds.
-Other worker users keep the default: the deadline throughout and a 6 s stall
-once a status line has arrived.
 
 Redirect chains are intentionally sequential: only one already-authorized hop
 from a request is executing at a time. Independent requests still progress
@@ -321,45 +327,42 @@ for keys.
 **Cost.** Seeding is kept off the first paint wherever there is a wait to
 hide it in:
 
-- **Home or a profile page at boot.** The first Home paint and input sample
-  do not wait for seeding. After paint, association wait frames optionally
-  mix the existing seed, gather one complete estimator batch per admitted
-  slice, and perform the ordinary credited release in its own slice. An
-  immediate navigation's foreground connection wait uses the same
-  preparation owner after checking controls.
-- **A boot straight to a network page** (restore last page, or a custom
-  homepage), a reconnect after resume, and any later association wait whose
-  warm-up already retired. The foreground association wait has no
-  preparation owner, so it calls the same step, `psp_entropy_prepare_step()`,
-  once per vblank while no button is held. The pool is usually released
-  before `network-ready`, and the first navigation no longer pays for it.
+- **Boot to Home or a profile page.** The first Home paint and input sample do
+  not wait for seeding. After paint, association wait frames optionally mix
+  the existing seed, gather one complete estimator batch per admitted slice,
+  and perform the ordinary credited release in its own slice. An immediate
+  navigation's foreground connection wait continues the same preparation after
+  checking controls.
+- **Boot straight to a network page** (restore last page, or a custom
+  homepage), a reconnect after resume, or any later association wait after
+  the warm-up retired. The association wait itself gathers one batch per
+  vblank while no button is held, so the pool is normally released before
+  `network-ready`.
 - **Trace replay (validation builds).** There is no association wait, so the
-  boot seeds just before the initial navigation
-  (`psp_validation_entropy_preseed()`). First-present does not include it;
+  boot seeds just before the initial navigation. First-present excludes it;
   the `event=seeded` line still reports it.
 
-Optional warm-up never releases uncredited output, even with the validation
-policy; if it refuses, ordinary demand retains its original bounded attempt
-and configured policy. It adds no network requests and moves, rather than
-duplicates, the existing seed-file read and write. The samples, the
-estimator, the credit and the release rule are the same whichever path runs
-the batches.
+Warm-up never releases uncredited output, even under the validation policy;
+if it refuses, ordinary demand keeps its bounded attempt and configured
+policy. It adds no network requests, and it moves rather than duplicates the
+seed-file read and write. The samples, estimator, credit and release rule are
+the same on every path.
 
-Without completed preparation (for example, leaving Home for a page before
-the warm-up finishes, with Wi-Fi already up), the remaining first seeding runs
-inside curl's global initialization on the browser thread: at least 4 work
-and 3 sleep batches (1,216 samples) when every batch earns the maximum. On a
-PSP the full gathering measures 88–175 ms (`elapsed-us`), plus one small
-Memory Stick read and a 48-byte write. A work batch takes about 1.8 ms and a
-sleep batch about 15 ms, so the time is mostly the number of sleep batches.
-The work samples are a few microseconds measured on a 1 us clock, so each
-is one of two or three integers. Their credit therefore depends on where the
-mean duration falls between two ticks, and it moves when a relink shifts
-the code by a fraction of a microsecond
-(`test_estimator_tracks_tick_quantization`). In the association wait the
-whole seeding takes 11–21 vblanks. After release, each mbed TLS entropy poll
-costs about ten SHA-256 compressions for its 128 bytes. The actual sample
-times and estimates are only known from a device run:
+Without completed preparation (leaving Home for a page before the warm-up
+finishes, with Wi-Fi already up), the rest of the first seeding runs inside
+curl's global initialization on the browser thread: at least 4 work and 3
+sleep batches (1,216 samples) when every batch earns the maximum, plus one
+small Memory Stick read and a 48-byte write. Sleep batches dominate that
+time. After release, each mbed TLS entropy poll costs about ten SHA-256
+compressions for its 128 bytes.
+
+Work samples are a few ticks of the 1 µs clock, so each is one of two or
+three integers, and their credit depends on where the mean duration falls
+between two ticks. A relink that shifts the measured loop by a fraction of a
+microsecond legitimately moves the credit per batch
+(`test_estimator_tracks_tick_quantization` in
+`tests/test_psp_entropy_pool.c`). Sample times and estimates are therefore
+known only from a device run:
 
 ```text
 tilefinch-entropy: event=seeded mode=credited credited-bits=... target=256 attempts=1 elapsed-us=... seed-file=loaded work-batches=... work-mbits=MIN..MAX work-sample-us=... sleep-batches=... sleep-mbits=MIN..MAX sleep-sample-us=...
@@ -369,25 +372,25 @@ tilefinch-entropy: seed-file=written
 `mode=uncredited` on hardware means the jitter estimate fell short within one
 attempt; `event=unseeded` is a build that requires credit refusing. Either
 must be understood before a release. Validation builds and the crypto selftest
-print these lines. The shipping browser installs no report sink and prints
-nothing, so there a refusal is seen only through the failed connection.
+print these lines. The shipping browser installs no report sink, so there a
+refusal shows only as the failed connection.
 
 **Raw-sample capture (validation builds).** The estimator sees one batch at a
 time, so structure longer than its lags (a beat between two clocks, or two
 such beats) needs the samples themselves. A validation build run from
 `host0:` with `host0:/entropy-capture.cfg` present records every batch the
-pool gathers, in measured order, with its estimate and credit, then at the
-preseed point seeds (even without a trace), takes the configured extra runs
-of contiguous work and sleep samples that never reach the pool, and writes
-one TFER file beside the program. It never arms from the Memory Stick and
-never writes there; keys and format are in `src/psp_entropy_capture.h`.
-`tools/entropy_capture_report.py capture-1.tfer ...` reads one or more boots
-and reports repeat rate and autocorrelation at lags 1..256 against
-independent samples with the same value frequencies, and screening
-min-entropy estimates in the style of SP 800-90B (most common value, best
-lag, first-order Markov). A lag past 8 beyond the Bonferroni threshold is
-reported as structure. A capture boot's samples are that boot's pool input,
-so its TLS session keys are not secret from whoever holds the file.
+pool gathers, in order, with its estimate and credit. At the preseed point it
+seeds (even without a trace), takes the configured extra runs of contiguous
+work and sleep samples, which never reach the pool, and writes one TFER file
+beside the program. It never arms from or writes to the Memory Stick; keys
+and format are in `src/psp_entropy_capture.h`.
+`tools/entropy_capture_report.py capture-1.tfer ...` reads one or more boots.
+It reports repeat rate and autocorrelation at lags 1..256 against independent
+samples with the same value frequencies, and screening min-entropy estimates
+in the style of SP 800-90B (most common value, best lag, first-order Markov);
+a lag past 8 beyond the Bonferroni threshold is reported as structure. A
+capture boot's samples are that boot's pool input, so its TLS session keys
+are not secret from whoever holds the file.
 
 ```text
 tilefinch-entropy-capture: armed output=host0:/entropy-1.tfer extra-rounds=16 work-run=4096 sleep-run=1024 buffer-kib=1024
@@ -411,12 +414,12 @@ and removes the durable generation without disabling live connection reuse.
 
 googlevideo media ranges negotiate TLS 1.2. The media servers send no TLS 1.3
 tickets on `/videoplayback`, so a TLS 1.3 media reconnect is always a full
-handshake (0.5-1.5 s on hardware). A TLS 1.2 ticket arrives inside the
-handshake itself, and a resumed TLS 1.2 handshake does no key exchange and
-verifies no certificate: 70-200 ms on hardware, across launches too. The
-ClientHello hook re-enables the TLS 1.2 tickets libcurl turns off, and every
-googlevideo requester (player ranges and the range probe) asks for TLS 1.2,
-because curl reuses a connection only for requests with the same TLS settings.
+handshake. A TLS 1.2 ticket arrives inside the handshake itself, and a resumed
+TLS 1.2 handshake, across launches too, does no key exchange and verifies no
+certificate, the two costly steps on the PSP's CPU. The ClientHello hook
+re-enables the TLS 1.2 tickets libcurl turns off, and every googlevideo
+requester (player ranges and the range probe) asks for TLS 1.2, because curl
+reuses a connection only for requests with the same TLS settings.
 The cost is that a resumed TLS 1.2 connection reuses the ticket's master
 secret instead of a fresh key exchange; certificate and hostname checks on
 the full handshake are unchanged.
@@ -495,7 +498,10 @@ latency claim.
 - The shipping build's TLS RNG seeds only from credited timing jitter
   ([Entropy](#entropy)); nothing time-seeded is ever counted as entropy.
 - CA and hostname verification fail closed.
-- TLS resumption never bypasses ordinary peer verification.
+- A full handshake always verifies the peer; resumption reuses a session
+  only for the host that verified it. A resumed handshake verifies nothing
+  itself, so a saved session is only as trustworthy as the Memory Stick
+  ([Memory Stick site data](../SECURITY_MODEL.md#memory-stick-site-data)).
 - A preconnect carries only the pinned User-Agent: no page credentials,
   cookies, referrer, or body.
 - HTTP status codes, TLS-policy failures, and CDN throttling are not evidence

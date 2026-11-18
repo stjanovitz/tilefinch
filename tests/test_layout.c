@@ -84,7 +84,8 @@ static const char responsive_page[] =
     ".column-center>span{display:block;height:10px}"
     ".tracking{letter-spacing:3px}"
     ".grid-remainder{display:grid;grid-template-columns:repeat(3,1fr);gap:2px;width:101px}"
-    ".grid-remainder>span{display:block;height:5px}"
+    /* Isolate pixel remainder allocation from the words' automatic minimums. */
+    ".grid-remainder>span{display:block;height:5px;min-width:0}"
     ".ratio{display:block;width:160px;aspect-ratio:16 / 9;background:center/cover no-repeat #202020 url(https://example.com/background.png)}"
     ".explicit-background{display:block;width:120px;height:60px;"
     "background-image:url(https://example.com/logo.png);"
@@ -378,6 +379,7 @@ static int test_column_order_plan_refusal_release(void)
 }
 
 #include "suites/layout_humanist_ink.inc"
+#include "suites/layout_corrections.inc"
 
 static int test_layout(void)
 {
@@ -952,6 +954,151 @@ static int test_legacy_mobile_style_fallbacks(void)
     return 0;
 }
 
+/* Inline fragments (getClientRects) were recorded for every layout, about
+   58 KB per article on the PSP, though only a script realm reads them; an
+   element the 2,048-entry cap cut short kept the fragments of its first
+   lines, so its client rect was too small. The table is now recorded only
+   for a document a realm holds, trimmed when the layout finishes, and an
+   element cut short keeps none (geometry falls back). */
+static size_t fragment_chain_length(const LayoutDocument *layout,
+                                    const lxb_dom_node_t *node)
+{
+    size_t length = 0;
+    for (const LayoutInlineFragment *f = layout_inline_fragment_first(layout, node);
+         f != NULL; f = layout_inline_fragment_next(layout, f)) length++;
+    return length;
+}
+
+static int test_inline_fragments_follow_script_realm(void)
+{
+    enum { LINKS = 2040 };
+    static char html[LINKS * 24 + 8192];
+    for (int variant = 0; variant < 3; variant++) {
+        int links = variant == 2 ? LINKS : 40;
+        size_t used = (size_t) snprintf(html, sizeof(html),
+            "<!doctype html><body><p>");
+        for (int i = 0; i < links; i++)
+            used += (size_t) snprintf(html + used, sizeof(html) - used,
+                                      "<a href=#%d>w</a> ", i);
+        used += (size_t) snprintf(html + used, sizeof(html) - used,
+                                  "</p><p><span id=long>");
+        for (int i = 0; i < 600; i++)
+            used += (size_t) snprintf(html + used, sizeof(html) - used,
+                                      "word ");
+        used += (size_t) snprintf(html + used, sizeof(html) - used,
+                                  "</span></p>");
+        CHECK(used < sizeof(html));
+        Budget budget;
+        budget_init(&budget, 32 * MIB);
+        CHECK(budget_install_lexbor(&budget));
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        LayoutDocument layout = {0};
+        CHECK(document_parse(&document, &budget, html, used, 31));
+        document.script_realm_bound = variant != 0;
+        CHECK(stylesheet_build(&sheet, &budget, &document, 480)
+              && layout_build(&layout, &budget, &document, &sheet,
+                              NULL, NULL, 480));
+        lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+        lxb_dom_node_t *first = find_id(root, "long");
+        lxb_dom_node_t *link = root;
+        while (link != NULL && !(link->type == LXB_DOM_NODE_TYPE_ELEMENT
+                                 && document_attribute(link, "href", NULL)))
+            link = link->first_child != NULL ? link->first_child
+                : link->next != NULL ? link->next : link->parent->next;
+        CHECK(first != NULL && link != NULL);
+        const LayoutInlineFragments *table = layout.inline_fragments;
+        if (variant == 0) {
+            /* No realm: nothing to read the table, so none is built. */
+            CHECK(table == NULL && !layout_inline_fragments_complete(&layout));
+        } else if (variant == 1) {
+            CHECK(table != NULL && table->count == table->capacity
+                  && !table->truncated
+                  && layout_inline_fragments_complete(&layout)
+                  && fragment_chain_length(&layout, link) == 1
+                  && fragment_chain_length(&layout, first) > 8);
+        } else {
+            /* The cap fell inside #long: it had fragments, and lost them. */
+            size_t recorded = 0;
+            for (size_t i = 0; table != NULL && i < table->count; i++)
+                if (table->entries[i].node == first) recorded++;
+            if (table == NULL || !table->truncated || recorded == 0
+                || fragment_chain_length(&layout, first) != 0
+                || fragment_chain_length(&layout, link) != 1
+                || layout_inline_fragments_complete(&layout))
+                fprintf(stderr, "fragment cap: count %u truncated %d "
+                        "recorded %zu chain %zu\n",
+                        table == NULL ? 0u : table->count,
+                        table != NULL && table->truncated, recorded,
+                        fragment_chain_length(&layout, first));
+            CHECK(table != NULL && table->truncated && recorded != 0
+                  && fragment_chain_length(&layout, first) == 0
+                  && fragment_chain_length(&layout, link) == 1
+                  && !layout_inline_fragments_complete(&layout));
+        }
+        layout_destroy(&layout);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+        CHECK(budget_uninstall_lexbor(&budget));
+    }
+    return 0;
+}
+
+/* An RTL inline inside LTR text is coalesced into one text command after
+   its fragments were sealed, which left their command (the end of their
+   content) past the display list. The next fragment then marked the table
+   unordered for good, and every later line's fragment walk scanned the
+   whole table. Commands now stay within the list and in order. */
+static int test_rtl_coalesced_fragment_commands(void)
+{
+    static const char html[] =
+        "<!doctype html><body><p>left <span id=rtl style=direction:rtl>"
+        "ab<span id=inner>cd</span>ef</span> right</p>"
+        "<p><a href=#>after</a> text</p>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 31));
+    document.script_realm_bound = true;
+    CHECK(stylesheet_build(&sheet, &budget, &document, 480)
+          && layout_build(&layout, &budget, &document, &sheet,
+                          NULL, NULL, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *rtl = find_id(root, "rtl");
+    lxb_dom_node_t *inner = find_id(root, "inner");
+    const LayoutInlineFragments *table = layout.inline_fragments;
+    CHECK(rtl != NULL && inner != NULL && table != NULL && table->count >= 3
+          && layout_inline_fragment_first(&layout, rtl) != NULL
+          && layout_inline_fragment_first(&layout, inner) != NULL);
+    /* "left", then the coalesced "abcdef": both fragments end there, not
+       at "right" and "after", the commands laid out after the merge. */
+    CHECK(layout.count > 2 && layout.commands[1].type == DRAW_TEXT
+          && layout.commands[1].text_length == 6);
+    uint32_t rtl_end = layout_inline_fragment_first(&layout, rtl)->command;
+    uint32_t inner_end = layout_inline_fragment_first(&layout, inner)->command;
+    if (rtl_end != 2 || inner_end != 2)
+        fprintf(stderr, "rtl fragment ends: rtl %u inner %u\n", rtl_end,
+                inner_end);
+    CHECK(rtl_end == 2 && inner_end == 2);
+    uint32_t previous = 0;
+    for (size_t i = 0; i < table->count; i++) {
+        const LayoutInlineFragment *f = &table->entries[i];
+        if (f->command > layout.count || f->command < previous)
+            fprintf(stderr, "rtl fragment %zu: command %u after %u, "
+                    "%zu commands\n", i, f->command, previous, layout.count);
+        CHECK(f->command <= layout.count && f->command >= previous);
+        previous = f->command;
+    }
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "--text-measure-cache-only") == 0) {
@@ -968,6 +1115,12 @@ int main(int argc, char **argv)
     if (argc == 2 && strcmp(argv[1], "--legacy-mobile-styles-only") == 0)
         return test_legacy_mobile_style_fallbacks();
     CHECK(test_legacy_mobile_style_fallbacks() == 0);
+    if (argc == 2 && strcmp(argv[1], "--inline-fragments-only") == 0)
+        return test_inline_fragments_follow_script_realm();
+    CHECK(test_inline_fragments_follow_script_realm() == 0);
+    if (argc == 2 && strcmp(argv[1], "--rtl-fragment-commands-only") == 0)
+        return test_rtl_coalesced_fragment_commands();
+    CHECK(test_rtl_coalesced_fragment_commands() == 0);
     if (argc == 2 && strcmp(argv[1], "--grid-columns-only") == 0)
         return test_grid_column_metadata_refusal();
     CHECK(test_grid_column_metadata_refusal() == 0);
@@ -1068,6 +1221,9 @@ int main(int argc, char **argv)
         budget_install_lexbor(&budget);
         return test_container_size_containment_layout(&budget);
     }
+    if (argc == 2 && strcmp(argv[1], "--corrections-only") == 0)
+        return test_layout_corrections();
+    CHECK(test_layout_corrections() == 0);
     CHECK(test_auto_grid_block_alignment() == 0);
     CHECK(test_oversized_style_cache_scan() == 0);
     CHECK(test_style_cache_preserves_layout_workspace() == 0);

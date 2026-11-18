@@ -104,9 +104,7 @@ pages without that headroom get the same smaller, explicitly shortened view.
 When you ask for Basic view on a page whose running scripts hold that
 memory, and the view comes out shortened because of it, Tilefinch stops the
 page's scripts first (Basic view stops them when it is shown anyway) and
-prepares the view again with the memory they held. On the 0.1.51 census
-pages this took npr.org's front page from 512 to about 2,200 nodes, and
-Wikipedia's long article to its whole length.
+prepares the view again with the memory they held.
 
 Both limits are fixed when preparation starts, so the same page and memory
 state always give the same view. Preparation stops walking the source as
@@ -140,7 +138,8 @@ Tilefinch does by itself when a page qualifies as above:
   with **Show Basic view** listed right after Retry. A declined offer is not
   repeated for that page.
 - **Off** never switches to or offers Basic view by itself. The Page tools
-  item still works, and the separate blank-page Reader fallback is unchanged.
+  item still works, and the separate blank-page Reader fallback still
+  applies.
 
 A page qualifies when its scripts failed or were stopped and it is left blank
 or without a usable action, or when a script-memory refusal prevented it from
@@ -198,62 +197,61 @@ Basic view where it can help (not under Off):
 ## Opening in Basic view by default
 
 Under **Automatic**, a site whose page's scripts ran out of memory on an
-earlier visit opens in Basic view from then on. Tilefinch remembers such a
-site by name only (the last 8, while **URL history** is on; see the
-[user guide](USER_GUIDE.md#heavy-pages)). The next load of any of its pages
-runs with page JavaScript off, so it needs a fraction of the memory and
-time, and its commit is shown in Basic view under the note "Basic view:
-scripts ran out of memory last time" with **X Try full page  O Keep Basic
-view**. **Menu → Page tools → Try full page** (right after **Basic view**,
-only on such a page) does the same as Cross after the note is gone.
+earlier visit opens in Basic view. The signal is that site's own earlier
+failure on this PSP, not a guess from a page's size or name. Tilefinch
+remembers such a site by name only, the last 8, while **URL history** is on
+(see the [user guide](USER_GUIDE.md#heavy-pages)). Turning URL history off,
+forgetting a history address, or **Menu → Page tools → Site information →
+Reset permissions** forgets it. **Ask** and **Off** use the **Load without
+scripts?** offer instead.
 
-Only a GET navigation opens this way: a form's POST result is the server's
-answer to it, and neither **Try full page** nor the reload below could repeat
-it, so a POST loads as the site's JavaScript setting says. A site set to
-always open in Reader (**Menu → Page tools → Site information → Permissions
-& controls → Always Reader**) opens in Reader instead. The note takes Cross and Circle only the first time
-a site opens this way in a session; its later pages show the same note as a
-plain status (a press then belongs to the page), and Page tools keeps **Try
-full page**. A page shown afterwards by another route (an offline page, a
-native page, a restored tab) does not offer it.
+The next load of any of the site's pages runs with page JavaScript off, so it
+needs a fraction of the memory and time, and is shown in Basic view under the
+note **BASIC VIEW: SCRIPTS RAN OUT OF MEMORY LAST TIME** with **X Try full
+page  O Keep Basic view**. The note takes Cross and Circle only the first
+time a site opens this way in a session; on its later pages it is a plain
+status, and a press belongs to the page. **Menu → Page tools → Try full
+page** (right after **Basic view**, only on such a page) does the same as
+Cross at any time.
+
+Every page load the browser starts is covered, including the page shown at
+startup (the restored last page or a custom homepage) and a tab switch that
+reloads its page. These are not:
+
+- a form's POST result: it is the server's answer to the form, and neither
+  **Try full page** nor the reload below could repeat it, so it loads as the
+  site's JavaScript setting says;
+- a site set to always open in Reader (**Menu → Page tools → Site
+  information → Permissions & controls → Always Reader**), which opens in
+  Reader instead;
+- a page shown afterwards by another route (an offline page, a native page,
+  a restored tab), which does not offer **Try full page**;
+- a URL given on the command line, and the trace and validation boots.
 
 Basic view is used only when it keeps the script-free page. The page loads
 again at once with its scripts when:
 
-- Basic view would leave out a visible form control (a currency converter's
-  amount box in a form it cannot keep, a POST form), including the fields of
-  a form the view's size bound cut short or withdrew;
+- Basic view would leave out a visible form control (an amount box in a form
+  it cannot keep, a POST form), including the fields of a form the view's
+  size limit cut short or withdrew;
 - the page has almost nothing to read without scripts (fewer than 512 bytes
   of text: an app shell that says to enable JavaScript);
 - a redirect took the load to another site that has no note of its own.
 
-The requested site then keeps the **Load without scripts?** offer instead,
+The requested site then gets the **Load without scripts?** offer instead,
 for the rest of the session and, while **URL history** is on, for later
-sessions too (the profile remembers the last 8 such sites by name; turning
-URL history off, **Menu → Page tools → Site information → Reset
-permissions** and forgetting a history address forget them).
+sessions too. The profile remembers the last 8 such sites by name and
+forgets them the same way as the notes above.
 
 **Try full page** reloads that address once with scripts on. When that full
 page loads, the site's note is forgotten and its pages open normally again;
-if its scripts run out of memory again, the note returns and the next visit
-opens in Basic view again. A redirect within the site, or to another noted
-site, is presented the same way: the load ran without scripts, wherever it
-ended. Going to another page before the full page loads drops the request.
-The site's JavaScript setting is not changed; the load that opened in Basic
-view only ran without scripts, and the next load follows the setting again,
-including after a load that could not start or failed.
-
-The signal is the site's own earlier failure, measured on this PSP, not a
-guess from the page's size or its name. On the 55-page census replay of
-0.1.51, scripts stopped at their memory limit on four pages: three judged
-partial (a BBC article, BBC Sport and weather.com), which open in Basic
-view, and xe.com's converter, judged working, whose amount fields Basic view
-would drop, so it keeps loading in full. **Ask** and **Off** keep the older
-**Load without scripts?** offer instead (user guide, "Heavy pages"). Every
-page load the browser starts is covered, including the page shown at
-startup (the restored last page or a custom homepage) and a tab switch that
-reloads its page; a URL given on the command line and the trace and
-validation boots are not.
+if its scripts run out of memory again, the note returns. A redirect within
+the site, or to another noted site, is shown in Basic view too, because the
+load ran without scripts wherever it ended. Going to another page before the
+full page loads drops the request. The site's JavaScript setting is never
+changed: the load that opened in Basic view only ran without scripts, and the
+next load follows the setting again, including after a load that could not
+start or failed.
 
 ## Switching and fragments
 

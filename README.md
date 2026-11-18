@@ -40,7 +40,7 @@ coding agents are capable of. A web browser tests all three.
 | **Cookie notices** | Common consent banners are hidden without clicking Accept or creating consent cookies; individual sites can be exempted. |
 | **Reader, Basic view and offline** | Reader mode reflows articles; Basic view rescues pages whose scripts fail, keeping their links, tables and simple search forms. Save articles, and install small manifest-backed web apps for offline use with their icon and the same-origin resources already loaded, then update, reinstall, or remove them. |
 | **Text entry** | The PSP system keyboard or the faster Danzeff radial keyboard, with completion from local bookmarks and history. |
-| **Games** | Canvas 2D and a WebGL 1 subset for charts and modest games, with `ImageBitmap` asset preparation, user-started PCM game audio, page fullscreen, and the standard Gamepad API mapped to the PSP's controls. The included [Treadline Arena](examples/treadline-arena/) is a 3D WebGL tank game with a campaign, bot battles, a Practice Range and adaptive music. |
+| **Games** | Canvas 2D and a WebGL 1 subset for charts and modest games, with `ImageBitmap` asset preparation, user-started Web Audio for effects, tones and filters, page fullscreen, and the standard Gamepad API mapped to the PSP's controls. The included [Treadline Arena](examples/treadline-arena/) is a 3D WebGL tank game with a campaign, bot battles, a Practice Range and adaptive music. |
 | **Appearance** | Automatic or forced page dark mode, dark and light browser chrome, downloadable color themes, page text scaling and page zoom, On/Smart/Off website fonts, translated browser menus, mixed right-to-left and left-to-right layout with Arabic-family shaping, and optional Japanese, Simplified and Traditional Chinese, Korean, Cyrillic, Extended Latin, Arabic, Hebrew, Devanagari (Hindi), Bengali–Assamese, and color-emoji glyph packs. |
 | **Native PSP interface** | An immediate home screen, the Library, clock, battery and Wi-Fi status, contextual controls, PNG screenshots, and diagnostics shown as photographable QR codes. |
 | **Optional XMB redirect** | With ARK-4, Sony's Internet Browser icon can launch Tilefinch; holding L opens the original browser instead. |
@@ -175,12 +175,14 @@ The [user guide](docs/USER_GUIDE.md) covers everyday use in detail:
 - **Find in page** from **Menu → Page tools**.
 - **Reader mode**, **Basic view** for pages whose scripts fail, and
   **saving and downloads**: saved articles, offline apps, files and videos.
-- **YouTube**: search, channels, playlists, sign-in, and the native player.
+- **Video, page audio and YouTube**: the native player, internet radio,
+  and YouTube search, channels, playlists and sign-in.
 - **Games and page controls**: handing the buttons to a page's Gamepad API,
   fullscreen, game audio, and direct multiplayer.
-- **Screenshots**, what Tilefinch offers **when a page will not load**, and
-  the **per-site controls** for JavaScript, ad blocking, cookie notices, and
-  storage.
+- **Messages from a page**, the **microphone**, **screenshots**, what
+  Tilefinch offers **when a page will not load** or is too heavy, and the
+  **per-site controls** for JavaScript, ad blocking, cookie notices, the
+  microphone and storage.
 
 ## Language support
 

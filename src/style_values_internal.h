@@ -249,11 +249,7 @@ bool style_span_case_equal(const char *text, size_t length,
 bool style_span_contains_text(const char *text, size_t length,
                               const char *wanted);
 
-static inline bool span_equal(const char *text, size_t length,
-                                    const char *wanted)
-{
-    return strlen(wanted) == length && memcmp(text, wanted, length) == 0;
-}
+bool span_equal(const char *text, size_t length, const char *wanted);
 
 /* snprintf(output, size, "%s", text) without the formatter: copies at most
    size - 1 bytes and always terminates (nothing when size is 0). */

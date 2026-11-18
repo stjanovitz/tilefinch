@@ -3838,8 +3838,9 @@ static int test_easing_validation_agreement(void)
         /* The PSP profile prefers reduced motion, which shows CSS
            animations as a static frame with no easing to read. Answer
            matchMedia the other way before motion.js reads it. */
-        "<!doctype html><script>const mm=matchMedia;window.matchMedia=q=>"
-        "/reduced-motion/.test(q)?{matches:false,media:q}:mm(q)</script>"
+        "<!doctype html><script>const mm=matchMedia;"
+        "__tilefinchTestBrowserPatch(window,'matchMedia',q=>"
+        "/reduced-motion/.test(q)?{matches:false,media:q}:mm(q))</script>"
         "<style>@keyframes p{from{opacity:0}to{opacity:1}}"
         "#bad{animation:p 1s steps(foo)}"
         "#fn{animation:p 1s cubic-bezier(.2,.8,.2,1)}"
@@ -3964,8 +3965,9 @@ static int test_long_linear_easing(void)
     CHECK(used < sizeof(over) - 1u && used >= STYLE_TIMING_FUNCTION_CAPACITY);
     char html[8192];
     used = (size_t) snprintf(html, sizeof(html),
-        "<!doctype html><script>const mm=matchMedia;window.matchMedia=q=>"
-        "/reduced-motion/.test(q)?{matches:false,media:q}:mm(q)</script>"
+        "<!doctype html><script>const mm=matchMedia;"
+        "__tilefinchTestBrowserPatch(window,'matchMedia',q=>"
+        "/reduced-motion/.test(q)?{matches:false,media:q}:mm(q))</script>"
         "<style>@keyframes p{from{opacity:0}to{opacity:1}}"
         "#t{opacity:1;transition:opacity 40ms %s}#t.go{opacity:0}"
         "#o{transition:opacity 40ms ease-out;transition:opacity 40ms %s}"
@@ -6766,17 +6768,21 @@ static int test_same_document_and_script_free_defaults_on_clock(void)
         "getterInput.addEventListener('tilefinch-keepalive',()=>{});"
         "const getterDisabled=Object.getOwnPropertyDescriptor("
         "getterInput,'disabled');"
-        "Object.defineProperty(getterInput,'disabled',{...getterDisabled,"
+        "__tilefinchTestBrowserPatch(getterInput,'disabled',{"
         "get(){if(this.id==='getter-partial'){document.body.setAttribute("
         "'data-getter-ran','yes');while(true){}}"
-        "return getterDisabled.get.call(this);}});"
+        "return getterDisabled.get.call(this);}},true);"
         "const getterForm=document.getElementById('getter-form');"
         "getterForm.addEventListener('tilefinch-keepalive',()=>{});"
-        "getterForm.checkValidity=function(){"
+        "__tilefinchTestBrowserPatch(getterForm,'checkValidity',function(){"
         "this.setAttribute('data-check-ran','yes');"
-        "throw new Error('hostile checkValidity');};</script>"
+        "throw new Error('hostile checkValidity');});</script>"
         "<main id=native-reader data-tilefinch-reader-root=article>"
         "<a name=tilefinch-extracted-legacy>Legacy anchor</a></main>";
+    /* The page makes one input's disabled getter and one form's
+       checkValidity hostile through the test seam
+       (__tilefinchTestBrowserPatch): a page's own function on an element
+       does not stand in for the member the browser reads. */
     bool fragment_committed = browser_engine_commit_html(
         engine, "https://actions.test/page", fragment_page,
         sizeof(fragment_page) - 1u, true);
@@ -7041,7 +7047,7 @@ static int test_same_document_and_script_free_defaults_on_clock(void)
         || navigation->page.script_result.events_dispatched != events_before
         || !actionable_has_attribute(
                document_body_node(document), "data-getter-ran")
-        || actionable_has_attribute(getter_partial, "checked")) {
+        || document_control_checked(getter_partial)) {
         fprintf(stderr,
                 "getter activation activate=%d type=%d outcome=%d "
                 "entered=%zu/%zu events=%zu/%zu ran=%d checked=%d error=%s\n",
@@ -7053,7 +7059,7 @@ static int test_same_document_and_script_free_defaults_on_clock(void)
                 events_before,
                 actionable_has_attribute(
                     document_body_node(document), "data-getter-ran"),
-                actionable_has_attribute(getter_partial, "checked"),
+                document_control_checked(getter_partial),
                 navigation->page.script_result.error);
     }
     CHECK(getter_activated && action.type == CONTROLLER_ACTION_NONE
@@ -7065,7 +7071,7 @@ static int test_same_document_and_script_free_defaults_on_clock(void)
           && navigation->page.script_result.events_dispatched == events_before
           && actionable_has_attribute(
                  document_body_node(document), "data-getter-ran")
-          && !actionable_has_attribute(getter_partial, "checked"));
+          && !document_control_checked(getter_partial));
 
     CHECK(browser_engine_focus_node(engine, failed_link)
           && browser_engine_activate(engine, &action)
@@ -7091,13 +7097,13 @@ static int test_same_document_and_script_free_defaults_on_clock(void)
         && browser_engine_activate(engine, &action);
     if (!partial_activated || action.type != CONTROLLER_ACTION_NONE
         || action.activation_outcome != CONTROLLER_ACTIVATION_RUNTIME_FAILED
-        || actionable_has_attribute(partial, "checked")) {
+        || document_control_checked(partial)) {
         fprintf(stderr,
                 "partial activation focus=%d activate=%d type=%d outcome=%d "
                 "checked=%d result=%d events=%zu error=%s\n",
                 partial_focused, partial_activated, (int) action.type,
                 (int) action.activation_outcome,
-                actionable_has_attribute(partial, "checked"),
+                document_control_checked(partial),
                 navigation->page.script_result.success,
                 navigation->page.script_result.events_dispatched,
                 navigation->page.script_result.error);
@@ -7106,7 +7112,7 @@ static int test_same_document_and_script_free_defaults_on_clock(void)
           && action.type == CONTROLLER_ACTION_NONE
           && action.activation_outcome
                  == CONTROLLER_ACTIVATION_RUNTIME_FAILED
-          && !actionable_has_attribute(partial, "checked"));
+          && !document_control_checked(partial));
 
     /* Native history/bridge publication is authoritative even when the URL
        strings for the advisory JS callback cannot be allocated. The next
@@ -7140,23 +7146,23 @@ static int test_same_document_and_script_free_defaults_on_clock(void)
                  &navigation->page.script_result));
 
     /* A parser-circuit teardown can retire the author realm while retaining
-       its already-mutated DOM. Latch the authored checked state natively at
-       the mutation boundary so a later script-free Reset does not mistake
-       the live mutation for the default. */
+       its already-mutated DOM. A later script-free Reset still sees the
+       original authored attribute, not the retained live checkedness. */
     CHECK(script_runtime_evaluate_diagnostic(
               navigation->page.runtime,
               "document.getElementById('realm-check').checked=false;"
               "globalThis.pocSummary='realm-mutated'",
               "<checked-default-before-realm-teardown>",
               &navigation->page.script_result)
-          && !actionable_has_attribute(realm_check, "checked")
+          && !document_control_checked(realm_check)
+          && actionable_has_attribute(realm_check, "checked")
           && browser_engine_set_javascript_enabled(engine, false)
           && navigation->page.runtime == NULL
           && browser_engine_focus_node(engine, realm_reset)
           && browser_engine_activate(engine, &action)
           && action.activation_outcome
                  == CONTROLLER_ACTIVATION_RUNTIME_UNAVAILABLE
-          && actionable_has_attribute(realm_check, "checked"));
+          && document_control_checked(realm_check));
 
     /* With no author realm, the controller supplies the bounded HTML
        defaults itself. These actions remain useful on script-free/fallback
@@ -7226,11 +7232,14 @@ static int test_same_document_and_script_free_defaults_on_clock(void)
           && browser_engine_activate(engine, &action)
           && action.activation_outcome
                  == CONTROLLER_ACTIVATION_RUNTIME_UNAVAILABLE
-          && actionable_has_attribute(check, "checked")
+          && document_control_checked(check)
+          && !actionable_has_attribute(check, "checked")
           && browser_engine_focus_node(engine, radio_label)
           && browser_engine_activate(engine, &action)
-          && actionable_has_attribute(radio, "checked")
-          && !actionable_has_attribute(old_radio, "checked")
+          && document_control_checked(radio)
+          && !document_control_checked(old_radio)
+          && actionable_has_attribute(old_radio, "checked")
+          && !actionable_has_attribute(radio, "checked")
           && browser_engine_focus_node(engine, summary)
           && browser_engine_activate(engine, &action)
           && actionable_has_attribute(details, "open")
@@ -7253,16 +7262,15 @@ static int test_same_document_and_script_free_defaults_on_clock(void)
     CHECK(value != NULL && value_length == 2u
           && memcmp(value, "51", 2u) == 0);
     /* Native default mutation plus refresh/relayout is transactional under
-       bounded page-allocation failures. Prime the retained default, then
+       bounded page-allocation failures. Prime the retained live state, then
        sweep enough allocation boundaries to exercise both admission and
        relayout rollback without leaving the checkbox half-toggled. */
     CHECK(browser_engine_focus_node(engine, fault_check)
           && browser_engine_activate(engine, &action)
           && browser_engine_activate(engine, &action)
-          && !actionable_has_attribute(fault_check, "checked"));
+          && !document_control_checked(fault_check));
     CHECK(browser_engine_focus_node(engine, fault_check));
-    bool fault_checked_before = actionable_has_attribute(
-        fault_check, "checked");
+    bool fault_checked_before = document_control_checked(fault_check);
     size_t fault_owned_before = navigation->budget->current;
     size_t fault_states_before = document->control_state_count;
     budget_inject_failure_after(navigation->budget, 1u);
@@ -7270,7 +7278,7 @@ static int test_same_document_and_script_free_defaults_on_clock(void)
         browser_engine_controller(engine), &action);
     budget_clear_failure_injection(navigation->budget);
     CHECK(!fault_accepted
-          && actionable_has_attribute(fault_check, "checked")
+          && document_control_checked(fault_check)
                  == fault_checked_before
           && navigation->budget->current == fault_owned_before
           && document->control_state_count == fault_states_before);
@@ -7280,7 +7288,7 @@ static int test_same_document_and_script_free_defaults_on_clock(void)
     budget_inject_failure_after(navigation->budget, 1u);
     CHECK(!browser_engine_activate(engine, &action));
     budget_clear_failure_injection(navigation->budget);
-    CHECK(!actionable_has_attribute(orphan_fault, "checked")
+    CHECK(!document_control_checked(orphan_fault)
           && navigation->budget->current == fault_owned_before
           && document->control_state_count == fault_states_before);
     size_t range_owned_before = 0;
@@ -7342,9 +7350,9 @@ static int test_same_document_and_script_free_defaults_on_clock(void)
     CHECK(!browser_engine_activate(engine, &action));
     budget_clear_failure_injection(navigation->budget);
     value = document_control_value(query, &value_length);
-    CHECK(actionable_has_attribute(check, "checked")
-          && actionable_has_attribute(radio, "checked")
-          && !actionable_has_attribute(old_radio, "checked")
+    CHECK(document_control_checked(check)
+          && document_control_checked(radio)
+          && !document_control_checked(old_radio)
           && actionable_has_attribute(
                  second, "data-tilefinch-option-selected")
           && value != NULL && value_length == sizeof("edited") - 1u
@@ -7355,9 +7363,9 @@ static int test_same_document_and_script_free_defaults_on_clock(void)
           && navigation->budget->current == reset_owned_before
           && document->control_state_count == reset_states_before);
     CHECK(browser_engine_activate(engine, &action)
-          && !actionable_has_attribute(check, "checked")
-          && actionable_has_attribute(old_radio, "checked")
-          && !actionable_has_attribute(radio, "checked")
+          && !document_control_checked(check)
+          && document_control_checked(old_radio)
+          && !document_control_checked(radio)
           && !actionable_has_attribute(
                  second, "data-tilefinch-option-selected"));
     value = document_control_value(range, &value_length);

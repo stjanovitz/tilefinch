@@ -55,11 +55,21 @@ _Static_assert(TILEFINCH_UI_LANGUAGE_COUNT <= 16,
 #undef PSP_THEME_TEXT_BODY
 #undef PSP_THEME_TEXT_MUTED
 #undef PSP_THEME_TEXT_FAINT
+/* The built-in accents are palette sources only (psp_ui_theme.c). Left
+   defined, an Ember token here would paint the old orange whatever theme
+   is selected; undefined, any use fails to compile. */
+#undef PSP_THEME_ACCENT_MIDNIGHT
+#undef PSP_THEME_ACCENT_MIDNIGHT_HI
 #undef PSP_THEME_ACCENT_EMBER
 #undef PSP_THEME_ACCENT_EMBER_HI
+#undef PSP_THEME_ACCENT_COBALT
+#undef PSP_THEME_ACCENT_COBALT_HI
+#undef PSP_THEME_ACCENT_SLATE
+#undef PSP_THEME_ACCENT_SLATE_HI
 #undef PSP_THEME_ON_ACCENT
 #undef PSP_THEME_OK
 #undef PSP_THEME_WARN
+#undef PSP_THEME_DANGER
 #define PSP_THEME_GROUND (psp_ui_theme_active_palette->ground)
 #define PSP_THEME_GROUND_READER (psp_ui_theme_active_palette->ground_reader)
 #define PSP_THEME_CHROME_BAR (psp_ui_theme_active_palette->chrome_bar)
@@ -72,11 +82,14 @@ _Static_assert(TILEFINCH_UI_LANGUAGE_COUNT <= 16,
 #define PSP_THEME_TEXT_BODY (psp_ui_theme_active_palette->text_body)
 #define PSP_THEME_TEXT_MUTED (psp_ui_theme_active_palette->text_muted)
 #define PSP_THEME_TEXT_FAINT (psp_ui_theme_active_palette->text_faint)
-#define PSP_THEME_ACCENT_EMBER (psp_ui_theme_active_palette->accent)
-#define PSP_THEME_ACCENT_EMBER_HI (psp_ui_theme_active_palette->accent_high)
+#define PSP_THEME_ACCENT (psp_ui_theme_active_palette->accent)
+#define PSP_THEME_ACCENT_HI (psp_ui_theme_active_palette->accent_high)
 #define PSP_THEME_ON_ACCENT (psp_ui_theme_active_palette->on_accent)
 #define PSP_THEME_OK (psp_ui_theme_active_palette->ok)
 #define PSP_THEME_WARN (psp_ui_theme_active_palette->warn)
+/* Destructive actions only (Clear, Delete, Remove, Reset); warnings and
+   failures keep PSP_THEME_WARN. */
+#define PSP_THEME_DANGER (psp_ui_theme_active_palette->danger)
 #define UI_COLLECTIONS_ACTIVATION_FEEDBACK UINT8_C(0x80)
 
 #define UI_TOP_HEIGHT 39
@@ -765,7 +778,7 @@ static UiChromePalette ui_chrome_palette(BrowserChromeTheme theme)
     psp_ui_theme_select(theme);
     UiChromePalette palette = {
         .panel = PSP_THEME_PANEL,
-        .accent = PSP_THEME_ACCENT_EMBER,
+        .accent = PSP_THEME_ACCENT,
         .text = PSP_THEME_TEXT,
         .muted = PSP_THEME_TEXT_MUTED
     };
@@ -786,7 +799,7 @@ static UiSurfaceAccent ui_surface_accent(BrowserChromeTheme theme)
 {
     psp_ui_theme_select(theme);
     return (UiSurfaceAccent) {
-        PSP_THEME_ACCENT_EMBER, PSP_THEME_ACCENT_EMBER_HI };
+        PSP_THEME_ACCENT, PSP_THEME_ACCENT_HI };
 }
 
 /*
@@ -1471,6 +1484,39 @@ unsigned psp_ui_ratio_extent_u64(
     uint32_t scaled_value = (uint32_t) (value >> shift);
     if (scaled_total == 0) return 0;
     return scaled_value * extent / scaled_total;
+}
+
+void psp_ui_collection_format_bytes(PspUiCollectionsRow *row, uint64_t bytes)
+{
+    char *out = row->trailing;
+    size_t capacity = sizeof(row->trailing);
+    if (bytes >= UINT64_C(1048576)) {
+        /* Bound the whole-MB digits so the figure fits in the row. */
+        unsigned long long whole = bytes / UINT64_C(1048576);
+        if (whole > UINT64_C(99999)) whole = UINT64_C(99999);
+        unsigned remainder = (unsigned) (bytes % UINT64_C(1048576));
+        snprintf(out, capacity, "%llu.%u MB", whole,
+                 remainder * 10u / 1048576u);
+    } else if (bytes >= 1024u) {
+        snprintf(out, capacity, "%llu KB",
+                 (unsigned long long) (bytes / 1024u));
+    } else {
+        snprintf(out, capacity, "%llu B", (unsigned long long) bytes);
+    }
+}
+
+void psp_ui_collection_download_progress(
+    PspUiCollectionsRow *row, uint64_t received, uint64_t total)
+{
+    row->progress_per_mille = (uint16_t)
+        psp_ui_ratio_extent_u64(received, total, 1000u);
+    if (total != 0)
+        snprintf(row->trailing, sizeof(row->trailing), "%u%%",
+                 row->progress_per_mille / 10u);
+    else if (received != 0)
+        psp_ui_collection_format_bytes(row, received);
+    else
+        row->trailing[0] = '\0';
 }
 
 /*
@@ -6920,7 +6966,10 @@ static TILEFINCH_OUT_OF_LINE void draw_page_information(
             fill_round_rect(pixels, width, height, stride, row,
                             PSP_THEME_RADIUS_ROW,
                             PSP_THEME_SURFACE_FOCUS, 4);
-        uint16_t ink = confirm ? PSP_THEME_WARN
+        /* Clear data and Reset permissions destroy what the site kept or
+           was granted; they read as danger focused or not, and armed. */
+        bool destructive = at > UI_SITE_INFO_ROW_SITE_STORAGE;
+        uint16_t ink = destructive ? PSP_THEME_DANGER
             : (selected ? text : PSP_THEME_TEXT_BODY);
         const char *label = tilefinch_ui_text(
             confirm ? "Press X again to confirm" : site_info_actions[at]);
@@ -7024,10 +7073,12 @@ static void draw_zip_install(const PspUiState *ui, uint16_t *pixels,
         "Only install software you trust.", "Existing folders are not replaced.",
         "The ZIP is kept. Nothing runs automatically."
     };
+    /* Removal states what it deletes in the danger color. */
     for (size_t i = 0; i < sizeof(notes) / sizeof(notes[0]); i++)
         draw_fitted_ui_text(pixels, width, height, stride, left, box.y + 146 + (int)i * 20,
             tilefinch_ui_text(view->removing ? (i == 0 ? "The whole app folder will be deleted." : i == 1
-                ? "Saved data inside it will also be deleted." : "Downloaded ZIP files are kept.") : notes[i]), right, muted, 1, false);
+                ? "Saved data inside it will also be deleted." : "Downloaded ZIP files are kept.") : notes[i]), right,
+            view->removing && i < 2u ? PSP_THEME_DANGER : muted, 1, false);
     draw_fitted_ui_text(pixels, width, height, stride, left, box.y + box.height - 20,
         tilefinch_ui_text(view->removing ? "X Remove   O Cancel" : "X Install   O Cancel"), right, muted, 1, false);
 }
@@ -7351,6 +7402,12 @@ static TILEFINCH_OUT_OF_LINE void draw_offline_app_preview(
             (preview->theme_color >> 16) & 0xffu,
             (preview->theme_color >> 8) & 0xffu,
             preview->theme_color & 0xffu);
+        /* A 1 px muted ring keeps a theme color close to the panel's own
+           (a dark app on a dark theme) from vanishing into the sheet. */
+        fill_round_rect(
+            pixels, width, height, stride,
+            (UiRect) {box.x + 15, box.y + 150, 26, 16},
+            PSP_THEME_RADIUS_CHIP + 1, muted, 4);
         fill_round_rect(
             pixels, width, height, stride,
             (UiRect) {box.x + 16, box.y + 151, 24, 14},
@@ -7447,11 +7504,13 @@ static TILEFINCH_OUT_OF_LINE void draw_failure_recovery(
     UiRect box = {38, 8, width - 76, 256};
     ui_apply_overlay_motion(ui, &box);
     draw_panel_furniture(pixels, width, height, stride, box, 40, 20);
+    /* Titled like every other panel, in the theme's text: the fixed
+       warning orange read as the retired Ember accent under every theme. */
     draw_text_bold(pixels, width, height, stride,
                    box.x + 15, box.y + 13,
                    ui->failure_recovery_heavy ? "Too heavy for the PSP"
                                               : "Page did not open", 34,
-                   PSP_THEME_WARN, 2);
+                   text, 2);
     /* A failed load's detail is two catalog lines, its headline and next
        step (psp_ui_failure_headline); any other detail is one line, as
        sent. */
@@ -7492,18 +7551,18 @@ static TILEFINCH_OUT_OF_LINE void draw_failure_recovery(
         UiRect row = {box.x + 11, top + (int) at * row_height,
                       box.width - 22, row_height - 2};
         bool selected = ui->menu_selection == at;
+        /* The chosen action wears the accent pill, as in the menus. */
         if (selected)
             fill_round_rect(pixels, width, height, stride, row,
-                            PSP_THEME_RADIUS_ROW,
-                            PSP_THEME_SURFACE_FOCUS, 4);
+                            PSP_THEME_RADIUS_ROW, accent, 4);
         draw_text(pixels, width, height, stride, row.x + 8, row.y + 3,
-                  labels[at], 48, selected ? text : PSP_THEME_TEXT_BODY, 1);
+                  labels[at], 48,
+                  selected ? PSP_THEME_ON_ACCENT : PSP_THEME_TEXT_BODY, 1);
     }
     draw_fitted_ui_text(pixels, width, height, stride,
               box.x + 15, box.y + box.height - 20,
               tilefinch_ui_text("X Choose   O Return"),
               box.x + box.width - 15, muted, 1, false);
-    (void) accent;
 }
 
 static TILEFINCH_OUT_OF_LINE void draw_help_detail(
@@ -8080,11 +8139,15 @@ static TILEFINCH_OUT_OF_LINE void draw_option_items(
                     box.x + 10, row_y - 4, pill_width, row_height
                 },
                 PSP_THEME_RADIUS_ROW, accent, 4);
+        /* Clear playback positions acts on one press. */
+        bool destructive =
+            ui_option_id(at) == UI_OPTION_CLEAR_PLAYBACK_POSITIONS;
         draw_ui_label_value(
             pixels, width, height, stride, box.x + 18, value_right, row_y,
             tilefinch_ui_text(label), ui_option_id(at) == UI_OPTION_NETWORK_PROFILE
                 ? value : tilefinch_ui_text(value),
-            selected ? PSP_THEME_ON_ACCENT : PSP_THEME_TEXT_BODY,
+            selected ? PSP_THEME_ON_ACCENT
+                : (destructive ? PSP_THEME_DANGER : PSP_THEME_TEXT_BODY),
             selected ? PSP_THEME_ON_ACCENT : accent, 2);
     }
     if (first != 0)
@@ -8803,7 +8866,7 @@ static TILEFINCH_OUT_OF_LINE void draw_site_data(
         bool armed = destructive
             && ui->data_clear_confirmation == (uint8_t) (row + 1);
         uint16_t color = selected ? PSP_THEME_ON_ACCENT
-            : (destructive ? rgb565(239, 107, 117) : PSP_THEME_TEXT_BODY);
+            : (destructive ? PSP_THEME_DANGER : PSP_THEME_TEXT_BODY);
         const char *value = NULL;
         if ((size_t) row < sites) {
             /* The origin is the site's own name; its size and where it is
@@ -8904,7 +8967,7 @@ static TILEFINCH_OUT_OF_LINE void draw_storage_site(
                 (UiRect) {box.x + 10, line_y - 4, box.width - 20, 21},
                 PSP_THEME_RADIUS_ROW, accent, 4);
         uint16_t color = selected ? PSP_THEME_ON_ACCENT
-            : (at == 1u ? rgb565(239, 107, 117) : PSP_THEME_TEXT_BODY);
+            : (at == 1u ? PSP_THEME_DANGER : PSP_THEME_TEXT_BODY);
         if (at == 0u)
             draw_ui_label_value(
                 pixels, width, height, stride, box.x + 18,
@@ -8980,7 +9043,7 @@ static TILEFINCH_OUT_OF_LINE void draw_glyph_confirm(
 
 static TILEFINCH_OUT_OF_LINE void draw_youtube_login_offer(
     const PspUiState *ui, uint16_t *pixels, int width, int height,
-    int stride, uint16_t text, uint16_t muted)
+    int stride, uint16_t accent, uint16_t text, uint16_t muted)
 {
     UiRect box = {24, 24, width - 48, 224};
     ui_apply_overlay_motion(ui, &box);
@@ -8999,10 +9062,18 @@ static TILEFINCH_OUT_OF_LINE void draw_youtube_login_offer(
         };
         psp_ui_join_reading_order(line, sizeof(line), pieces, 2u);
         int y = i < 4u ? box.y + 14 + (int) i * 23 : box.y + 100 + (int) (i - 4u) * 25;
+        /* The chosen answer wears the accent pill, as in the menus. */
+        bool chosen = i >= 4u && ui->menu_selection == i - 4u;
+        if (chosen)
+            fill_round_rect(pixels, width, height, stride,
+                            (UiRect) {box.x + 8, y - 4, box.width - 16, 23},
+                            PSP_THEME_RADIUS_ROW, accent, 4);
         /* A line too wide at the larger scale (most translations) drops
            to the compact one rather than losing its end. */
         draw_fitted_ui_text(pixels, width, height, stride, box.x + 14, y,
-            line, box.x + box.width - 14, i == 0u || i >= 4u ? text : muted,
+            line, box.x + box.width - 14,
+            chosen ? PSP_THEME_ON_ACCENT
+                   : (i == 0u || i >= 4u ? text : muted),
             i == 0u || i >= 4u ? 2 : 1, i == 0u);
     }
     /* Circle and Select both answer Not now (psp_ui_menu's Select). */
@@ -9745,7 +9816,7 @@ static TILEFINCH_OUT_OF_LINE void draw_collections(
             fill_round_edge_bar(
                 pixels, width, height, stride, box, PSP_THEME_RADIUS_ROW,
                 PSP_THEME_FOCUS_STROKE,
-                confirm ? PSP_THEME_WARN
+                confirm ? PSP_THEME_DANGER
                         : (ui->focus_settle_frames != 0
                                ? accent.accent_high : accent.accent));
         }
@@ -9755,6 +9826,12 @@ static TILEFINCH_OUT_OF_LINE void draw_collections(
               + PSP_THEME_SPACE_L;
         int content_x = box.x + PSP_THEME_SPACE_M;
         if (row->app_theme_valid) {
+            /* The install preview's 1 px muted ring: it clears the focus
+               bar on the left and leaves 3 px before the icon. */
+            fill_round_rect(
+                pixels, width, height, stride,
+                (UiRect) {content_x - 1, box.y + 6, 7, 24}, 3,
+                PSP_THEME_TEXT_MUTED, 4);
             fill_round_rect(
                 pixels, width, height, stride,
                 (UiRect) {content_x, box.y + 7, 5, 22}, 2,
@@ -9797,7 +9874,7 @@ static TILEFINCH_OUT_OF_LINE void draw_collections(
                 tilefinch_ui_text(row->is_web_app
                                       ? "PRESS SQUARE AGAIN TO UNINSTALL"
                                       : "PRESS SQUARE AGAIN TO DELETE"),
-                TILEFINCH_UI_TRANSLATION_BYTES, row_right, PSP_THEME_WARN, 1,
+                TILEFINCH_UI_TRANSLATION_BYTES, row_right, PSP_THEME_DANGER, 1,
                 NULL, false);
         else
             draw_url_text(
@@ -10809,7 +10886,8 @@ static TILEFINCH_OUT_OF_LINE void psp_ui_composite_browser(
     } else if (ui->screen == PSP_UI_SCREEN_HEAVY_OFFER) {
         draw_heavy_offer(ui, pixels, width, height, stride, text, muted);
     } else if (ui->screen == PSP_UI_SCREEN_YOUTUBE_LOGIN) {
-        draw_youtube_login_offer(ui, pixels, width, height, stride, text, muted);
+        draw_youtube_login_offer(ui, pixels, width, height, stride, accent,
+                                 text, muted);
     } else if (ui->screen == PSP_UI_SCREEN_OPTIONS) {
         draw_options(ui, pixels, width, height, stride, panel, accent, text,
                      muted);
@@ -11071,11 +11149,14 @@ static void draw_startup_splash(
     const char *status, int progress_per_mille, uint16_t *pixels,
     int width, int height, int stride)
 {
+    /* Startup draws the default palette (psp_ui_startup_composite); its
+       neutrals are that palette's tokens, as the launcher's are, not the
+       retired navy ones. */
     uint16_t background = PSP_THEME_GROUND;
-    uint16_t panel = rgb565(13, 32, 43);
-    uint16_t accent = PSP_THEME_ACCENT_EMBER;
-    uint16_t text = rgb565(236, 244, 244);
-    uint16_t muted = rgb565(128, 151, 161);
+    uint16_t panel = PSP_THEME_LINE;
+    uint16_t accent = PSP_THEME_ACCENT;
+    uint16_t text = PSP_THEME_TEXT;
+    uint16_t muted = PSP_THEME_TEXT_MUTED;
     startup_fill(pixels, width, height, stride, background);
 
     int mark_x = width / 2 - TILEFINCH_BOOT_MARK_UNITS / 2;
@@ -11131,7 +11212,7 @@ static void draw_startup_homepage(
     uint16_t border = rgb565(215, 219, 223);
     uint16_t heading = rgb565(16, 20, 24);
     uint16_t muted = rgb565(92, 102, 112);
-    uint16_t accent = PSP_THEME_ACCENT_EMBER;
+    uint16_t accent = PSP_THEME_ACCENT;
     startup_fill(pixels, width, height, stride, page);
 
     /* Match the profile-backed homepage without reading page or font assets. */
@@ -11202,10 +11283,15 @@ void psp_ui_startup_composite(
     uint16_t *pixels, int width, int height, int stride)
 {
     /* Startup is deliberately file-independent. A custom palette is selected
-       only after the profile has explicitly requested and loaded it. */
-    psp_ui_theme_select(BROWSER_CHROME_THEME_FINCH);
+       only after the profile has explicitly requested and loaded it. A
+       startup surface drawn after that (a failure, a validation step) puts
+       the selected palette back, so painters that read the active palette
+       directly, such as the video overlay, do not fall back to the
+       default. */
     if (pixels == NULL || width <= 0 || height <= 0 || stride < width)
         return;
+    const PspUiThemePalette *selected = psp_ui_theme_active_palette;
+    psp_ui_theme_select(BROWSER_CHROME_THEME_FINCH);
     if (view == PSP_UI_STARTUP_HOMEPAGE) {
         draw_startup_homepage(
             status, progress_per_mille, pixels, width, height, stride);
@@ -11213,6 +11299,7 @@ void psp_ui_startup_composite(
         draw_startup_splash(
             status, progress_per_mille, pixels, width, height, stride);
     }
+    psp_ui_theme_active_palette = selected;
 }
 
 size_t psp_ui_state_bytes(void)
@@ -13392,7 +13479,7 @@ static __attribute__((noinline)) void draw_media_audio_bar(
         int live_width = chrome_text_width_bytes(live, strlen(live), 1, true);
         UiRect chip = {x, y - 1, live_width + 12, 18};
         fill_round_rect(pixels, width, height, stride, chip,
-                        PSP_THEME_RADIUS_CHIP, PSP_THEME_ACCENT_EMBER, 4);
+                        PSP_THEME_RADIUS_CHIP, PSP_THEME_ACCENT, 4);
         draw_fitted_ui_text(pixels, width, height, stride, chip.x + 6,
                             y + 2, live, chip.x + chip.width - 6,
                             PSP_THEME_ON_ACCENT, 1, true);
@@ -13419,7 +13506,7 @@ static void draw_media_control_bar(
 {
     uint16_t text = PSP_THEME_TEXT;
     uint16_t muted = PSP_THEME_TEXT_MUTED;
-    uint16_t accent = PSP_THEME_ACCENT_EMBER;
+    uint16_t accent = PSP_THEME_ACCENT;
     bool tracks_available = media->presentation != NULL
         && (media->presentation->audio_track_count != 0
             || media->presentation->subtitle_track_count != 0
@@ -13444,7 +13531,7 @@ static void draw_media_control_bar(
                         accent, 4);
         fill_round_rect(pixels, width, height, stride,
                         (UiRect) {right - 5, track_y - 3, 10, 10}, 5,
-                        PSP_THEME_ACCENT_EMBER_HI, 4);
+                        PSP_THEME_ACCENT_HI, 4);
         int live_end = draw_fitted_ui_text(
             pixels, width, height, stride, left, height - 53 + offset,
             tilefinch_ui_text("LIVE"), right, text, 2, false);
@@ -13503,7 +13590,7 @@ static void draw_media_control_bar(
     }
     fill_round_rect(pixels, width, height, stride,
                     (UiRect) {left + filled - 4, track_y - 3, 10, 10},
-                    5, PSP_THEME_ACCENT_EMBER_HI, 4);
+                    5, PSP_THEME_ACCENT_HI, 4);
     char current[24], duration[24], legend[64];
     media_format_time(display_time, current, sizeof(current));
     media_format_time(media->duration_us, duration, sizeof(duration));
@@ -14220,7 +14307,7 @@ static inline __attribute__((always_inline)) void draw_media_queue_body(
     snprintf(number, sizeof(number), ui_mirror_axis != 0 ? "#%u <" : "> #%u",
              (unsigned) presentation->queue_position + 1u);
     draw_text(pixels, width, height, stride, box.x + 20, box.y + 48,
-        number, 16, PSP_THEME_ACCENT_EMBER_HI, 1);
+        number, 16, PSP_THEME_ACCENT_HI, 1);
     if (presentation->queue_count)
         draw_media_row_text(pixels, width, height, stride, box.x + 78,
             box.y + 48, presentation->queue_titles[0], 42,
@@ -14302,7 +14389,7 @@ static void draw_media_track_row(
         draw_text(pixels, width, height, stride,
                   box.x + box.width - 30, y,
                   presentation->track_menu_tab == PSP_UI_MEDIA_TAB_QUEUE ? ">" : "X", 1,
-                  PSP_THEME_ACCENT_EMBER_HI, 1);
+                  PSP_THEME_ACCENT_HI, 1);
 }
 
 bool psp_ui_media_raster_menu_update(const PspUiMediaState *media,
@@ -14362,7 +14449,7 @@ static void draw_media_track_menu_box(
         unsigned column = media_menu_tab_column(presentation->track_menu_tab);
         draw_fitted_ui_text(pixels, width, height, stride, box.x + 24, box.y + 12,
             tilefinch_ui_text(media_menu_tabs[column].label), box.x + box.width - 24,
-            PSP_THEME_ACCENT_EMBER_HI, 2, true);
+            PSP_THEME_ACCENT_HI, 2, true);
         draw_text(pixels, width, height, stride, box.x + 8, box.y + 12, "<", 1,
             PSP_THEME_TEXT_MUTED, 2);
         draw_text(pixels, width, height, stride, box.x + box.width - 18, box.y + 12, ">", 1,
@@ -14375,7 +14462,7 @@ static void draw_media_track_menu_box(
         draw_fitted_ui_text(pixels, width, height, stride, edges[column] + 4, box.y + 12,
             tilefinch_ui_text(media_menu_tabs[column].label), edges[column + 1u] - 4,
             presentation->track_menu_tab == tab
-                ? PSP_THEME_ACCENT_EMBER_HI : PSP_THEME_TEXT_MUTED, 2, true);
+                ? PSP_THEME_ACCENT_HI : PSP_THEME_TEXT_MUTED, 2, true);
     }
     draw_panel_rule(pixels, width, height, stride, box, box.y + 35);
     /* The tabs keep their order (L and R step through them); the rows
@@ -14513,7 +14600,7 @@ void psp_ui_media_composite_layers(
             draw_media_track_menu(media, pixels, width, height, stride);
         return;
     }
-    /* Ember overlay language: warm near-black chrome, token text, accent
+    /* Overlay language: the theme's chrome ground, token text, accent
        scrubber and play glyph. All static chrome uses a stable opaque ground.
        Moving video behind an RGB565 blend visibly shimmers at glyph and shape
        edges on the physical panel. */
@@ -14521,7 +14608,7 @@ void psp_ui_media_composite_layers(
     uint16_t panel = PSP_THEME_PANEL;
     uint16_t text = PSP_THEME_TEXT;
     uint16_t muted = PSP_THEME_TEXT_MUTED;
-    uint16_t accent = PSP_THEME_ACCENT_EMBER;
+    uint16_t accent = PSP_THEME_ACCENT;
     if (include_title) {
         fill_rect(pixels, width, height, stride,
                   (UiRect) {0, 0, width, UI_MEDIA_TITLE_BAR_HEIGHT}, bar, 4);
@@ -14570,12 +14657,12 @@ void psp_ui_media_composite_layers(
         }
         if (shown == NULL || shown == headline)
             shown = tilefinch_ui_text(headline);
+        /* The theme's text, as the page's failure panel: a fixed pink was
+           near-invisible on the Daylight panel. The accent Retry marks it. */
         draw_fitted_ui_text(
             pixels, width, height, stride,
             message.x + 18, message.y + 17,
-            shown, message.x + message.width - 18,
-            media->failed ? rgb565(248, 160, 160) : text,
-            2, false);
+            shown, message.x + message.width - 18, text, 2, false);
         /* A details line may carry a short code for bug reports on its
            own line after the cause ("Check Wi-Fi, then press X to
            retry\nfetch failed"); the code is drawn small in the panel's

@@ -337,25 +337,6 @@ PspHomeTargetKind psp_home_target_kind(
  * the trailing detail is formatted, and it is formatted into the row.
  */
 
-static void psp_collections_format_bytes(
-    char *out, size_t capacity, uint64_t bytes)
-{
-    if (bytes >= UINT64_C(1048576)) {
-        /* The trailing field is 14 bytes; clamp the whole-MB digits so the
-           formatted size always fits instead of truncating mid-number. */
-        unsigned long long whole = bytes / UINT64_C(1048576);
-        if (whole > UINT64_C(99999)) whole = UINT64_C(99999);
-        snprintf(out, capacity, "%llu.%llu MB", whole,
-                 (unsigned long long)
-                     ((bytes % UINT64_C(1048576)) / UINT64_C(104858)));
-    } else if (bytes >= 1024u) {
-        snprintf(out, capacity, "%llu KB",
-                 (unsigned long long) (bytes / 1024u));
-    } else {
-        snprintf(out, capacity, "%llu B", (unsigned long long) bytes);
-    }
-}
-
 static const char *psp_collections_offline_state(OfflineItemState state)
 {
     switch (state) {
@@ -436,23 +417,14 @@ void psp_collections_sync_ui(
             }
             surface->view.rows[rows].deletable = true;
             surface->view.rows[rows].offline_state = (uint8_t) item->state;
-            OfflineDownloadSnapshot snapshot = {0};
-            if (downloads != NULL
-                && offline_download_manager_snapshot(
-                    downloads, item->id, &snapshot)
-                && snapshot.total_bytes != 0) {
-                surface->view.rows[rows].progress_per_mille = (uint16_t)
-                    psp_ui_ratio_extent_u64(
-                        snapshot.downloaded_bytes,
-                        snapshot.total_bytes, 1000u);
-            }
             const char *state = psp_collections_offline_state(item->state);
             if (item->state == OFFLINE_ITEM_DOWNLOADING) {
-                unsigned percent =
-                    surface->view.rows[rows].progress_per_mille / 10u;
-                snprintf(surface->view.rows[rows].trailing,
-                         sizeof(surface->view.rows[rows].trailing), "%u%%",
-                         percent);
+                OfflineDownloadSnapshot snapshot = {0};
+                if (downloads != NULL)
+                    (void) offline_download_manager_snapshot(
+                        downloads, item->id, &snapshot);
+                psp_ui_collection_download_progress(&surface->view.rows[rows],
+                    snapshot.downloaded_bytes, snapshot.total_bytes);
                 if (snapshot.bytes_per_second != 0
                     && snapshot.available_bytes != 0) {
                     char speed[24], free_mb[24];
@@ -468,13 +440,13 @@ void psp_collections_sync_ui(
                     psp_ui_join_reading_order(
                         surface->download_detail[rows],
                         sizeof(surface->download_detail[rows]), pieces, 5u);
+                    surface->view.rows[rows].detail =
+                        surface->download_detail[rows];
                 } else {
-                    snprintf(surface->download_detail[rows],
-                             sizeof(surface->download_detail[rows]),
-                             "%s", tilefinch_ui_text("Preparing resumable download"));
+                    surface->view.rows[rows].detail = snapshot.downloaded_bytes
+                        ? tilefinch_ui_text("Downloading")
+                        : tilefinch_ui_text("Preparing resumable download");
                 }
-                surface->view.rows[rows].detail =
-                    surface->download_detail[rows];
             } else if ((item->state == OFFLINE_ITEM_PAUSED
                         || item->state == OFFLINE_ITEM_FAILED)
                        && item->failure_reason[0] != '\0') {
@@ -500,9 +472,8 @@ void psp_collections_sync_ui(
                 surface->view.rows[rows].detail =
                     surface->download_detail[rows];
             } else {
-                psp_collections_format_bytes(
-                    surface->view.rows[rows].trailing,
-                    sizeof(surface->view.rows[rows].trailing),
+                psp_ui_collection_format_bytes(
+                    &surface->view.rows[rows],
                     item->content_bytes + item->audio_bytes);
             }
             surface->id[rows] = item->id;

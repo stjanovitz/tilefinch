@@ -15,7 +15,7 @@
    The time is whole seconds; any fractional part is ignored (".5" is 0).
    A missing URL means "refresh this document". Parsing is pure: the caller
    resolves the URL against the document (navigation does, see
-   docs/ARCHITECTURE.md, "Declarative refresh") and decides whether the
+   docs/engineering/PAGE_NAVIGATIONS.md) and decides whether the
    refresh may run. */
 typedef struct {
     /* Saturates at UINT32_MAX for absurd inputs. */

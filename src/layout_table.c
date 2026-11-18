@@ -115,6 +115,40 @@ size_t table_cell_row_span(lxb_dom_node_t *cell)
 
 #define TABLE_PLACEMENT_LIMIT 512u
 
+void table_expand_row_spans(LayoutContext *context, const TableTracks *tracks,
+                            const ComputedStyle *table_style)
+{
+    if (tracks == NULL || !tracks->has_row_spans) return;
+    for (size_t i = 0; i < tracks->placement_count; i++) {
+        const TableCellPlacement *place = &tracks->placements[i];
+        if (place->row_span <= 1) continue;
+        lxb_dom_node_t *row = place->cell->parent;
+        const LayoutNodeBox *cell_box = layout_box_for_node(context->layout,
+                                                           place->cell);
+        if (row == NULL || cell_box == NULL) continue;
+        int end = cell_box->y + cell_box->height;
+        unsigned rows = 0, visited = 0;
+        /* A rowspan stops at its row group. Unpublished preview rows
+           have no box and cannot supply a definite extent yet. */
+        for (lxb_dom_node_t *at = row;
+             at != NULL && rows < place->row_span && visited++ < TABLE_PLACEMENT_LIMIT;
+             at = at->next) {
+            if (!document_node_is_tag(at, LXB_TAG_TR)) continue;
+            const LayoutNodeBox *box = layout_box_for_node(context->layout, at);
+            if (box == NULL) continue;
+            rows++;
+            int bottom = box->y + box->height;
+            if (bottom > end) end = bottom;
+        }
+        if (end <= cell_box->y + cell_box->height) continue;
+        ComputedStyle group = row->parent == tracks->table ? *table_style
+            : layout_style_for_node(context, row->parent, table_style);
+        ComputedStyle row_style = layout_style_for_node(context, row, &group);
+        ComputedStyle cell = layout_style_for_node(context, place->cell, &row_style);
+        layout_expand_table_cell(context, place->cell, &cell, end - cell_box->y);
+    }
+}
+
 static size_t table_bounded_span_attribute(
     lxb_dom_node_t *node, const char *name);
 
@@ -967,6 +1001,7 @@ const TableTracks *table_tracks_for_table(
         table_tracks_release(context, tracks);
         return NULL;
     }
+    tracks->has_row_spans = has_row_spans;
     table_measure_columns(
         context, table, table_style, available_width,
         preferred, minimum, &count);
@@ -1050,13 +1085,19 @@ const TableTracks *table_tracks_for_table(
     return tracks;
 }
 
-const TableTracks *table_tracks_for_row(
-    LayoutContext *context, lxb_dom_node_t *row, int available_width)
+static lxb_dom_node_t *table_ancestor(const lxb_dom_node_t *node)
 {
-    lxb_dom_node_t *table = row == NULL ? NULL : row->parent;
+    lxb_dom_node_t *table = node == NULL ? NULL : node->parent;
     while (table != NULL && !document_node_is_tag(table, LXB_TAG_TABLE)) {
         table = table->parent;
     }
+    return table;
+}
+
+const TableTracks *table_tracks_for_row(
+    LayoutContext *context, lxb_dom_node_t *row, int available_width)
+{
+    lxb_dom_node_t *table = table_ancestor(row);
     if (table == NULL) return NULL;
     for (size_t i = 0; i < context->table_track_count; i++) {
         if (context->table_tracks[i].table == table
@@ -1068,19 +1109,29 @@ const TableTracks *table_tracks_for_row(
     return NULL;
 }
 
+/* The first track set of the cell's table, or NULL. */
+static const TableTracks *table_tracks_for_cell(
+    const LayoutContext *context, const lxb_dom_node_t *cell)
+{
+    lxb_dom_node_t *table = context == NULL ? NULL : table_ancestor(cell);
+    for (size_t i = 0; table != NULL && i < context->table_track_count; i++) {
+        if (context->table_tracks[i].table == table) return &context->table_tracks[i];
+    }
+    return NULL;
+}
+
 bool table_cell_uses_collapsed_geometry(
     const LayoutContext *context, const lxb_dom_node_t *cell)
 {
-    if (context == NULL || cell == NULL) return false;
-    lxb_dom_node_t *table = cell->parent;
-    while (table != NULL && !document_node_is_tag(table, LXB_TAG_TABLE)) {
-        table = table->parent;
-    }
-    if (table == NULL) return false;
-    for (size_t i = 0; i < context->table_track_count; i++) {
-        if (context->table_tracks[i].table == table) {
-            return context->table_tracks[i].border_collapse;
-        }
-    }
-    return false;
+    const TableTracks *tracks = table_tracks_for_cell(context, cell);
+    return tracks != NULL && tracks->border_collapse;
+}
+
+/* Whether table_expand_row_spans will size this rowspan cell: the table
+   kept tracks and placed it. Others fall back to their own row. */
+bool table_cell_row_span_placed(const LayoutContext *context,
+                                lxb_dom_node_t *cell)
+{
+    return table_cell_placement(table_tracks_for_cell(context, cell), cell,
+                                NULL, NULL, NULL);
 }

@@ -312,6 +312,21 @@ bool layout_build_scroll_metadata(LayoutDocument *layout,
 {
     if (layout == NULL || stylesheet == NULL
         || layout->node_box_count == 0) return true;
+    for (size_t i = 0; i < layout->sticky_count; i++) {
+        StickyRange *range = &layout->sticky_ranges[i];
+        const lxb_dom_node_t *node = range->node;
+        for (unsigned depth = 0; node != NULL && depth < 256u; depth++) {
+            node = node->parent;
+            const LayoutNodeBox *box = layout_box_for_node(layout, node);
+            if (box != NULL && box->clips_y && !box->clip_only_y
+                && !document_node_is_tag(node, LXB_TAG_HTML)
+                && !document_node_is_tag(node, LXB_TAG_BODY)) {
+                range->scrollport_box_plus_one =
+                    (size_t) (box - layout->node_boxes) + 1u;
+                break;
+            }
+        }
+    }
     for (size_t i = 0; i < layout->node_box_count; i++) {
         const LayoutNodeBox *box = &layout->node_boxes[i];
         bool scrollable_x = box->clips_x && !box->clip_only_x
@@ -365,11 +380,68 @@ bool layout_build_scroll_metadata(LayoutDocument *layout,
     return true;
 }
 
-static int scroll_apply_axis(int current, int maximum, int delta,
+int layout_sticky_offset(const LayoutDocument *layout, const StickyRange *range,
+                         int viewport_scroll, int viewport_height)
+{
+    int leading = viewport_scroll, extent = viewport_height;
+    if (range->scrollport_box_plus_one != 0
+        && range->scrollport_box_plus_one <= layout->node_box_count) {
+        const LayoutNodeBox *port = &layout->node_boxes[
+            range->scrollport_box_plus_one - 1u];
+        leading = layout_add_coordinate(
+            layout_add_coordinate(port->y, port->clip_inset_top), port->scroll_y);
+        extent = port->client_height;
+    }
+    int offset = 0;
+    if (range->bottom_inset != INT_MAX) {
+        int limit = layout_subtract_coordinate(
+            layout_add_coordinate(leading, extent), range->bottom_inset);
+        int up = layout_subtract_coordinate(limit, range->bottom_y);
+        if (up < offset) offset = up;
+    }
+    if (range->top != INT_MAX) {
+        int limit = layout_add_coordinate(leading, range->top);
+        int down = layout_subtract_coordinate(limit, range->origin_y);
+        if (down > offset) offset = down;
+    }
+    if (offset > range->maximum_offset) return range->maximum_offset;
+    if (offset < range->minimum_offset) return range->minimum_offset;
+    return offset;
+}
+
+int layout_node_sticky_offset(const LayoutDocument *layout,
+                              const lxb_dom_node_t *node,
+                              int viewport_scroll, int viewport_height)
+{
+    if (layout == NULL || layout->sticky_count == 0 || node == NULL) return 0;
+    int offset = 0;
+    const LayoutNodeBox *box = layout_box_for_node(layout, node);
+    if (box != NULL && box->positioned_ancestor_distance == UINT8_MAX)
+        return 0; /* Escapes the ancestor scroll/sticky coordinate space. */
+    for (size_t i = 0; i < layout->sticky_count; i++) {
+        const StickyRange *range = &layout->sticky_ranges[i];
+        if (node != range->node && box != NULL
+            && (box->command_start < range->command_start
+                || box->command_end > range->command_end)) continue;
+        const lxb_dom_node_t *at = node;
+        for (unsigned depth = 0; at != NULL && depth < 256u;
+             depth++, at = at->parent) {
+            if (at != range->node) continue;
+            int candidate = layout_sticky_offset(
+                layout, range, viewport_scroll, viewport_height);
+            if (candidate > offset || (offset <= 0 && candidate < offset))
+                offset = candidate;
+            break;
+        }
+    }
+    return offset;
+}
+
+static int scroll_apply_axis(int current, int minimum, int maximum, int delta,
                              int *remaining)
 {
     int64_t requested = (int64_t) current + delta;
-    int next = requested < 0 ? 0
+    int next = requested < minimum ? minimum
         : (requested > maximum ? maximum : (int) requested);
     if (remaining != NULL) {
         int64_t rest = requested - next;
@@ -400,11 +472,13 @@ bool layout_scroll_node_chain(LayoutDocument *layout, lxb_dom_node_t *node,
         int next_rest_x = rest_x, next_rest_y = rest_y;
         int maximum_x = box->content_width - box->client_width;
         int maximum_y = box->content_height - box->client_height;
+        if (maximum_x < 0) maximum_x = 0;
         int next_x = scroll_apply_axis(
-            box->scroll_x, maximum_x < 0 ? 0 : maximum_x,
+            box->scroll_x, box->scroll_rtl ? -maximum_x : 0,
+            box->scroll_rtl ? 0 : maximum_x,
             rest_x, &next_rest_x);
         int next_y = scroll_apply_axis(
-            box->scroll_y, maximum_y < 0 ? 0 : maximum_y,
+            box->scroll_y, 0, maximum_y < 0 ? 0 : maximum_y,
             rest_y, &next_rest_y);
         if (next_x != box->scroll_x || next_y != box->scroll_y) {
             layout->scroll_generation++;
@@ -654,6 +728,8 @@ static const LayoutNodeBox *scroll_layout_box(const void *layout,
 static bool scroll_placement_walk(LayoutBoxLookup lookup, const void *boxes,
                                   const lxb_dom_node_t *node,
                                   bool overflow_clips,
+                                  const lxb_dom_node_t *root,
+                                  const LayoutObserverMargin *margin,
                                   LayoutScrollPlacement *placement)
 {
     struct {
@@ -665,10 +741,15 @@ static bool scroll_placement_walk(LayoutBoxLookup lookup, const void *boxes,
     int dx = 0, dy = 0;
     unsigned skip = scroll_escape_span(lookup(boxes, node));
     unsigned steps = 0;
+    bool below_root = true, in_root = root == NULL;
     for (const lxb_dom_node_t *at = node->parent;
          at != NULL && steps < SCROLL_ANCESTOR_LIMIT;
          at = at->parent, steps++) {
         const LayoutNodeBox *box = lookup(boxes, at);
+        if (at == root) {
+            in_root = skip == 0;
+            below_root = false;
+        }
         bool escaped = skip != 0;
         if (escaped) skip--;
         unsigned span = scroll_escape_span(box);
@@ -681,7 +762,7 @@ static bool scroll_placement_walk(LayoutBoxLookup lookup, const void *boxes,
         enclosed = true;
         dx -= box->scroll_x;
         dy -= box->scroll_y;
-        if (applied_count < SCROLL_PLACEMENT_CLIP_LIMIT) {
+        if (below_root && applied_count < SCROLL_PLACEMENT_CLIP_LIMIT) {
             applied[applied_count].box = box;
             applied[applied_count].dx = dx;
             applied[applied_count].dy = dy;
@@ -698,6 +779,22 @@ static bool scroll_placement_walk(LayoutBoxLookup lookup, const void *boxes,
         layout_node_box_clip_rect(
             box, box->x + (dx - applied[i].dx), box->y + (dy - applied[i].dy),
             &left, &top, &right, &bottom);
+        if (margin != NULL && !box->clip_path_clip
+            && ((box->clips_x && !box->clip_only_x)
+                || (box->clips_y && !box->clip_only_y))) {
+            int offsets[4];
+            int width = right - left;
+            for (unsigned side = 0; side < 4; side++) {
+                int64_t v = margin->values[side];
+                if ((margin->percent_mask & (1u << side)) != 0)
+                    v = v * width / 100;
+                offsets[side] = layout_clamp_coordinate(v / 64);
+            }
+            left = layout_subtract_coordinate(left, offsets[3]);
+            top = layout_subtract_coordinate(top, offsets[0]);
+            right = layout_add_coordinate(right, offsets[1]);
+            bottom = layout_add_coordinate(bottom, offsets[2]);
+        }
         if (box->clips_x) {
             placement->clipped_x = true;
             if (left > placement->clip_left) placement->clip_left = left;
@@ -710,7 +807,7 @@ static bool scroll_placement_walk(LayoutBoxLookup lookup, const void *boxes,
                 placement->clip_bottom = bottom;
         }
     }
-    return enclosed;
+    return in_root && (root != NULL || enclosed);
 }
 
 bool layout_node_scroll_placement(const LayoutDocument *layout,
@@ -741,7 +838,7 @@ bool layout_node_scroll_placement(const LayoutDocument *layout,
         }
         if (!enclosed) return false;
     }
-    return scroll_placement_walk(scroll_layout_box, layout, node, false,
+    return scroll_placement_walk(scroll_layout_box, layout, node, false, NULL, NULL,
                                  placement);
 }
 
@@ -755,7 +852,21 @@ bool layout_node_overflow_placement(const LayoutDocument *layout,
         .clip_right = INT_MAX / 2, .clip_bottom = INT_MAX / 2
     };
     if (layout == NULL || node == NULL) return false;
-    return scroll_placement_walk(scroll_layout_box, layout, node, true,
+    return scroll_placement_walk(scroll_layout_box, layout, node, true, NULL, NULL,
+                                 placement);
+}
+
+bool layout_node_observer_placement(const LayoutDocument *layout,
+                                    const lxb_dom_node_t *node,
+                                    const lxb_dom_node_t *root,
+                                    const LayoutObserverMargin *margin,
+                                    LayoutScrollPlacement *placement)
+{
+    *placement = (LayoutScrollPlacement) {
+        .clip_left = INT_MIN / 2, .clip_top = INT_MIN / 2,
+        .clip_right = INT_MAX / 2, .clip_bottom = INT_MAX / 2
+    };
+    return scroll_placement_walk(scroll_layout_box, layout, node, true, root, margin,
                                  placement);
 }
 
@@ -770,7 +881,7 @@ bool layout_boxes_overflow_placement(LayoutBoxLookup lookup,
         .clip_right = INT_MAX / 2, .clip_bottom = INT_MAX / 2
     };
     if (lookup == NULL || node == NULL) return false;
-    return scroll_placement_walk(lookup, boxes, node, true, placement);
+    return scroll_placement_walk(lookup, boxes, node, true, NULL, NULL, placement);
 }
 
 LayoutCursor layout_cursor_for_node(const Stylesheet *stylesheet,

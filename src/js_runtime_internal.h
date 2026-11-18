@@ -374,6 +374,7 @@ typedef struct {
     bool active;
     bool headers_pending;
     bool headers_valid;
+    bool terminal_response;
     uint64_t id;
     struct DomBridge *bridge;
     TilefinchCredentialsMode credentials;
@@ -629,6 +630,7 @@ typedef struct DomBridge {
        lost (layout resets, resources are rescanned). */
     bool mutations_unrecorded;
     BrowserSession *session;
+    uint32_t session_storage_scope;
     const FontSet *fonts;
     char *document_url;
     const char *top_level_url;
@@ -1011,6 +1013,7 @@ typedef struct DomBridge {
     void *synchronous_layout_opaque;
     bool synchronous_layout_images_only;
     bool synchronous_layout_geometry_only;
+    bool expect_navigation_layout;
     /* script_runtime_set_sheet_settle_callback; a refusal stands until
        dom_version moves past `sheet_settle_refused_version`. */
     ScriptSynchronousLayoutCallback sheet_settle;
@@ -1470,6 +1473,9 @@ struct ScriptRuntime {
        it has taken its one hook claim (js_runtime_lazy_loading). */
     uint8_t lazy_loading_feature;
     bool lazy_hook_claimed;
+    /* A bit per lazy placeholder: an assignment through it is calling a
+       setter (runtime_lazy_bootstrap_assign). */
+    uint8_t lazy_assigning[16];
     /* Open while lazy modules load (and the step that builds their
        objects runs): what the interfaces held when it opened, so that only
        what those modules define is marked when it closes. NULL inside an
@@ -1478,6 +1484,9 @@ struct ScriptRuntime {
     bool platform_window_open;
     bool platform_window_loaded;
     JSPlatformSnapshot *platform_window;
+    /* The realm's interfaces are snapshotted when its bootstrap ends
+       (runtime_snapshot_interfaces). */
+    bool interface_snapshot;
 #ifdef JS_RT_TEST_INSTRUMENTS
     /* The bootstrap, eager and lazy, publishes its test-only probes. Off
        only when a host test asks for the shipping realm surface. */
@@ -2013,13 +2022,16 @@ JSValue js_rt_compile_source_type(JSContext *context, const char *source,
 bool js_rt_admit_cached_compile_source(
     JSContext *context, size_t length, const char *name,
     ScriptCompileSourceKind source_kind, ScriptResult *result);
+/* Whether module text goes to the function-source store (on unless the lab
+   switch TILEFINCH_JS_MODULE_SOURCE_STORE=0 turns it off). */
+bool js_rt_module_source_store_enabled(void);
 /* Function source outside the heap (evaluation.inc, "Function source
-   outside the heap"): bytecode restored from the classic cache refers to
-   its script's text by offset. Call begin before JS_ReadObject() with the
-   script text (NULL if not at hand: functions that need it then do not
-   restore) and end after it with what begin returned and the same text. A
-   false end means the restored functions cannot read their text (the
-   Budget refused the copy): discard the restored value as a failed
+   outside the heap"): bytecode restored from the classic or module cache
+   refers to its script's text by offset. Call begin before JS_ReadObject()
+   with the script text (NULL if not at hand: functions that need it then
+   do not restore) and end after it with what begin returned and the same
+   text. A false end means the restored functions cannot read their text
+   (the Budget refused the copy): discard the restored value as a failed
    restore. */
 uint32_t js_rt_source_store_begin_restore(ScriptRuntime *runtime,
                                           const char *source, size_t length);
@@ -2058,6 +2070,12 @@ bool js_rt_evaluate_external_module_at(
 bool js_rt_evaluate_source(JSContext *context, const char *source,
                            size_t length, const char *name,
                            ScriptResult *result);
+/* As js_rt_evaluate_source for the browser's own script: it and the
+   functions it defines are browser code and read the interface snapshot
+   (JS_EVAL_FLAG_TRUSTED); code it compiles at run time is not. */
+bool js_rt_evaluate_browser_source(JSContext *context, const char *source,
+                                   size_t length, const char *name,
+                                   ScriptResult *result);
 const char *js_rt_bridge_calculated_base_url(DomBridge *bridge);
 bool js_rt_image_preload_changed(DomBridge *bridge, lxb_dom_node_t *node);
 const ImageResource *js_rt_image_preload_find(DomBridge *bridge,
@@ -2727,6 +2745,8 @@ JSValue js_dom_query_all(JSContext *context,
 JSValue js_dom_register_shadow_root(JSContext *context,
                                     JSValueConst this_value,
                                     int argc, JSValueConst *argv);
+JSValue js_dom_assign_slot(JSContext *context, JSValueConst this_value,
+                           int argc, JSValueConst *argv);
 JSValue js_dom_constructed_sheet_text(JSContext *context,
                                       JSValueConst this_value,
                                       int argc, JSValueConst *argv);
@@ -2806,6 +2826,10 @@ JSValue js_dom_set_attribute(JSContext *context,
 JSValue js_dom_set_control_value(JSContext *context,
                                  JSValueConst this_value,
                                  int argc, JSValueConst *argv);
+JSValue js_dom_control_checked(JSContext *context, JSValueConst this_value,
+                              int argc, JSValueConst *argv);
+JSValue js_dom_form_direction(JSContext *context, JSValueConst this_value,
+                             int argc, JSValueConst *argv);
 JSValue js_dom_parser_form_owner(JSContext *context,
                                  JSValueConst this_value,
                                  int argc, JSValueConst *argv);

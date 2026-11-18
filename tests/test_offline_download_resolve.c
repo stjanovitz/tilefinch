@@ -476,13 +476,256 @@ static int test_failed_resolve_message(void)
     return fixture_close(&fixture);
 }
 
+static int test_resume_representation(void)
+{
+    Fixture fixture;
+    ReplayRecord records[] = {
+        {"GET", "https://www.youtube.com/watch?v=TFTEST00006",
+         "text/html", watch_page, sizeof(watch_page) - 1u},
+    };
+    if (fixture_open(&fixture, "TFTEST00006", records, 1) != 0) return 1;
+    OfflineDownloadManager *download = &fixture.download;
+    YoutubeStream stream = {
+        .video_id = "TFTEST00006", .content_length = 2000, .itag = 18,
+        .media_url = "https://rr2.googlevideo.com/videoplayback?id=asset&lmt=1&expire=1",
+    };
+    CHECK(offline_download_manager_start(download, fixture.id)
+          && offline_download_manager_adopt_resolved(download, &stream));
+    CHECK(fputs("old prefix", download->output) >= 0
+          && offline_download_manager_pause(download, fixture.id));
+    snprintf(stream.media_url, sizeof(stream.media_url),
+             "https://rr3.googlevideo.com/videoplayback?id=asset&lmt=1&expire=2");
+    CHECK(offline_download_manager_start(download, fixture.id)
+          && offline_download_manager_adopt_resolved(download, &stream)
+          && download->part_offset == strlen("old prefix")
+          && offline_download_manager_pause(download, fixture.id));
+    snprintf(stream.media_url, sizeof(stream.media_url),
+             "https://rr3.googlevideo.com/videoplayback?id=asset&lmt=2&expire=3");
+    CHECK(offline_download_manager_start(download, fixture.id)
+          && offline_download_manager_adopt_resolved(download, &stream)
+          && download->part_offset == 0
+          && offline_download_manager_pause(download, fixture.id));
+    /* A nonempty directory at a partial path models a removal refusal.
+       The old index must not be relabelled to the incoming representation. */
+    char path[384], child[400];
+    CHECK(offline_library_item_path(&fixture.library, fixture.id, ".audio.part",
+                                     path, sizeof(path)) && mkdir(path, 0700) == 0);
+    snprintf(child, sizeof(child), "%s/refuse", path);
+    FILE *file = fopen(child, "wb");
+    CHECK(file != NULL && fclose(file) == 0);
+    stream.content_length = 3000; stream.itag = 134;
+    CHECK(offline_download_manager_start(download, fixture.id)
+          && !offline_download_manager_adopt_resolved(download, &stream));
+    const OfflineLibraryItem *item = offline_library_find(&fixture.library, fixture.id);
+    CHECK(item->state == OFFLINE_ITEM_PAUSED && item->content_bytes == 2000
+          && item->itag == 18 && access(child, F_OK) == 0);
+    return fixture_close(&fixture);
+}
+
+static bool item_file(const Fixture *fixture, const char *suffix,
+                      char *path, size_t size)
+{
+    return offline_library_item_path(&fixture->library, fixture->id, suffix,
+                                     path, size);
+}
+
+static bool write_bytes(const char *path, size_t length)
+{
+    FILE *file = fopen(path, "wb");
+    if (file == NULL) return false;
+    bool ok = true;
+    for (size_t i = 0; ok && i < length; i++) ok = fputc('v', file) != EOF;
+    return fclose(file) == 0 && ok;
+}
+
+static off_t file_length(const char *path)
+{
+    struct stat status;
+    return stat(path, &status) == 0 ? status.st_size : -1;
+}
+
+/* A brand-new download takes the reset branch with none of its files on
+   the card: every removal answers ENOENT and must still count as done. */
+static int test_new_download_resets_without_files(void)
+{
+    Fixture fixture;
+    ReplayRecord records[] = {
+        {"GET", "https://www.youtube.com/watch?v=TFTEST00007",
+         "text/html", watch_page, sizeof(watch_page) - 1u},
+    };
+    if (fixture_open(&fixture, "TFTEST00007", records, 1) != 0) return 1;
+    static const char *suffixes[] = {
+        ".video.part", ".audio.part", ".video.mp4", ".audio.mp4",
+        ".video.identity"
+    };
+    char path[384];
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++)
+        CHECK(item_file(&fixture, suffixes[i], path, sizeof(path))
+              && access(path, F_OK) != 0);
+    YoutubeStream stream = {
+        .video_id = "TFTEST00007", .content_length = 2000, .itag = 135,
+        .audio_content_length = 1000, .audio_itag = 140,
+        .split_streams = true,
+        .media_url = "https://rr2.googlevideo.com/videoplayback?id=v&lmt=1",
+        .audio_url = "https://rr2.googlevideo.com/videoplayback?id=a&lmt=1",
+    };
+    OfflineDownloadManager *download = &fixture.download;
+    CHECK(offline_download_manager_start(download, fixture.id)
+          && offline_download_manager_adopt_resolved(download, &stream)
+          && download->phase == OFFLINE_DOWNLOAD_VIDEO
+          && download->part_offset == 0);
+    CHECK(item_file(&fixture, ".video.identity", path, sizeof(path))
+          && file_length(path) == 32);
+    const OfflineLibraryItem *item =
+        offline_library_find(&fixture.library, fixture.id);
+    CHECK(item->state == OFFLINE_ITEM_DOWNLOADING
+          && offline_download_manager_pause(download, fixture.id));
+    return fixture_close(&fixture);
+}
+
+/* A download paused on 0.1.52 has an index naming the stream (lengths,
+   itags, split flag) but no receipt. Updating must keep its bytes. */
+static int test_unreceipted_download_resumes(void)
+{
+    Fixture fixture;
+    ReplayRecord records[] = {
+        {"GET", "https://www.youtube.com/watch?v=TFTEST00008",
+         "text/html", watch_page, sizeof(watch_page) - 1u},
+    };
+    if (fixture_open(&fixture, "TFTEST00008", records, 1) != 0) return 1;
+    YoutubeStream stream = {
+        .video_id = "TFTEST00008", .content_length = 2000, .itag = 135,
+        .audio_content_length = 1000, .audio_itag = 140,
+        .split_streams = true,
+        .media_url = "https://rr2.googlevideo.com/videoplayback?id=v&lmt=1&expire=1",
+        .audio_url = "https://rr2.googlevideo.com/videoplayback?id=a&lmt=1&expire=1",
+    };
+    /* What 0.1.52 left: the index applied, a finished video and part of
+       the audio, and no .video.identity. */
+    CHECK(offline_library_apply_youtube_stream(
+        &fixture.library, fixture.id, &stream));
+    char video_final[384], audio_part[384], receipt[384];
+    CHECK(item_file(&fixture, ".video.mp4", video_final, sizeof(video_final))
+          && item_file(&fixture, ".audio.part", audio_part, sizeof(audio_part))
+          && item_file(&fixture, ".video.identity", receipt, sizeof(receipt))
+          && write_bytes(video_final, 2000) && write_bytes(audio_part, 300)
+          && access(receipt, F_OK) != 0);
+    snprintf(stream.media_url, sizeof(stream.media_url),
+             "https://rr3.googlevideo.com/videoplayback?id=v&lmt=1&expire=2");
+    snprintf(stream.audio_url, sizeof(stream.audio_url),
+             "https://rr3.googlevideo.com/videoplayback?id=a&lmt=1&expire=2");
+    OfflineDownloadManager *download = &fixture.download;
+    CHECK(offline_download_manager_start(download, fixture.id)
+          && offline_download_manager_adopt_resolved(download, &stream)
+          && download->phase == OFFLINE_DOWNLOAD_AUDIO
+          && download->part_offset == 300
+          && file_length(video_final) == 2000
+          && file_length(receipt) == 32);
+    const OfflineLibraryItem *item =
+        offline_library_find(&fixture.library, fixture.id);
+    CHECK(item->downloaded_bytes == 2300
+          && offline_download_manager_pause(download, fixture.id));
+    /* The receipt now binds those bytes: another revision resets them. */
+    snprintf(stream.audio_url, sizeof(stream.audio_url),
+             "https://rr3.googlevideo.com/videoplayback?id=a&lmt=2&expire=3");
+    CHECK(offline_download_manager_start(download, fixture.id)
+          && offline_download_manager_adopt_resolved(download, &stream)
+          && download->phase == OFFLINE_DOWNLOAD_VIDEO
+          && download->part_offset == 0
+          && access(video_final, F_OK) != 0
+          && offline_download_manager_pause(download, fixture.id));
+    return fixture_close(&fixture);
+}
+
+/* Without a receipt, an index that names another stream still resets. */
+static int test_unreceipted_mismatch_resets(void)
+{
+    Fixture fixture;
+    ReplayRecord records[] = {
+        {"GET", "https://www.youtube.com/watch?v=TFTEST00009",
+         "text/html", watch_page, sizeof(watch_page) - 1u},
+    };
+    if (fixture_open(&fixture, "TFTEST00009", records, 1) != 0) return 1;
+    YoutubeStream stream = {
+        .video_id = "TFTEST00009", .content_length = 2000, .itag = 18,
+        .media_url = "https://rr2.googlevideo.com/videoplayback?id=v&lmt=1",
+    };
+    CHECK(offline_library_apply_youtube_stream(
+        &fixture.library, fixture.id, &stream));
+    char video_part[384], receipt[384];
+    CHECK(item_file(&fixture, ".video.part", video_part, sizeof(video_part))
+          && item_file(&fixture, ".video.identity", receipt, sizeof(receipt))
+          && write_bytes(video_part, 500));
+    stream.itag = 22; /* same length, another format */
+    OfflineDownloadManager *download = &fixture.download;
+    CHECK(offline_download_manager_start(download, fixture.id)
+          && offline_download_manager_adopt_resolved(download, &stream)
+          && download->phase == OFFLINE_DOWNLOAD_VIDEO
+          && download->part_offset == 0
+          && file_length(video_part) == 0
+          && file_length(receipt) == 32
+          && offline_download_manager_pause(download, fixture.id));
+    return fixture_close(&fixture);
+}
+
+/* A part longer than its stream is not a prefix of it. Opening it for
+   the next stream restarts that stream instead of failing the attempt. */
+static int test_oversized_part_restarts(void)
+{
+    Fixture fixture;
+    ReplayRecord records[] = {
+        {"GET", "https://www.youtube.com/watch?v=TFTEST00010",
+         "text/html", watch_page, sizeof(watch_page) - 1u},
+    };
+    if (fixture_open(&fixture, "TFTEST00010", records, 1) != 0) return 1;
+    YoutubeStream stream = {
+        .video_id = "TFTEST00010", .content_length = 2000, .itag = 135,
+        .audio_content_length = 1000, .audio_itag = 140,
+        .split_streams = true,
+        .media_url = "https://rr2.googlevideo.com/videoplayback?id=v&lmt=1",
+        .audio_url = "https://rr2.googlevideo.com/videoplayback?id=a&lmt=1",
+    };
+    OfflineDownloadManager *download = &fixture.download;
+    CHECK(offline_download_manager_start(download, fixture.id)
+          && offline_download_manager_adopt_resolved(download, &stream)
+          && download->phase == OFFLINE_DOWNLOAD_VIDEO
+          && offline_download_manager_pause(download, fixture.id));
+    /* The whole video arrived but was not yet published. */
+    char video_part[384], video_final[384], audio_part[384];
+    CHECK(item_file(&fixture, ".video.part", video_part, sizeof(video_part))
+          && item_file(&fixture, ".video.mp4", video_final, sizeof(video_final))
+          && item_file(&fixture, ".audio.part", audio_part, sizeof(audio_part))
+          && write_bytes(video_part, 2000));
+    CHECK(offline_download_manager_start(download, fixture.id)
+          && offline_download_manager_adopt_resolved(download, &stream)
+          && download->phase == OFFLINE_DOWNLOAD_VIDEO
+          && download->part_offset == download->part_total);
+    CHECK(write_bytes(audio_part, 1500));
+    (void) offline_download_manager_pump(download);
+    const OfflineLibraryItem *item =
+        offline_library_find(&fixture.library, fixture.id);
+    CHECK(download->active_id == fixture.id
+          && download->phase == OFFLINE_DOWNLOAD_AUDIO
+          && download->part_offset == 0
+          && item->state == OFFLINE_ITEM_DOWNLOADING
+          && file_length(video_final) == 2000
+          && file_length(audio_part) == 0
+          && offline_download_manager_pause(download, fixture.id));
+    return fixture_close(&fixture);
+}
+
 int main(void)
 {
     if (test_resolve_spans_pumps() != 0
         || test_resolve_uses_cached_identity() != 0
         || test_pause_during_resolve() != 0
         || test_cancel_during_resolve() != 0
-        || test_failed_resolve_message() != 0)
+        || test_failed_resolve_message() != 0
+        || test_resume_representation() != 0
+        || test_new_download_resets_without_files() != 0
+        || test_unreceipted_download_resumes() != 0
+        || test_unreceipted_mismatch_resets() != 0
+        || test_oversized_part_restarts() != 0)
         return 1;
     printf("offline download resolve tests passed\n");
     return 0;

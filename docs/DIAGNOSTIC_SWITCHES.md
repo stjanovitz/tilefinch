@@ -23,9 +23,10 @@ rejects any value other than these:
 - *always*: a shipping build reads it too.
 - *always, set by the PSP app*: a shipping read whose value the app exports.
   The PSP starts with an empty environment, and in a shipping build the app's
-  `psp_apply_engine_env_knobs` exports only four switches:
+  `psp_apply_engine_env_knobs` exports only five switches:
   `TILEFINCH_JS_BOOT_WINDOW_KB`, `TILEFINCH_JS_GC_GROWTH_PCT`,
-  `TILEFINCH_JS_LAZY_FUNCTIONS` and `TILEFINCH_JS_ARRAY_CAP_KB`.
+  `TILEFINCH_JS_LAZY_FUNCTIONS`, `TILEFINCH_JS_INTERFACE_SNAPSHOT` and
+  `TILEFINCH_JS_ARRAY_CAP_KB`.
 
 Every other *always* read finds its switch unset on the device, so its
 default applies, but the code and its strings ship.
@@ -146,9 +147,9 @@ default applies, but the code and its strings ship.
 | `TILEFINCH_DISABLE_INSERT_SCOPED_REUSE` | 1 | `src/navigation/layout_reuse.inc` | host | Reset the layout reuse cache for every child-list insertion instead of scoping detached-subtree insertions to their parent. |
 | `TILEFINCH_DISABLE_NODE_RETIREMENT` | 1 | `src/navigation/mutation_classify.inc` | host | Do not bind the runtime's freed-subtree callback to the page reuse cache, so removals, moves and innerHTML replacements reset the cache again. |
 | `TILEFINCH_DISABLE_LAZY_BUNDLE_RECORDS` | 1 | `src/js_lazy_webpack.c` | host | Neither look up nor store lazy webpack bundle records: every load plans its lazy bundles as a first visit does (A/B baseline for the record cache). |
-| `TILEFINCH_LAZY_WEBPACK_FACTORY_TEXT` | 1 | `src/js_lazy_webpack.c` | host / PSP validation | `heap` keeps a lazy webpack factory's `Function.prototype.toString()` text in the QuickJS heap, as before factories compiled without it (A/B baseline; see ARCHITECTURE.md, "Function source outside the heap"). |
-| `TILEFINCH_LAZY_WEBPACK_PREFLIGHT` | 1 | `src/js_lazy_webpack.c` | host | Compile every factory of a lazy webpack bundle once as a syntax check before registration, falling back to the eager path if one fails: the behaviour before the first-visit preflight was retired (A/B baseline; see ARCHITECTURE.md, "Lazy webpack bundles"). |
-| `TILEFINCH_JS_GC_PACING` | 1 | `src/js_runtime/document_state.inc` | host / PSP validation | `0` restores the JS collection pacing from before amortized near-limit pacing (QuickJS's half-headroom threshold re-arm, and the compile-pressure collections before every lazy webpack factory and external compile), for a same-binary A/B. On PSP validation builds, `boot.cfg`'s `validation_gc_pacing=0` sets it and a `tilefinch-gc-pacing: mode=0` line confirms it. |
+| `TILEFINCH_LAZY_WEBPACK_FACTORY_TEXT` | 1 | `src/js_lazy_webpack.c` | host / PSP validation | `heap` keeps a lazy webpack factory's `Function.prototype.toString()` text in the QuickJS heap instead of compiling factories without it (A/B baseline; see [Factory text](engineering/SCRIPT_MEMORY.md#factory-text)). |
+| `TILEFINCH_LAZY_WEBPACK_PREFLIGHT` | 1 | `src/js_lazy_webpack.c` | host | Compile every factory of a lazy webpack bundle once as a syntax check before registration, falling back to the eager path if one fails, instead of skipping the first-visit preflight (A/B baseline; see [Syntax errors: a deliberate deviation](engineering/SCRIPT_MEMORY.md#syntax-errors-a-deliberate-deviation)). |
+| `TILEFINCH_JS_GC_PACING` | 1 | `src/js_runtime/document_state.inc` | host / PSP validation | `0` replaces amortized near-limit pacing with QuickJS's half-headroom threshold re-arm and a compile-pressure collection before every lazy webpack factory and external compile, for a same-binary A/B. On PSP validation builds, `boot.cfg`'s `validation_gc_pacing=0` sets it and a `tilefinch-gc-pacing: mode=0` line confirms it. |
 | `TILEFINCH_DISABLE_LAZY_WEBPACK` | 1 | `src/js_lazy_webpack.c` | host / PSP validation | Load large webpack bundles eagerly instead of through the lazy factory plan. |
 | `TILEFINCH_DISABLE_HAS_SCOPED_INVALIDATION` | 2 | `src/js_computed_style.c` | host | Reset the layout reuse cache and getComputedStyle's retained styles for every change a `:has()` rule may observe instead of invalidating only the elements whose `:has()`-dependent matches can move (for A/B comparison). |
 | `TILEFINCH_DISABLE_RETAINED_MATCHES` | 1 | `src/layout_reuse.c` | host | Disable the page layout reuse cache's retained per-element matched-rule lists for timing and equivalence comparison. |
@@ -177,10 +178,12 @@ default applies, but the code and its strings ship.
 | `TILEFINCH_JS_GC_MIN_SLACK_KB` | 1 | `src/js_runtime/runtime_loop.inc` | host / PSP validation | Minimum growth window re-armed after a full collection, in KiB. |
 | `TILEFINCH_JS_GC_RESERVE_KB` | 1 | `src/js_runtime/runtime_loop.inc` | host / PSP validation | Pre-limit reserve kept below the hard heap limit, in KiB. |
 | `TILEFINCH_JS_GC_SLACK_KB` | 1 | `src/js_runtime/document_state.inc` | host / PSP validation | Fixed slack added to the GC threshold, in KiB. |
+| `TILEFINCH_JS_INTERFACE_SNAPSHOT` | 1 | `src/js_runtime/runtime_creation.inc` | always, set by the PSP app | `0` builds every realm without the interface snapshot, so the browser's own script reads the built-ins as the page left them (docs/ARCHITECTURE.md, "Interface snapshot"). The PSP app exports it only when `boot.cfg` sets `interface_snapshot=0`. |
 | `TILEFINCH_JS_LAZY_FUNCTIONS` | 1 | `src/js_runtime/evaluation.inc` | always, set by the PSP app | Minimum source bytes of a page function compiled lazily on first call; 0 compiles every function eagerly. The PSP app exports it only when `boot.cfg` sets `lazy_functions`. |
 | `TILEFINCH_JS_PREPARSE` | 1 | `src/js_runtime/evaluation.inc` | host / PSP validation | `0` parses the body of every lazily compiled function in full when its script compiles, instead of validating it with the preparser (preparsing). |
 | `TILEFINCH_JS_POOL_TRIM_RETRY` | 1 | `src/budget.c` | host / PSP validation | Set to 0 to disable the trim-and-retry on a refused QuickJS pool request. |
-| `TILEFINCH_JS_SOURCE_STORE` | 1 | `src/js_runtime/evaluation.inc` | host / PSP validation | Where a classic page script of at least 8 KiB keeps its `Function.prototype.toString()` text (docs/ARCHITECTURE.md, "Function source outside the heap"): unset (or `pressure`) is the shipping policy, `plain` never compresses, `lz` compresses every block as the script compiles, `keep` keeps the text in the QuickJS heap as before, `strip` keeps none (toString() answers `[native code]`; for A/B measurement only). |
+| `TILEFINCH_JS_SOURCE_STORE` | 1 | `src/js_runtime/evaluation.inc` | host / PSP validation | Where a classic page script of at least 8 KiB keeps its `Function.prototype.toString()` text ([Measuring](engineering/SCRIPT_MEMORY.md#measuring)): unset (or `pressure`) is the shipping policy, `plain` never compresses, `lz` compresses every block as the script compiles, `keep` keeps the text in the QuickJS heap instead of the store, `strip` keeps none (toString() answers `[native code]`; for A/B measurement only). |
+| `TILEFINCH_JS_MODULE_SOURCE_STORE` | 1 | `src/js_runtime/evaluation.inc` | host / PSP validation | `0` strips the text of a module of at least 8 KiB with no function-source store copy, so its functions' `toString()` answers `[native code]`, for A/B measurement ([Function source outside the heap](engineering/SCRIPT_MEMORY.md#function-source-outside-the-heap)). |
 | `TILEFINCH_JS_SOURCE_STORE_MIN_KB` | 1 | `src/js_runtime/evaluation.inc` | host / PSP validation | Smallest classic page script, in KiB, whose text goes to the function-source store (default 8). |
 | `TILEFINCH_JS_STACK_KB` | 1 | `src/js_runtime/runtime_creation.inc` | host / PSP validation | QuickJS native stack limit, in KiB. |
 | `TILEFINCH_SELECTOR_COOPERATE_VISITS` | 1 | `src/style_sheet/declarations.inc` | host | Selector matching visits between cooperative checkpoints. |

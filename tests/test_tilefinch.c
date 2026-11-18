@@ -8694,6 +8694,107 @@ static int test_overlay_passes_skip_unrelated_commands(Budget *budget)
     return 0;
 }
 
+/* A stuck sticky header whose child clips its overflow dropped the cached
+   overflow geometry: each of its clipped commands walked every node box
+   (twice, for its clips and their origins), so a frame cost 174 us over
+   1,000 rows and 1.26 ms over 8,000 on the host. The cached clip boxes are
+   now moved instead, so the boxes examined per frame do not depend on the
+   page's length, and the frames match the uncached walk. The third page
+   has more clipped boxes in the header than the per-frame list holds. */
+static int test_stuck_sticky_overflow_uses_cache(Budget *budget)
+{
+    uint64_t per_frame[3] = {0, 0, 0};
+    for (int size = 0; size < 3; size++) {
+        int rows = size == 1 ? 4000 : 500;
+        int titles = size == 2 ? 30 : 1;
+        static char html[4000 * 32 + 4096];
+        size_t used = (size_t) snprintf(html, sizeof(html),
+            "<!doctype html><style>html,body{overflow-x:hidden;margin:0}"
+            "header{position:sticky;top:0;height:44px;background:#00f}"
+            ".in{overflow:hidden;height:40px;border-radius:12px;"
+            "background:#f00}"
+            ".in div{float:left;width:8px;height:60px;background:#0f0;"
+            "margin:1px}"
+            ".t{overflow:hidden;white-space:nowrap;width:60px;color:#fff}"
+            ".r{height:10px;background:#eee;margin:2px}</style><body>"
+            "<div class=r></div><header><div class=in>");
+        for (int i = 0; i < 40; i++)
+            used += (size_t) snprintf(html + used, sizeof(html) - used,
+                                      "<div></div>");
+        used += (size_t) snprintf(html + used, sizeof(html) - used, "</div>");
+        for (int i = 0; i < titles; i++)
+            used += (size_t) snprintf(html + used, sizeof(html) - used,
+                "<div class=t>a long clipped header title %d</div>", i);
+        used += (size_t) snprintf(html + used, sizeof(html) - used,
+                                  "</header>");
+        for (int i = 0; i < rows; i++)
+            used += (size_t) snprintf(html + used, sizeof(html) - used,
+                                      "<div class=r></div>");
+        CHECK(used < sizeof(html));
+        PocDocument document = {0};
+        Stylesheet stylesheet = {0};
+        LayoutDocument layout = {0};
+        CHECK(document_parse(&document, budget, html, used, 29)
+              && stylesheet_build(&stylesheet, budget, &document, 480)
+              && layout_build(&layout, budget, &document, &stylesheet,
+                              NULL, NULL, 480));
+        CHECK(layout.sticky_count != 0 && layout.command_flags != NULL);
+        TileCache cache, uncached;
+        uint16_t *frame = budget_malloc(budget, 480u * 272u * sizeof(*frame));
+        uint16_t *expected =
+            budget_malloc(budget, 480u * 272u * sizeof(*frame));
+        CHECK(frame != NULL && expected != NULL
+              && tile_cache_init(&cache, budget, &layout, 24)
+              && tile_cache_set_frame(&cache, frame, 480u * 272u)
+              && tile_cache_init(&uncached, budget, &layout, 24)
+              && tile_cache_set_frame(&uncached, expected, 480u * 272u));
+        uncached.overflow_cache_disabled = true;
+        const int offsets[] = {0, 7, 300, 2000, 3000};
+        for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); i++) {
+            CHECK(tile_cache_render_frame(&cache, offsets[i], 480, 272, NULL)
+                  && tile_cache_render_frame(&uncached, offsets[i], 480, 272,
+                                             NULL));
+            if (memcmp(frame, expected, 480u * 272u * sizeof(*frame)) != 0) {
+                size_t at = 0;
+                while (frame[at] == expected[at]) at++;
+                fprintf(stderr, "stuck sticky overflow: scroll %d differs "
+                        "at %zu,%zu: %04x vs %04x\n", offsets[i], at % 480u,
+                        at / 480u, frame[at], expected[at]);
+                CHECK(false);
+            }
+        }
+        /* Stuck: the green floats paint at the top inside the rounded
+           clip, which cuts the corner. */
+        CHECK(frame[10u * 480u + 5u] == 0x07e0u && frame[0] != 0x07e0u);
+        CHECK(uncached.sticky_overflow_box_visits >= layout.node_box_count);
+        enum { FRAMES = 4 };
+        uint64_t visits = cache.sticky_overflow_box_visits;
+        for (int f = 1; f <= FRAMES; f++)
+            CHECK(tile_cache_render_frame(&cache, 3000 + f * 9, 480, 272,
+                                          NULL));
+        per_frame[size] = (cache.sticky_overflow_box_visits - visits) / FRAMES;
+        uint64_t limit = size == 2 ? 4096u : 64u;
+        if (per_frame[size] == 0 || per_frame[size] > limit
+            || cache.overflow_cache_fallbacks != 0)
+            fprintf(stderr, "stuck sticky overflow: %d rows, %zu boxes, "
+                    "%llu box visits per frame, %zu cache fallbacks\n", rows,
+                    layout.node_box_count,
+                    (unsigned long long) per_frame[size],
+                    cache.overflow_cache_fallbacks);
+        CHECK(per_frame[size] != 0 && per_frame[size] <= limit
+              && cache.overflow_cache_fallbacks == 0);
+        tile_cache_destroy(&uncached);
+        tile_cache_destroy(&cache);
+        budget_free(budget, expected);
+        budget_free(budget, frame);
+        layout_destroy(&layout);
+        stylesheet_destroy(&stylesheet);
+        document_destroy(&document);
+    }
+    CHECK(per_frame[0] == per_frame[1]);
+    return 0;
+}
+
 /* A text run was walked glyph by glyph to its end for every tile it
    crossed, so one unbroken 50,000-character line cost 31 ms per host frame
    (and 1.5 to 3 s on the PSP). A left-to-right run now stops two ems past

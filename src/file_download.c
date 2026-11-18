@@ -13,6 +13,7 @@
 
 #include "tilefinch/font.h"
 #include "tilefinch/platform.h"
+#include "tilefinch/sha256.h"
 #include "tilefinch/update.h"
 #include "tilefinch/url.h"
 #include "tilefinch/user_agent.h"
@@ -34,6 +35,7 @@ struct FileDownloadManager {
     /* A 416 confirmed the partial file already holds the whole entity. */
     bool resume_complete;
     char validator[FILE_VALIDATOR_LIMIT];
+    uint8_t resource_digest[TILEFINCH_SHA256_DIGEST_BYTES];
     char error[OFFLINE_LIBRARY_FAILURE_LIMIT];
 };
 
@@ -471,9 +473,11 @@ static bool save_validator(FileDownloadManager *manager)
     FILE *file = fopen(temporary, "wb");
     if (file == NULL) return false;
     const OfflineLibraryItem *item = offline_library_find(manager->library, manager->id);
-    bool okay = item != NULL && fputs("TFDL01\n", file) >= 0
+    bool okay = item != NULL && fputs("TFDL02\n", file) >= 0
         && fputs(item->source_url, file) >= 0 && fputc('\n', file) != EOF
-        && fputs(manager->validator, file) >= 0 && fputc('\n', file) != EOF;
+        && fputs(manager->validator, file) >= 0 && fputc('\n', file) != EOF
+        && fwrite(manager->resource_digest, 1, sizeof(manager->resource_digest),
+                  file) == sizeof(manager->resource_digest);
     if (fflush(file) != 0 || ferror(file)) okay = false;
     if (fclose(file) != 0) okay = false;
     if (!okay || !tilefinch_platform_replace_file(temporary, path, NULL)) {
@@ -486,14 +490,18 @@ static bool save_validator(FileDownloadManager *manager)
 static void load_validator(FileDownloadManager *manager)
 {
     manager->validator[0] = '\0';
+    memset(manager->resource_digest, 0, sizeof(manager->resource_digest));
     char path[FILE_DOWNLOAD_PATH_LIMIT];
     if (!offline_library_item_path(manager->library, manager->id, ".file.meta", path, sizeof(path))) return;
     FILE *file = fopen(path, "rb");
     if (file == NULL) return;
     char magic[16] = {0}, url[OFFLINE_LIBRARY_URL_LIMIT + 2u] = {0}, validator[FILE_VALIDATOR_LIMIT + 2u] = {0};
-    bool okay = fgets(magic, sizeof(magic), file) != NULL && !strcmp(magic, "TFDL01\n")
+    /* Old sidecars lack the identity and can only restart from zero. */
+    bool okay = fgets(magic, sizeof(magic), file) != NULL && !strcmp(magic, "TFDL02\n")
         && fgets(url, sizeof(url), file) != NULL
         && fgets(validator, sizeof(validator), file) != NULL
+        && fread(manager->resource_digest, 1, sizeof(manager->resource_digest),
+                 file) == sizeof(manager->resource_digest)
         && fgetc(file) == EOF && !ferror(file);
     fclose(file);
     const OfflineLibraryItem *item = offline_library_find(manager->library, manager->id);
@@ -502,6 +510,30 @@ static void load_validator(FileDownloadManager *manager)
     url[u - 1] = validator[v - 1] = '\0';
     if (!strcmp(item->source_url, url) && safe_validator(validator))
         memcpy(manager->validator, validator, strlen(validator) + 1u);
+}
+
+/* Names the resource that answered after redirects. A signed CDN
+   redirect puts a fresh signature and expiry in the query of every
+   attempt, so under a strong ETag, which the origin assigns to one
+   entity, the scheme, host and path name the resource. A Last-Modified
+   date is shared by every file uploaded in the same second: there the
+   whole URL, query included, must match. */
+static bool response_resource_digest(const FetchResult *response,
+                                     bool strong, uint8_t digest[32])
+{
+    const char *url = response->effective_url;
+    size_t length = strong ? strcspn(url, "?#") : strlen(url);
+    return length != 0 && tilefinch_sha256_digest(
+        (const uint8_t *) url, length, digest);
+}
+
+static bool matches_resource(const FileDownloadManager *manager,
+                             const FetchResult *response)
+{
+    uint8_t digest[TILEFINCH_SHA256_DIGEST_BYTES];
+    return response_resource_digest(
+               response, manager->validator[0] == 'E', digest)
+        && !memcmp(digest, manager->resource_digest, sizeof(digest));
 }
 
 static void close_output(FileDownloadManager *manager)
@@ -546,6 +578,7 @@ static bool range_not_satisfiable(FileDownloadManager *manager, const FetchResul
     char tail;
     const char *validator = manager->validator[0] == 'E' ? response->etag : response->last_modified;
     if (manager->offset != 0 && safe_validator(manager->validator)
+        && matches_resource(manager, response)
         && !strcmp(validator, manager->validator + 2)
         && fetch_response_header_value(response, "content-range", range, sizeof(range))
         && sscanf(range, "bytes */%llu%c", &complete, &tail) == 1
@@ -582,6 +615,7 @@ static bool headers(void *opaque, const FetchResult *response)
         uint64_t first = 0, last = 0, complete = 0;
         const char *validator = manager->validator[0] == 'E' ? response->etag : response->last_modified;
         if (manager->offset == 0 || !safe_validator(manager->validator)
+            || !matches_resource(manager, response)
             || strcmp(validator, manager->validator + 2)
             || !fetch_response_header_value(response, "content-range", range, sizeof(range))
             || !offline_download_parse_content_range(range, &first, &last, &complete)
@@ -612,7 +646,10 @@ static bool headers(void *opaque, const FetchResult *response)
             memcpy(manager->validator, "M:", 2);
             memcpy(manager->validator + 2, response->last_modified, strlen(response->last_modified) + 1u);
         }
-        if (!safe_validator(manager->validator)) manager->validator[0] = '\0';
+        if (!safe_validator(manager->validator)
+            || !response_resource_digest(response, manager->validator[0] == 'E',
+                                         manager->resource_digest))
+            manager->validator[0] = '\0';
         char disposition[4097], filename[FILE_DOWNLOAD_FILENAME_LIMIT];
         bool have = fetch_response_header_value(response, "content-disposition", disposition, sizeof(disposition));
         if (have && file_download_filename(item->source_url, disposition, filename)) {

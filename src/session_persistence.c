@@ -9,7 +9,8 @@
 #include <string.h>
 
 #define PERSIST_HEADER_BYTES 36u
-#define PERSIST_VERSION UINT32_C(1)
+#define PERSIST_VERSION_LEGACY UINT32_C(1)
+#define PERSIST_VERSION UINT32_C(2)
 #define PERSIST_PATH_BYTES 1200u
 #define PERSIST_SKIP_BUFFER_BYTES 256u
 #define RECORD_CACHE UINT32_C(1)
@@ -35,6 +36,7 @@ typedef struct {
 
 typedef struct {
     BrowserSessionPersistenceMask mask;
+    uint32_t version;
     size_t cache_count;
     size_t storage_count;
     size_t cache_bytes;
@@ -102,6 +104,8 @@ struct BrowserSessionPersistenceLoad {
     size_t scalar_size;
     size_t value_read;
     size_t value_size;
+    size_t key_length;
+    uint32_t version;
     uint32_t record_type;
     uint32_t record_bytes;
     char url[TILEFINCH_URL_SERIALIZED_LIMIT];
@@ -274,7 +278,7 @@ static bool storage_record_size(const SiteStorageLocalView *entry,
 {
     size_t total = 0;
     if (!field_size(entry->origin, BROWSER_ORIGIN_LIMIT, &total)
-        || !field_size(entry->key, BROWSER_KEY_LIMIT, &total)
+        || !blob_size(entry->key_length, &total)
         || !blob_size(entry->value_length, &total)
         || total > UINT32_MAX) {
         return false;
@@ -351,7 +355,7 @@ static bool emit_payload(PersistWriter *writer,
             writer_u32(writer, RECORD_LOCAL_STORAGE);
             writer_u32(writer, (uint32_t) size);
             writer_field(writer, entry.origin);
-            writer_field(writer, entry.key);
+            writer_blob(writer, entry.key, entry.key_length);
             writer_blob(writer, entry.value, entry.value_length);
         }
     }
@@ -401,7 +405,7 @@ static BrowserSessionPersistenceStatus build_plan(
     const BrowserSession *session, BrowserSessionPersistenceMask mask,
     const BrowserSessionPersistenceLimits *limits, PersistPlan *plan)
 {
-    *plan = (PersistPlan) {.mask = mask};
+    *plan = (PersistPlan) {.mask = mask, .version = PERSIST_VERSION_LEGACY};
     if ((mask & BROWSER_SESSION_PERSIST_CACHE) != 0) {
         uint8_t order[BROWSER_CACHE_ENTRIES];
         size_t count = 0;
@@ -447,9 +451,15 @@ static BrowserSessionPersistenceStatus build_plan(
         }
     }
     if ((mask & BROWSER_SESSION_PERSIST_LOCAL_STORAGE) != 0) {
-        plan->storage_count = site_storage_local_count(session);
-        if (plan->storage_count > limits->maximum_local_storage_entries)
-            return BROWSER_SESSION_PERSISTENCE_LIMIT_EXCEEDED;
+        size_t cursor = 0;
+        SiteStorageLocalView entry;
+        while (site_storage_next_local(session, &cursor, &entry)) {
+            if (++plan->storage_count > limits->maximum_local_storage_entries)
+                return BROWSER_SESSION_PERSISTENCE_LIMIT_EXCEEDED;
+            if (entry.key_length == 0
+                || memchr(entry.key, '\0', entry.key_length) != NULL)
+                plan->version = PERSIST_VERSION;
+        }
     }
     return BROWSER_SESSION_PERSISTENCE_OK;
 }
@@ -460,7 +470,7 @@ static void build_header(unsigned char header[PERSIST_HEADER_BYTES],
 {
     memset(header, 0, PERSIST_HEADER_BYTES);
     memcpy(header, persist_magic, sizeof(persist_magic));
-    put_u32(header + 8, PERSIST_VERSION);
+    put_u32(header + 8, plan->version);
     put_u32(header + 12, PERSIST_HEADER_BYTES);
     put_u32(header + 16, plan->mask);
     put_u32(header + 20, (uint32_t) payload_bytes);
@@ -536,7 +546,7 @@ BrowserSessionPersistenceStatus browser_session_persistence_save(
        generation a later release wrote. */
     uint32_t primary_version = persist_file_version(path);
     if (primary_version > PERSIST_VERSION
-        || (primary_version != PERSIST_VERSION
+        || (primary_version < PERSIST_VERSION_LEGACY
             && persist_file_version(backup) > PERSIST_VERSION))
         return BROWSER_SESSION_PERSISTENCE_NEWER_FORMAT;
     unsigned char header[PERSIST_HEADER_BYTES];
@@ -738,7 +748,7 @@ static bool async_field_length(
 
 static bool async_field_body(
     BrowserSessionPersistenceLoad *load, char *value, size_t capacity,
-    size_t *budget)
+    size_t *budget, bool binary)
 {
     if (load->value_size >= capacity) {
         load->status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
@@ -747,7 +757,7 @@ static bool async_field_body(
     if (!async_read(
             load, value, load->value_size, &load->value_read,
             budget, true, true)) return false;
-    if (memchr(value, '\0', load->value_size) != NULL) {
+    if (!binary && memchr(value, '\0', load->value_size) != NULL) {
         load->status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
         return false;
     }
@@ -842,14 +852,14 @@ static bool async_commit_storage(BrowserSessionPersistenceLoad *load)
     if (!tilefinch_url_origin(
             load->origin, normalized, sizeof(normalized))
         || strcmp(load->origin, normalized) != 0
-        || browser_session_storage_get(
-               load->staging, load->origin, true, load->key,
+        || browser_session_storage_get_bytes(
+               load->staging, load->origin, true, load->key, load->key_length,
                &old_value, NULL)) {
         load->status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
         return false;
     }
-    if (!browser_session_storage_set(
-            load->staging, load->origin, true, load->key,
+    if (!browser_session_storage_set_bytes(
+            load->staging, load->origin, true, load->key, load->key_length,
             (const char *) load->value, load->body_length)) {
         load->status = BROWSER_SESSION_PERSISTENCE_OUT_OF_MEMORY;
         return false;
@@ -988,6 +998,7 @@ BrowserSessionPersistenceLoadProgress browser_session_persistence_load_pump(
             if (!async_read(
                     load, load->header, sizeof(load->header),
                     &load->header_read, &budget, false, false)) break;
+            load->version = get_u32(load->header + 8);
             load->stored_mask = get_u32(load->header + 16);
             load->payload_remaining = get_u32(load->header + 20);
             load->expected_hash = get_u32(load->header + 24);
@@ -995,14 +1006,14 @@ BrowserSessionPersistenceLoadProgress browser_session_persistence_load_pump(
             load->expected_storage = get_u32(load->header + 32);
             if (memcmp(load->header, persist_magic,
                        sizeof(persist_magic)) == 0
-                && get_u32(load->header + 8) > PERSIST_VERSION) {
+                && load->version > PERSIST_VERSION) {
                 /* Not damage: never fall back past it to an older one. */
                 load->status = BROWSER_SESSION_PERSISTENCE_NEWER_FORMAT;
                 break;
             }
             if (memcmp(
                     load->header, persist_magic, sizeof(persist_magic)) != 0
-                || get_u32(load->header + 8) != PERSIST_VERSION
+                || load->version < PERSIST_VERSION_LEGACY
                 || get_u32(load->header + 12) != PERSIST_HEADER_BYTES
                 || load->stored_mask == 0
                 || (load->stored_mask & ~BROWSER_SESSION_PERSIST_ALL) != 0
@@ -1057,7 +1068,7 @@ BrowserSessionPersistenceLoadProgress browser_session_persistence_load_pump(
 #define ASYNC_FIELD_BODY_CASE(phase_name, next_phase, member) \
         case phase_name: \
             if (async_field_body( \
-                    load, load->member, sizeof(load->member), &budget)) \
+                    load, load->member, sizeof(load->member), &budget, false)) \
                 load->phase = next_phase; \
             break
         ASYNC_FIELD_LENGTH_CASE(
@@ -1158,7 +1169,7 @@ BrowserSessionPersistenceLoadProgress browser_session_persistence_load_pump(
             policy, true);
         case ASYNC_LOAD_CACHE_POLICY:
             if (async_field_body(
-                    load, load->policy, sizeof(load->policy), &budget))
+                    load, load->policy, sizeof(load->policy), &budget, false))
                 async_finish_record(load);
             break;
         ASYNC_FIELD_LENGTH_CASE(
@@ -1170,8 +1181,13 @@ BrowserSessionPersistenceLoadProgress browser_session_persistence_load_pump(
         ASYNC_FIELD_LENGTH_CASE(
             ASYNC_LOAD_STORAGE_KEY_LENGTH, ASYNC_LOAD_STORAGE_KEY,
             key, true);
-        ASYNC_FIELD_BODY_CASE(
-            ASYNC_LOAD_STORAGE_KEY, ASYNC_LOAD_STORAGE_VALUE_LENGTH, key);
+        case ASYNC_LOAD_STORAGE_KEY:
+            load->key_length = load->value_size;
+            if (async_field_body(
+                    load, load->key, sizeof(load->key), &budget,
+                    load->version >= PERSIST_VERSION))
+                load->phase = ASYNC_LOAD_STORAGE_VALUE_LENGTH;
+            break;
         case ASYNC_LOAD_STORAGE_VALUE_LENGTH:
             if (!async_read_scalar(load, 4u, &budget, true)) break;
             load->body_length = async_take_u32(load);

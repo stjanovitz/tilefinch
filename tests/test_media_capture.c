@@ -1714,9 +1714,10 @@ static int test_disabled_track_feeds_silence(void)
 /* Replaces crypto.randomUUID so that its Nth call from now throws. */
 #define FAIL_ID_CALL(n)                                                     \
     "if(!globalThis.realId)globalThis.realId=crypto.randomUUID;let calls=0;"                    \
-    "crypto.randomUUID=function(){if(++calls===" #n ")"                     \
-    "throw new Error('no ids');return realId.call(crypto)};"
-#define RESTORE_IDS "crypto.randomUUID=realId;"
+    "__tilefinchTestBrowserPatch(crypto,'randomUUID',function(){"           \
+    "if(++calls===" #n ")"                                                  \
+    "throw new Error('no ids');return realId.call(crypto)});"
+#define RESTORE_IDS "__tilefinchTestBrowserPatch(crypto,'randomUUID',realId);"
 
 static int test_failed_construction_releases(void)
 {

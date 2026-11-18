@@ -6940,39 +6940,10 @@ report:
         if (browser.tabs == NULL) {
             printf("tilefinch-tabs: bounded session allocation unavailable\n");
         } else if (browser_profile_restore_last_page(browser.profile)
-                   && browser_tabs_restore_session(
-                       browser.tabs, process.storage.tab_session)) {
-            const BrowserTabSnapshot *restored_tab =
-                browser_tabs_active(browser.tabs);
-            const BrowserTabHistoryEntry *restored_entry =
-                restored_tab == NULL || restored_tab->history_count == 0
-                    || restored_tab->history_index
-                           >= restored_tab->history_count
-                ? NULL
-                : &restored_tab->history[restored_tab->history_index];
-            const char *current_url = engine_views.navigation->page.document_url;
-            if (restored_entry == NULL || current_url == NULL
-                || strcmp(restored_entry->url, current_url) != 0) {
-                browser_tabs_destroy(browser.tabs);
-                browser.tabs = browser_tabs_create(browser.budget, engine_views.navigation);
-                printf("tilefinch-tabs: saved session did not match page\n");
-            } else {
-                NavigationHistoryRecord records[BROWSER_TAB_HISTORY_LIMIT];
-                size_t record_count = 0, record_current = 0;
-                bool history_restored = browser_tab_history_records(
-                        restored_tab, records, &record_count,
-                        &record_current)
-                    && browser_engine_replace_history(
-                        browser.engine, records, record_count, record_current)
-                    && browser_engine_restore_view(
-                        browser.engine, restored_entry->scroll_y,
-                        restored_entry->focus_kind,
-                        restored_entry->focus_index);
-                printf(
-                    "tilefinch-tabs: session restore tabs=%zu result=%s\n",
-                    browser_tabs_count(browser.tabs),
-                    history_restored ? "ok" : "facts-only");
-            }
+                   && psp_tabs_restore_startup(browser.tabs, browser.engine,
+                                              process.storage.tab_session)) {
+            printf("tilefinch-tabs: session restore tabs=%zu\n",
+                   browser_tabs_count(browser.tabs));
         }
         (void) psp_engine_views_refresh(&engine_views, browser.engine);
         psp_sync_ui(&process.presentation.ui, browser.engine, browser.profile);

@@ -87,6 +87,19 @@ static bool css_unescape_value(const char *text, size_t length,
     return true;
 }
 
+bool style_decode_custom_name(const char *text, size_t length,
+                              char output[STYLE_CUSTOM_NAME_CAPACITY])
+{
+    /* Six hex digits, backslash and optional whitespace per byte. */
+    return length >= 2 && length < STYLE_CUSTOM_NAME_CAPACITY * 8u
+        && (text[0] == '\\' || (text[0] == '-'
+            && (text[1] == '-' || text[1] == '\\')))
+        && memchr(text, '\\', length) != NULL
+        && skip_selector_identifier(text, length, 0) == length
+        && css_unescape_value(text, length, output, STYLE_CUSTOM_NAME_CAPACITY)
+        && output[0] == '-' && output[1] == '-' && output[2] != '\0';
+}
+
 static size_t css_function_close(const char *text, size_t length,
                                  size_t open)
 {

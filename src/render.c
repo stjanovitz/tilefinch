@@ -1459,11 +1459,149 @@ static void paint_cached_fixed_overlays(TileCache *cache, uint16_t *frame,
     cache->fixed_cache_blits++;
 }
 
+/* Clip geometry for stuck sticky commands, built from the overflow cache.
+   A stuck range moves only the clip boxes inside its subtree, so the cached
+   geometry of a run (which folds every box that applies to it) cannot be
+   used as is. Walking every node box per command instead cost a frame
+   ~1.3 ms on a host page of 8,000 boxes. `clips` lists the cached clip
+   boxes whose scroll range meets the range's commands, with bit 31 set for
+   those that move with it; the last run's moved geometry is kept, since
+   every command of a run has the same clip boxes. */
+enum { STICKY_CLIP_LIST = 24 };
+typedef struct {
+    const StickyRange *range;
+    size_t count;
+    bool complete;
+    uint32_t clips[STICKY_CLIP_LIST];
+    const OverflowGeometry *run;
+    const StickyRange *run_range;
+    int run_dy;
+    OverflowGeometry geometry;
+    RoundedClip rounded[MAXIMUM_ROUNDED_CLIPS];
+    size_t rounded_count;
+} StickyClipScratch;
+
+#define STICKY_CLIP_MOVES UINT32_C(0x80000000)
+
+static bool sticky_clip_meets_range(const LayoutNodeBox *box,
+                                    const StickyRange *range)
+{
+    return (box->clips_x || box->clips_y)
+        && box->scroll_command_start < range->command_end
+        && box->scroll_command_end > range->command_start;
+}
+
+static void sticky_clip_list_prepare(TileCache *cache,
+                                     StickyClipScratch *scratch,
+                                     const StickyRange *range)
+{
+    if (scratch->range == range) return;
+    const struct RenderOverflowCache *overflow = cache->overflow_cache;
+    const LayoutDocument *layout = cache->layout;
+    scratch->range = range;
+    scratch->count = 0;
+    scratch->complete = true;
+    scratch->run = NULL;
+    for (size_t c = 0; c < overflow->clip_count; c++) {
+        cache->sticky_overflow_box_visits++;
+        const LayoutNodeBox *box =
+            &layout->node_boxes[overflow->clip_boxes[c].box_index];
+        if (!sticky_clip_meets_range(box, range)) continue;
+        if (scratch->count == STICKY_CLIP_LIST || c >= STICKY_CLIP_MOVES) {
+            scratch->complete = false;
+            return;
+        }
+        uint32_t entry = (uint32_t) c;
+        if (sticky_clip_offset(box, range, 1) != 0) entry |= STICKY_CLIP_MOVES;
+        scratch->clips[scratch->count++] = entry;
+    }
+}
+
+/* The cached geometry of `run` with the clip boxes inside `range` moved by
+   `sticky_dy`: the same boxes, origins and rounded clips the uncached walk
+   (overflow_command_geometry_moved) finds for the run's commands. */
+static const OverflowGeometry *sticky_run_geometry(
+    TileCache *cache, StickyClipScratch *scratch,
+    const OverflowGeometry *run, const StickyRange *range, int sticky_dy)
+{
+    if (scratch->run == run && scratch->run_range == range
+        && scratch->run_dy == sticky_dy) return &scratch->geometry;
+    struct RenderOverflowCache *overflow = cache->overflow_cache;
+    const LayoutDocument *layout = cache->layout;
+    sticky_clip_list_prepare(cache, scratch, range);
+    size_t command = run->command_index;
+    OverflowGeometry *geometry = &scratch->geometry;
+    *geometry = (OverflowGeometry) {
+        .command_index = run->command_index,
+        .command_end = run->command_end,
+        .clip_left = INT_MIN / 2,
+        .clip_top = INT_MIN / 2,
+        .clip_right = INT_MAX / 2,
+        .clip_bottom = INT_MAX / 2
+    };
+    scratch->rounded_count = 0;
+    size_t total = scratch->complete ? scratch->count : overflow->clip_count;
+    for (size_t at = 0; at < total; at++) {
+        size_t c;
+        bool moves;
+        if (scratch->complete) {
+            c = scratch->clips[at] & ~STICKY_CLIP_MOVES;
+            moves = (scratch->clips[at] & STICKY_CLIP_MOVES) != 0;
+        } else {
+            cache->sticky_overflow_box_visits++;
+            c = at;
+            if (!sticky_clip_meets_range(
+                    &layout->node_boxes[overflow->clip_boxes[c].box_index],
+                    range)) continue;
+            moves = sticky_clip_offset(
+                &layout->node_boxes[overflow->clip_boxes[c].box_index],
+                range, 1) != 0;
+        }
+        const OverflowClipBox *clip = &overflow->clip_boxes[c];
+        const LayoutNodeBox *box = &layout->node_boxes[clip->box_index];
+        if (command < box->scroll_command_start
+            || command >= box->scroll_command_end
+            || layout_positioned_command_escapes_clip_indexed(
+                   layout, command, box, &overflow->positioned)) continue;
+        geometry->found = true;
+        geometry->dx -= box->scroll_x;
+        geometry->dy -= box->scroll_y;
+        int y = render_saturating_add_int(clip->visual_y,
+                                          moves ? sticky_dy : 0);
+        int left, top, right, bottom;
+        layout_node_box_clip_rect(box, clip->visual_x, y,
+                                  &left, &top, &right, &bottom);
+        if (box->clips_x) {
+            if (left > geometry->clip_left) geometry->clip_left = left;
+            if (right < geometry->clip_right) geometry->clip_right = right;
+        }
+        if (box->clips_y) {
+            if (top > geometry->clip_top) geometry->clip_top = top;
+            if (bottom < geometry->clip_bottom) geometry->clip_bottom = bottom;
+        }
+        if (box->clips_x && box->clips_y
+            && layout_node_box_clip_radius(box) != 0
+            && scratch->rounded_count < MAXIMUM_ROUNDED_CLIPS) {
+            int radius = overflow_clip_radius(layout, box);
+            if (style_border_radius_maximum(radius) > 0) {
+                scratch->rounded[scratch->rounded_count++] = (RoundedClip) {
+                    left, top, right - left, bottom - top, radius
+                };
+            }
+        }
+    }
+    scratch->run = run;
+    scratch->run_range = range;
+    scratch->run_dy = sticky_dy;
+    return geometry;
+}
+
 /* Paints sticky command `i` moved down by `sticky_dy`, clipped like the
    tile pass would clip it when it sits in an overflow box. */
 static void paint_sticky_command(TileCache *cache, uint16_t *frame, size_t i,
-                                 int sticky_dy, int scroll_y,
-                                 int viewport_width, int viewport_height)
+                                 const StickyRange *sticky, int sticky_dy, int scroll_y,
+                                 int viewport_width, int viewport_height,
+                                 StickyClipScratch *scratch)
 {
     const DrawCommand *source = &cache->layout->commands[i];
     DrawCommand command = *source;
@@ -1480,8 +1618,15 @@ static void paint_sticky_command(TileCache *cache, uint16_t *frame, size_t i,
 
     int dx = 0, dy = 0, clip_left = 0, clip_top = 0;
     int clip_right = 0, clip_bottom = 0;
-    const OverflowGeometry *geometry =
-        overflow_cached_geometry(cache, i);
+    const OverflowGeometry *geometry = overflow_cached_geometry(cache, i);
+    const RoundedClip *moved_rounded = NULL;
+    size_t moved_rounded_count = 0;
+    if (geometry != NULL && sticky_dy != 0) {
+        geometry = sticky_run_geometry(cache, scratch, geometry, sticky,
+                                       sticky_dy);
+        moved_rounded = scratch->rounded;
+        moved_rounded_count = scratch->rounded_count;
+    }
     if (geometry != NULL) {
         if (!geometry->found
             || geometry->clip_right <= geometry->clip_left
@@ -1494,24 +1639,27 @@ static void paint_sticky_command(TileCache *cache, uint16_t *frame, size_t i,
         clip_top = geometry->clip_top;
         clip_right = geometry->clip_right;
         clip_bottom = geometry->clip_bottom;
-    } else if (!overflow_command_geometry(
-                   cache->layout, i, &dx, &dy, &clip_left, &clip_top,
-                   &clip_right, &clip_bottom, NULL)) {
-        return;
+    } else {
+        cache->sticky_overflow_box_visits += cache->layout->node_box_count;
+        if (!overflow_command_geometry_moved(
+                cache->layout, i, &dx, &dy, &clip_left, &clip_top,
+                &clip_right, &clip_bottom, NULL, sticky, sticky_dy)) return;
     }
     command.x = render_saturating_add_int(command.x, dx);
     command.y = render_saturating_add_int(command.y, dy);
-    clip_top = render_saturating_add_int(clip_top, sticky_dy);
-    clip_bottom = render_saturating_add_int(clip_bottom, sticky_dy);
     RoundedClip rounded_clips[MAXIMUM_ROUNDED_CLIPS];
-    size_t rounded_clip_count = geometry != NULL
-        ? overflow_cached_rounded_clips(
-            cache, i, rounded_clips, MAXIMUM_ROUNDED_CLIPS)
-        : overflow_rounded_clips(
-            cache->layout, i, rounded_clips, MAXIMUM_ROUNDED_CLIPS, NULL);
-    for (size_t clip = 0; clip < rounded_clip_count; clip++) {
-        rounded_clips[clip].y = render_saturating_add_int(
-            rounded_clips[clip].y, sticky_dy);
+    const RoundedClip *clips = rounded_clips;
+    size_t rounded_clip_count;
+    if (moved_rounded != NULL) {
+        clips = moved_rounded;
+        rounded_clip_count = moved_rounded_count;
+    } else if (geometry != NULL) {
+        rounded_clip_count = overflow_cached_rounded_clips(
+            cache, i, rounded_clips, MAXIMUM_ROUNDED_CLIPS);
+    } else {
+        rounded_clip_count = overflow_rounded_clips_moved(
+            cache->layout, i, rounded_clips, MAXIMUM_ROUNDED_CLIPS, NULL,
+            sticky, sticky_dy);
     }
     int visible_left = clip_left > 0 ? clip_left : 0;
     int visible_right = clip_right < viewport_width
@@ -1538,7 +1686,7 @@ static void paint_sticky_command(TileCache *cache, uint16_t *frame, size_t i,
         .top = visible_top,
         .right = visible_right,
         .bottom = visible_bottom,
-        .rounded_clips = rounded_clips,
+        .rounded_clips = clips,
         .rounded_clip_count = rounded_clip_count
     };
     rasterize_command_copy(cache, &target, &command, i);
@@ -1558,32 +1706,18 @@ static void paint_sticky_overlays(TileCache *cache, uint16_t *frame,
 {
     const LayoutDocument *layout = cache->layout;
     bool untiled = layout->command_flags != NULL;
-    if (!untiled && scroll_y <= 0) return;
     size_t range_count = layout->sticky_count;
     if (range_count > LAYOUT_STICKY_RANGE_LIMIT) {
         range_count = LAYOUT_STICKY_RANGE_LIMIT;
     }
     int offsets[LAYOUT_STICKY_RANGE_LIMIT];
+    StickyClipScratch clip_scratch = { .range = NULL };
     bool painting = false;
     for (size_t range_index = 0; range_index < range_count; range_index++) {
         const StickyRange *range = &layout->sticky_ranges[range_index];
-        int trigger = render_saturating_subtract_int(
-            range->origin_y, range->top);
-        offsets[range_index] = INT_MIN;
-        if (scroll_y <= trigger) {
-            if (untiled) {
-                offsets[range_index] = 0;
-                painting = true;
-            }
-            continue;
-        }
-        int sticky_dy = render_saturating_subtract_int(scroll_y, trigger);
-        if (range->maximum_offset != INT_MAX
-            && sticky_dy > range->maximum_offset) {
-            sticky_dy = range->maximum_offset;
-        }
-        offsets[range_index] = sticky_dy;
-        painting = true;
+        int dy = layout_sticky_offset(layout, range, scroll_y, viewport_height);
+        offsets[range_index] = untiled || dy != 0 ? dy : INT_MIN;
+        painting |= untiled || dy != 0;
     }
     if (!painting) return;
     bool ordered = layout->paint_order_count == layout->count;
@@ -1608,19 +1742,24 @@ static void paint_sticky_overlays(TileCache *cache, uint16_t *frame,
                 : ordered ? layout->paint_order[at] : at;
             if ((layout->command_flags[i] & LAYOUT_COMMAND_STICKY) == 0)
                 continue;
-            int sticky_dy = INT_MIN;
+            int sticky_dy = 0;
+            const StickyRange *owner = NULL;
             for (size_t range_index = 0; range_index < range_count;
                  range_index++) {
                 const StickyRange *range =
                     &layout->sticky_ranges[range_index];
+                int dy = offsets[range_index];
                 if (i >= range->command_start && i < range->command_end
-                    && offsets[range_index] > sticky_dy) {
-                    sticky_dy = offsets[range_index];
+                    && (owner == NULL || (dy > sticky_dy && dy > 0)
+                        || (dy < sticky_dy && sticky_dy <= 0))) {
+                    owner = range;
+                    sticky_dy = dy;
                 }
             }
-            if (sticky_dy != INT_MIN) {
-                paint_sticky_command(cache, frame, i, sticky_dy, scroll_y,
-                                     viewport_width, viewport_height);
+            if (owner != NULL) {
+                paint_sticky_command(cache, frame, i, owner, sticky_dy, scroll_y,
+                                     viewport_width, viewport_height,
+                                     &clip_scratch);
             }
         }
         return;
@@ -1635,8 +1774,9 @@ static void paint_sticky_overlays(TileCache *cache, uint16_t *frame,
             size_t i = indexed ? entries[at].command
                 : ordered ? layout->paint_order[at] : at;
             if (i < range->command_start || i >= range->command_end) continue;
-            paint_sticky_command(cache, frame, i, offsets[range_index],
-                                 scroll_y, viewport_width, viewport_height);
+            paint_sticky_command(cache, frame, i, range, offsets[range_index],
+                                 scroll_y, viewport_width, viewport_height,
+                                 &clip_scratch);
         }
     }
 }

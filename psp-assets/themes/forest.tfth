@@ -1,5 +1,5 @@
 tilefinch-theme
-format=1
+format=2
 name=Forest
 ground=#0D1410
 ground_reader=#111912
@@ -18,3 +18,4 @@ accent_high=#83C49D
 on_accent=#07150D
 ok=#7FD6A2
 warn=#E08A52
+danger=#EF6B75

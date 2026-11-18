@@ -1568,9 +1568,7 @@ static bool simple_pseudo_matches(const Stylesheet *sheet,
     }
     if (checked_pseudo
         && !((style_tag_is(node, "input")
-              && lxb_dom_element_has_attribute(
-                     lxb_dom_interface_element(node),
-                     (const lxb_char_t *) "checked", 7))
+              && document_control_checked(node))
              || (style_tag_is(node, "option")
                  && lxb_dom_element_has_attribute(
                         lxb_dom_interface_element(node),
@@ -1800,6 +1798,15 @@ static bool compound_matches_depth(
     return true;
 }
 
+/* In a shadow-root-scoped query the carrier stands for the root, a
+   fragment: only a bare :scope compound matches it, and it has no
+   ancestors or element features to match. */
+static bool selector_is_scope(const char *text, size_t length)
+{
+    trim(&text, &length);
+    return length == 6 && strncasecmp(text, ":scope", 6) == 0;
+}
+
 static bool style_selector_matches_internal(const Stylesheet *sheet,
                                             lxb_dom_node_t *node,
                                             const char *text, size_t length,
@@ -1850,6 +1857,9 @@ static bool style_selector_matches_internal(const Stylesheet *sheet,
     if (combinator == '>') {
         lxb_dom_node_t *parent = node->parent;
         while (parent != NULL && parent->type != LXB_DOM_NODE_TYPE_ELEMENT) parent = parent->parent;
+        if (scope != NULL && document_shadow_trees_present()
+            && document_node_is_shadow_carrier(parent))
+            return parent == scope && selector_is_scope(text, prefix_length);
         if (parent != NULL) {
             STYLE_SELECTOR_COUNT(sheet, selector_ancestor_visits, 1);
             if (!style_selector_cooperate_visit(sheet, parent)) return false;
@@ -1895,6 +1905,11 @@ static bool style_selector_matches_internal(const Stylesheet *sheet,
          parent != NULL
              && ancestor_depth < STYLE_RELATIVE_SELECTOR_DEPTH_LIMIT;
          parent = parent->parent, ancestor_depth++) {
+        /* A shadow carrier is a fragment in DOM queries, not an ordinary
+           ancestor through which a selector can reach the host. */
+        if (scope != NULL && document_shadow_trees_present()
+            && document_node_is_shadow_carrier(parent))
+            return parent == scope && selector_is_scope(text, prefix_length);
         STYLE_SELECTOR_COUNT(sheet, selector_ancestor_visits, 1);
         if (!style_selector_cooperate_visit(sheet, parent)) return false;
         if (parent->type == LXB_DOM_NODE_TYPE_ELEMENT

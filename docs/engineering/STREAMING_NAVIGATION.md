@@ -71,39 +71,45 @@ closing element is parsed, after blocking stylesheets available at that point.
 They see the prefix DOM but not later elements. Deferred, asynchronous, and
 module work enters the bounded final lifecycle.
 
-`document.write()` from a script the parser is running (including that
-script's microtasks and the handlers it dispatches) feeds the parser at the
-insertion point, as HTML specifies and Chromium does. The parser stops right
-after each `</script>` and runs the script between Lexbor calls, so the
-written markup continues the document's input just after that end tag; a
-written inline script runs inside the `write()` call; a written
-parser-blocking external script runs after the writing script returns and
-before any markup written after it, which waits (at most 256 KiB of it;
-beyond that `write()` throws `RangeError`). A `write()` nested more than 21
-deep is ignored, Chromium's limit, and a written script shares its writer's
-watchdog deadline. Written scripts pass the same CSP, content-blocker,
-admission and circuit-breaker checks as the response's own. When one of
-them trips the breaker or a parser refusal, the writing script finishes
-first (later written scripts in it are skipped) and the page's JavaScript
-stops once it returns.
+`document.write()` follows HTML and Chromium.
 
-Outside such a script `write()` has no insertion point, and it does what
-Chromium does with the two cases that matter on real pages. A write from an
-external classic script (asynchronous, deferred or script-inserted `src`, as
-ad loaders are) or a module script, or from a microtask they queue, is
-ignored: HTML's ignore-destructive-writes counter, kept in the DOM bridge
-while such a script runs. Any other write (a timer, an event handler, a
-callback) once the document is parsed opens it first, which replaces the
-page: the body's children are removed and the written markup takes their
-place. The opened document takes every later write, from any script, until
-`document.close()`; the next write after that opens it again. Written markup
-is parsed in a microtask (or at `close()`), and a script in it does not run:
-Chromium runs it as a parser-inserted script, and inserting it from the
-bootstrap would make it a script-inserted one, which a policy's
-`'strict-dynamic'` trusts. The head, its styles and the listeners are kept.
-A timer's or handler's write while the document is still parsing is added at
-the end of the body instead, where Chromium would stop the parse and blank
-the page.
+**From a script the parser is running** (including that script's microtasks
+and the handlers it dispatches), `write()` feeds the parser at the insertion
+point. The parser stops right after each `</script>` and runs the script
+between Lexbor calls, so written markup continues the input just after that
+end tag:
+
+- a written inline script runs inside the `write()` call;
+- a written parser-blocking external script runs after the writing script
+  returns and before any markup written after it, which waits (at most
+  256 KiB of it; beyond that `write()` throws `RangeError`);
+- a `write()` nested more than 21 deep is ignored (Chromium's limit), and a
+  written script shares its writer's watchdog deadline;
+- written scripts pass the same CSP, content-blocker, admission and
+  circuit-breaker checks as the response's own. When one trips the breaker
+  or a parser refusal, the writing script finishes first (later written
+  scripts in it are skipped) and the page's JavaScript stops once it returns.
+
+**Without an insertion point**, `write()` handles the two cases that matter on
+real pages:
+
+- a write from an external classic script (asynchronous, deferred or
+  script-inserted `src`, as ad loaders are) or a module script, or from a
+  microtask they queue, is ignored: HTML's ignore-destructive-writes
+  counter, kept in the DOM bridge while such a script runs;
+- any other write (a timer, an event handler, a callback) after the
+  document is parsed opens it, which replaces the page: the body's children
+  are removed and the written markup takes their place. The head, its styles
+  and the listeners are kept. The opened document takes every later write,
+  from any script, until `document.close()`; the next write after that opens
+  it again;
+- written markup is parsed in a microtask (or at `close()`), and a script in
+  it does not run. Chromium runs it as a parser-inserted script; inserting
+  it from the bootstrap would make it script-inserted, which a policy's
+  `'strict-dynamic'` trusts;
+- a timer's or handler's write while the document is still parsing is
+  appended to the body, where Chromium would stop the parse and blank the
+  page.
 
 The parser progressively resolves:
 
@@ -118,8 +124,8 @@ known. Immediate CSS, parser-blocking scripts, and visible images outrank
 speculation. Unsupported or lower-value preloads remain ordinary later
 resource work.
 
-The parser does not do that stylesheet work inside the pump that feeds a
-script's end tag. It stops feeding just before the end tag of an open
+Style work for a parser-blocking script does not run inside the pump that
+feeds its end tag. The parser stops just before the end tag of an open
 parser-blocking script whose realm or sheet is not ready, then prepares both
 over the following pumps, each bounded by the parser's time quota
 (`src/navigation/style_prepare.inc`):
@@ -127,68 +133,71 @@ over the following pumps, each bounded by the parser's time quota
 1. It creates the script realm.
 2. It polls the render-blocking style preloads; it never waits on them.
 3. It builds the sheet. An external sheet of 16 KB or more is parsed in
-   slices that stop at rule boundaries (`StyleCssSlicedParse`,
-   `StylesheetParseDeferral`).
+   slices that stop at rule boundaries.
 
 The end tag is then fed, and the checkpoint reuses the sheet by fingerprint.
 A streaming preview with a stale sheet starts the same preparation. Anything
-unexpected abandons the preparation and the checkpoint builds as before.
-`blocking-stylesheets ... prepared=` (lab) and `style-prepare=` (PSP
+unexpected abandons the preparation, and the checkpoint builds the sheet
+itself. `blocking-stylesheets ... prepared=` (lab) and `style-prepare=` (PSP
 validation log) count preparations, abandoned ones, pumps, and the longest
 step.
 
 Stylesheet suffixes preserve compiler/index state when the input order remains
 valid. `@font-face` discovery occurs during the CSS parse. Preview layout is
 skipped when the parsed prefix cannot affect visible pixels, and otherwise
-limits work to the viewport-relevant region before authoritative layout. A
-laid-out preview paints when its first screen shows text or a decoded image,
-or an unfilled image slot of at least 16 CSS px a side together with other
-visible paint that is not the page background and visible text laid out
-below the screen (a masthead of inline-SVG logos above the first headline).
-A preview that would be blank until its images arrive is dropped, and the
-next attempt waits for more of the document. The PSP compositor declines a
-first preview that rasters to one colour, as such a masthead can in night
-mode; a declined slots-only preview backs off the same way.
+limits work to the viewport-relevant region before authoritative layout.
+
+A laid-out preview paints only when its first screen would not be blank
+until images arrive:
+
+- it paints when the first screen shows text or a decoded image;
+- it also paints when the first screen holds an unfilled image slot of at
+  least 16 CSS px a side together with other visible non-background paint,
+  and visible text is laid out below the screen (an image header above the
+  first text);
+- otherwise the preview is dropped and the next attempt waits for more of
+  the document. The PSP compositor also declines a first preview that
+  rasters to one colour, and a declined slots-only preview backs off the
+  same way.
 
 A live preview rasterizes the inline SVGs on its first screen that need no
 network (up to 128 KiB of pixels) into the stream's own image table and
-paints again. The committed page's image loads share those rasters
-(`images_lend_preview_rasters`): an inline `<svg>` whose serialized markup
-matches one takes a reference to its pixels instead of rasterizing it
-again, so each such SVG is rasterized once per load. Each table holds its
-own reference, so the stream dropping its previews after the commit, or a
-cancelled load, frees nothing the other still shows. The PSP validation log
-reports both: `tilefinch-preview-svg:` per preview pass and
+paints again. The committed page's images share those rasters: an inline
+`<svg>` whose serialized markup matches one takes a reference to its pixels,
+so each such SVG is rasterized once per load. Each image table holds its own
+reference, so the stream dropping its previews after commit, or a cancelled
+load, frees nothing the other still shows. The PSP validation log reports
+`tilefinch-preview-svg:` per preview pass and
 `tilefinch-commit-svg: ... preview-shared=` for the commit.
 
-A painted preview whose current screen shows no text or decoded image while
-the preview holds some further down sets the provisional viewport's
-`reading_hint`. The PSP app then shows **PREVIEW READY  R TO READ** in the
+When a painted preview's current screen shows no text or decoded image but
+the preview holds some further down, the provisional viewport carries a
+reading hint, and the PSP app shows **PREVIEW READY  R TO READ** in the
 loading toast. The browser thread sets that toast in its own UI and, under
-the presentation fence, in the supervisor's copy; the supervisor never
-reads the engine. The hint ends for that load at the first screen that
-shows content (a rasterized logo included), at the first page press, at
-cancellation and when the load ends. The job records when it showed and
-ended (`reading_hint_shown_us`, `reading_hint_cleared_us`; validation
-`reading-hint=`).
+the presentation fence, in the supervisor's copy; the supervisor never reads
+the engine. The hint ends for that load at the first screen that shows
+content (a rasterized logo included), at the first page press, at
+cancellation, and when the load ends. The job records when it was shown and
+cleared (validation `reading-hint=`).
 
 ## Provisional layouts
 
 A page can be published with a provisional layout: the screens at the
-reader's position laid out, the rest a placeholder that idle work fills
-(`navigation_complete_layout_step`). A reader of one place below the cut,
-a same-page `#fragment` or a Find match, lays the page out only through it
-(`navigation_layout_through`): the build has no limit until the target's
-box (or its nearest ancestor's) is recorded, then stops three screens
-below it. The target counts only when its box was recorded before the cut
+reader's position are laid out, and the rest is a placeholder that idle work
+fills. A reader of one place below the cut (a same-page `#fragment` or a Find
+match) lays the page out only through that target: the build has no limit
+until the target's box (or its nearest ancestor's) is recorded, then stops
+three screens below it.
+
+The target counts as laid out only when its box was recorded before the cut
 and its screen ends above the cut and above any container the cut may have
-moved (`LayoutDocument.preview_moved_top`: a flex row, table, inline-level
-or transformed box, a box with a descendant pinned to its bottom, or an
-inexact multicolumn, column flex, grid or first-rows table cut). Anything
-else completes the layout. Find takes a match from a provisional index only
-when every match before it is proven too, guides the build by the next DOM
-text that holds the term, and completes the layout to wrap or to show that
-there is no match. A page with a script realm is always completed.
+moved: a flex row, table, inline-level or transformed box, a box with a
+descendant pinned to its bottom, or an inexact multicolumn, column flex,
+grid or first-rows table cut. Anything else completes the layout. Find takes
+a match from a provisional index only when every match before it is proven
+too, guides the build by the next DOM text that holds the term, and completes
+the layout to wrap or to show that there is no match. A page with a script
+realm is always completed.
 
 ## Resumable finalization
 
@@ -211,8 +220,7 @@ Navigation metrics include:
 - first DOM, first eligible preview, first paint, and completion time;
 - first content and first text: when a presented, fully rasterized screen at
   the reader's position first holds non-space text or a decoded image, and
-  text (`first_content_us`, `first_text_us`; first paint counts a blank
-  masthead frame too);
+  when it first holds text (first paint counts a blank frame too);
 - partial layout/paint counts and skipped no-pixel previews;
 - pump/yield counts, work units, maximum slice, and finalization time;
 - cancellation, timeout, truncation, replacement mode, and rollback outcome.
@@ -245,9 +253,9 @@ constructed part of its document.
 
 - Enormous documents whose final DOM/layout exceed the content budget are
   rejected even though their response body can be streamed.
-- `document.write()` without an insertion point empties the body and parses
-  into it rather than opening a new document and parser; while the document
-  is still parsing it appends to the body.
+- `document.write()` without an insertion point replaces the body's children
+  rather than opening a new document and parser (see
+  [Parser, scripts, and resources](#parser-scripts-and-resources)).
 - Live-site challenge clearance is not part of navigation.
 - Desktop replay timing is not PSP network or CPU timing.
 

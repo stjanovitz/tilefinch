@@ -2397,23 +2397,26 @@
         "let selectionChanges=0;document.addEventListener('selectionchange',"
         "()=>selectionChanges++);const range=document.createRange(),textNode="
         "target.firstChild;range.setStart(textNode,0);range.setEnd(textNode,2);"
-        "const selection=getSelection();selection.removeAllRanges();selection."
-        "addRange(range);field.setSelectionRange(2,5,'backward');const "
+        "const selection=getSelection();selection.removeAllRanges();"
+        "const emptySelectionQuiet=selectionChanges===0;selection.addRange(range);"
+        "field.setSelectionRange(2,5,'backward');const "
         "selectionOk=bidiLogical&&bidiCopy&&range instanceof Range&&range.toString()==='GO'&&"
         "selection.rangeCount===1&&selection.anchorNode===textNode&&"
         "selection.focusOffset===2&&selection.type==='Range'&&field."
         "selectionStart===2&&field.selectionEnd===5&&field."
-        "selectionDirection==='backward'&&selectionChanges===3;"
+        "selectionDirection==='backward'&&emptySelectionQuiet&&selectionChanges===2;"
+        "selection.removeAllRanges();selection.removeAllRanges();"
+        "const clearedSelection=selection.rangeCount===0&&selectionChanges===3;"
         "const expected=['window-capture:1','document-capture:1',"
         "'outer-capture:1','target:2','outer-bubble:3','document-bubble:3',"
         "'window-bubble:3','window-capture:1','document-capture:1',"
         "'outer-capture:1','target:2','outer-bubble:3','window-bubble:3'];"
-        "globalThis.pocSummary=pathOk&&constructorsOk&&focusOk&&selectionOk&&"
+        "globalThis.pocSummary=pathOk&&constructorsOk&&focusOk&&selectionOk&&clearedSelection&&"
         "!targetAfterStop&&"
         "!ancestorAfterStop&&"
         "order.join('|')===expected.join('|')"
         "?'events:ok':'events:flags='+[pathOk,constructorsOk,focusOk,"
-        "selectionOk,targetAfterStop,!ancestorAfterStop,"
+        "selectionOk,clearedSelection,targetAfterStop,!ancestorAfterStop,"
         "order.join('|')===expected.join('|')].join(',')+':focus=' + "
         "focusOrder.join('|')+':active='+(document.activeElement?.id||"
         "document.activeElement?.tagName||'none')+':'+"
@@ -4491,16 +4494,16 @@
         "<body><details id=disclosure><summary id=summary>More"
         " information</summary><p id=secret>DISCLOSED CONTENT</p></details>"
         "<p id=result>WAIT</p><script>const details=document.getElementById("
-        "'disclosure'),summary=document.getElementById('summary');details."
-        "addEventListener('toggle',event=>details.setAttribute('data-toggle',"
-        "event.oldState+'>'+event.newState+':'+event.isTrusted));summary.click();"
+        "'disclosure'),summary=document.getElementById('summary');let toggles=0;"
+        "details.addEventListener('toggle',event=>details.setAttribute('data-toggle',"
+        "++toggles+':'+event.oldState+'>'+event.newState+':'+event.isTrusted));summary.click();"
         "const opened=details.open&&details.matches(':open');summary.click();"
         "globalThis.pocSummary=opened&&!details.open&&summary instanceof "
         "HTMLSummaryElement&&details instanceof HTMLDetailsElement&&details."
-        "getAttribute('data-toggle')==='open>closed:true'?'details:ok':'details:fail';"
+        "getAttribute('data-toggle')===null?'details:ok':'details:fail';"
         "document.getElementById('result').textContent=pocSummary;"
         "let backgroundSteps=0;function backgroundStep(){backgroundSteps++;"
-        "if(backgroundSteps<8)setTimeout(backgroundStep,0);}"
+        "if(backgroundSteps<32)setTimeout(backgroundStep,0);}"
         "setTimeout(backgroundStep,0);</script></body>";
     static NavigationSession details_navigation;
     CHECK(navigation_init(&details_navigation, &budget, 2));
@@ -4523,7 +4526,8 @@
     lxb_dom_node_t *summary_node = find_id(details_root, "summary");
     BrowserController details_controller;
     ControllerAction details_action;
-    CHECK(controller_init(&details_controller, &details_navigation)
+    CHECK(attribute_equals(details_node, "data-toggle", "1:closed>closed:true")
+          && controller_init(&details_controller, &details_navigation)
           && controller_focus_node(&details_controller, summary_node)
           && controller_activate(&details_controller, &details_action)
           && details_action.type == CONTROLLER_ACTION_CONTROL
@@ -4531,20 +4535,28 @@
                  lxb_dom_interface_element(details_node),
                  (const lxb_char_t *) "open", 4)
           && attribute_equals(details_node, "data-toggle",
-                              "closed>open:true")
+                              "1:closed>closed:true")
           && command_x(&details_navigation.page.layout,
                        "DISCLOSED") >= 0
           && details_navigation.page.script_result.pending_tasks > 0);
+    for (int i = 0; i < 4 && !attribute_equals(
+             details_node, "data-toggle", "2:closed>open:true"); ++i)
+        CHECK(navigation_advance_runtime(&details_navigation, 1, 1));
+    CHECK(attribute_equals(details_node, "data-toggle", "2:closed>open:true"));
     CHECK(controller_focus_node(&details_controller, summary_node)
           && controller_activate(&details_controller, &details_action)
           && !lxb_dom_element_has_attribute(
                   lxb_dom_interface_element(details_node),
                   (const lxb_char_t *) "open", 4)
           && attribute_equals(details_node, "data-toggle",
-                              "open>closed:true")
+                              "2:closed>open:true")
           && command_x(&details_navigation.page.layout,
                        "DISCLOSED") < 0
           && details_navigation.page.script_result.pending_tasks > 0);
+    for (int i = 0; i < 4 && !attribute_equals(
+             details_node, "data-toggle", "3:open>closed:true"); ++i)
+        CHECK(navigation_advance_runtime(&details_navigation, 1, 1));
+    CHECK(attribute_equals(details_node, "data-toggle", "3:open>closed:true"));
     navigation_destroy(&details_navigation);
     CHECK(budget.current == 0);
 
@@ -4595,12 +4607,8 @@
         &choice_navigation.page.stylesheet, check_node, NULL);
     BrowserController choice_controller;
     ControllerAction choice_action;
-    bool radio_a_checked = lxb_dom_element_has_attribute(
-        lxb_dom_interface_element(radio_a_node),
-        (const lxb_char_t *) "checked", 7);
-    bool radio_b_checked = lxb_dom_element_has_attribute(
-        lxb_dom_interface_element(radio_b_node),
-        (const lxb_char_t *) "checked", 7);
+    bool radio_a_checked = document_control_checked(radio_a_node);
+    bool radio_b_checked = document_control_checked(radio_b_node);
     if (!checked_choice_style.has_width || checked_choice_style.width != 77
         || radio_a_checked || !radio_b_checked) {
         fprintf(stderr,
@@ -4618,9 +4626,7 @@
         && controller_focus_node(&choice_controller, check_node);
     bool choice_activated = choice_focused
         && controller_activate(&choice_controller, &choice_action);
-    bool check_still_checked = lxb_dom_element_has_attribute(
-        lxb_dom_interface_element(check_node),
-        (const lxb_char_t *) "checked", 7);
+    bool check_still_checked = document_control_checked(check_node);
     if (!choice_controller_initialized || !choice_focused || !choice_activated
         || choice_action.type != CONTROLLER_ACTION_CONTROL
         || check_still_checked) {
@@ -4724,7 +4730,7 @@
         "'invalid',event=>invalid.push('kind:'+event.isTrusted));const missing="
         "!form.checkValidity()&&field.validity.valueMissing&&kind.validity."
         "valueMissing;field.value='12';kind.value='ok';const pattern=!field."
-        "checkValidity()&&field.validity.patternMismatch&&field.validity.tooShort;"
+        "checkValidity()&&field.validity.patternMismatch&&!field.validity.tooShort;"
         "field.value='123';field.setCustomValidity('Nope');const custom=!field."
         "checkValidity()&&field.validity.customError&&field.validationMessage==="
         "'Nope';field.setCustomValidity('');let submitted=false;form.addEventListener("
@@ -4798,9 +4804,7 @@
           && controller_focus_node(&label_controller, label_node)
           && controller_activate(&label_controller, &label_action)
           && label_action.type == CONTROLLER_ACTION_CONTROL
-          && !lxb_dom_element_has_attribute(
-                 lxb_dom_interface_element(labeled_choice_node),
-                 (const lxb_char_t *) "checked", 7)
+          && !document_control_checked(labeled_choice_node)
           && attribute_equals(labeled_choice_node,
                               "data-tilefinch-focus", ""));
     navigation_destroy(&label_navigation);

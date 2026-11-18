@@ -10,6 +10,11 @@
   document.body.appendChild(canvas);
   const gl = canvas.getContext("webgl");
   const failures = [];
+  /* Replaces one of the context's internal methods to count its calls.
+     Host and validation realms give the test seam for that: a page's own
+     function on the context does not stand in for the context's method. */
+  const patch = globalThis.__tilefinchTestBrowserPatch
+    || ((target, name, value) => { target[name] = value; });
   const build = (vs, fs) => {
     const program = gl.createProgram();
     for (const [kind, source] of [[gl.VERTEX_SHADER, vs], [gl.FRAGMENT_SHADER, fs]]) {
@@ -447,10 +452,10 @@ void main() { gl_FragColor = vec4(diffuse, 1.0); }`;
     for (const [name, value] of Object.entries(pointBase))
       uniform(points, name, value);
     const kept = { hit: 0, built: 0 }, prepare = gl._prepareMaterial;
-    gl._prepareMaterial = function (program, plan) {
+    patch(gl, "_prepareMaterial", function (program, plan) {
       if (program === points) kept[program._materialCache.valid ? "hit" : "built"]++;
       return prepare.call(this, program, plan);
-    };
+    });
     for (let at = 0; at < 4; at++) {
       const moved = new Float32Array(identity4);
       moved[12] = at * 0.01;
@@ -459,7 +464,7 @@ void main() { gl_FragColor = vec4(diffuse, 1.0); }`;
       gl.drawArrays(gl.POINTS, 0, 1);
       gl.finish();
     }
-    gl._prepareMaterial = prepare;
+    patch(gl, "_prepareMaterial", prepare);
     if (kept.built > 1 || kept.hit < 3)
       failures.push("points-kept=" + kept.hit + "/" + kept.built);
     release();
@@ -475,10 +480,10 @@ void main() { gl_FragColor = vec4(diffuse, 1.0); }`;
     attribute(litKept, "position", positions, 3);
     attribute(litKept, "normal", normals, 3);
     const counted = { built: 0 }, buildMaterial = gl._buildMaterial;
-    gl._buildMaterial = function (program, plan) {
+    patch(gl, "_buildMaterial", function (program, plan) {
       if (program === litKept) counted.built++;
       return buildMaterial.call(this, program, plan);
-    };
+    });
     const red = { ...unlit, diffuse: [1, 0, 0] },
       blue = { ...unlit, diffuse: [0, 0, 1] };
     for (let at = 0; at < 8; at++) {
@@ -526,7 +531,7 @@ void main() { gl_FragColor = vec4(diffuse, 1.0); }`;
     kept.push(valid());
     if (kept.join() !== "true,true,true,false,false")
       failures.push("lit-same-value=" + kept.join());
-    gl._buildMaterial = buildMaterial;
+    patch(gl, "_buildMaterial", buildMaterial);
     const stats = globalThis.__tilefinchWebGLDiagnostics,
       builds = () => stats.materialRecordBuilds;
     /* Two programs of one material type alternate, each with its own

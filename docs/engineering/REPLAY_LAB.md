@@ -71,37 +71,42 @@ instead of the occurrence sequence above:
    with that redirect, so the caller's redirect policy and playlist rebase
    run as live.
 
-The host lab records media through the PSP's own code:
-`record-page-media [SECONDS [MAX-MB]]` under `--capture-http` follows the
-page's media action (including an embed hop), captures HLS as
-`psp_media_hls.c` requests it up to SECONDS of video (MAX-MB bounds the
-bytes), and captures a progressive file as one Range response of up to
-MAX-MB. `check-page-media [SECONDS]` under `--replay-http-response-keyed`
-opens the recording through the same path (`src/media_replay_check.c`) and
-reads every sample to SECONDS, proving the device will find each media
-request. Each line also names the decoder the PSP open path would give the
-video (`decoder=firmware|software|refused`, with the SPS `profile` and
-`level`); a refused candidate moves on to the page's next one in the PSP's
-order (`candidate=N/M`), and `chosen=N of=M` names the one that would play.
-Recording walks the same way. A progressive file is judged before it is
-recorded in bulk: from its first 2 MiB, or, when the moov is not there (a
-file indexed at its end), from its top-level box headers and the moov read
-by targeted Range requests, all captured. A refused file keeps only those
-reads and the walk records the next candidate, up to the first one that
-would play; a file whose verdict cannot be taken is recorded and the next
-candidate is recorded too. An HLS candidate plays when either selection
-bound plays (the firmware variant first; the software one is a fallback).
-MAX-MB bounds the bytes of the whole walk. With `focused` first (`check-page-media focused 60`), both take
-the media action Cross builds on the focused element instead of the
-page's, so a script can move focus onto the declared media card (the lab's
-`tick` and `pump` insert it as the PSP does, printing
-`loop-media-card installed`) and prove its Play.
-`check-page-media 60 seek=20` then seeks an HLS stream to 20 s the way the
-player does (the video source picks the segment holding the target, a
-separate audio rendition follows to that landing) and prints
-`loop-page-media-seek` with the stream's duration, the landing, the first
-video and audio times there and the audio units playback would drop; the
-landing's segments must be in the recording.
+The host lab records and checks media through the PSP's own code:
+
+- `record-page-media [SECONDS [MAX-MB]]`, under `--capture-http`, follows
+  the page's media action (including an embed hop) and captures HLS as
+  `psp_media_hls.c` requests it, up to SECONDS of video, or a progressive
+  file as one Range response of up to MAX-MB. MAX-MB bounds the bytes of
+  the whole candidate walk (below).
+- `check-page-media [SECONDS]`, under `--replay-http-response-keyed`, opens
+  the recording through the same path (`src/media_replay_check.c`) and
+  reads every sample to SECONDS, proving the device will find each media
+  request.
+- With `focused` first (`check-page-media focused 60`), both take the media
+  action Cross builds on the focused element instead of the page's, so a
+  script can move focus onto the declared media card (the lab's `tick` and
+  `pump` insert it as the PSP does, printing `loop-media-card installed`)
+  and prove its Play.
+- `seek=S` (`check-page-media 60 seek=20`) seeks an HLS stream to S seconds
+  the way the player does (the video source picks the segment holding the
+  target; a separate audio rendition follows to that landing) and prints
+  `loop-page-media-seek` with the stream's duration, the landing, the first
+  video and audio times there and the audio units playback would drop. The
+  landing's segments must be in the recording.
+
+Recording and checking walk the page's candidates in the PSP's order. Each
+line names the decoder the PSP open path would give the video
+(`decoder=firmware|software|refused`, with the SPS `profile` and `level`);
+a refused candidate moves on to the next one (`candidate=N/M`), and
+`chosen=N of=M` names the one that would play. An HLS candidate plays when
+either selection bound plays (the firmware variant first; the software one
+is a fallback). A progressive file is judged before it is recorded in bulk:
+from its first 2 MiB, or, when the moov is not there (a file indexed at its
+end), from its top-level box headers and the moov read by targeted Range
+requests, all captured. A refused file keeps only those reads and the walk
+records the next candidate, up to the first one that would play; a file
+whose verdict cannot be taken is recorded, and so is the next candidate.
+
 `tilefinch-trace-media-replay-tests` covers both lanes and the seek with a
 generated stream.
 

@@ -22,8 +22,8 @@ void os_thread_jit_write_protect_np(bool enabled) { (void)enabled; }
 void *os_mmap(void *hint, size_t size, int prot, int flags, os_file_handle file)
 {
     (void)hint; (void)prot; (void)flags; (void)file;
-    /* The component runtime is initialized with Tilefinch's Budget-owned
-       fixed pool. Linear memory must use that allocator too: allocating it
+    /* The component runtime is initialized with Tilefinch's Budget-backed
+       allocator. Linear memory must use that allocator too: allocating it
        from the PSP process heap escapes the page budget and commonly fails
        once the browser has fragmented the remaining system heap. */
     if (size == 0 || size > UINT32_MAX) return NULL;

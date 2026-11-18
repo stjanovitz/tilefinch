@@ -502,19 +502,8 @@ static void multiplayer_apply_command(PspMultiplayerSession *session,
             session, command->peer_identity, command->accepted);
     } else if (command->kind == PSP_MULTIPLAYER_COMMAND_REMOTE_CODE) {
         struct sockaddr_in endpoint;
-        if (multiplayer_decode_endpoint(command->code, &endpoint)) {
-            if (session->request.mode == TILEFINCH_MULTIPLAYER_MODE_HOST) {
-                session->punch_endpoint = endpoint;
-                session->punch_valid = true;
-                session->last_punch_us = 0;
-            } else {
-                session->remote = endpoint;
-                session->remote_valid = true;
-                session->remote_nonce = 0;
-                session->cookie = 0;
-                session->request.mode = TILEFINCH_MULTIPLAYER_MODE_JOIN;
-                session->last_handshake_us = 0;
-            }
+        if (multiplayer_decode_endpoint(command->code, &endpoint)
+            && multiplayer_apply_remote_endpoint(session, &endpoint)) {
             multiplayer_status(session, "punching");
         }
     } else if (command->kind == PSP_MULTIPLAYER_COMMAND_CLOSE) {

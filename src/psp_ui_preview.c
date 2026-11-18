@@ -8,6 +8,7 @@
 #include "tilefinch/ui_language.h"
 #include "tilefinch/media_capture.h"
 #include "tilefinch/platform.h"
+#include "tilefinch/diagnostics.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -105,6 +106,29 @@ static void preview_media_raise(PspUiMediaState *media, const char *failure)
         psp_ui_media_set_error(media, failure);
 }
 
+/* A mode may end in "@midnight", "@ocean", "@plum", "@ember" or "@light"
+   to draw it in that built-in theme instead of the default. */
+static bool preview_theme_named(const char *name, BrowserChromeTheme *theme)
+{
+    static const struct {
+        const char *name;
+        BrowserChromeTheme theme;
+    } themes[] = {
+        {"midnight", BROWSER_CHROME_THEME_FINCH},
+        {"ocean", BROWSER_CHROME_THEME_OCEAN},
+        {"plum", BROWSER_CHROME_THEME_PLUM},
+        {"ember", BROWSER_CHROME_THEME_EMBER},
+        {"light", BROWSER_CHROME_THEME_LIGHT}
+    };
+    for (size_t at = 0; at < sizeof(themes) / sizeof(themes[0]); at++) {
+        if (strcmp(name, themes[at].name) == 0) {
+            *theme = themes[at].theme;
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool write_ppm(const char *path, const uint16_t *frame)
 {
     FILE *file = fopen(path, "wb");
@@ -151,7 +175,20 @@ static bool read_ppm(const char *path, uint16_t *frame)
 int main(int argc, char **argv)
 {
     const char *output = argc > 1 ? argv[1] : "psp-ui-preview.ppm";
-    const char *mode = argc > 2 ? argv[2] : "";
+    char mode_text[96];
+    snprintf(mode_text, sizeof(mode_text), "%s", argc > 2 ? argv[2] : "");
+    const char *mode = mode_text;
+    bool themed = false;
+    BrowserChromeTheme theme = BROWSER_CHROME_THEME_FINCH;
+    char *theme_suffix = strrchr(mode_text, '@');
+    if (theme_suffix != NULL) {
+        *theme_suffix = '\0';
+        themed = preview_theme_named(theme_suffix + 1, &theme);
+        if (!themed) {
+            fprintf(stderr, "unknown preview theme: %s\n", theme_suffix + 1);
+            return 1;
+        }
+    }
     const char *page_frame = argc > 3 ? argv[3] : NULL;
     uint16_t *frame = calloc(PREVIEW_WIDTH * PREVIEW_HEIGHT, sizeof(*frame));
     if (frame == NULL) return 1;
@@ -451,17 +488,30 @@ int main(int argc, char **argv)
         ui.site_data_bytes = 1400u * 1024u;
         ui.site_storage_state = 1;
         ui.toast_frames = 0;
+    } else if (strcmp(mode, "site-information-confirm") == 0) {
+        /* Reset permissions armed under the unarmed Clear data row. */
+        ui.screen = PSP_UI_SCREEN_PAGE_INFORMATION;
+        ui.menu_selection = 3;
+        ui.data_clear_confirmation = 4;
+        ui.site_cookie_count = 3;
+        ui.site_storage_count = 12;
+        ui.site_data_bytes = 1400u * 1024u;
+        ui.site_storage_state = 1;
+        ui.toast_frames = 0;
     } else if (strcmp(mode, "site-storage") == 0
                || strcmp(mode, "site-storage-caches") == 0
                || strcmp(mode, "site-storage-compiled") == 0
+               || strcmp(mode, "site-storage-clear") == 0
                || strcmp(mode, "storage-site") == 0) {
         ui.screen = strcmp(mode, "storage-site") == 0
             ? PSP_UI_SCREEN_STORAGE_SITE : PSP_UI_SCREEN_DATA_OPTIONS;
         /* Three listed sites, then the fixed rows: Disk cache is the
-           fourth, Keep compiled scripts the fifth. */
+           fourth, Keep compiled scripts the fifth, Clear session storage
+           the last, which scrolls every Clear row into view. */
         ui.data_options_selection =
             strcmp(mode, "site-storage-caches") == 0 ? 6
-            : strcmp(mode, "site-storage-compiled") == 0 ? 7 : 0;
+            : strcmp(mode, "site-storage-compiled") == 0 ? 7
+            : strcmp(mode, "site-storage-clear") == 0 ? 12 : 0;
         ui.keep_compiled_scripts = true;
         ui.compiled_scripts_kib = 3277;
         ui.site_storage_offers = true;
@@ -709,6 +759,7 @@ int main(int argc, char **argv)
         ui.overlay_animation_frames = 0;
         ui.toast_frames = 0;
     } else if (strcmp(mode, "collections") == 0
+               || strcmp(mode, "collections-delete") == 0
                || strcmp(mode, "collections-bookmarks") == 0
                || strcmp(mode, "collections-history") == 0) {
         psp_ui_set_device_status(14, 8, 62, false, false, 3);
@@ -719,6 +770,9 @@ int main(int argc, char **argv)
         psp_ui_show_collections(&ui, section_view->section);
         psp_ui_set_collections(&ui, section_view);
         ui.collections_selection = 1;
+        /* The selected row asks for its second delete press. */
+        if (strcmp(mode, "collections-delete") == 0)
+            ui.collections_delete_confirmation = 2;
         ui.overlay_animation_frames = 0;
         ui.toast_frames = 0;
     } else if (strcmp(mode, "text-entry") == 0) {
@@ -835,6 +889,23 @@ int main(int argc, char **argv)
             ui.toast_frames = 0;
             ui.overlay_animation_frames = 0;
         }
+    } else if (strcmp(mode, "page-failure") == 0) {
+        /* A load that could not reach its site, shown as the failed
+           navigation shows it (psp_script_main): the typed failure's
+           headline and next step, then the recovery sheet. */
+        psp_ui_set_page(&ui, "github.com",
+                        "https://github.com/tilefinch/tilefinch/issues/1",
+                        true);
+        char detail[PSP_UI_STATUS_CAPACITY];
+        snprintf(detail, sizeof(detail), "%s\n%s",
+                 psp_ui_failure_headline(TILEFINCH_DIAGNOSTIC_NETWORK_FAILED),
+                 psp_ui_failure_next_step(
+                     TILEFINCH_DIAGNOSTIC_NETWORK_FAILED));
+        psp_ui_show_status(&ui, detail, 300);
+        psp_ui_show_failure_recovery(
+            &ui, detail, PSP_UI_FAILURE_DISABLE_JAVASCRIPT);
+        ui.toast_frames = 0;
+        ui.overlay_animation_frames = 0;
     } else if (strcmp(mode, "bot-wall") == 0) {
         /* The notice over a bot-protection wall (navigation_bot_wall);
            the optional fourth argument names the site, the fifth the
@@ -891,6 +962,10 @@ int main(int argc, char **argv)
     } else if (preview_media_mode(mode)) {
         ui.chrome_visible = false;
         ui.toast_frames = 0;
+    }
+    if (themed) {
+        ui.chrome_theme = (uint8_t) theme;
+        psp_ui_theme_select(theme);
     }
     if (strcmp(mode, "night") == 0) {
         ui.color_mode = BROWSER_COLOR_MODE_DARK;

@@ -3452,9 +3452,10 @@ static void computed_style_serialize(const ComputedStyleRead *read,
     case CSP_PLACE_CONTENT: {
         static const char *const content_names[] = {
             "start", "center", "end", "space-between", "space-around",
-            "space-evenly", "stretch"
+            "space-evenly", "stretch", "start", "end", "flex-start",
+            "left", "right", "unsafe center"
         };
-        size_t align = style->align_content;
+        size_t align = style_align_content_in_axis(style->align_content, false);
         size_t justify = style->justify_content;
         if (align >= sizeof(content_names) / sizeof(content_names[0])) {
             align = JUSTIFY_STRETCH;
@@ -3659,6 +3660,10 @@ static void computed_style_serialize(const ComputedStyleRead *read,
     }
     case CSP_CLIP_PATH: {
         unsigned clip = computed_style_clip_path_type(style);
+        if (clip != STYLE_CLIP_PATH_NONE && pseudo == PSEUDO_NONE
+            && style_retained_property_value(bridge->stylesheet, node,
+                                              name, name_length, value, value_size))
+            break;
         if (clip == STYLE_CLIP_PATH_CIRCLE) {
             snprintf(value, value_size, "circle()");
         } else if (clip == STYLE_CLIP_PATH_INSET) {
@@ -3743,7 +3748,8 @@ static void computed_style_serialize(const ComputedStyleRead *read,
     case CSP_JUSTIFY_CONTENT: {
         static const char *justify_names[] = {
             "flex-start", "center", "flex-end", "space-between",
-            "space-around", "space-evenly", "stretch"
+            "space-around", "space-evenly", "stretch", "start", "end",
+            "flex-start", "left", "right", "unsafe center"
         };
         size_t justify = style->justify_content;
         if (justify >= sizeof(justify_names) / sizeof(justify_names[0])) {
@@ -3775,7 +3781,8 @@ static void computed_style_serialize(const ComputedStyleRead *read,
     case CSP_ALIGN_CONTENT: {
         static const char *align_content_names[] = {
             "flex-start", "center", "flex-end", "space-between",
-            "space-around", "space-evenly", "stretch"
+            "space-around", "space-evenly", "stretch", "start", "end",
+            "flex-start", "left", "right", "unsafe center"
         };
         snprintf(value, value_size, "%s",
                  align_content_names[style->align_content]);

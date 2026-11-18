@@ -495,6 +495,32 @@ static const PageRecord empty_scripts[] = {
     SCRIPT("https://news.example/empty-dyn.js", ""),
 };
 
+/* An element's load stops at the document: window's load listeners
+   (capture and bubble) and onload run once, for the window's own load, and
+   never for a script (blocking, async, defer, module or inserted), while a
+   document capture listener sees every one. */
+#define LOAD_PATH_PAGE \
+    "<!doctype html><html><head>" REC \
+    "<script>var w=0,d=0;addEventListener('load',function(){w++},true);" \
+    "addEventListener('load',function(){w++});" \
+    "document.addEventListener('load',function(e){" \
+    "if(e.target!==document)d++},true);onload=function(){" \
+    "setTimeout(function(){rec('w='+w+',d='+d)},0)}</script>" \
+    "<script src=\"/empty.js\"></script>" \
+    "<script async src=\"/empty-async.js\"></script>" \
+    "<script defer src=\"/empty-defer.js\"></script>" \
+    "<script type=module src=\"/empty.mjs\"></script>" \
+    "<script>var s=document.createElement('script');s.src='/empty-dyn.js';" \
+    "document.head.appendChild(s)</script></head><body></body></html>"
+
+static const PageRecord load_path_resources[] = {
+    SCRIPT("https://news.example/empty.js", ""),
+    SCRIPT("https://news.example/empty-async.js", ""),
+    SCRIPT("https://news.example/empty-defer.js", ""),
+    SCRIPT("https://news.example/empty.mjs", ""),
+    SCRIPT("https://news.example/empty-dyn.js", ""),
+};
+
 /* Off, a tag-manager container whose body is empty answers nothing (the
    page stays hidden until its own timeout), like any container that loads
    without ending the hiding: it fires load, not error. Measurements that
@@ -581,6 +607,9 @@ int main(void)
         {"empty external scripts load", EMPTY_SCRIPTS_PAGE, empty_scripts,
          COUNT(empty_scripts), BLOCKER_OFF, 1, 8,
          "blocking,data,async,defer,module,import,dynamic-import,inserted"},
+        {"element load stops at the document", LOAD_PATH_PAGE,
+         load_path_resources, COUNT(load_path_resources), BLOCKER_OFF, 1, 8,
+         "w=2,d=5"},
         {"google anti-flicker, empty container, off", GOOGLE_PAGE,
          empty_container, 1, BLOCKER_OFF, 1, 4,
          "load,class=hidden,opacity=0"},

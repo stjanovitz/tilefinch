@@ -495,6 +495,9 @@ typedef struct {
        after failure or failure after success. */
     bool overflow_static_active;
     size_t overflow_tile_commands;
+    /* Boxes examined to clip stuck sticky commands inside overflow boxes:
+       cached clip boxes, or every node box per command without the cache. */
+    uint64_t sticky_overflow_box_visits;
     bool forced_dark;
     /* Scroll state last mirrored into the visual layout, and last answer to
        "is any overflow box scrolled vertically", keyed by the source

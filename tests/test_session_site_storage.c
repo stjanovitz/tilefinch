@@ -1037,7 +1037,7 @@ static int test_newer_and_foreign_logs_are_kept(void)
     memcpy(older, log, log_length);
     older_length = log_length;
     CHECK(write_log(backup, older, older_length));
-    log[4] = 2u;
+    log[4] = 3u;
     CHECK(write_log(name, log, log_length));
     CHECK(browser_session_init(&session, &budget, 32u * 1024u)
           && browser_session_site_storage_configure(&session, directory)
@@ -1095,6 +1095,303 @@ static int test_newer_and_foreign_logs_are_kept(void)
     browser_session_destroy(&session);
     CHECK(log_unchanged(name, log, log_length) && budget.current == 0);
     remove_log(name);
+    return 0;
+}
+
+static int test_length_delimited_storage_keys(void)
+{
+    static const char binary[] = "id\0tail";
+    static const size_t key_len = sizeof(binary) - 1u;
+    Budget budget;
+    budget_init(&budget, 2u * MIB);
+    BrowserSession session;
+    char name[64], snapshot[256];
+    unsigned char header[16];
+    size_t length = 0;
+    FILE *file;
+    const char *stored = NULL;
+    const char *listed = NULL;
+    snprintf(snapshot, sizeof(snapshot), "%s/binary-keys", directory);
+    CHECK(browser_session_init(&session, &budget, 32u * 1024u)
+          && browser_session_storage_set(&session, game, true, "id", "a", 1)
+          && browser_session_storage_set_bytes(
+              &session, game, true, binary, key_len, "b", 1)
+          && browser_session_storage_set(&session, game, true, "", "c", 1)
+          && browser_session_persistence_save(
+              &session, snapshot, BROWSER_SESSION_PERSIST_LOCAL_STORAGE,
+              NULL) == BROWSER_SESSION_PERSISTENCE_OK);
+    browser_session_destroy(&session);
+    CHECK(browser_session_init(&session, &budget, 32u * 1024u)
+          && browser_session_persistence_load(
+              &session, snapshot, BROWSER_SESSION_PERSIST_LOCAL_STORAGE,
+              NULL) == BROWSER_SESSION_PERSISTENCE_OK
+          && browser_session_storage_get(&session, game, true, "id", &stored,
+                                         NULL) && strcmp(stored, "a") == 0
+          && browser_session_storage_get(&session, game, true, "", &stored,
+                                         NULL) && strcmp(stored, "c") == 0
+          && browser_session_storage_get_bytes(
+              &session, game, true, binary, key_len, &stored, NULL)
+          && strcmp(stored, "b") == 0);
+    CHECK(remove(snapshot) == 0
+          && browser_session_storage_remove_bytes(
+              &session, game, true, binary, key_len)
+          && browser_session_storage_remove(&session, game, true, "")
+          && browser_session_site_storage_configure(&session, directory)
+          && browser_session_site_storage_set_policy(
+              &session, game, BROWSER_SITE_STORAGE_STICK)
+          && always_file(name, sizeof(name)));
+    char log_path[256];
+    snprintf(log_path, sizeof(log_path), "%s/%s", directory, name);
+    file = fopen(log_path, "rb");
+    CHECK(file != NULL && fread(header, 1, sizeof(header), file) == sizeof(header)
+          && fclose(file) == 0 && header[4] == 1u);
+    CHECK(browser_session_storage_set_bytes(
+              &session, game, true, binary, key_len, "b", 1)
+          && browser_session_storage_set(&session, game, true, "", "c", 1));
+    browser_session_destroy(&session);
+    file = fopen(log_path, "rb");
+    CHECK(file != NULL && fread(header, 1, sizeof(header), file) == sizeof(header)
+          && fclose(file) == 0 && header[4] == 2u);
+    CHECK(browser_session_init(&session, &budget, 32u * 1024u)
+          && browser_session_site_storage_configure(&session, directory)
+          && browser_session_site_storage_set_policy(
+              &session, game, BROWSER_SITE_STORAGE_STICK)
+          && browser_session_storage_key_bytes(
+              &session, game, true, 1, &listed, &length)
+          && length == key_len && memcmp(listed, binary, key_len) == 0
+          && browser_session_storage_get(&session, game, true, "", &stored,
+                                         NULL) && strcmp(stored, "c") == 0
+          && browser_session_storage_get_bytes(
+              &session, game, true, binary, key_len, &stored, NULL)
+          && strcmp(stored, "b") == 0
+          && browser_session_storage_remove_bytes(
+              &session, game, true, binary, key_len)
+          && browser_session_storage_get(&session, game, true, "id", &stored,
+                                         NULL) && strcmp(stored, "a") == 0
+          && !browser_session_storage_get_bytes(
+              &session, game, true, binary, key_len, NULL, NULL)
+          && browser_session_site_storage_forget(&session, game));
+    browser_session_destroy(&session);
+    CHECK(budget.current == 0 && !always_file(name, sizeof(name)));
+    return 0;
+}
+
+static bool log_version(const char *log_path, unsigned char *version)
+{
+    unsigned char header[16];
+    FILE *file = fopen(log_path, "rb");
+    bool ok = file != NULL
+        && fread(header, 1, sizeof(header), file) == sizeof(header);
+    if (file != NULL && fclose(file) != 0) ok = false;
+    if (ok) *version = header[4];
+    return ok;
+}
+
+/* An empty sessionStorage key needs log version 2 only while its record is
+   in the log. The reload drops that dead record, and the log must go back
+   to version 1 so 0.1.52 still reads the site's localStorage. */
+static int test_session_key_does_not_keep_version_two(void)
+{
+    Budget budget;
+    budget_init(&budget, 2u * MIB);
+    BrowserSession session;
+    char name[64], log_path[256];
+    unsigned char version = 0;
+    const char *stored = NULL;
+    CHECK(browser_session_init(&session, &budget, 32u * 1024u)
+          && browser_session_site_storage_configure(&session, directory)
+          && browser_session_site_storage_set_policy(
+              &session, game, BROWSER_SITE_STORAGE_STICK)
+          && browser_session_storage_set(&session, game, true, "id", "a", 1)
+          && always_file(name, sizeof(name)));
+    snprintf(log_path, sizeof(log_path), "%s/%s", directory, name);
+    CHECK(log_version(log_path, &version) && version == 1u);
+    CHECK(browser_session_storage_set(&session, game, false, "", "s", 1)
+          && log_version(log_path, &version) && version == 2u);
+    /* Clearing it rewrites the log without that key. */
+    CHECK(browser_session_storage_clear(&session, game, false)
+          && log_version(log_path, &version) && version == 1u
+          && browser_session_storage_set(&session, game, false, "", "s", 1)
+          && log_version(log_path, &version) && version == 2u);
+    browser_session_destroy(&session);
+    CHECK(browser_session_init(&session, &budget, 32u * 1024u)
+          && browser_session_site_storage_configure(&session, directory)
+          && browser_session_site_storage_set_policy(
+              &session, game, BROWSER_SITE_STORAGE_STICK)
+          && browser_session_storage_get(&session, game, true, "id", &stored,
+                                         NULL) && strcmp(stored, "a") == 0
+          && !browser_session_storage_get(&session, game, false, "", NULL,
+                                          NULL)
+          && log_version(log_path, &version) && version == 1u);
+    /* A localStorage key that needs version 2 keeps it across a reload. */
+    CHECK(browser_session_storage_set(&session, game, true, "", "c", 1)
+          && log_version(log_path, &version) && version == 2u);
+    browser_session_destroy(&session);
+    CHECK(browser_session_init(&session, &budget, 32u * 1024u)
+          && browser_session_site_storage_configure(&session, directory)
+          && browser_session_site_storage_set_policy(
+              &session, game, BROWSER_SITE_STORAGE_STICK)
+          && browser_session_storage_get(&session, game, true, "", &stored,
+                                         NULL) && strcmp(stored, "c") == 0
+          && browser_session_storage_set(&session, game, false, "x", "s", 1)
+          && browser_session_storage_clear(&session, game, false)
+          && log_version(log_path, &version) && version == 2u
+          && browser_session_site_storage_forget(&session, game));
+    browser_session_destroy(&session);
+    CHECK(budget.current == 0 && !always_file(name, sizeof(name)));
+    return 0;
+}
+
+static int test_opfs_writer_locks_are_shared_and_owned(void)
+{
+    Budget budget;
+    BrowserSession session;
+    budget_init(&budget, 2u * MIB);
+    CHECK(browser_session_init(&session, &budget, 32u * 1024u));
+    const char *path = "/shared";
+    CHECK(browser_session_opfs_create(&session, game, path, BROWSER_OPFS_FILE)
+          == BROWSER_OPFS_OK
+          && browser_session_opfs_create(&session, news, path, BROWSER_OPFS_FILE)
+             == BROWSER_OPFS_OK);
+    unsigned first_realm = 1, next_realm = 2;
+    uint64_t first = 0, second = 0;
+    CHECK(browser_session_opfs_lock(&session, game, path, &first_realm, false, &first)
+             == BROWSER_OPFS_OK
+          && first != 0
+          && browser_session_opfs_lock(&session, game, path, &next_realm, false, &second)
+             == BROWSER_OPFS_LOCKED
+          && browser_session_opfs_remove(&session, news, path, false)
+             == BROWSER_OPFS_OK);
+    browser_session_opfs_unlock(&session, &next_realm, first);
+    CHECK(browser_session_opfs_remove(&session, game, path, false)
+          == BROWSER_OPFS_LOCKED);
+    browser_session_opfs_unlock(&session, &first_realm, 0);
+    CHECK(browser_session_opfs_lock(&session, game, path, &next_realm, false, &second)
+          == BROWSER_OPFS_OK && second != first);
+    browser_session_opfs_unlock(&session, &first_realm, first);
+    CHECK(browser_session_opfs_remove(&session, game, path, false)
+          == BROWSER_OPFS_LOCKED);
+    browser_session_destroy(&session);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+static bool opfs_holds(BrowserSession *session, const char *path,
+                       const char *expected)
+{
+    BrowserOpfsView view;
+    size_t length = strlen(expected);
+    return browser_session_opfs_read(session, game, path, &view)
+               == BROWSER_OPFS_OK
+           && view.data_length == length
+           && (length == 0 || memcmp(view.data, expected, length) == 0);
+}
+
+static uint64_t opfs_generation(BrowserSession *session, const char *path)
+{
+    BrowserOpfsView view;
+    return browser_session_opfs_stat(session, game, path, &view)
+               == BROWSER_OPFS_OK ? view.generation : 0;
+}
+
+/* A shared writer commits only through its own live lease: the token, owner,
+   origin, path and the generation it locked must all match. A commit moves
+   every other shared lease on that entry to the new generation, while a
+   write outside the lease or a clear-and-recreate makes them stale. Shared
+   and exclusive leases exclude each other in both directions. */
+static int test_opfs_commit_shared(void)
+{
+    Budget budget;
+    BrowserSession session;
+    budget_init(&budget, 2u * MIB);
+    CHECK(browser_session_init(&session, &budget, 32u * 1024u));
+    const char *path = "/doc";
+    CHECK(browser_session_opfs_create(&session, game, path, BROWSER_OPFS_FILE)
+              == BROWSER_OPFS_OK
+          && browser_session_opfs_create(&session, game, "/other",
+                                         BROWSER_OPFS_FILE) == BROWSER_OPFS_OK
+          && browser_session_opfs_create(&session, news, path, BROWSER_OPFS_FILE)
+              == BROWSER_OPFS_OK
+          && browser_session_opfs_write(&session, game, path,
+                 (const unsigned char *) "v0", 2) == BROWSER_OPFS_OK);
+    unsigned first_realm = 1, next_realm = 2, other_realm = 3;
+    uint64_t first = 0, second = 0, refused = 0;
+    CHECK(browser_session_opfs_lock(&session, game, path, &first_realm, true,
+                                    &first) == BROWSER_OPFS_OK
+          && browser_session_opfs_lock(&session, game, path, &next_realm, true,
+                                       &second) == BROWSER_OPFS_OK
+          && first != 0 && second != 0 && first != second
+          && browser_session_opfs_lock(&session, game, path, &other_realm,
+                                       false, &refused) == BROWSER_OPFS_LOCKED);
+
+    const unsigned char *bytes = (const unsigned char *) "v1";
+    CHECK(browser_session_opfs_commit_shared(&session, game, path, &next_realm,
+                                             first, bytes, 2) == BROWSER_OPFS_STALE
+          && browser_session_opfs_commit_shared(&session, game, path,
+                 &first_realm, 0, bytes, 2) == BROWSER_OPFS_STALE
+          && browser_session_opfs_commit_shared(&session, game, path, NULL,
+                 first, bytes, 2) == BROWSER_OPFS_STALE
+          && browser_session_opfs_commit_shared(&session, game, path,
+                 &first_realm, first + second, bytes, 2) == BROWSER_OPFS_STALE
+          && browser_session_opfs_commit_shared(&session, game, "/other",
+                 &first_realm, first, bytes, 2) == BROWSER_OPFS_STALE
+          && browser_session_opfs_commit_shared(&session, news, path,
+                 &first_realm, first, bytes, 2) == BROWSER_OPFS_STALE
+          && opfs_holds(&session, path, "v0"));
+
+    const uint64_t locked = opfs_generation(&session, path);
+    CHECK(locked != 0
+          && browser_session_opfs_commit_shared(&session, game, path,
+                 &first_realm, first, bytes, 2) == BROWSER_OPFS_OK
+          && opfs_holds(&session, path, "v1"));
+    const uint64_t committed = opfs_generation(&session, path);
+    CHECK(committed != 0 && committed != locked
+          && browser_session_opfs_commit_shared(&session, game, path,
+                 &next_realm, second, (const unsigned char *) "v2", 2)
+              == BROWSER_OPFS_OK
+          && opfs_holds(&session, path, "v2")
+          && opfs_generation(&session, path) != committed
+          && browser_session_opfs_commit_shared(&session, game, path,
+                 &first_realm, first, (const unsigned char *) "v3", 2)
+              == BROWSER_OPFS_OK);
+
+    /* A write outside the lease replaces the snapshot both writers hold. */
+    CHECK(browser_session_opfs_write(&session, game, path,
+              (const unsigned char *) "outside", 7) == BROWSER_OPFS_OK
+          && browser_session_opfs_commit_shared(&session, game, path,
+                 &first_realm, first, bytes, 2) == BROWSER_OPFS_STALE
+          && browser_session_opfs_commit_shared(&session, game, path,
+                 &next_realm, second, bytes, 2) == BROWSER_OPFS_STALE
+          && opfs_holds(&session, path, "outside"));
+    browser_session_opfs_unlock(&session, &first_realm, 0);
+    browser_session_opfs_unlock(&session, &next_realm, 0);
+
+    /* An exclusive lease refuses shared ones and never commits as shared. */
+    uint64_t exclusive = 0;
+    CHECK(browser_session_opfs_lock(&session, game, path, &other_realm, false,
+                                    &exclusive) == BROWSER_OPFS_OK
+          && browser_session_opfs_lock(&session, game, path, &first_realm,
+                                       true, &refused) == BROWSER_OPFS_LOCKED
+          && browser_session_opfs_commit_shared(&session, game, path,
+                 &other_realm, exclusive, bytes, 2) == BROWSER_OPFS_STALE
+          && opfs_holds(&session, path, "outside"));
+    browser_session_opfs_unlock(&session, &other_realm, exclusive);
+
+    /* Clearing site data leaves the lease pointing at a file that is gone;
+       a file recreated at the same path is not the one it locked. */
+    CHECK(browser_session_opfs_lock(&session, game, path, &first_realm, true,
+                                    &first) == BROWSER_OPFS_OK
+          && browser_session_opfs_clear_all(&session)
+          && browser_session_opfs_commit_shared(&session, game, path,
+                 &first_realm, first, bytes, 2) == BROWSER_OPFS_NOT_FOUND
+          && browser_session_opfs_create(&session, game, path, BROWSER_OPFS_FILE)
+              == BROWSER_OPFS_OK
+          && browser_session_opfs_commit_shared(&session, game, path,
+                 &first_realm, first, bytes, 2) == BROWSER_OPFS_STALE
+          && opfs_holds(&session, path, ""));
+    browser_session_opfs_unlock(&session, &first_realm, 0);
+    browser_session_destroy(&session);
+    CHECK(budget.current == 0);
     return 0;
 }
 
@@ -1215,7 +1512,8 @@ int main(int argc, char **argv)
             : !strcmp(argv[1], "clear-site-refusal") ? test_retirement_unlink_refusal(1)
             : !strcmp(argv[1], "clear-local-refusal") ? test_retirement_unlink_refusal(2)
             : !strcmp(argv[1], "cleanup-marker") ? test_session_cleanup_retry_marker()
-            : !strcmp(argv[1], "marker-admission") ? test_session_marker_admission() : 1;
+            : !strcmp(argv[1], "marker-admission") ? test_session_marker_admission()
+            : !strcmp(argv[1], "opfs-commit-shared") ? test_opfs_commit_shared() : 1;
         rmdir(directory);
         return failed;
     }
@@ -1234,6 +1532,10 @@ int main(int argc, char **argv)
         || test_clear_scrubs_stick_values()
         || test_unflushed_append_is_refused()
         || test_newer_and_foreign_logs_are_kept()
+        || test_length_delimited_storage_keys()
+        || test_session_key_does_not_keep_version_two()
+        || test_opfs_writer_locks_are_shared_and_owned()
+        || test_opfs_commit_shared()
         || test_torn_tail_and_compaction()
         || test_full_rewrite_compacts()
         || test_compaction_swap_is_crash_safe()

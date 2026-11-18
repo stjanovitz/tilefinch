@@ -285,10 +285,68 @@ class PrivateConsoleTests(unittest.TestCase):
     @unittest.skipUnless(LAB, "requires the host lab executable")
     def test_synchronous_script_form_keeps_formdata_entry_list(self):
         for delayed in (False, True):
-            with self.subTest(delayed=delayed):
-                self.check_script_form_entry_list(delayed)
+            for request_submit in (False, True):
+                with self.subTest(delayed=delayed, request_submit=request_submit):
+                    self.check_script_form_entry_list(delayed, request_submit)
 
-    def check_script_form_entry_list(self, delayed):
+    @unittest.skipUnless(LAB, "requires the host lab executable")
+    def test_fetch_and_xhr_preserve_case_of_extension_methods(self):
+        with tempfile.TemporaryDirectory() as directory:
+            seen = []
+            class Handler(http.server.BaseHTTPRequestHandler):
+                def log_message(self, *_):
+                    pass
+
+                def reply(self, body):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def extension(self):
+                    seen.append((self.command, self.path))
+                    self.reply(b"ok")
+
+                do_patch = do_pAtCh = do_PATCH = do_propfind = do_PROPFIND = do_PUT = extension
+
+                def do_GET(self):
+                    if self.path != "/":
+                        return self.extension()
+                    self.reply(b"""<!doctype html><p>Methods</p><script>
+                      window.runProbe=async()=>{
+                        for(const method of ['get','put','patch','pAtCh','propfind']){
+                          const request=new Request('/fetch',{method});
+                          await fetch(request);
+                          await new Promise(resolve=>{
+                            const xhr=new XMLHttpRequest();xhr.open(method,'/xhr');
+                            xhr.onloadend=resolve;xhr.send();
+                          });
+                        }
+                        window.done=true;
+                      };runProbe();
+                    </script>""")
+            with http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+                threading.Thread(target=server.serve_forever, daemon=True).start()
+                commands = Path(directory) / "commands.txt"
+                commands.write_text("until 240 16 window.done===true\nquit\n")
+                try:
+                    result = subprocess.run(
+                        [str(LAB), "--url", f"http://127.0.0.1:{server.server_port}/",
+                         "--psp-profile", "realistic", "--fetch-scripts",
+                         "--commands", str(commands), "--no-loop-capture",
+                         "--output", "/dev/null", "--pace-real-time"],
+                        capture_output=True, text=True, timeout=30, cwd=directory)
+                    self.assertEqual(result.returncode, 0, result.stdout)
+                    self.assertIn("loop-until matched=yes", result.stdout)
+                    self.assertEqual(seen,
+                        [(method, path) for method in
+                         ('GET','PUT','patch','pAtCh','propfind')
+                         for path in ('/fetch','/xhr')])
+                finally:
+                    server.shutdown()
+
+    def check_script_form_entry_list(self, delayed, request_submit):
         with tempfile.TemporaryDirectory() as directory:
             received = []
             class Handler(http.server.BaseHTTPRequestHandler):
@@ -296,21 +354,34 @@ class PrivateConsoleTests(unittest.TestCase):
                     pass
                 def do_GET(self):
                     body = b"""<form id=f method=post action='/continue'>
-                      <input name=original value=mock></form><script>
+                      <input name=original value=mock>
+                      <input name=excluded form="" value=wrong>
+                      <select name=single id=single><option value=wrong>One</option></select>
+                      <select name=multiple multiple><option value=wrong>Two</option></select>
+                      <select name=default><option disabled value=wrong>Three</option>
+                        <option value=right>Four</option></select></form>
+                      <button id=send form=f formaction='/selected' name=action value=external>Send</button><script>
                       var f=document.getElementById('f');
                       f.addEventListener('formdata',function(e){
                         e.formData.set('continuation','mock-listener-field');
+                        e.formData.set('event',Object.prototype.toString.call(e));
                         e.formData.delete('original');
-                      });f.submit();</script>"""
+                      });
+                      document.getElementById('single').selectedIndex=-1;
+                      function send(){f.requestSubmit(document.getElementById('send'))}
+                      send();</script>"""
+                    if not request_submit:
+                        body = body.replace(
+                            b"f.requestSubmit(document.getElementById('send'))", b"f.submit()")
                     if delayed:
-                        body = body.replace(b'f.submit();', b'setTimeout(function(){f.submit()},0);')
+                        body = body.replace(b' send();', b' setTimeout(send,0);')
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html")
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
                 def do_POST(self):
-                    received.append(self.rfile.read(int(self.headers['Content-Length'])))
+                    received.append((self.path, self.rfile.read(int(self.headers['Content-Length']))))
                     body = b"<p>Continuation completed</p>"
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html")
@@ -326,7 +397,12 @@ class PrivateConsoleTests(unittest.TestCase):
                 session.status(timeout=30)
                 if delayed:
                     session.send(b"pump 8 16\n")
-                self.assertEqual(received, [b"continuation=mock-listener-field"])
+                expected = b"default=right&"
+                if request_submit:
+                    expected += b"action=external&"
+                self.assertEqual(received, [
+                    ("/selected" if request_submit else "/continue",
+                     expected + b"continuation=mock-listener-field&event=%5Bobject+FormDataEvent%5D")])
             finally:
                 session.close()
                 server.shutdown()

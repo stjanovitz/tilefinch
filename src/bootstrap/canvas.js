@@ -76,6 +76,17 @@
       "source-out", "source-atop", "destination-in", "destination-out",
       "destination-atop", "xor", "lighter",
     ],
+    replacesClip = (state) => {
+      const mode = state.globalCompositeOperation;
+      return mode === "copy" || mode === "source-in" || mode === "source-out" ||
+        mode === "destination-in" || mode === "destination-atop";
+    },
+    rasterOperation = (state) =>
+      compositeOperations.indexOf(state.globalCompositeOperation) |
+      (state.opaque ? 16 : 0) | (replacesClip(state) ? 32 : 0),
+    paintDamage = (state, bounds) => replacesClip(state)
+      ? { left: state.clipRect[0], top: state.clipRect[1],
+          right: state.clipRect[2], bottom: state.clipRect[3] } : bounds,
     states = new WeakMap(),
     contexts = new WeakMap(),
     contextKinds = new WeakMap(),
@@ -350,6 +361,7 @@
           nativeStore: false,
           surfaceUnavailable: false,
           originClean: true,
+          opaque: false,
           ignoredSaveDepth: 0,
           fill: [0, 0, 0, 255],
           fillStyle: "#000000",
@@ -465,13 +477,16 @@
       if (state.originClean === false) {
         if (!state.nativeStore)
           state.nativeStore = nativeSurface(state.canvas.__handle,
-            state.width, state.height, null) === true;
+            state.width, state.height, null, state.opaque) === true;
         return surfaceTarget(state);
       }
-      if (!state.pixels)
+      if (!state.pixels) {
         state.pixels = new Uint8ClampedArray(
           state.width * state.height * 4,
         );
+        if (state.opaque)
+          for (let at = 3; at < state.pixels.length; at += 4) state.pixels[at] = 255;
+      }
       return state.pixels;
     },
     normalizedRect = (state, x, y, width, height) => {
@@ -566,15 +581,16 @@
       );
       if (outputAlpha <= 0) {
         pixels.fill(0, at, at + 4);
+        if (state.opaque) pixels[at + 3] = 255;
         return;
       }
       for (let channel = 0; channel < 3; channel++)
         pixels[at + channel] = byte(
           (color[channel] * sourceAlpha * sourceFactor +
             pixels[at + channel] * destinationAlpha * destinationFactor) /
-            outputAlpha,
+            (state.opaque ? 1 : outputAlpha),
         );
-      pixels[at + 3] = byte(outputAlpha * 255);
+      pixels[at + 3] = state.opaque ? 255 : byte(outputAlpha * 255);
     },
     drawLine = (state, from, to, color, width = 1) => {
       let x0 = Math.round(from.x),
@@ -613,7 +629,7 @@
         }
       }
     },
-    pointInSubpaths = (subpaths, x, y, evenOdd = false) => {
+    pointInSubpaths = (subpaths, x, y, evenOdd = false, includeEdge = false) => {
       let winding = 0,
         parity = false;
       for (const points of subpaths) {
@@ -621,6 +637,11 @@
         for (let index = 0; index < points.length; index++) {
           const first = points[index],
             second = points[(index + 1) % points.length];
+          if (includeEdge && x >= Math.min(first.x, second.x) &&
+              x <= Math.max(first.x, second.x) && y >= Math.min(first.y, second.y) &&
+              y <= Math.max(first.y, second.y) &&
+              (x - first.x) * (second.y - first.y) === (y - first.y) * (second.x - first.x))
+            return true;
           if (
             (first.y <= y && second.y > y) ||
             (second.y <= y && first.y > y)
@@ -727,9 +748,9 @@
       }
       return output;
     },
-    serializedPaint = (paint) => {
+    serializedPaint = (paint, inverse) => {
       if (!(paint instanceof CanvasGradient)) return new Float64Array();
-      const output = new Float64Array(8 + paint._stops.length * 5);
+      const output = new Float64Array(8 + paint._stops.length * 5 + (inverse ? 6 : 0));
       output[0] = { linear: 1, radial: 2, conic: 3 }[paint._kind] || 0;
       for (let index = 0; index < Math.min(6, paint._values.length); index++)
         output[index + 1] = paint._values[index];
@@ -739,6 +760,7 @@
         output[at++] = stop.offset;
         for (const channel of stop.color) output[at++] = channel;
       }
+      if (inverse) output.set(inverse, at);
       return output;
     },
     canvasFontSpec = (font) => {
@@ -797,8 +819,11 @@
         clipPaths: fallback.clipPaths,
       };
       if (fallback.fill) {
-        const bounds = canvasDirtyBounds(local, fallback.subpaths, 1);
-        if (!bounds) return;
+        const bounds = paintDamage(local, canvasDirtyBounds(local, fallback.subpaths, 1));
+        if (!bounds || (replacesClip(local) &&
+            (bounds.right - bounds.left) * (bounds.bottom - bounds.top) *
+              fallback.subpaths.reduce((total, points) => total + points.length, 0) > 4 * 1024 * 1024))
+          return;
         for (let y = bounds.top; y < bounds.bottom; y++)
           for (let x = bounds.left; x < bounds.right; x++)
             if (pointInSubpaths(
@@ -807,9 +832,10 @@
               blendPixel(
                 local, x, y,
                 fallback.paint
-                  ? paintColorAt(fallback.paint, x + 0.5, y + 0.5)
+                  ? paintColorAt(fallback.paint, x + 0.5, y + 0.5, fallback.paintInverse)
                   : fallback.color,
               );
+            else if (replacesClip(local)) blendPixel(local, x, y, [0, 0, 0, 0]);
       } else {
         for (const points of fallback.subpaths)
           for (let index = 1; index < points.length; index++)
@@ -859,6 +885,7 @@
         shadowArgs[0] = shiftedCoordinates(args[0], offsetX, offsetY);
         shadowArgs.splice(3, 4, ...state.shadow);
         shadowArgs[7] = state.globalAlpha * weight;
+        shadowArgs[8] &= ~32;
         if (!queuePaintCommand(state, {
           kind: 0, args: shadowArgs, shadow: true,
         })) return false;
@@ -875,6 +902,7 @@
         transform[5] += offsetY;
         shadowArgs.splice(7, 4, ...state.shadow);
         shadowArgs[11] = state.globalAlpha * weight;
+        shadowArgs[12] &= ~32;
         shadowArgs[15] = transform;
         if (!queuePaintCommand(state, {
           kind: 1, args: shadowArgs, shadow: true,
@@ -894,6 +922,20 @@
      retains at most that much more than one entry did; a source change
      replaces the element's entry. */
   const identityTransform = Object.freeze([1, 0, 0, 1, 0, 0]);
+  const affineInverse = ([a,b,c,d,e,f]) => {
+    const det = a*d - b*c;
+    if (!det || !Number.isFinite(det)) return null;
+    return [d/det, -b/det, -c/det, a/det, (c*f-d*e)/det, (b*e-a*f)/det];
+  };
+  const matrixPoint = (m, x, y) => ({
+    x: m[0]*x + m[2]*y + m[4], y: m[1]*x + m[3]*y + m[5],
+  });
+  const pushCurrentPath = (state, command) => {
+    if (state.path.length >= 256) return;
+    if (!state.path.length) state.pathTransform = state.transform;
+    if (state.transform !== state.pathTransform) command.matrix = state.transform;
+    state.path.push(command);
+  };
   const imageSnapshots = new Map(),
     imageSnapshotLimit = 4,
     imageSnapshotExtraBytes = 512 * 1024;
@@ -1033,9 +1075,13 @@
         pattern.state.width, pattern.state.height, ...extra,
       ]);
     },
-    paintColorAt = (paint, x, y) => {
+    paintColorAt = (paint, x, y, inverse) => {
       const pattern = patternStates.get(paint);
-      if (!pattern) return paint._colorAt(x, y);
+      if (!pattern) {
+        if (!inverse) return paint._colorAt(x, y);
+        const pt = matrixPoint(inverse, x, y);
+        return paint._colorAt(pt.x, pt.y);
+      }
       const state = pattern.state;
       if (!state.pixels || state.width === 0 || state.height === 0)
         return [0, 0, 0, 0];
@@ -1327,11 +1373,11 @@
       push(["A", x + tl, y + tl, tl, Math.PI, Math.PI * 1.5, false]);
       push(["Z"]);
     },
-    appendArcTo = (commands, push, x1, y1, x2, y2, radius) => {
+    appendArcTo = (commands, push, x1, y1, x2, y2, radius,
+                   from = pathCurrentPoint(commands)) => {
       [x1, y1, x2, y2, radius] = [x1, y1, x2, y2, radius].map(Number);
       if (radius < 0) throw new DOMException("Negative arc radius", "IndexSizeError");
       if (![x1, y1, x2, y2, radius].every(Number.isFinite)) return;
-      const from = pathCurrentPoint(commands);
       if (!from) { push(["M", x1, y1]); return; }
       const first = { x: from.x - x1, y: from.y - y1 },
         second = { x: x2 - x1, y: y2 - y1 },
@@ -1509,18 +1555,16 @@
     },
     pathCommandsToSubpaths = (commands, matrix) => {
       const subpaths = [];
-      let current = null, currentSource = null;
-      const transform = (point) => ({
-          x: matrix[0] * point.x + matrix[2] * point.y + matrix[4],
-          y: matrix[1] * point.x + matrix[3] * point.y + matrix[5],
-        }),
-        append = (point) => {
+      let current = null, currentMatrix = matrix;
+      const transform = (point) => matrixPoint(currentMatrix, point.x, point.y),
+        appendDevice = (point) => {
           if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) return;
           if (!current) { current = []; subpaths.push(current); }
-          current.push(transform(point));
-          currentSource = point;
-        };
+          current.push(point);
+        },
+        append = point => appendDevice(transform(point));
       for (const command of commands) {
+        currentMatrix = command.matrix ?? matrix;
         if (command[0] === "M") {
           current = []; subpaths.push(current);
           append({ x: command[1], y: command[2] });
@@ -1555,27 +1599,30 @@
             });
           }
         } else if (command[0] === "Q") {
-          const from = currentSource || { x: command[1], y: command[2] };
+          const control = transform({x:command[1],y:command[2]}),
+            to = transform({x:command[3],y:command[4]}),
+            from = current?.[current.length - 1] ?? control;
           for (let step = 1; step <= 16; step++) {
             const t = step / 16, inverse = 1 - t;
-            append({
-              x: inverse * inverse * from.x + 2 * inverse * t * command[1] +
-                t * t * command[3],
-              y: inverse * inverse * from.y + 2 * inverse * t * command[2] +
-                t * t * command[4],
+            appendDevice({
+              x: inverse * inverse * from.x + 2 * inverse * t * control.x + t * t * to.x,
+              y: inverse * inverse * from.y + 2 * inverse * t * control.y + t * t * to.y,
             });
           }
         } else if (command[0] === "C") {
-          const from = currentSource || { x: command[1], y: command[2] };
+          const c1 = transform({x:command[1],y:command[2]}),
+            c2 = transform({x:command[3],y:command[4]}),
+            to = transform({x:command[5],y:command[6]}),
+            from = current?.[current.length - 1] ?? c1;
           for (let step = 1; step <= 24; step++) {
             const t = step / 24, inverse = 1 - t;
-            append({
+            appendDevice({
               x: inverse ** 3 * from.x +
-                3 * inverse * inverse * t * command[1] +
-                3 * inverse * t * t * command[3] + t ** 3 * command[5],
+                3 * inverse * inverse * t * c1.x +
+                3 * inverse * t * t * c2.x + t ** 3 * to.x,
               y: inverse ** 3 * from.y +
-                3 * inverse * inverse * t * command[2] +
-                3 * inverse * t * t * command[4] + t ** 3 * command[6],
+                3 * inverse * inverse * t * c1.y +
+                3 * inverse * t * t * c2.y + t ** 3 * to.y,
             });
           }
         } else if (command[0] === "E") {
@@ -2159,7 +2206,7 @@
           dirty = canvasDirtyBounds(state, subpaths, 1);
         if (__tilefinchCanvasRasterPath(
           target, state.width, state.height, flattenedPath(subpaths),
-          true, false, 0, 0, 0, 0, 1, 2,
+          true, false, 0, 0, 0, 0, 1, state.opaque ? 18 : 2,
           1, 0, 0, 10, new Float64Array(), 0,
           new Float64Array(state.clipRect), new Float64Array(),
           serializedClips(state),
@@ -2170,12 +2217,17 @@
       if (!rect) return;
       if (!__tilefinchCanvasRasterRect(
         target, state.width, state.height, rect.left, rect.top,
-        rect.right, rect.bottom, 0, 0, 0, 0, 1, 0,
+        rect.right, rect.bottom, 0, 0, 0, 0, 1, state.opaque ? 16 : 0,
       )) return;
       scheduleCanvasCommit(state, rect);
     }
     fillRect(x, y, width, height) {
       const state = stateFor(this.canvas);
+      const operation = rasterOperation(state), replace = (operation & 32) !== 0;
+      if (replace) {
+        x = Number(x); y = Number(y); width = Number(width); height = Number(height);
+        if (![x, y, width, height].every(Number.isFinite) || !width || !height) return;
+      }
       if (state.imageCommands.length && !flushImageCommands(state)) return;
       if (state.fillPaint || shadowActive(state)) {
         const path = new Path2D();
@@ -2184,7 +2236,7 @@
         return;
       }
       if (
-        state.transform.some(
+        replace || state.transform.some(
           (value, index) => value !== identityTransform[index],
         )
       ) {
@@ -2211,7 +2263,7 @@
             pixels, state.width, state.height, rect.left, rect.top,
             rect.right, rect.bottom, red, green, blue, state.fill[3],
             state.globalAlpha,
-            compositeOperations.indexOf(state.globalCompositeOperation),
+            operation,
             serializedClips(state),
           )) return;
         } else
@@ -2222,7 +2274,7 @@
         state.rectCommands.push([
           rect.left, rect.top, rect.right, rect.bottom,
           red, green, blue, state.fill[3], state.globalAlpha,
-          compositeOperations.indexOf(state.globalCompositeOperation),
+          operation,
         ]);
         canvasDiagnostics.rectangleCommands++;
         /* Thirty-two maximum-sized PSP surfaces remain below the native call's
@@ -2240,24 +2292,25 @@
     beginPath() {
       const state = stateFor(this.canvas);
       state.path = [];
+      state.pathTransform = null;
       state.subpath = null;
     }
     moveTo(x, y) {
       const state = stateFor(this.canvas);
-      if (state.path.length < 256) state.path.push(["M", Number(x), Number(y)]);
+      pushCurrentPath(state, ["M", Number(x), Number(y)]);
     }
     lineTo(x, y) {
       const state = stateFor(this.canvas);
-      if (state.path.length < 256) state.path.push(["L", Number(x), Number(y)]);
+      pushCurrentPath(state, ["L", Number(x), Number(y)]);
     }
     closePath() {
       const state = stateFor(this.canvas);
-      if (state.path.length < 256) state.path.push(["Z"]);
+      pushCurrentPath(state, ["Z"]);
     }
     rect(x, y, width, height) {
       const state = stateFor(this.canvas);
       if (state.path.length < 256)
-        state.path.push([
+        pushCurrentPath(state, [
           "R",
           Number(x),
           Number(y),
@@ -2271,7 +2324,7 @@
         throw new DOMException("Negative arc radius", "IndexSizeError");
       const state = stateFor(this.canvas);
       if (state.path.length < 256)
-        state.path.push([
+        pushCurrentPath(state, [
           "A",
           Number(x),
           Number(y),
@@ -2285,25 +2338,31 @@
       const state = stateFor(this.canvas);
       appendRoundRect(
         (command) => {
-          if (state.path.length < 256) state.path.push(command);
+          pushCurrentPath(state, command);
         },
         x, y, width, height, radii,
       );
     }
     arcTo(x1, y1, x2, y2, radius) {
       const state = stateFor(this.canvas);
+      let from;
+      if (state.path.length &&
+          (state.path[state.path.length - 1].matrix ?? state.pathTransform) !== state.transform) {
+        const subpaths = pathCommandsToSubpaths(state.path, state.pathTransform),
+          last = subpaths[subpaths.length - 1], pos = last?.[last.length - 1],
+          inverse = affineInverse(state.transform);
+        from = pos && inverse ? matrixPoint(inverse, pos.x, pos.y) : null;
+      }
       appendArcTo(
         state.path,
-        (command) => {
-          if (state.path.length < 256) state.path.push(command);
-        },
-        x1, y1, x2, y2, radius,
+        (command) => pushCurrentPath(state, command),
+        x1, y1, x2, y2, radius, from,
       );
     }
     quadraticCurveTo(controlX, controlY, x, y) {
       const state = stateFor(this.canvas);
       if (state.path.length < 256)
-        state.path.push([
+        pushCurrentPath(state, [
           "Q",
           Number(controlX),
           Number(controlY),
@@ -2314,7 +2373,7 @@
     bezierCurveTo(controlX1, controlY1, controlX2, controlY2, x, y) {
       const state = stateFor(this.canvas);
       if (state.path.length < 256)
-        state.path.push([
+        pushCurrentPath(state, [
           "C",
           Number(controlX1),
           Number(controlY1),
@@ -2340,7 +2399,7 @@
         throw new DOMException("Negative ellipse radius", "IndexSizeError");
       const state = stateFor(this.canvas);
       if (state.path.length < 256)
-        state.path.push([
+        pushCurrentPath(state, [
           "E",
           Number(x),
           Number(y),
@@ -2353,9 +2412,10 @@
         ]);
     }
     _subpaths(path) {
-      const state = stateFor(this.canvas),
-        commands = path instanceof Path2D ? path._commands : state.path;
-      return pathCommandsToSubpaths(commands, state.transform);
+      const state = stateFor(this.canvas);
+      return path instanceof Path2D
+        ? pathCommandsToSubpaths(path._commands, state.transform)
+        : pathCommandsToSubpaths(state.path, state.pathTransform ?? identityTransform);
     }
     fill(pathOrRule, rule) {
       const path = pathOrRule instanceof Path2D ? pathOrRule : null,
@@ -2369,12 +2429,16 @@
       if ((state.rectCommands.length || state.imageCommands.length) &&
           !flushRectCommands(state)) return;
       const flattened = flattenedPath(subpaths),
-        dirty = canvasDirtyBounds(state, subpaths, 1 + shadowPadding(state)),
-        evenOdd = fillRule === "evenodd";
+        dirty = paintDamage(state,
+          canvasDirtyBounds(state, subpaths, 1 + shadowPadding(state))),
+        evenOdd = fillRule === "evenodd",
+        paintInverse = state.fillPaint instanceof CanvasGradient &&
+          state.transform.some((number, at) => number !== identityTransform[at])
+          ? affineInverse(state.transform) : null;
       if (state.fillPaint instanceof CanvasPattern) {
         if (!paintAllowed(state, state.fillPaint)) return;
         if (!flushPaintCommands(state)) return;
-        if (state.originClean === false) {
+        if (state.originClean === false || replacesClip(state)) {
           /* A tainted canvas's pattern fill runs natively, pixel for pixel
              as the loop below; the pattern's pixels never reach script. */
           const target = ensureSurface(state),
@@ -2385,7 +2449,7 @@
           if (!rasterPattern(
             target, state.width, state.height, flattened, evenOdd,
             state.globalAlpha,
-            compositeOperations.indexOf(state.globalCompositeOperation),
+            rasterOperation(state),
             new Float64Array(state.clipRect), serializedClips(state),
             source, patternParameters(pattern),
           )) return;
@@ -2416,9 +2480,9 @@
       } else {
         const args = [
           flattened, true, evenOdd, ...state.fill, state.globalAlpha,
-          compositeOperations.indexOf(state.globalCompositeOperation),
+          rasterOperation(state),
           1, 0, 0, 10, new Float64Array(), 0,
-          new Float64Array(state.clipRect), serializedPaint(state.fillPaint),
+          new Float64Array(state.clipRect), serializedPaint(state.fillPaint, paintInverse),
           serializedClips(state),
         ];
         if (!queuePathShadows(state, args)) return;
@@ -2431,6 +2495,7 @@
             subpaths,
             color: [...state.fill],
             paint: state.fillPaint,
+            paintInverse,
             globalAlpha: state.globalAlpha,
             operation: state.globalCompositeOperation,
             clipRect: [...state.clipRect],
@@ -2452,7 +2517,7 @@
       const args = [
         flattenedPath(subpaths), false, false, ...state.stroke,
         state.globalAlpha,
-        compositeOperations.indexOf(state.globalCompositeOperation),
+        rasterOperation(state),
         lineWidth,
         ["butt", "round", "square"].indexOf(state.lineCap),
         ["miter", "round", "bevel"].indexOf(state.lineJoin),
@@ -2482,7 +2547,7 @@
         (state.lineJoin === "miter" ? state.miterLimit : 1) + 1 +
         shadowPadding(state);
       scheduleCanvasCommit(
-        state, canvasDirtyBounds(state, subpaths, strokePadding),
+        state, paintDamage(state, canvasDirtyBounds(state, subpaths, strokePadding)),
       );
     }
     clip(pathOrRule, rule) {
@@ -2535,7 +2600,7 @@
         x = Number(path ? xOrY : pathOrX),
         y = Number(path ? yOrRule : xOrY),
         fillRule = String(path ? maybeRule || "nonzero" : yOrRule || "nonzero");
-      return pointInSubpaths(this._subpaths(path), x, y, fillRule === "evenodd");
+      return pointInSubpaths(this._subpaths(path), x, y, fillRule === "evenodd", true);
     }
     isPointInStroke(pathOrX, xOrY, maybeY) {
       const path = pathOrX instanceof Path2D ? pathOrX : null,
@@ -2588,11 +2653,8 @@
     }
     setLineDash(segments) {
       const values = Array.from(segments, Number);
-      if (
-        values.length > 32 ||
-        values.some((value) => !Number.isFinite(value) || value < 0)
-      )
-        throw new TypeError("Invalid line dash");
+      if (values.some(value => !Number.isFinite(value) || value < 0)) return;
+      if (values.length > 32) throw new TypeError("Line dash quota exceeded");
       if (values.length % 2) values.push(...values);
       stateFor(this.canvas).lineDash = values;
     }
@@ -2637,15 +2699,10 @@
       stateFor(this.canvas).transform = [1, 0, 0, 1, 0, 0];
     }
     transform(a, b, c, d, e, f) {
+      const values = [Number(a), Number(b), Number(c), Number(d), Number(e), Number(f)];
+      if (!values.every(Number.isFinite)) return;
       const state = stateFor(this.canvas),
-        result = new DOMMatrix(state.transform).multiply([
-          a,
-          b,
-          c,
-          d,
-          e,
-          f,
-        ]);
+        result = new DOMMatrix(state.transform).multiply(values);
       state.transform = [
         result.a,
         result.b,
@@ -2733,7 +2790,7 @@
         args = [
           text, x, y, spec.size, spec.family, spec.bold, spec.italic,
           ...color, state.globalAlpha,
-          compositeOperations.indexOf(state.globalCompositeOperation),
+          rasterOperation(state),
           false, 0, new Float64Array(state.transform),
           new Float64Array(state.clipRect), scale, serializedClips(state),
         ];
@@ -2745,7 +2802,7 @@
                 ? patternSource(pattern) : null,
               patternParameters(pattern, x, y)],
           } : { kind: 1, args }))
-        scheduleCanvasCommit(state, dirty);
+        scheduleCanvasCommit(state, paintDamage(state, dirty));
     }
     strokeText(text, x, y, maximumWidth) {
       text = String(text).slice(0, 256);
@@ -2784,13 +2841,13 @@
       const args = [
         text, x, y, spec.size, spec.family, spec.bold, spec.italic,
         ...state.stroke, state.globalAlpha,
-        compositeOperations.indexOf(state.globalCompositeOperation),
+        rasterOperation(state),
         true, state.lineWidth, new Float64Array(state.transform),
         new Float64Array(state.clipRect), scale, serializedClips(state),
       ];
       if (queueTextShadows(state, args) &&
           queuePaintCommand(state, { kind: 1, args }))
-        scheduleCanvasCommit(state, dirty);
+        scheduleCanvasCommit(state, paintDamage(state, dirty));
     }
     drawImage(source, ...arguments_) {
       /* sourceState.pixels is a clean script buffer or a number naming
@@ -2903,12 +2960,10 @@
           transformPoint(target, dx + dw, dy + dh),
           transformPoint(target, dx, dy + dh),
         ]],
-        dirty = canvasDirtyBounds(target, destination, 1);
+        dirty = paintDamage(target, canvasDirtyBounds(target, destination, 1));
       if (!targetPixels || !retainedSourcePixels || !sw || !sh || !dw || !dh)
         return;
-      const operation = compositeOperations.indexOf(
-        target.globalCompositeOperation,
-      );
+      const operation = rasterOperation(target);
       if (!target.clipPaths.length) {
         if (target.imageCommands.length >= 16 && !flushImageCommands(target))
           return;
@@ -3103,7 +3158,7 @@
           target, state.width, state.height, imageData.data,
           imageData.width, imageData.height, sourceLeft, sourceTop,
           copyWidth, copyHeight, x + sourceLeft, y + sourceTop, copyWidth,
-          copyHeight, false, 1, 0, new Float64Array(identityTransform),
+          copyHeight, false, 1, state.opaque ? 16 : 0, new Float64Array(identityTransform),
           new Float64Array([0, 0, state.width, state.height]),
           new Float64Array(0),
         )) return;
@@ -3118,6 +3173,13 @@
           from = (sourceY * imageData.width + sourceLeft) * 4,
           to = (targetY * state.width + x + sourceLeft) * 4;
         target.set(imageData.data.subarray(from, from + rowBytes), to);
+        if (state.opaque)
+          for (let at = to; at < to + rowBytes; at += 4) {
+            const alpha = target[at + 3];
+            for (let c = 0; c < 3; c++)
+              target[at + c] = Math.round(target[at + c] * alpha / 255);
+            target[at + 3] = 255;
+          }
       }
       const dirty = normalizedRect(
         state, x + sourceLeft, y + sourceTop, copyWidth, copyHeight);
@@ -3132,7 +3194,7 @@
       }
     }
     getContextAttributes() {
-      return { alpha: true, colorSpace: "srgb", willReadFrequently: false };
+      return { alpha: !stateFor(this.canvas).opaque, colorSpace: "srgb", willReadFrequently: false };
     }
   }
 
@@ -3273,6 +3335,11 @@
       context = new CanvasRenderingContext2D(this);
       contexts.set(this, context);
       contextKinds.set(this, "2d");
+      if (attributes?.alpha !== undefined && !attributes.alpha) {
+        const state = stateFor(this);
+        state.opaque = true;
+        if (ensureSurface(state)) markCanvasFull(state);
+      }
     }
     return context;
   };

@@ -8,6 +8,7 @@
    floor). TILEFINCH_APP_LAUNCH_FRAMES lengthens the measured soak. */
 #include "tilefinch/browser_engine.h"
 #include "tilefinch/browser_profile.h"
+#include "tilefinch/fetch.h"
 #include "tilefinch/js_runtime.h"
 #include "tilefinch/offline_library.h"
 #include "tilefinch/psp_offline_store.h"
@@ -147,8 +148,9 @@ static bool install_treadline(BrowserEngine *engine, OfflineLibrary *library,
     char *list = read_source("examples/treadline-arena/package-files.txt",
                              &list_length);
     CHECK(list != NULL);
-    /* Installation needs the whole working set in the live cache, as the
-       Game Profile documents (the Memory cache setting). */
+    /* This direct library save reads only the live cache, so stage the
+       whole working set there (the PSP preview downloads evicted files
+       again first; install_fetches_evicted covers that). */
     CHECK(browser_session_cache_set_maximum_bytes(
         browser_engine_session(engine), 2u * MIB));
     size_t staged = 0;
@@ -854,11 +856,246 @@ static bool reinstall_from_library(const char *directory)
 }
 
 static char shown_progress[80];
+static char fetch_progress[80];
+static unsigned fetch_progress_lines;
 
 static void show_progress(void *context, const char *status)
 {
     (void) context;
     snprintf(shown_progress, sizeof(shown_progress), "%s", status);
+    if (strncmp(status, "DOWNLOADING ", 12) == 0) {
+        snprintf(fetch_progress, sizeof(fetch_progress), "%s", status);
+        fetch_progress_lines++;
+    }
+}
+
+/* A small app served from a synthetic keyed replay (never the network):
+   its page, manifest, stylesheet, two same-origin classic scripts and one
+   cross-origin script. `omit` names a file the replay leaves out. */
+#define FETCH_APP "https://app.test/game/"
+static char *template_copy(void)
+{
+    static char copy[4096];
+    size_t length = 0;
+    char *text = read_source("fixtures/http-legacy-charset/0001.meta",
+                             &length);
+    snprintf(copy, sizeof(copy), "%s", text == NULL ? "" : text);
+    free(text);
+    return copy;
+}
+
+static bool write_app_trace(const char *directory, const char *omit,
+                            bool icon)
+{
+    static const struct { const char *url, *type; } files[] = {
+        {FETCH_APP "index.html", "text/html"},
+        {FETCH_APP "app.webmanifest", "application/manifest+json"},
+        {FETCH_APP "app.css", "text/css"},
+        {FETCH_APP "one.js", "text/javascript"},
+        {FETCH_APP "two.js", "text/javascript"},
+        {"https://cdn.test/lib.js", "text/javascript"},
+        {FETCH_APP "icon.svg", "image/svg+xml"}
+    };
+    (void) mkdir(directory, 0700);
+    char path[512];
+    unsigned written = 0;
+    for (size_t at = 0; at < sizeof(files) / sizeof(files[0]); at++) {
+        if ((omit != NULL && strstr(files[at].url, omit) != NULL)
+            || (!icon && at == 6u)) continue;
+        char body[24 * 1024];
+        size_t length = 0;
+        if (at == 0)
+            length = (size_t) snprintf(body, sizeof(body),
+                "<!doctype html><html><head><title>Fetch test</title>"
+                "<link rel=manifest href=app.webmanifest>"
+                "<link rel=stylesheet href=app.css>"
+                "<script src=one.js></script><script src=two.js></script>"
+                "<script src=\"https://cdn.test/lib.js\"></script>"
+                "</head><body><p id=out>app</p></body></html>");
+        else if (at == 1)
+            length = (size_t) snprintf(body, sizeof(body),
+                "{\"name\":\"Fetch Test\",\"start_url\":\"./index.html\","
+                "\"display\":\"fullscreen\"%s}", icon
+                    ? ",\"icons\":[{\"src\":\"icon.svg\",\"sizes\":\"96x96\"}]"
+                    : "");
+        else if (at == 2)
+            length = (size_t) snprintf(body, sizeof(body),
+                                       "body{color:#123456}");
+        else if (at == 6)
+            length = (size_t) snprintf(body, sizeof(body),
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"96\" "
+                "height=\"96\"><rect width=\"96\" height=\"96\" "
+                "fill=\"#20c060\"/></svg>");
+        else {
+            /* Large enough that the scripts do not fit a small cache. */
+            length = (size_t) snprintf(body, sizeof(body),
+                                       "var file%zu = 1;\n", at);
+            while (length + 40u < sizeof(body))
+                length += (size_t) snprintf(body + length,
+                                            sizeof(body) - length,
+                                            "/* padding padding padding */\n");
+        }
+        snprintf(path, sizeof(path), "%s/%04u.body", directory, written);
+        FILE *file = fopen(path, "wb");
+        CHECK(file != NULL && fwrite(body, 1, length, file) == length
+              && fclose(file) == 0);
+        snprintf(path, sizeof(path), "%s/%04u.meta", directory, written);
+        file = fopen(path, "wb");
+        CHECK(file != NULL);
+        /* A current-format record, cloned from a checked-in fixture. */
+        uint64_t hash = UINT64_C(0xcbf29ce484222325);
+        for (size_t at_byte = 0; at_byte < length; at_byte++)
+            hash = (hash ^ (unsigned char) body[at_byte])
+                * UINT64_C(0x100000001b3);
+        for (char *line = strtok(template_copy(), "\n"); line != NULL;
+             line = strtok(NULL, "\n")) {
+            if (!strncmp(line, "url=", 4)
+                || !strncmp(line, "logical-request-url=", 20)
+                || !strncmp(line, "effective-url=", 14))
+                fprintf(file, "%.*s%s\n",
+                        (int) (strchr(line, '=') - line + 1), line,
+                        files[at].url);
+            else if (!strncmp(line, "length=", 7))
+                fprintf(file, "length=%zu\n", length);
+            else if (!strncmp(line, "response-body-hash=", 19))
+                fprintf(file, "response-body-hash=%016llx\n",
+                        (unsigned long long) hash);
+            else if (!strncmp(line, "content-type=", 13))
+                fprintf(file, "content-type=%s\n", files[at].type);
+            else if (!strncmp(line, "response-header-0=", 18))
+                fprintf(file, "response-header-0=content-type: %s\n",
+                        files[at].type);
+            else fprintf(file, "%s\n", line);
+        }
+        CHECK(fclose(file) == 0);
+        written++;
+    }
+    snprintf(path, sizeof(path), "%s/trace.meta", directory);
+    FILE *file = fopen(path, "wb");
+    CHECK(file != NULL);
+    fprintf(file, "psp-http-trace-clock=1\norigin-ms=1700000000000\n"
+            "capture-complete=yes\nrecord-count=%u\n", written);
+    CHECK(fclose(file) == 0);
+    return true;
+}
+
+static bool begin_replay(const char *directory)
+{
+    char error[256] = {0};
+    bool begun = fetch_trace_replay_begin_response_keyed(
+        directory, error, sizeof(error));
+    if (!begun) fprintf(stderr, "replay: %s\n", error);
+    return begun;
+}
+
+static size_t replay_requests(void)
+{
+    FetchTraceReplayStats stats = {0};
+    return fetch_trace_replay_stats(&stats) ? stats.request_count : 0u;
+}
+
+/* A page whose files the Memory cache evicted installs completely: the
+   preview downloads its same-origin scripts and stylesheet again (never the
+   cross-origin script), and a file that cannot be downloaded again is
+   reported as unavailable. */
+static bool install_fetches_evicted(const char *directory)
+{
+    char served[256], partial[256];
+    snprintf(served, sizeof(served), "%s/trace-all", directory);
+    snprintf(partial, sizeof(partial), "%s/trace-partial", directory);
+    CHECK(write_app_trace(served, NULL, false)
+          && write_app_trace(partial, "two.js", false));
+    for (unsigned round = 0; round < 2u; round++) {
+        BrowserEngine *engine = make_engine();
+        CHECK(engine != NULL);
+        BrowserSession *session = browser_engine_session(engine);
+        CHECK(begin_replay(served)
+              && browser_engine_load_url(engine, FETCH_APP "index.html",
+                                         true));
+        /* The page ran; a Memory cache smaller than the app dropped all
+           of its responses. */
+        CHECK(browser_session_cache_set_maximum_bytes(session, 1u)
+              && !browser_session_cache_offline_holds(
+                     session, FETCH_APP "index.html", NULL, NULL, NULL));
+        if (round == 1u) {
+            fetch_trace_end();
+            CHECK(begin_replay(partial));
+        }
+        size_t before = replay_requests();
+        PspOfflineStore store;
+        psp_offline_store_init(&store, browser_engine_budget(engine),
+                               session, directory);
+        store.show_progress = show_progress;
+        fetch_progress_lines = 0;
+        bool prepared = psp_offline_store_prepare_current_app(&store, engine);
+        if (!prepared)
+            fprintf(stderr, "fetch preview: %s\n",
+                    psp_offline_store_status(&store));
+        const PspUiOfflineAppPreview *preview =
+            psp_offline_store_app_preview(&store);
+        CHECK(prepared && preview != NULL);
+        printf("OFFLINE-APP-FETCH round=%u captured=%u unavailable=%u "
+               "requests=%zu progress=\"%s\"\n", round,
+               (unsigned) preview->captured_resources,
+               (unsigned) preview->unavailable_resources,
+               replay_requests() - before, fetch_progress);
+        /* The manifest and the three same-origin files; lib.js is never
+           requested. */
+        CHECK(replay_requests() - before == 4u && fetch_progress_lines == 3u
+              && strcmp(fetch_progress,
+                        "DOWNLOADING 3 OF 3 APP FILES  O STOP") == 0);
+        CHECK(preview->captured_resources == (round == 0u ? 3u : 2u)
+              && preview->unavailable_resources == (round == 0u ? 0u : 1u));
+        CHECK(psp_offline_store_install_current_app(&store, engine));
+        const OfflineLibraryItem *item =
+            &store.library.items[store.library.count - 1u];
+        CHECK(item->resource_count == (round == 0u ? 3u : 2u));
+        /* The Memory cache returns to its limit with the preparation. */
+        CHECK(session->maximum_cache_bytes == 1u
+              && store.app_cache_limit == 0u);
+        CHECK(offline_library_remove(&store.library, item->id));
+        psp_offline_store_destroy(&store);
+        fetch_trace_end();
+        browser_engine_destroy(engine);
+    }
+    return true;
+}
+
+/* An app whose manifest icon is SVG markup (Treadline's icon.svg, listed
+   without a type) gets its Library icon rasterized from that markup. */
+static bool install_svg_icon(const char *directory)
+{
+    char traced[256];
+    snprintf(traced, sizeof(traced), "%s/trace-icon", directory);
+    CHECK(write_app_trace(traced, NULL, true));
+    BrowserEngine *engine = make_engine();
+    CHECK(engine != NULL);
+    BrowserSession *session = browser_engine_session(engine);
+    CHECK(begin_replay(traced)
+          && browser_engine_load_url(engine, FETCH_APP "index.html", true));
+    PspOfflineStore store;
+    psp_offline_store_init(&store, browser_engine_budget(engine), session,
+                           directory);
+    CHECK(psp_offline_store_prepare_current_app(&store, engine)
+          && psp_offline_store_install_current_app(&store, engine));
+    const OfflineLibraryItem *item =
+        &store.library.items[store.library.count - 1u];
+    unsigned char icon[OFFLINE_LIBRARY_APP_ICON_LIMIT];
+    bool stored = item->icon_bytes == sizeof(icon)
+        && offline_library_read_web_app_icon(&store.library, item->id, icon);
+    size_t center = ((OFFLINE_LIBRARY_APP_ICON_EDGE / 2u)
+                     * OFFLINE_LIBRARY_APP_ICON_EDGE
+                     + OFFLINE_LIBRARY_APP_ICON_EDGE / 2u) * 4u;
+    printf("OFFLINE-APP-SVG-ICON stored=%d rgba=%02x%02x%02x%02x\n",
+           stored, stored ? icon[center] : 0u, stored ? icon[center + 1] : 0u,
+           stored ? icon[center + 2] : 0u, stored ? icon[center + 3] : 0u);
+    CHECK(stored && icon[center] == 0x20u && icon[center + 1] == 0xc0u
+          && icon[center + 2] == 0x60u && icon[center + 3] == 0xffu);
+    CHECK(offline_library_remove(&store.library, item->id));
+    psp_offline_store_destroy(&store);
+    fetch_trace_end();
+    browser_engine_destroy(engine);
+    return true;
 }
 
 /* The store turns library progress into the busy-work status line. */
@@ -889,6 +1126,8 @@ int main(void)
              "/tmp/tilefinch-app-launch-%ld", (long) getpid());
     (void) mkdir(directory, 0700);
     bool okay = store_progress_line(directory)
+        && install_fetches_evicted(directory)
+        && install_svg_icon(directory)
         && installed_app_heap_scope(directory)
         && on_demand_triggers(directory)
         && stale_library_flow(directory)

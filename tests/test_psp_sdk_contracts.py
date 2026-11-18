@@ -8020,6 +8020,25 @@ int main(void) {
         checkpoint = (ROOT / "src/js_runtime/event_loop.inc").read_text(encoding="utf-8")
         self.assertIn("!runtime->checkpoint_trace_suppressed;", checkpoint)
 
+    def test_cleanup_closes_an_unclosed_timing_window(self):
+        # A scenario that opens webgl-measure-start without a matching end
+        # (treadline-offline-controls) left the capture open into shutdown;
+        # once full it dropped the outcome line the PPSSPP runner waits for.
+        log = without_comments((ROOT / "src/psp_log.c").read_text(encoding="utf-8"))
+        validation = log[log.index("#else"):]
+        start = validation.index("void psp_log_set_phase(PspLogPhase phase)")
+        body = validation[start:validation.index("\n}\n", start)]
+        self.assertIn("if (phase == PSP_LOG_PHASE_CLEANUP) "
+                      "psp_log_end_timing_window();", body)
+        self.assertLess(body.index("psp_log_end_timing_window()"),
+                        body.index("psp_log_heartbeat()"))
+        main = without_comments((ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+        for outcome in ('printf("tilefinch-validation: outcome=exit-requested',
+                        'printf("tilefinch-validation: outcome=clean-exit'):
+            at = main.index(outcome)
+            self.assertIn("psp_log_set_phase(PSP_LOG_PHASE_CLEANUP);",
+                          main[main.rindex("static ", 0, at):at])
+
     def test_canvas_copy_and_conversion_attribution_report_actual_work(self):
         runtime = (ROOT / "src/psp_app/psp_app_validation_present.c").read_text(encoding="utf-8")
         query = runtime[runtime.index("static bool psp_present_thread_cpu("):

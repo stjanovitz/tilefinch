@@ -13,6 +13,8 @@ YoutubePlaylistQueue *youtube_playlist_begin(Budget *, BrowserSession *,
     const char *page_url, size_t index, bool all, const char *expected_video);
 void youtube_playlist_destroy(YoutubePlaylistQueue *);
 bool youtube_playlist_pump(YoutubePlaylistQueue *, const FetchPumpQuota *);
+/* A selection or explicit retry may run even when optional prefetch can't. */
+bool youtube_playlist_should_pump(const YoutubePlaylistQueue *, bool allow_prefetch);
 bool youtube_playlist_select(YoutubePlaylistQueue *, size_t position);
 bool youtube_playlist_step(YoutubePlaylistQueue *, int direction);
 void youtube_playlist_retry(YoutubePlaylistQueue *);

@@ -7,9 +7,7 @@ change the PSP link, or try a link-order experiment.
 
 The Allegrex has a 16 KiB instruction cache and a 16 KiB data cache. Each is
 two-way set associative with 64-byte lines, so each way is 8 KiB and an
-address modulo 8 KiB picks its set. PSPSDK's `cpu_icache_inv_all` walks
-`4096 << Config.IC` bytes per way in 64-byte steps and issues the index
-operation twice per line, once for each way.
+address modulo 8 KiB picks its set.
 
 A page load's hot code is many times the size of the cache. Which hot lines
 share a set decides how many conflict misses a journey takes. When code ahead
@@ -87,14 +85,14 @@ clusters are ordered hottest per byte first. A size change in a function
 outside the list then moves no listed function, and a size change in a
 tier-1 function moves only the tier-1 functions after it.
 
-It is off because on a PSP the ordered layout ran the archive.org search
-journey slower than the natural link order, with every padding control
-tried, and it did not make timings less sensitive to code changes. An
-earlier experiment that ordered the hot set by heat alone was rejected for
-the same reason. The heat comes from PPSSPP program-counter samples, which
-count instructions, not cache misses, and the hot set is many times the
-I-cache, so ordering by heat reshuffles conflicts rather than removing them.
-The private performance ledger has the measurements.
+It is off because on a PSP the ordered layout ran a browsing journey
+slower than the natural link order under every padding control tried, and
+it did not make timings less sensitive to code changes; ordering the hot set
+by heat alone fails the same way. The heat comes from PPSSPP
+program-counter samples, which count instructions, not cache misses, and
+the hot set is many times the I-cache, so ordering by heat reshuffles
+conflicts rather than removing them. Maintainers keep the measurements in
+the private performance ledger under `.private-investigations/`.
 
 The order is link-only. Objects and instructions are unchanged, and so are
 frame hashes and PPSSPP timings. With the option on, the two alignments
@@ -104,7 +102,7 @@ Each entry matches its function under any GCC clone suffix
 (`.text.foo .text.foo.*` also matches `foo.constprop.0` and `foo.isra.0`),
 because the shipping and validation builds clone different functions. GNU
 ld silently ignores a pattern that matches nothing, so a renamed function,
-a moved source file or a function that is now inlined everywhere would
+a moved source file or a function inlined at every call site would
 quietly lose its place. Two checks catch that:
 
 - With the option on, `tools/check_psp_hot_order.py` runs after each PSP
@@ -114,8 +112,8 @@ quietly lose its place. Two checks catch that:
   misses. Entries for functions absent from the image (validation-only code
   in a shipping link, for example) are reported and not charged.
 - `tilefinch-psp-hot-order-tests` checks the file's shape and fails when a
-  Tilefinch or QuickJS entry names a function that no longer exists in the
-  sources.
+  Tilefinch or QuickJS entry names a function that the sources do not
+  define.
 
 ### Regenerating the list
 
@@ -124,14 +122,15 @@ quietly lose its place. Two checks catch that:
 2. Profile under PPSSPP with `tools/ppsspp-pc-profile.sh` (see
    [Program-counter profiles under PPSSPP](VALIDATION_RECORDS.md#program-counter-profiles-under-ppsspp)):
    - three browsing journeys at 111 MHz: the `layout-reuse-study` input
-     script on the archive.org search trace, on the Reddit census capture
-     and on the CNN census capture;
+     script on three site-census captures;
    - two game workloads, because browsing journeys never run the game
-     audio mixer or WebGL: a three.js page with lit materials at 111 MHz
-     (the committed list used three.js r128's lambert-phong demo served
-     from 127.0.0.1, with an input script that waits for the first frame
-     and then 300 frames), and the `webaudio-program-probe` scenario at
-     333 MHz.
+     audio mixer or WebGL: a three.js page with lit materials at 111 MHz,
+     served from loopback, with an input script that waits for the first
+     frame and then 300 frames, and the `webaudio-program-probe` scenario
+     at 333 MHz.
+
+   The header of the committed `cmake/PspHotOrder.ld` names the build and
+   the profiles it came from.
 3. Report each profile with
    `tools/pc_profile_report.py --elf BUILD/psp-browser-script.unstripped
    --mhz MHZ --json-out NAME.json NAME.tsv`.
@@ -151,14 +150,14 @@ quietly lose its place. Two checks catch that:
 
    Each profile is normalized to weight 1, or to the weight after `=`; the
    game profiles count half as much as a browsing journey. `--coverage
-   0.98` keeps the functions that make up 98% of the combined heat (about
-   320 functions, 540 KB); functions with fewer than three samples are
-   dropped. `--pin` adds a function that the profiles under-sample but that
+   0.98` keeps the functions that make up 98% of the combined heat;
+   functions with fewer than three samples are dropped. `--pin` adds a function that the profiles under-sample but that
    runs on every audio block or lit draw; a pinned function gets the heat
    of the coldest listed one, so it clusters with its callers. `--command`
-   records in the file header how the file was made, including which build
-   (by version and date; the generator refuses a commit id, which the public
-   history would not contain) and profiles it came from.
+   records in the file header how the file was made: name the build by
+   version and date, never a commit id (the generator refuses one, because
+   the public history does not contain development commits), and the
+   profiles.
 5. Run `ctest -R tilefinch-psp-hot-order-tests`, rebuild both PSP presets
    with the option on, and check frame hashes with PPSSPP journeys. Then
    time the new list on a PSP against the natural link order, each with

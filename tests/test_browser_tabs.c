@@ -152,8 +152,18 @@ int main(void)
        rotate over the good generation. */
     CHECK(browser_tabs_set_active_find_query(tabs, "new primary")
           && browser_tabs_save_session(tabs, session_path, hibernation_path)
-          && access(session_backup, F_OK) == 0
-          && unlink(session_path) == 0);
+          && access(session_backup, F_OK) == 0);
+    BrowserTabs *retry = browser_tabs_create(&budget, &navigation);
+    CHECK(retry != NULL);
+    budget_inject_failure_after(&budget, 0);
+    CHECK(!browser_tabs_restore_session(retry, session_path));
+    budget_clear_failure_injection(&budget);
+    CHECK(!browser_tabs_save_session(retry, session_path, hibernation_path)
+          && access(session_path, F_OK) == 0
+          && browser_tabs_restore_session(retry, session_path)
+          && strcmp(browser_tabs_active_find_query(retry), "new primary") == 0);
+    browser_tabs_destroy(retry);
+    CHECK(unlink(session_path) == 0);
     BrowserTabs *backup_restored = browser_tabs_create(&budget, &navigation);
     CHECK(backup_restored != NULL
           && browser_tabs_restore_session(backup_restored, session_path)

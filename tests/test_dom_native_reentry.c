@@ -21,6 +21,17 @@ static int case_page_scroll;
 /* Set: after the case's source, the host commits a same-document
    navigation to #tf-hash and then finishes loading the document. */
 static bool case_host_lifecycle;
+/* Set: the realm has no interface snapshot, so a page's patch of a
+   built-in still reaches the browser's own script. Every case runs both
+   ways: with the snapshot a page's patch cannot reach the browser at all,
+   so only the pass without it shows that the browser's script keeps to
+   the intrinsics it captured (the defence when boot.cfg turns the
+   snapshot off). */
+static bool case_no_interface_snapshot;
+static const char *case_pass(void)
+{
+    return case_no_interface_snapshot ? " (no snapshot)" : "";
+}
 
 static bool run_page_case(const char *name, const char *source, bool styled)
 {
@@ -32,6 +43,7 @@ static bool run_page_case(const char *name, const char *source, bool styled)
     if (case_handle_slots != 0)
         fixture.options.execution_policy.dom_handle_slot_capacity =
             case_handle_slots;
+    fixture.options.interface_snapshot_disabled = case_no_interface_snapshot;
     Stylesheet sheet = {0};
     if (styled && !stylesheet_build(&sheet, &fixture.budget, &fixture.document,
                                     480))
@@ -52,13 +64,15 @@ static bool run_page_case(const char *name, const char *source, bool styled)
         ok = script_runtime_advance(runtime, 16, 16, &result);
     ok = ok && result.success && strcmp(result.summary, "OK") == 0;
     if (!ok)
-        fprintf(stderr, "%s: summary=%s error=%s\n", name,
+        fprintf(stderr, "%s%s: summary=%s error=%s\n", name, case_pass(),
                 result.summary, result.error);
     script_runtime_destroy(runtime);
     if (styled) stylesheet_destroy(&sheet);
     bool zero_owned = script_page_fixture_close(&fixture);
-    if (!zero_owned) fprintf(stderr, "%s: nonzero teardown ownership\n", name);
-    printf("%s: %s teardown-owned-bytes=%zu\n", name,
+    if (!zero_owned)
+        fprintf(stderr, "%s%s: nonzero teardown ownership\n", name,
+                case_pass());
+    printf("%s%s: %s teardown-owned-bytes=%zu\n", name, case_pass(),
            ok && zero_owned ? "PASS" : "FAIL", fixture.budget.current);
     return ok && zero_owned;
 }
@@ -80,6 +94,7 @@ static bool run_host_dispatch_case(const char *name, const char *setup,
     ScriptPageFixture fixture;
     if (!script_page_fixture_open(&fixture, "<script></script>", 0))
         return false;
+    fixture.options.interface_snapshot_disabled = case_no_interface_snapshot;
     ScriptResult result = {0};
     ScriptRuntime *runtime = script_runtime_create_configured(
         &fixture.document, &fixture.budget, 12u * 1024u * 1024u, 1000,
@@ -97,12 +112,14 @@ static bool run_host_dispatch_case(const char *name, const char *setup,
                                                   &result);
     ok = ok && result.success && strcmp(result.summary, "OK") == 0;
     if (!ok)
-        fprintf(stderr, "%s: summary=%s error=%s\n", name,
+        fprintf(stderr, "%s%s: summary=%s error=%s\n", name, case_pass(),
                 result.summary, result.error);
     script_runtime_destroy(runtime);
     bool zero_owned = script_page_fixture_close(&fixture);
-    if (!zero_owned) fprintf(stderr, "%s: nonzero teardown ownership\n", name);
-    printf("%s: %s teardown-owned-bytes=%zu\n", name,
+    if (!zero_owned)
+        fprintf(stderr, "%s%s: nonzero teardown ownership\n", name,
+                case_pass());
+    printf("%s%s: %s teardown-owned-bytes=%zu\n", name, case_pass(),
            ok && zero_owned ? "PASS" : "FAIL", fixture.budget.current);
     return ok && zero_owned;
 }
@@ -775,9 +792,11 @@ static const struct {
      "v=globalThis[n];want(typeof v==='function'&&v!==f,n+' not set');"
      "try{globalThis[n]=f}catch(_){}want(globalThis[n]===v,n+' replaced')}"
      "document.body.appendChild(document.createElement('canvas'));"},
-    /* Page code that runs while a lazy module loads (here a patched array
-       iterator a module's for-of calls) can neither set one of its hooks
-       before the module does nor claim a hook publisher of its own. */
+    /* Code that runs while a lazy module loads (here an array iterator
+       a module's for-of calls, replaced through the test seam, since a
+       page's own patch no longer runs there) can neither set one of the
+       module's hooks before it does nor claim a hook publisher of its
+       own. */
     {"lazy-hooks-mid-load", "HTMLCanvasElement",
      "const f=()=>{bad.push('page hook ran')},names=["
      "'CanvasAttributeChanged','CanvasConnected','CanvasDimension',"
@@ -789,17 +808,18 @@ static const struct {
      "'WebGLMethods'],"
      "I=Object.getPrototypeOf([][Symbol.iterator]()),next=I.next;"
      "let ran=0,claims=0,inside=false;"
-     "I.next=function(){if(!inside){inside=true;ran++;try{"
+     "__tilefinchTestBrowserPatch(I,'next',function(){if(!inside){inside=true;ran++;try{"
      "const c=globalThis.__tilefinchEventInterfaces.claimHooks?.();"
      "if(typeof c==='function')claims++;"
      "for(let i=0;i<names.length;i++){const n='__tilefinch'+names[i];"
      "try{globalThis[n]=f}catch(_){}if(typeof c==='function')c(n,f)}}"
-     "finally{inside=false}}return Reflect.apply(next,this,[])};"
+     "finally{inside=false}}return Reflect.apply(next,this,[])});"
      "try{document.createElement('canvas').getContext('2d');"
      "document.createElement('canvas').getContext('webgl');"
      "document.body.appendChild(document.createElement('div'))"
      ".addEventListener('transitionend',()=>{});void indexedDB;"
-     "void WebAssembly.Module}finally{I.next=next}"
+     "void WebAssembly.Module}finally{"
+     "__tilefinchTestBrowserPatch(I,'next',next)}"
      "want(ran>0,'no page code ran while modules loaded');"
      "want(claims===0,'page claimed '+claims+' publishers');"
      "for(let i=0;i<names.length;i++){const n='__tilefinch'+names[i];"
@@ -983,10 +1003,8 @@ static const struct {
      "want(typeof WebAssembly.Module==='function','WebAssembly');"},
 };
 
-int main(int argc, char **argv)
+static bool run_cases(void)
 {
-    if (argc > 2) return 2;
-    if (argc == 2) selected_case = argv[1];
     bool ok = true;
     /* NB-03: result lists and records are defined, never [[Set]]. */
     ok &= run_page_case("fresh-results-are-defined",
@@ -1783,6 +1801,17 @@ int main(int argc, char **argv)
         "'tag lost: '+__tilefinchNodeOwner(d));"
         "globalThis.pocSummary='OK'})()");
     case_handle_slots = 0;
+    return ok;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc > 2) return 2;
+    if (argc == 2) selected_case = argv[1];
+    bool ok = run_cases();
+    case_no_interface_snapshot = true;
+    ok &= run_cases();
+    case_no_interface_snapshot = false;
     if (selected_case != NULL && !selected_case_ran) {
         fprintf(stderr, "unknown case: %s\n", selected_case);
         return 2;

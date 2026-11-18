@@ -10,6 +10,14 @@ bool navigation_set_gamepad_state(
     return script_runtime_set_gamepad_state(session->page.runtime, state);
 }
 
+static bool navigation_settle_dispatched_event(NavigationSession *session)
+{
+    if (script_runtime_consume_relayout(session->page.runtime)
+        && !navigation_relayout(session)) return false;
+    (void) navigation_publish_script_scroll(session);
+    return true;
+}
+
 bool navigation_dispatch_event(NavigationSession *session,
                                const char *selector,
                                const char *event_type)
@@ -22,13 +30,7 @@ bool navigation_dispatch_event(NavigationSession *session,
             session, session->page.runtime);
         return false;
     }
-    int scroll_y = 0;
-    if (script_runtime_consume_scroll(session->page.runtime, &scroll_y)) {
-        int maximum = navigation_max_scroll(session);
-        navigation_set_scroll(session, scroll_y < maximum ? scroll_y : maximum);
-    }
-    return !script_runtime_consume_relayout(session->page.runtime)
-           || navigation_relayout(session);
+    return navigation_settle_dispatched_event(session);
 }
 
 bool navigation_dispatch_node_event(NavigationSession *session,
@@ -43,13 +45,7 @@ bool navigation_dispatch_node_event(NavigationSession *session,
             session, session->page.runtime);
         return false;
     }
-    int scroll_y = 0;
-    if (script_runtime_consume_scroll(session->page.runtime, &scroll_y)) {
-        int maximum = navigation_max_scroll(session);
-        navigation_set_scroll(session, scroll_y < maximum ? scroll_y : maximum);
-    }
-    return !script_runtime_consume_relayout(session->page.runtime)
-           || navigation_relayout(session);
+    return navigation_settle_dispatched_event(session);
 }
 
 bool navigation_dispatch_node_activation(NavigationSession *session,
@@ -63,13 +59,7 @@ bool navigation_dispatch_node_activation(NavigationSession *session,
             session, session->page.runtime);
         return false;
     }
-    int scroll_y = 0;
-    if (script_runtime_consume_scroll(session->page.runtime, &scroll_y)) {
-        int maximum = navigation_max_scroll(session);
-        navigation_set_scroll(session, scroll_y < maximum ? scroll_y : maximum);
-    }
-    return !script_runtime_consume_relayout(session->page.runtime)
-           || navigation_relayout(session);
+    return navigation_settle_dispatched_event(session);
 }
 
 static NavigationFrame *navigation_loaded_frame_for_element(
@@ -362,13 +352,7 @@ bool navigation_dispatch_node_pointer(
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     uint64_t pointer_dispatched = navigation_now_us();
 #endif
-    int scroll_y = 0;
-    if (script_runtime_consume_scroll(session->page.runtime, &scroll_y)) {
-        int maximum = navigation_max_scroll(session);
-        navigation_set_scroll(session, scroll_y < maximum ? scroll_y : maximum);
-    }
-    bool finished = !script_runtime_consume_relayout(session->page.runtime)
-        || navigation_relayout(session);
+    bool finished = navigation_settle_dispatched_event(session);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     if (phase == 5u) {
         char pointer_phases[160];

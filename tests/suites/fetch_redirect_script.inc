@@ -29,35 +29,45 @@ static bool test_javascript_binary_responses(Budget *budget, unsigned port)
         "textRaw=__tilefinchFetchSync('GET','/final',undefined,'','','cors',"
         "'same-origin'),textXhr=new XMLHttpRequest;"
         "textXhr.open('GET','/binary',false);textXhr.send();"
-        "const arrayXhr=new XMLHttpRequest;arrayXhr.open('GET','/binary',false);"
-        "arrayXhr.responseType='arraybuffer';arrayXhr.send();"
-        "const arrayBytes=new Uint8Array(arrayXhr.response),"
-        "textArrayXhr=new XMLHttpRequest;"
-        "textArrayXhr.open('GET','/final',false);"
-        "textArrayXhr.responseType='arraybuffer';textArrayXhr.send();"
-        "const textArray=new TextDecoder().decode(textArrayXhr.response);"
-        "let guarded=false;"
-        "try{void arrayXhr.responseText;}catch(error){guarded=error.name==="
-        "'InvalidStateError';}const jsonXhr=new XMLHttpRequest;"
-        "jsonXhr.open('GET','/binary-json',false);jsonXhr.responseType='json';"
-        "jsonXhr.send();const blobXhr=new XMLHttpRequest;"
-        "blobXhr.open('GET','/binary',false);blobXhr.responseType='blob';"
-        "blobXhr.send();const checks=[!own(raw,'body'),"
+        "const checks=[!own(raw,'body'),"
         "raw.bodyBytes instanceof ArrayBuffer,raw.bodyLength===5,"
         "bytes.join(',')==='0,65,195,169,66',!own(textRaw,'body'),"
         "own(textRaw,'bodyBytes'),textRaw.bodyLength===textRaw.bodyBytes.byteLength,"
         "textXhr.responseText.length===4,textXhr.responseText.charCodeAt(0)===0,"
         "textXhr.responseText.charCodeAt(2)===233,textXhr.response==="
-        "textXhr.responseText,arrayBytes.join(',')==='0,65,195,169,66',"
-        "textArray.startsWith('method=GET;'),"
-        "guarded,jsonXhr.response&&jsonXhr.response.ok===true&&"
-        "jsonXhr.response.n===7,blobXhr.response instanceof Blob&&"
-        "blobXhr.response.size===5&&blobXhr.response.type==="
-        "'application/octet-stream'];globalThis.pocSummary=checks.every(Boolean)"
+        "textXhr.responseText];globalThis.pocSummary=checks.every(Boolean)"
         "?'binary-sync-ok':'binary-sync-failed:'+checks.join(',');})()";
     CHECK(script_runtime_evaluate_diagnostic(
               runtime, synchronous_probe, "<binary-sync-probe>", &result)
           && strcmp(result.summary, "binary-sync-ok") == 0
+          && result.last_xhr_response_bytes == 5
+          && result.last_xhr_response_text_units == 4
+          && result.last_xhr_response_type[0] == '\0');
+
+    /* A Window XHR with a non-default responseType must be asynchronous.
+       Still exercise all four native typed-response paths. */
+    static const char typed_probe[] =
+        "(async()=>{const get=(url,type)=>new Promise((resolve,reject)=>{"
+        "const xhr=new XMLHttpRequest;xhr.open('GET',url);xhr.responseType=type;"
+        "xhr.onload=()=>resolve(xhr);xhr.onerror=reject;xhr.send()});"
+        "const arrayXhr=await get('/binary','arraybuffer'),"
+        "textArrayXhr=await get('/final','arraybuffer'),"
+        "jsonXhr=await get('/binary-json','json'),"
+        "blobXhr=await get('/binary','blob');"
+        "let guarded=false;try{void arrayXhr.responseText;}"
+        "catch(error){guarded=error.name==='InvalidStateError';}"
+        "const checks=[new Uint8Array(arrayXhr.response).join(',')"
+        "==='0,65,195,169,66',new TextDecoder().decode(textArrayXhr.response)"
+        ".startsWith('method=GET;'),guarded,jsonXhr.response?.ok===true"
+        "&&jsonXhr.response.n===7,blobXhr.response instanceof Blob"
+        "&&blobXhr.response.size===5&&blobXhr.response.type==="
+        "'application/octet-stream'];globalThis.pocSummary=checks.every(Boolean)"
+        "?'binary-typed-ok':'binary-typed-failed:'+checks.join(',')})()"
+        ".catch(error=>globalThis.pocSummary='binary-typed-error:'+error)";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, typed_probe, "<binary-typed-probe>", &result)
+          && pump_script_network(runtime, &result)
+          && strcmp(result.summary, "binary-typed-ok") == 0
           && result.last_xhr_response_bytes == 5
           && result.last_xhr_response_text_units == 0
           && strcmp(result.last_xhr_response_type, "blob") == 0);

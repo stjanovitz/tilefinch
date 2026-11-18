@@ -1710,10 +1710,11 @@ void psp_present_boot_surface(
      * the first publish for pixels that the next ordinary present overwrites
      * in full.
      */
+    const uint16_t background = PSP_STARTUP_BACKGROUND;
     for (int y = 0; y < PSP_SCREEN_HEIGHT; y++) {
         uint16_t *row = vram + (size_t) y * PSP_VRAM_STRIDE;
         for (int x = 0; x < PSP_VRAM_STRIDE; x++) {
-            row[x] = PSP_STARTUP_BACKGROUND;
+            row[x] = background;
         }
     }
     psp_ui_startup_composite(
@@ -1845,7 +1846,8 @@ static void psp_work_cooperate_begin_internal(
        Library's item and profile strings: the browser thread writes those
        only under psp_presentation_fence_acquire, never across I/O. It may
        also show a preview sheet, which psp_work_cooperate_release_view
-       takes off it before the preview is freed (docs/ARCHITECTURE.md). */
+       takes off it before the preview is freed
+       (docs/engineering/UI_DURING_PAGE_WORK.md). */
     psp_navigation_cooperate.ui = ui;
     if (ui != NULL) {
         psp_navigation_cooperate.supervisor_ui = *ui;

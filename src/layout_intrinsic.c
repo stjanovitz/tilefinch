@@ -180,7 +180,7 @@ static bool intrinsic_grid_track_widths(
                 context->sheet, container_style, false,
                 (unsigned) explicit_column);
         types[column] = type;
-        widths[column] = (int) floor;
+        widths[column] = (floor & GRID_TRACK_PERCENT_MINIMUM) ? 0 : (int) floor;
         if (type == GRID_TRACK_FIXED && (int) value > widths[column]) {
             widths[column] = (int) value;
         }

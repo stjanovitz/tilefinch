@@ -1,12 +1,14 @@
 /* Function source outside the heap (evaluation.inc, "Function source
-   outside the heap"; js_source_store.h): a classic page script of at least
-   8 KiB keeps its text in the realm's function-source store, not the
-   QuickJS heap. Through the real external classic-script path:
-   Function.prototype.toString() and stack positions are unchanged, a
-   revisit restored from the classic bytecode table reads the text the
-   revisit registers, the threshold holds, a store under pressure drops
-   only text no lazily compiled function needs (toString() then answers
-   with the "[native code]" form), and worker realms are unaffected. */
+   outside the heap"; js_source_store.h): a page script of at least 8 KiB,
+   classic or module, keeps its text in the realm's function-source store,
+   not the QuickJS heap. Through the real external classic-script and
+   module paths: Function.prototype.toString() and stack positions are
+   unchanged, a revisit restored from the classic or module bytecode table
+   reads the text the revisit registers, the threshold holds, a store under
+   pressure drops only text no lazily compiled function needs (toString()
+   then answers with the "[native code]" form), a module restore whose text
+   the store refuses is dropped and the module compiled instead, and worker
+   realms are unaffected. */
 #include "tilefinch/browser_engine.h"
 #include "tilefinch/document.h"
 #include "tilefinch/js_runtime.h"
@@ -39,6 +41,10 @@
 
 static const char page_url[] = "https://site.test/";
 
+/* The script under test is a module (the module path and module bytecode
+   table) rather than a classic script. */
+static bool module_mode = false;
+
 /* A classic script: `functions` (author text whose toString() the summary
    checks, one per line, each named f<i>), padded with a comment to at
    least `minimum` bytes. The summary is "ok" when every function's
@@ -65,6 +71,14 @@ static char *make_script(const SourceForm *functions, size_t count,
     for (size_t i = 0; i < count; i++)
         length += (size_t) snprintf(source + length, capacity - length,
                                     "%s\n", functions[i].code);
+    /* a module's names are its own: the probes read them as globals */
+    if (module_mode) {
+        length += (size_t) snprintf(source + length, capacity - length,
+                                    "globalThis.thrower = thrower;\n");
+        for (size_t i = 0; i < count; i++)
+            length += (size_t) snprintf(source + length, capacity - length,
+                                        "globalThis.f%zu = f%zu;\n", i, i);
+    }
     length += (size_t) snprintf(source + length, capacity - length,
         "(function () {\n"
         "  var expect = [");
@@ -121,6 +135,18 @@ static const SourceForm forms[] = {
 
 typedef ScriptPageFixture SourceFixture;
 
+/* The page fixture, with the module bytecode table on in module mode. */
+static bool source_fixture_open(SourceFixture *fixture)
+{
+    if (!script_page_fixture_open(
+            fixture, "<script src=/app.js></script>", 640u * KIB))
+        return false;
+    if (module_mode)
+        browser_session_module_bytecode_set_limit(&fixture->session,
+                                                  1u * MIB);
+    return true;
+}
+
 static bool put_response(SourceFixture *fixture, const char *url,
                          const char *source)
 {
@@ -128,6 +154,32 @@ static bool put_response(SourceFixture *fixture, const char *url,
         &fixture->session, url, (const unsigned char *) source,
         strlen(source), "\"v1\"", NULL, "text/javascript",
         "public,max-age=3600", NULL, 1);
+}
+
+/* The bytecode table counters of the path under test. */
+static size_t cache_misses(const ScriptResult *r)
+{
+    return module_mode ? r->module_bytecode_cache_misses
+                       : r->external_script_bytecode_cache_misses;
+}
+
+static size_t cache_stores(const ScriptResult *r)
+{
+    return module_mode ? r->module_bytecode_cache_stores
+                       : r->external_script_bytecode_cache_stores;
+}
+
+static size_t cache_hits(const ScriptResult *r)
+{
+    return module_mode ? r->module_bytecode_cache_hits
+                       : r->external_script_bytecode_cache_hits;
+}
+
+static size_t cache_restore_failures(const ScriptResult *r)
+{
+    return module_mode
+        ? r->module_bytecode_cache_restore_failures
+        : r->external_script_bytecode_cache_restore_failures;
 }
 
 static void run_idle_stores(ScriptRuntime *runtime, ScriptResult *result)
@@ -140,10 +192,11 @@ static void run_idle_stores(ScriptRuntime *runtime, ScriptResult *result)
    realm, then `probe` (a diagnostic script, may be NULL) whose summary is
    returned in *probe_result; *stats gets the realm's store statistics
    before it is destroyed. */
-static bool visit(SourceFixture *fixture, const char *url, const char *source,
-                  const char *probe, ScriptResult *result,
-                  ScriptResult *probe_result, ScriptSourceStoreStats *stats,
-                  size_t relieve)
+static bool visit_injected(SourceFixture *fixture, const char *url,
+                           const char *source, const char *probe,
+                           ScriptResult *result, ScriptResult *probe_result,
+                           ScriptSourceStoreStats *stats, size_t relieve,
+                           long inject_after)
 {
     memset(result, 0, sizeof(*result));
     ScriptRuntime *runtime = script_runtime_create_configured(
@@ -161,8 +214,18 @@ static bool visit(SourceFixture *fixture, const char *url, const char *source,
         return false;
     }
     memcpy(body, source, length + 1);
-    bool ok = script_runtime_evaluate_external_classic_cached(
-        runtime, fixture->script, body, length, url, url, false, result);
+    /* One refused Budget allocation, `inject_after` allocations into the
+       evaluation (negative: none). */
+    if (inject_after >= 0)
+        budget_inject_failure_after(&fixture->budget, (size_t) inject_after);
+    bool ok = module_mode
+        ? script_runtime_evaluate_external_module_response(
+              runtime, fixture->script, body, length, url, url, "",
+              TILEFINCH_CREDENTIALS_SAME_ORIGIN, false, result)
+        : script_runtime_evaluate_external_classic_cached(
+              runtime, fixture->script, body, length, url, url, false,
+              result);
+    budget_clear_failure_injection(&fixture->budget);
     memset(body, '#', length);
     free(body);
     if (relieve != 0) {
@@ -181,6 +244,15 @@ static bool visit(SourceFixture *fixture, const char *url, const char *source,
     return ok;
 }
 
+static bool visit(SourceFixture *fixture, const char *url, const char *source,
+                  const char *probe, ScriptResult *result,
+                  ScriptResult *probe_result, ScriptSourceStoreStats *stats,
+                  size_t relieve)
+{
+    return visit_injected(fixture, url, source, probe, result, probe_result,
+                          stats, relieve, -1);
+}
+
 static bool summary_is(const ScriptResult *result, const char *expected)
 {
     if (strcmp(result->summary, expected) == 0) return true;
@@ -194,8 +266,7 @@ static bool summary_is(const ScriptResult *result, const char *expected)
 static int test_tostring_and_revisit(void)
 {
     SourceFixture fixture;
-    CHECK(script_page_fixture_open(
-        &fixture, "<script src=/app.js></script>", 640u * KIB));
+    CHECK(source_fixture_open(&fixture));
     static const char url[] = "https://site.test/app.js";
     char *source = make_script(forms, FORM_COUNT, 48u * KIB, url);
     CHECK(source != NULL && put_response(&fixture, url, source));
@@ -208,8 +279,7 @@ static int test_tostring_and_revisit(void)
                 0));
     CHECK(summary_is(&first, "ok"));
     CHECK(summary_is(&first_probe, "6,true,true"));
-    CHECK(first.external_script_bytecode_cache_misses == 1
-          && first.external_script_bytecode_cache_stores == 1);
+    CHECK(cache_misses(&first) == 1 && cache_stores(&first) == 1);
     if (!(stats.added == 1 && stats.added_bytes == strlen(source)
           && stats.reads >= FORM_COUNT && stats.read_failures == 0))
         fprintf(stderr, "first visit: added=%llu bytes=%llu/%zu reads=%llu "
@@ -224,13 +294,11 @@ static int test_tostring_and_revisit(void)
     CHECK(put_response(&fixture, url, source));
     CHECK(visit(&fixture, url, source, probe, &second, &second_probe, &stats,
                 0));
-    if (second.external_script_bytecode_cache_hits != 1)
+    if (cache_hits(&second) != 1)
         fprintf(stderr, "revisit: hits=%zu misses=%zu failures=%zu\n",
-                second.external_script_bytecode_cache_hits,
-                second.external_script_bytecode_cache_misses,
-                second.external_script_bytecode_cache_restore_failures);
-    CHECK(second.external_script_bytecode_cache_hits == 1
-          && second.external_script_bytecode_cache_restore_failures == 0
+                cache_hits(&second), cache_misses(&second),
+                cache_restore_failures(&second));
+    CHECK(cache_hits(&second) == 1 && cache_restore_failures(&second) == 0
           && second.host_compile_attempts + 1 == first.host_compile_attempts);
     /* the restored script's own check, then the probe's */
     CHECK(summary_is(&second, "ok"));
@@ -242,12 +310,55 @@ static int test_tostring_and_revisit(void)
     return 0;
 }
 
+/* Admission's reclaim (script_runtime_reclaim_for_admission) takes stored
+   text only for a Budget shortfall: without include_store it leaves the
+   store as it is; with it, plain blocks are compressed. */
+static int test_admission_reclaim_store_step(void)
+{
+    SourceFixture fixture;
+    CHECK(source_fixture_open(&fixture));
+    static const char url[] = "https://site.test/app.js";
+    char *source = make_script(forms, FORM_COUNT, 96u * KIB, url);
+    CHECK(source != NULL);
+    ScriptResult result;
+    memset(&result, 0, sizeof(result));
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &fixture.document, &fixture.budget, 8u * MIB, 8000, page_url,
+        &fixture.options, &result);
+    CHECK(runtime != NULL);
+    CHECK(script_runtime_evaluate_external_classic_cached(
+        runtime, fixture.script, source, strlen(source), url, url, false,
+        &result));
+    CHECK(summary_is(&result, "ok"));
+    ScriptSourceStoreStats before, after;
+    script_source_store_stats(runtime->source_store, &before);
+    CHECK(before.plain_bytes != 0
+          && script_source_store_reclaimable(runtime->source_store)
+                 >= before.compressible_plain_bytes);
+    CHECK(script_runtime_admission_reclaimable(runtime, true)
+          >= script_runtime_admission_reclaimable(runtime, false)
+                 + before.compressible_plain_bytes);
+    (void) script_runtime_reclaim_for_admission(runtime, 64u * MIB, false);
+    script_source_store_stats(runtime->source_store, &after);
+    CHECK(after.plain_bytes == before.plain_bytes
+          && after.compressed_blocks == before.compressed_blocks
+          && after.evicted == before.evicted
+          && after.entries == before.entries);
+    (void) script_runtime_reclaim_for_admission(runtime, 64u * MIB, true);
+    script_source_store_stats(runtime->source_store, &after);
+    CHECK(after.compressed_blocks > before.compressed_blocks
+          && after.plain_bytes < before.plain_bytes);
+    script_runtime_destroy(runtime);
+    free(source);
+    CHECK(script_page_fixture_close(&fixture));
+    return 0;
+}
+
 /* The summary of the script's own self-check on its first visit. */
 static int check_self_test(size_t minimum, bool stored)
 {
     SourceFixture fixture;
-    CHECK(script_page_fixture_open(
-        &fixture, "<script src=/app.js></script>", 640u * KIB));
+    CHECK(source_fixture_open(&fixture));
     static const char url[] = "https://site.test/app.js";
     char *source = make_script(forms, FORM_COUNT, minimum, url);
     CHECK(source != NULL && put_response(&fixture, url, source));
@@ -280,8 +391,7 @@ static int test_threshold(void)
 static int test_pressure_fallback(void)
 {
     SourceFixture fixture;
-    CHECK(script_page_fixture_open(
-        &fixture, "<script src=/app.js></script>", 640u * KIB));
+    CHECK(source_fixture_open(&fixture));
     static const char url[] = "https://site.test/app.js";
     /* small functions only: compiled eagerly, nothing requires the text */
     static const SourceForm small[] = {
@@ -328,8 +438,7 @@ static int test_pressure_fallback(void)
 static int test_worker_realm(void)
 {
     SourceFixture fixture;
-    CHECK(script_page_fixture_open(
-        &fixture, "<script src=/app.js></script>", 640u * KIB));
+    CHECK(source_fixture_open(&fixture));
     static const char url[] = "https://site.test/app.js";
     char *source = make_script(forms, FORM_COUNT, 16u * KIB, url);
     CHECK(source != NULL && put_response(&fixture, url, source));
@@ -380,8 +489,7 @@ enum { LAZY_REACTION, LAZY_REACTION_EXECUTOR, LAZY_LISTENER_EXECUTOR };
 static int lazy_memory_failure_case(int trigger)
 {
     SourceFixture fixture;
-    CHECK(script_page_fixture_open(
-        &fixture, "<script src=/app.js></script>", 640u * KIB));
+    CHECK(source_fixture_open(&fixture));
     ScriptResult result;
     memset(&result, 0, sizeof(result));
     ScriptRuntime *runtime = script_runtime_create_configured(
@@ -777,6 +885,57 @@ static int test_incompressible_blocks_tried_once(void)
     return 0;
 }
 
+/* A module revisit whose restored functions cannot read their text (the
+   Budget refuses the store's copy as the restore registers it) drops the
+   restored record and compiles the module from source, which runs and
+   whose functions answer toString() with their text. One refusal is
+   injected at each Budget allocation of the revisit in turn; every revisit
+   in which it landed on the store must end that way. */
+static int test_module_refused_restore_compiles(void)
+{
+    SourceFixture fixture;
+    CHECK(source_fixture_open(&fixture));
+    static const char url[] = "https://site.test/app.js";
+    char *source = make_script(forms, FORM_COUNT, 48u * KIB, url);
+    CHECK(source != NULL);
+    ScriptResult first, unused;
+    ScriptSourceStoreStats stats;
+    CHECK(visit(&fixture, url, source, NULL, &first, &unused, &stats, 0));
+    CHECK(summary_is(&first, "ok") && cache_stores(&first) == 1);
+    size_t store_refusals = 0;
+    for (long inject = 0; inject < 1000; inject++) {
+        size_t injected = fixture.budget.injected_failure_count;
+        ScriptResult revisit;
+        bool ok = visit_injected(&fixture, url, source, NULL, &revisit,
+                                 &unused, &stats, 0, inject);
+        /* past the revisit's last allocation */
+        if (fixture.budget.injected_failure_count == injected) break;
+        if (stats.refused == 0) continue;
+        store_refusals++;
+        if (!ok || cache_restore_failures(&revisit) != 1)
+            fprintf(stderr, "refusal at allocation %ld: ok=%d hits=%zu "
+                    "restore-failures=%zu\n", inject, ok ? 1 : 0,
+                    cache_hits(&revisit), cache_restore_failures(&revisit));
+        /* compiled from source, as on the first visit, and it ran with
+           its text */
+        CHECK(ok && cache_restore_failures(&revisit) == 1
+              && cache_hits(&revisit) == 0);
+        CHECK(revisit.host_compile_attempts == first.host_compile_attempts);
+        CHECK(summary_is(&revisit, "ok"));
+    }
+    if (store_refusals == 0)
+        fprintf(stderr, "no injected refusal reached the store's restore\n");
+    CHECK(store_refusals != 0);
+    /* the record replaced by the fallback compile's restores */
+    ScriptResult again;
+    CHECK(visit(&fixture, url, source, NULL, &again, &unused, &stats, 0));
+    CHECK(summary_is(&again, "ok") && cache_hits(&again) == 1
+          && cache_restore_failures(&again) == 0);
+    free(source);
+    CHECK(script_page_fixture_close(&fixture));
+    return 0;
+}
+
 int main(void)
 {
     CHECK(test_codec() == 0);
@@ -788,6 +947,13 @@ int main(void)
     CHECK(test_pressure_fallback() == 0);
     CHECK(test_worker_realm() == 0);
     CHECK(test_lazy_memory_failure_yields_checkpoint() == 0);
+    CHECK(test_admission_reclaim_store_step() == 0);
+    /* The same, for a module: its text goes to the store too. */
+    module_mode = true;
+    CHECK(test_tostring_and_revisit() == 0);
+    CHECK(test_threshold() == 0);
+    CHECK(test_pressure_fallback() == 0);
+    CHECK(test_module_refused_restore_compiles() == 0);
     printf("tilefinch-function-source-store-tests: ok\n");
     return 0;
 }

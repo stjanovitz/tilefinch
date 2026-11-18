@@ -13,8 +13,9 @@ requires.
 
 The optional Japanese, Chinese, Korean, Cyrillic, Extended Latin, Arabic,
 Hebrew, Devanagari (Hindi), Bengali-Assamese, and color-emoji packs are
-likewise not part of the download. They are generated from Noto fonts, carry the complete SIL Open Font License notice
-and a digest of the source font, and are fetched only when you ask for one.
+likewise not part of the download. They are generated from Noto fonts, carry
+the complete SIL Open Font License notice and a digest of the source font, and
+are fetched only when you ask for one.
 Tilefinch does not read the PSP's proprietary firmware fonts.
 
 Tilefinch is an independent, unofficial homebrew project. It is not

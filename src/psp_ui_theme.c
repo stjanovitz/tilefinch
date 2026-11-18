@@ -11,7 +11,7 @@
 
 #define RGB(r, g, b) PSP_THEME_RGB((r), (g), (b))
 
-_Static_assert(sizeof(PspUiThemePalette) == 17u * sizeof(uint16_t),
+_Static_assert(sizeof(PspUiThemePalette) == 18u * sizeof(uint16_t),
                "theme palette must not contain indeterminate padding");
 
 static const PspUiThemePalette theme_midnight = {
@@ -21,7 +21,7 @@ static const PspUiThemePalette theme_midnight = {
     PSP_THEME_TEXT, PSP_THEME_TEXT_BODY, PSP_THEME_TEXT_MUTED,
     PSP_THEME_TEXT_FAINT, PSP_THEME_ACCENT_MIDNIGHT,
     PSP_THEME_ACCENT_MIDNIGHT_HI, PSP_THEME_ON_ACCENT,
-    PSP_THEME_OK, PSP_THEME_WARN
+    PSP_THEME_OK, PSP_THEME_WARN, PSP_THEME_DANGER
 };
 
 static const PspUiThemePalette theme_ocean = {
@@ -31,7 +31,7 @@ static const PspUiThemePalette theme_ocean = {
     PSP_THEME_TEXT, PSP_THEME_TEXT_BODY, PSP_THEME_TEXT_MUTED,
     PSP_THEME_TEXT_FAINT, PSP_THEME_ACCENT_COBALT,
     PSP_THEME_ACCENT_COBALT_HI, PSP_THEME_ON_ACCENT,
-    PSP_THEME_OK, PSP_THEME_WARN
+    PSP_THEME_OK, PSP_THEME_WARN, PSP_THEME_DANGER
 };
 
 static const PspUiThemePalette theme_slate = {
@@ -41,7 +41,7 @@ static const PspUiThemePalette theme_slate = {
     PSP_THEME_TEXT, PSP_THEME_TEXT_BODY, PSP_THEME_TEXT_MUTED,
     PSP_THEME_TEXT_FAINT, PSP_THEME_ACCENT_SLATE,
     PSP_THEME_ACCENT_SLATE_HI, PSP_THEME_ON_ACCENT,
-    PSP_THEME_OK, PSP_THEME_WARN
+    PSP_THEME_OK, PSP_THEME_WARN, PSP_THEME_DANGER
 };
 
 static const PspUiThemePalette theme_ember = {
@@ -51,7 +51,7 @@ static const PspUiThemePalette theme_ember = {
     PSP_THEME_TEXT, PSP_THEME_TEXT_BODY, PSP_THEME_TEXT_MUTED,
     PSP_THEME_TEXT_FAINT, PSP_THEME_ACCENT_EMBER,
     PSP_THEME_ACCENT_EMBER_HI, PSP_THEME_ON_ACCENT,
-    PSP_THEME_OK, PSP_THEME_WARN
+    PSP_THEME_OK, PSP_THEME_WARN, PSP_THEME_DANGER
 };
 
 /* Cool blue-grey surfaces complement the default Midnight accent while
@@ -65,7 +65,7 @@ static const PspUiThemePalette theme_light = {
     RGB(0x59, 0x6C, 0x83), RGB(0x84, 0x92, 0xA5),
     RGB(0x24, 0x58, 0x8F), RGB(0x3F, 0x78, 0xB8),
     RGB(0xFF, 0xFF, 0xFF), RGB(0x26, 0x7A, 0x55),
-    RGB(0xA9, 0x4F, 0x24)
+    RGB(0xA9, 0x4F, 0x24), RGB(0xB3, 0x26, 0x1E)
 };
 
 static PspUiThemePalette theme_custom;
@@ -149,9 +149,14 @@ static bool parse_color(const char *value, uint16_t *color)
 typedef struct {
     const char *name;
     size_t offset;
+    /* The first format that has the field; an older file naming it is
+       rejected as an unknown field, as that format's readers reject it. */
+    uint8_t since_format;
 } ThemeField;
 
-#define THEME_FIELD(member) { #member, offsetof(PspUiThemePalette, member) }
+#define THEME_FIELD(member) { #member, offsetof(PspUiThemePalette, member), 1u }
+#define THEME_FIELD_SINCE(member, format) \
+    { #member, offsetof(PspUiThemePalette, member), (format) }
 static const ThemeField theme_fields[] = {
     THEME_FIELD(ground), THEME_FIELD(ground_reader),
     THEME_FIELD(chrome_bar), THEME_FIELD(hint_bar), THEME_FIELD(panel),
@@ -159,9 +164,130 @@ static const ThemeField theme_fields[] = {
     THEME_FIELD(text), THEME_FIELD(text_body), THEME_FIELD(text_muted),
     THEME_FIELD(text_faint), THEME_FIELD(accent),
     THEME_FIELD(accent_high), THEME_FIELD(on_accent), THEME_FIELD(ok),
-    THEME_FIELD(warn)
+    THEME_FIELD(warn), THEME_FIELD_SINCE(danger, 2u)
 };
+#undef THEME_FIELD_SINCE
 #undef THEME_FIELD
+_Static_assert(sizeof(theme_fields) / sizeof(theme_fields[0])
+                   == sizeof(PspUiThemePalette) / sizeof(uint16_t),
+               "every palette color needs a theme-file field");
+
+/*
+ * WCAG relative luminance of each RGB565 channel code, in millionths, with
+ * the channel's weight applied (0.2126 red, 0.7152 green, 0.0722 blue), so
+ * a color's luminance is the sum of three lookups. Codes expand to 8 bits
+ * as tilefinch_rgb5_to_u8/tilefinch_rgb6_to_u8 do; the values are
+ * round(weight * linear(expanded / 255) * 1e6). Only a theme file without a
+ * danger color reads these, once, when it loads.
+ */
+static const uint32_t theme_luminance_red[32] = {
+    0u, 516u, 1102u, 1942u, 3071u, 4714u, 6530u, 8699u, 11238u, 14558u,
+    17938u, 21737u, 25967u, 30642u, 36448u, 42110u, 48253u, 54890u, 62959u,
+    70679u, 78925u, 87707u, 97033u, 108188u, 118703u, 129791u, 141461u,
+    155296u, 168230u, 181771u, 195928u, 212600u
+};
+static const uint32_t theme_luminance_green[64] = {
+    0u, 868u, 1737u, 2629u, 3706u, 5003u, 6533u, 8305u, 10330u, 12618u,
+    15176u, 18014u, 21139u, 24560u, 28283u, 32317u, 36668u, 41342u, 46347u,
+    51689u, 57373u, 64970u, 71448u, 78287u, 85494u, 93074u, 101032u, 109373u,
+    118103u, 127226u, 136747u, 146672u, 157005u, 167751u, 178913u, 190498u,
+    202508u, 214949u, 227825u, 241139u, 254897u, 269103u, 287495u, 302721u,
+    318408u, 334559u, 351178u, 368269u, 385836u, 403882u, 422411u, 441426u,
+    460932u, 480931u, 501428u, 522426u, 543927u, 565936u, 588456u, 611491u,
+    635043u, 659115u, 683712u, 715200u
+};
+static const uint32_t theme_luminance_blue[32] = {
+    0u, 175u, 374u, 659u, 1043u, 1601u, 2218u, 2954u, 3817u, 4944u, 6092u,
+    7382u, 8818u, 10406u, 12378u, 14301u, 16387u, 18641u, 21381u, 24003u,
+    26803u, 29786u, 32953u, 36741u, 40312u, 44078u, 48041u, 52739u, 57132u,
+    61730u, 66538u, 72200u
+};
+
+/* Luminance plus WCAG's 0.05 flare term, in millionths. */
+static uint32_t theme_luminance_flared(uint16_t color)
+{
+    return theme_luminance_red[tilefinch_rgb565_red_code(color)]
+        + theme_luminance_green[tilefinch_rgb565_green_code(color)]
+        + theme_luminance_blue[tilefinch_rgb565_blue_code(color)] + 50000u;
+}
+
+/* The weaker of a color's two contrasts, as the ratio high / low. */
+typedef struct {
+    uint32_t high;
+    uint32_t low;
+} ThemeContrast;
+
+static ThemeContrast theme_contrast(uint16_t color, uint16_t first,
+                                    uint16_t second)
+{
+    uint32_t ink = theme_luminance_flared(color);
+    uint32_t grounds[2] = {
+        theme_luminance_flared(first), theme_luminance_flared(second)
+    };
+    ThemeContrast weakest = {1u, 0u};
+    for (size_t at = 0; at < 2u; at++) {
+        ThemeContrast contrast = ink > grounds[at]
+            ? (ThemeContrast) {ink, grounds[at]}
+            : (ThemeContrast) {grounds[at], ink};
+        /* Smaller ratio: high/low < weakest.high/weakest.low. */
+        if (weakest.low == 0u
+            || (uint64_t) contrast.high * weakest.low
+                   < (uint64_t) weakest.high * contrast.low)
+            weakest = contrast;
+    }
+    return weakest;
+}
+
+static bool theme_contrast_readable(ThemeContrast contrast)
+{
+    /* WCAG AA for text: high / low >= 4.5. */
+    return (uint64_t) contrast.high * 2u >= (uint64_t) contrast.low * 9u;
+}
+
+/*
+ * A danger color for a palette whose file did not name one. Danger text is
+ * drawn on the panel and on the focused row, so it must read on both. The
+ * reds run from pale to deep; the dark themes' danger and Daylight's are
+ * among them, so a file that copies a built-in theme's grounds gets that
+ * theme's danger. A dark panel takes the first red, from the dark themes'
+ * outward to paler ones, that reaches 4.5:1 on both surfaces; a light panel
+ * the first from Daylight's outward to deeper ones. When none does (mid-tone
+ * or mismatched surfaces), the most legible of every red and the theme's
+ * own text color is used, so the row stays readable even if it is not red.
+ */
+static uint16_t theme_derived_danger(const PspUiThemePalette *palette)
+{
+    static const uint16_t reds[] = {
+        RGB(0xFF, 0xC4, 0xC8), RGB(0xFF, 0xA4, 0xAA), RGB(0xF7, 0x86, 0x8E),
+        PSP_THEME_DANGER, RGB(0xE0, 0x50, 0x5C), RGB(0xCC, 0x3A, 0x44),
+        RGB(0xB3, 0x26, 0x1E), RGB(0x96, 0x1C, 0x22), RGB(0x7A, 0x14, 0x18),
+        RGB(0x5C, 0x0C, 0x10)
+    };
+    enum { DARK_FIRST = 3, LIGHT_FIRST = 6, RED_COUNT = 10 };
+    _Static_assert(sizeof(reds) / sizeof(reds[0]) == RED_COUNT,
+                   "derived danger ramp");
+    uint16_t panel = palette->panel;
+    uint16_t focus = palette->surface_focus;
+    /* A panel is dark when white text would contrast more than black:
+       1.05 / L > L / 0.05, i.e. flared luminance below sqrt(0.0525). */
+    bool dark = theme_luminance_flared(panel) < 229129u;
+    for (int step = 0; step < 4; step++) {
+        int at = dark ? DARK_FIRST - step : LIGHT_FIRST + step;
+        if (theme_contrast_readable(theme_contrast(reds[at], panel, focus)))
+            return reds[at];
+    }
+    uint16_t best = palette->text;
+    ThemeContrast best_contrast = theme_contrast(best, panel, focus);
+    for (size_t at = 0; at < RED_COUNT; at++) {
+        ThemeContrast contrast = theme_contrast(reds[at], panel, focus);
+        if ((uint64_t) contrast.high * best_contrast.low
+            > (uint64_t) best_contrast.high * contrast.low) {
+            best = reds[at];
+            best_contrast = contrast;
+        }
+    }
+    return best;
+}
 
 static bool theme_label_valid(const char *label)
 {
@@ -199,6 +325,8 @@ static bool theme_parse_file(
     unsigned fields = 0u;
     unsigned lines = 0u;
     size_t total = 0u;
+    unsigned format = 0u;
+    unsigned newest_field_format = 1u;
     bool header_seen = false;
     bool format_seen = false;
     bool name_seen = false;
@@ -246,10 +374,15 @@ static bool theme_parse_file(
             if (format_seen) {
                 valid = false;
                 theme_error(error, error_capacity, "DUPLICATE THEME FORMAT");
-            } else if (strcmp(equals, "1") != 0) {
+            } else if (strlen(equals) != 1u || equals[0] < '0'
+                       || (unsigned) (equals[0] - '0')
+                              < PSP_UI_THEME_FORMAT_OLDEST
+                       || (unsigned) (equals[0] - '0')
+                              > PSP_UI_THEME_FORMAT_VERSION) {
                 valid = false;
                 theme_error(error, error_capacity, "UNSUPPORTED THEME FORMAT");
             } else {
+                format = (unsigned) (equals[0] - '0');
                 format_seen = true;
             }
             if (!valid) break;
@@ -288,6 +421,8 @@ static bool theme_parse_file(
                 + theme_fields[at].offset);
             *slot = color;
             seen |= UINT32_C(1) << at;
+            if (theme_fields[at].since_format > newest_field_format)
+                newest_field_format = theme_fields[at].since_format;
             fields++;
             matched = true;
             break;
@@ -309,6 +444,12 @@ static bool theme_parse_file(
                     !format_seen ? "THEME FORMAT MISSING"
                                  : "THEME HAS NO COLORS");
     }
+    /* The format line may follow the colors, so a field newer than the
+       file's format is only known to be unknown here. */
+    if (valid && newest_field_format > format) {
+        valid = false;
+        theme_error(error, error_capacity, "UNKNOWN THEME FIELD");
+    }
     if (valid && total == PSP_UI_THEME_FILE_LIMIT) {
         int extra = fgetc(file);
         if (extra != EOF) {
@@ -318,6 +459,12 @@ static bool theme_parse_file(
     }
     fclose(file);
     if (!valid) return false;
+    bool danger_seen = false;
+    for (size_t at = 0; at < sizeof(theme_fields) / sizeof(theme_fields[0]);
+         at++)
+        if (theme_fields[at].offset == offsetof(PspUiThemePalette, danger))
+            danger_seen = (seen & (UINT32_C(1) << at)) != 0u;
+    if (!danger_seen) candidate.danger = theme_derived_danger(&candidate);
     *palette = candidate;
     return true;
 }

@@ -134,14 +134,14 @@ If the decoder has to be shut down during playback, the player says
 `VIDEO DECODER NEEDS APP RESTART` and stops offering Retry: only relaunching
 Tilefinch brings the decoder back, so Retry would just fail again.
 
-`PSP aligned codec allocation failed` means a firmware working buffer could
-not be allocated before decoding began, not that the video format was
-rejected. The player first tries its existing bounded page-memory recovery;
-if the failure remains, try a fresh Tilefinch launch with one tab. In a bug
-report include the exact PSP model, Tilefinch version, complete firmware
-version, launch method, and whether the firmware's extra-memory option is
-disabled. A small total-free figure alone cannot diagnose this failure:
-alignment and the C heap's layout matter too.
+`PSP aligned codec allocation failed` means the PSP could not set aside the
+decoder's working memory before playback began, not that the video format
+was rejected. The player first frees what it can from the page and tries
+again; if the failure remains, restart Tilefinch and play the video with one
+tab open. In a bug report include the exact PSP model, Tilefinch version,
+complete firmware version, launch method, and whether the firmware's
+extra-memory option is disabled. A free-memory figure alone cannot explain
+this failure, because the decoder needs its memory in particular shapes.
 
 For allocation details enable **Menu → Settings → Device & storage → Save
 error reports**, reproduce the failure, then export **Help & diagnostics →
@@ -200,12 +200,11 @@ the global switch.
 
 If a large site stays empty with a script error, check the `file_kb=` line
 of your `boot.cfg` (or `data/boot-overrides.cfg`). It is the largest single
-script Tilefinch accepts, in KiB, and the default is 4096. Older versions
-shipped `file_kb=512`, which refuses the app bundles of many sites; this
-version replaces exactly that old default once, the first time it starts,
-and adds a `#file_kb-migrated-from=512` line so it never does so again. A
-value you chose yourself, including 512 set after that line, is never
-changed.
+script Tilefinch accepts, in KiB, and the default is 4096; a smaller value
+refuses the app scripts of many sites. At startup Tilefinch raises a
+`file_kb=512` line to the default once and adds a
+`#file_kb-migrated-from=512` line to record it. Any other value you set, and
+512 set after that line, is left alone.
 
 ## A site misbehaves after it updates
 
@@ -224,7 +223,8 @@ If Google shows **Couldn't sign you in — This browser or app may not be
 secure** and Tilefinch says **Google refused sign-in from this browser**,
 Google has declined to sign this browser in. That is Google's decision about
 the browser, not a fault in your account or password, and trying again gives
-the same answer. Searching and watching work without signing in.
+the same answer. Tilefinch does not retry or present itself as another
+browser. Searching and watching work without signing in.
 
 If signing in ends on a Google page instead of returning to YouTube, choose
 **Menu → Page tools → Continue to YouTube**. Tilefinch counts you as signed

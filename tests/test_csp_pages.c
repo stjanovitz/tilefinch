@@ -1656,13 +1656,14 @@ static bool held_preloads_yield(void)
 
 static bool module_disk_tier_behind_sri_and_csp(void)
 {
-    int used = snprintf(disk_dep, sizeof(disk_dep),
-                        "function big(n){var s=[];");
+    /* Top-level code, compiled with the module: a function body would
+       compile on its first call, so its bytes would stay out of the record. */
+    int used = snprintf(disk_dep, sizeof(disk_dep), "var n=2,s=[];");
     for (int i = 0; used < 11000; i++)
         used += snprintf(disk_dep + used, sizeof(disk_dep) - (size_t) used,
                          "s.push(n*%d+%d);", i, i * 7);
     snprintf(disk_dep + used, sizeof(disk_dep) - (size_t) used,
-             "return s}export const dep='d'+big(2).length;");
+             "export const dep='d'+s.length;");
     char cache[512];
     if (!script_test_make_scratch_root(cache, sizeof(cache), "csp-disk"))
         return false;

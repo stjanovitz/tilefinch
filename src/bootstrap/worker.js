@@ -68,6 +68,7 @@ globalThis.__tilefinchInstallWorker = (
     createWorkerPerformance = globalThis.__tilefinchCreateWorkerPerformance,
     createTrustedTypesRealm =
       globalThis.__tilefinchCreateTrustedTypesRealm,
+    createWorkerXHR = globalThis.__tilefinchCreateWorkerXHR,
     abortXHRForWorker = globalThis.__tilefinchAbortXHRForWorker,
     abortFileReaderForWorker =
       globalThis.__tilefinchAbortFileReaderForWorker,
@@ -117,6 +118,7 @@ globalThis.__tilefinchInstallWorker = (
     typeof cancelTimer !== "function" ||
     typeof createWorkerPerformance !== "function" ||
     typeof createTrustedTypesRealm !== "function" ||
+    typeof createWorkerXHR !== "function" ||
     typeof abortXHRForWorker !== "function" ||
     typeof abortFileReaderForWorker !== "function" ||
     typeof blobTextForWorker !== "function" ||
@@ -126,6 +128,21 @@ globalThis.__tilefinchInstallWorker = (
     throw new Error("Worker bootstrap is unavailable");
 
   const workerSourceForBlob = (blob) => workerIntrinsics.sourceForBlob(blob);
+  /* The bytes a worker's queued OPFS write snapshot holds, charged as
+     opfs.js charges the owner's: the clone is an owner-realm value, so a
+     buffer is told by its internal slot (the byteLength getters), never by
+     instanceof. */
+  const { ArrayBuffer: TrustedArrayBuffer, apply: trustedApply } = eventInterfaces,
+    bufferByteLength = getOwnPropertyDescriptor(
+      TrustedArrayBuffer.prototype, "byteLength").get,
+    opfsWriteCharge = (value) => {
+      const data = value !== null && typeof value === "object" &&
+        !TrustedArrayBuffer.isView(value) && value.type === "write" ? value.data : value;
+      if (TrustedArrayBuffer.isView(data)) return data.byteLength;
+      if (typeof data === "string") return data.length * 2;
+      try { return trustedApply(bufferByteLength, data, []); } catch (_) {}
+      return typeof data?.size === "number" ? data.size : undefined;
+    };
 
   /* Dedicated workers share selected Web Platform constructors with their
      owner, but never the owner's arbitrary global properties.  Keep this
@@ -392,6 +409,7 @@ globalThis.__tilefinchInstallWorker = (
         responseClone=OwnerResponse.prototype.clone;
       class Headers extends OwnerHeaders{
         constructor(init={}){super(init)}
+        getSetCookie(){return Array.from(OwnerHeaders.prototype.getSetCookie.call(this))}
         *entries(){
           const iterator=OwnerHeaders.prototype.entries.call(this);
           for(const pair of iterator)yield [pair[0],pair[1]];
@@ -441,16 +459,24 @@ globalThis.__tilefinchInstallWorker = (
           return localizeResponse(OwnerResponse.redirect(url,status))
         }
         static json(data,init={}){
+          init??={};
+          const serialized=JSON.stringify(data);
+          if(serialized===undefined)
+            throw new TypeError('Response data cannot be serialized as JSON');
           const headers=new Headers(init.headers);
           if(!headers.has('content-type'))
             headers.set('content-type','application/json');
-          return new Response(JSON.stringify(data),{...init,headers});
+          return new Response(serialized,{...init,headers});
         }
       }
-      localizeResponse=value=>value instanceof Response?value:
-        new Response(value.body,{status:value.status,statusText:value.statusText,
-          url:value.url,headers:value.headers,redirected:value.redirected,
-          type:value.type});
+      // The worker exclusively owns these fresh transport/factory results.
+      // Project their interfaces into this realm without reconstructing the
+      // response, which would lose its header guard and internal status 0.
+      localizeResponse=value=>{
+        Object.setPrototypeOf(value,Response.prototype);
+        Object.setPrototypeOf(value.headers,Headers.prototype);
+        return value;
+      };
       root.Headers=Headers;root.Request=Request;root.Response=Response;
       root.fetch=(...args)=>localPromise(Reflect.apply(ownerFetch,root,args))
         .then(localizeResponse);
@@ -466,11 +492,9 @@ globalThis.__tilefinchInstallWorker = (
         responseType=Object.getOwnPropertyDescriptor(at,'responseType');
         at=Object.getPrototypeOf(at);
       }
-      function WorkerXMLHttpRequest(...args){
+      function WorkerXMLHttpRequest(){
         if(!new.target)throw new TypeError('constructor requires new');
-        const xhr=Reflect.construct(Base,args,new.target);
-        register(xhr);
-        return xhr;
+        return register(new.target);
       }
       WorkerXMLHttpRequest.prototype=Object.create(Base.prototype);
       Object.defineProperty(WorkerXMLHttpRequest.prototype,'constructor',{
@@ -2135,10 +2159,10 @@ globalThis.__tilefinchInstallWorker = (
                     LocalWritableStream = state.realm?.WritableStream,
                     methods = new Map();
                   if (typeof LocalWritableStream !== "function") return owner;
+                  const localWrite = LocalWritableStream.prototype._write;
                   const target = new LocalWritableStream({
                     write(value) {
-                      return localPromise(() => owner.write(
-                        cloneWorkerValue(value, ownerIntrinsics)));
+                      return localPromise(() => owner.write(value));
                     },
                     close() {
                       return localPromise(() => owner.close()).then(
@@ -2164,6 +2188,16 @@ globalThis.__tilefinchInstallWorker = (
                         });
                     },
                   });
+                  Object.defineProperty(target, "_write", { value(value) {
+                    /* Snapshot before the local stream queues the operation,
+                       not later when it forwards the write to the owner. */
+                    try {
+                      const copy = cloneWorkerValue(value, ownerIntrinsics);
+                      return Reflect.apply(localWrite, this, [copy, opfsWriteCharge(copy)]);
+                    } catch (error) {
+                      return WorkerPromise.reject(error);
+                    }
+                  }});
                   if (LocalWriter?.prototype)
                     Object.setPrototypeOf(target, LocalWriter.prototype);
                   const facade = new Proxy(target, {
@@ -2480,9 +2514,11 @@ globalThis.__tilefinchInstallWorker = (
       /* These two construction hooks exist only while the fresh realm builds
          its Worker-local XHR facade. The facade closes over their values and
          they are removed from the inherited scope before author code runs. */
-      scope.__tilefinchRegisterWorkerXHR = (xhr) => {
+      scope.__tilefinchRegisterWorkerXHR = (newTarget) => {
+        const xhr = createWorkerXHR(newTarget);
         state.xhrs.add(xhr);
         addListener(xhr, "loadend", () => state.xhrs.delete(xhr));
+        return xhr;
       };
       scope.__tilefinchRegisterWorkerFileReader = (reader) => {
         state.fileReaders.add(reader);
@@ -2649,21 +2685,6 @@ globalThis.__tilefinchInstallWorker = (
       const state = workerStates.get(this);
       if (!state) throw new TypeError("Illegal invocation");
       setEventHandler(this, state.handlers, "messageerror", value);
-    }
-    /* A page's own call: in browsers worker.addEventListener is
-       EventTarget.prototype's, so a page that patches that method (zone.js)
-       sees these calls, and still does. */
-    addEventListener(type, callback, options = false) {
-      const state = workerStates.get(this);
-      if (!state) throw new TypeError("Illegal invocation");
-      return workerIntrinsics.apply(EventTarget.prototype.addEventListener,
-        this, [type, callback, options]);
-    }
-    removeEventListener(type, callback, options = false) {
-      const state = workerStates.get(this);
-      if (!state) throw new TypeError("Illegal invocation");
-      return workerIntrinsics.apply(EventTarget.prototype.removeEventListener,
-        this, [type, callback, options]);
     }
     postMessage(value) {
       const state = workerStates.get(this);

@@ -96,6 +96,245 @@ static bool make_two_generation_library(
                "Second", second, error, sizeof(error));
 }
 
+/* An allocation refusal is not evidence that all index generations are
+   absent. In particular it must not publish an empty library or sweep data. */
+static int test_index_allocation_refusal_preserves_library(
+    Budget *budget, const char *root)
+{
+    char directory[200], primary[240], payload[240];
+    snprintf(directory, sizeof(directory), "%s/refused-index", root);
+    uint32_t first = 0, second = 0;
+    CHECK(make_two_generation_library(budget, directory, &first, &second));
+    snprintf(primary, sizeof(primary), "%s/library.bin", directory);
+    snprintf(payload, sizeof(payload), "%s/%08x.video.part", directory,
+             (unsigned) second);
+    CHECK(write_whole(payload, (const unsigned char *) "part", 4));
+    static unsigned char original[64u * 1024u];
+    size_t length = 0;
+    CHECK(read_whole(primary, original, sizeof(original), &length));
+    OfflineLibrary reader;
+    offline_library_init(&reader, budget, directory);
+    budget_inject_failure_after(budget, 1); /* staged struct succeeds */
+    bool loaded = offline_library_load(&reader);
+    budget_clear_failure_injection(budget);
+    CHECK(!loaded && !reader.loaded && same_file(primary, original, length)
+          && access(payload, F_OK) == 0);
+    CHECK(offline_library_load(&reader) && reader.count == 2
+          && offline_library_find(&reader, second) != NULL
+          && access(payload, F_OK) == 0);
+    return 0;
+}
+
+static int test_index_read_refusal_preserves_library(
+    Budget *budget, const char *root)
+{
+    char directory[200], primary[240], payload[240];
+    snprintf(directory, sizeof(directory), "%s/unreadable-index", root);
+    uint32_t first = 0, second = 0;
+    CHECK(make_two_generation_library(budget, directory, &first, &second));
+    snprintf(primary, sizeof(primary), "%s/library.bin", directory);
+    snprintf(payload, sizeof(payload), "%s/%08x.video.part", directory,
+             (unsigned) second);
+    CHECK(write_whole(payload, (const unsigned char *) "part", 4));
+    static unsigned char original[64u * 1024u];
+    size_t length = 0;
+    CHECK(read_whole(primary, original, sizeof(original), &length));
+    OfflineLibrary reader;
+    offline_library_init(&reader, budget, directory);
+    CHECK(chmod(primary, 0000) == 0);
+    bool loaded = offline_library_load(&reader);
+    CHECK(chmod(primary, 0600) == 0);
+    CHECK(!loaded && !reader.loaded && same_file(primary, original, length)
+          && access(payload, F_OK) == 0);
+    CHECK(offline_library_load(&reader) && reader.count == 2
+          && offline_library_find(&reader, second) != NULL);
+    return 0;
+}
+
+/* A corrupt newest index can make an older backup the only readable
+   generation. Payloads named only by the lost generation are not orphans. */
+static int test_backup_recovery_preserves_newer_payload(
+    Budget *budget, const char *root)
+{
+    char directory[200], primary[240], payload[240];
+    snprintf(directory, sizeof(directory), "%s/older-backup", root);
+    uint32_t first = 0, second = 0;
+    CHECK(make_two_generation_library(budget, directory, &first, &second));
+    snprintf(primary, sizeof(primary), "%s/library.bin", directory);
+    snprintf(payload, sizeof(payload), "%s/%08x.video.part", directory,
+             (unsigned) second);
+    CHECK(write_whole(payload, (const unsigned char *) "part", 4));
+    CHECK(write_whole(primary, (const unsigned char *) "broken", 6));
+    for (unsigned attempt = 0; attempt < 2; attempt++) {
+        OfflineLibrary reader;
+        offline_library_init(&reader, budget, directory);
+        CHECK(offline_library_load(&reader) && reader.count == 1
+              && offline_library_find(&reader, first) != NULL
+              && access(payload, F_OK) == 0);
+    }
+    OfflineLibrary writer;
+    offline_library_init(&writer, budget, directory);
+    CHECK(offline_library_load(&writer));
+    char error[256] = {0};
+    uint32_t next = 0;
+    CHECK(offline_library_enqueue_youtube(
+              &writer, "https://www.youtube.com/watch?v=TFTEST00013",
+              "Third", &next, error, sizeof(error))
+          && next > second && access(payload, F_OK) == 0);
+    OfflineLibrary rebooted;
+    offline_library_init(&rebooted, budget, directory);
+    CHECK(offline_library_load(&rebooted)
+          && offline_library_find(&rebooted, next) != NULL
+          && access(payload, F_OK) == 0);
+    return 0;
+}
+
+/* Power lost inside replace_file after the primary moved to .bak: .tmp is
+   the complete newest generation, nothing was lost, and loading it must
+   neither keep a recovery marker nor stop the orphan sweep. */
+static int test_interrupted_save_loads_tmp_cleanly(
+    Budget *budget, const char *root)
+{
+    char directory[200], primary[240], temporary[240], marker[240];
+    char orphan[240];
+    snprintf(directory, sizeof(directory), "%s/interrupted-save", root);
+    uint32_t first = 0, second = 0;
+    CHECK(make_two_generation_library(budget, directory, &first, &second));
+    snprintf(primary, sizeof(primary), "%s/library.bin", directory);
+    snprintf(temporary, sizeof(temporary), "%s/library.bin.tmp", directory);
+    snprintf(marker, sizeof(marker), "%s/library.bin.recovered", directory);
+    snprintf(orphan, sizeof(orphan), "%s/%08x.video.part", directory,
+             (unsigned) (second + 5u));
+    CHECK(rename(primary, temporary) == 0
+          && write_whole(orphan, (const unsigned char *) "part", 4));
+    OfflineLibrary reader;
+    offline_library_init(&reader, budget, directory);
+    CHECK(offline_library_load(&reader) && reader.count == 2
+          && offline_library_find(&reader, second) != NULL
+          && reader.recovery_floor == 0
+          && access(primary, F_OK) == 0 && access(marker, F_OK) != 0
+          && access(orphan, F_OK) != 0);
+    return 0;
+}
+
+/* A damaged primary recovered from .bak keeps the lost generation's files
+   and ids, but only those: orphans above the floor are still swept, and
+   the marker goes once no unlisted file at or below the floor is left. */
+static int test_recovery_marker_floor_and_clearing(
+    Budget *budget, const char *root)
+{
+    char directory[200], primary[240], marker[240], lost[240], orphan[240];
+    snprintf(directory, sizeof(directory), "%s/recovery-floor", root);
+    uint32_t first = 0, second = 0;
+    CHECK(make_two_generation_library(budget, directory, &first, &second));
+    snprintf(primary, sizeof(primary), "%s/library.bin", directory);
+    snprintf(marker, sizeof(marker), "%s/library.bin.recovered", directory);
+    snprintf(lost, sizeof(lost), "%s/%08x.video.part", directory,
+             (unsigned) second);
+    CHECK(write_whole(lost, (const unsigned char *) "part", 4)
+          && write_whole(primary, (const unsigned char *) "broken", 6));
+    OfflineLibrary reader;
+    offline_library_init(&reader, budget, directory);
+    CHECK(offline_library_load(&reader) && reader.count == 1
+          && reader.recovery_floor == second
+          && access(lost, F_OK) == 0);
+    static unsigned char recorded[64];
+    size_t length = 0;
+    char expected[16];
+    snprintf(expected, sizeof(expected), "%08x\n", (unsigned) second);
+    CHECK(read_whole(marker, recorded, sizeof(recorded), &length)
+          && length == 9u && memcmp(recorded, expected, 9u) == 0);
+    /* An orphan above the floor, e.g. a removal cut short by power loss. */
+    char error[256] = {0};
+    uint32_t third = 0;
+    CHECK(offline_library_enqueue_youtube(
+              &reader, "https://www.youtube.com/watch?v=TFTEST00014",
+              "Third", &third, error, sizeof(error))
+          && third > second);
+    snprintf(orphan, sizeof(orphan), "%s/%08x.video.part", directory,
+             (unsigned) third);
+    CHECK(write_whole(orphan, (const unsigned char *) "part", 4)
+          && offline_library_remove(&reader, third)
+          && write_whole(orphan, (const unsigned char *) "part", 4));
+    offline_library_init(&reader, budget, directory);
+    CHECK(offline_library_load(&reader) && reader.recovery_floor == second
+          && access(lost, F_OK) == 0 && access(orphan, F_OK) != 0
+          && access(marker, F_OK) == 0);
+    /* A marker from an older build carries no floor: rescan for one. */
+    CHECK(write_whole(marker, (const unsigned char *) "1", 1));
+    offline_library_init(&reader, budget, directory);
+    CHECK(offline_library_load(&reader) && reader.recovery_floor == second
+          && access(lost, F_OK) == 0);
+    /* The user removed the lost file by hand: the floor has done its job. */
+    CHECK(unlink(lost) == 0);
+    offline_library_init(&reader, budget, directory);
+    CHECK(offline_library_load(&reader) && reader.recovery_floor == 0
+          && access(marker, F_OK) != 0);
+    offline_library_init(&reader, budget, directory);
+    CHECK(offline_library_load(&reader) && reader.recovery_floor == 0
+          && reader.count == 1);
+    return 0;
+}
+
+/* A valid header/checksum must not publish partially decoded entries when
+   the declared item count exceeds the complete records in the body. */
+static int test_partial_index_never_publishes(
+    Budget *budget, const char *root)
+{
+    char directory[200], primary[240], backup[240], payload[240];
+    snprintf(directory, sizeof(directory), "%s/partial-index", root);
+    uint32_t first = 0, second = 0;
+    CHECK(make_two_generation_library(budget, directory, &first, &second));
+    snprintf(primary, sizeof(primary), "%s/library.bin", directory);
+    snprintf(backup, sizeof(backup), "%s/library.bin.bak", directory);
+    snprintf(payload, sizeof(payload), "%s/%08x.video.part", directory,
+             (unsigned) second);
+    CHECK(write_whole(payload, (const unsigned char *) "part", 4));
+    static unsigned char truncated[64u * 1024u];
+    size_t length = 0;
+    CHECK(read_whole(backup, truncated, sizeof(truncated), &length)
+          && length > 20u && unlink(backup) == 0);
+    truncated[12] = 2u; /* two entries declared, only one complete */
+    uint32_t checksum = test_offline_hash(truncated + 20u, length - 20u);
+    for (unsigned byte = 0; byte < 4u; byte++)
+        truncated[16u + byte] = (unsigned char) (checksum >> (8u * byte));
+    CHECK(write_whole(primary, truncated, length));
+    OfflineLibrary reader;
+    offline_library_init(&reader, budget, directory);
+    CHECK(!offline_library_load(&reader) && !reader.loaded
+          && same_file(primary, truncated, length)
+          && access(payload, F_OK) == 0);
+    return 0;
+}
+
+/* A transient primary read failure during save must not overwrite a
+   previously complete .tmp generation. */
+static int test_save_read_refusal_keeps_staged_index(
+    Budget *budget, const char *root)
+{
+    char directory[200], primary[240], backup[240], temporary[240];
+    snprintf(directory, sizeof(directory), "%s/save-read-refusal", root);
+    uint32_t first = 0, second = 0;
+    CHECK(make_two_generation_library(budget, directory, &first, &second));
+    snprintf(primary, sizeof(primary), "%s/library.bin", directory);
+    snprintf(backup, sizeof(backup), "%s/library.bin.bak", directory);
+    snprintf(temporary, sizeof(temporary), "%s/library.bin.tmp", directory);
+    static unsigned char older[64u * 1024u], newer[64u * 1024u];
+    size_t older_length = 0, newer_length = 0;
+    CHECK(read_whole(backup, older, sizeof(older), &older_length)
+          && read_whole(primary, newer, sizeof(newer), &newer_length)
+          && write_whole(temporary, older, older_length));
+    OfflineLibrary writer;
+    offline_library_init(&writer, budget, directory);
+    CHECK(offline_library_load(&writer));
+    CHECK(chmod(primary, 0000) == 0);
+    bool saved = offline_library_save(&writer);
+    CHECK(chmod(primary, 0600) == 0);
+    CHECK(!saved && same_file(primary, newer, newer_length)
+          && same_file(temporary, older, older_length));
+    return 0;
+}
+
 /* IS-06: an index a later release wrote is not damage. Loading must not
    fall back past it, publish an older generation over it or sweep the
    payloads only it names. */
@@ -308,7 +547,14 @@ int main(void)
     char p2_root[200];
     snprintf(p2_root, sizeof(p2_root), "%s-p2", directory);
     CHECK(mkdir(p2_root, 0700) == 0);
-    if (test_newer_index_is_left_alone(&budget, p2_root) != 0
+    if (test_index_allocation_refusal_preserves_library(&budget, p2_root) != 0
+        || test_index_read_refusal_preserves_library(&budget, p2_root) != 0
+        || test_backup_recovery_preserves_newer_payload(&budget, p2_root) != 0
+        || test_interrupted_save_loads_tmp_cleanly(&budget, p2_root) != 0
+        || test_recovery_marker_floor_and_clearing(&budget, p2_root) != 0
+        || test_partial_index_never_publishes(&budget, p2_root) != 0
+        || test_save_read_refusal_keeps_staged_index(&budget, p2_root) != 0
+        || test_newer_index_is_left_alone(&budget, p2_root) != 0
         || test_unwritable_index_still_opens(&budget, p2_root) != 0
         || test_removed_download_is_finished(&budget, p2_root) != 0
         || test_icon_refill_keeps_listed_icons(&budget, p2_root) != 0)
@@ -579,6 +825,20 @@ int main(void)
                         manifest.display_mode), "Standalone") == 0
           && strcmp(manifest.icon_url,
                     "https://example.test/icon.png") == 0);
+    /* SVG icons are rasterized at install; a type no decoder takes is
+       skipped. */
+    static const char vector_json[] =
+        "{\"icons\":[{\"src\":\"a.gif\",\"type\":\"image/gif\"},"
+        "{\"src\":\"icon.svg\",\"sizes\":\"any\","
+        "\"type\":\"image/svg+xml\"}]}";
+    TilefinchWebAppManifest vector_manifest = {0};
+    CHECK(tilefinch_web_app_manifest_parse(
+              vector_json, sizeof(vector_json) - 1u,
+              "https://example.test/app.webmanifest",
+              "https://example.test/game", &vector_manifest,
+              error, sizeof(error))
+          && strcmp(vector_manifest.icon_url,
+                    "https://example.test/icon.svg") == 0);
     CHECK(!tilefinch_web_app_manifest_parse(
               manifest_json, sizeof(manifest_json) - 1u,
               "https://other.test/app.webmanifest",
@@ -839,6 +1099,10 @@ int main(void)
     (void) unlink(index);
     (void) unlink(index_temporary);
     (void) unlink(index_backup);
+    char recovery_marker[240];
+    snprintf(recovery_marker, sizeof(recovery_marker),
+             "%s/library.bin.recovered", directory);
+    (void) unlink(recovery_marker);
     CHECK(rmdir(directory) == 0);
     document_destroy(&document);
     CHECK(budget_uninstall_lexbor(&budget));

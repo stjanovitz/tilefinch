@@ -668,6 +668,7 @@ int main(void)
     CHECK(config.window_kb == 4096);
     CHECK(config.lazy_functions == -1);
     CHECK(config.page_task_yield == -1);
+    CHECK(config.interface_snapshot == -1);
     CHECK(config.file_kb == 4096);
     CHECK(config.total_mb == 16);
     CHECK(config.css_width == 480);
@@ -740,6 +741,12 @@ int main(void)
     config.page_task_yield = 0;
     CHECK(psp_boot_config_validate(&config, &invalid));
     config.page_task_yield = -1;
+    config.interface_snapshot = 2;
+    CHECK(!psp_boot_config_validate(&config, &invalid)
+          && strcmp(invalid, "interface_snapshot") == 0);
+    config.interface_snapshot = 0;
+    CHECK(psp_boot_config_validate(&config, &invalid));
+    config.interface_snapshot = -1;
     config.validation_js_profile = 2;
     CHECK(!psp_boot_config_validate(&config, &invalid)
           && strcmp(invalid, "validation_js_profile") == 0);

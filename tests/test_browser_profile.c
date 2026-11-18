@@ -1241,6 +1241,27 @@ int main(void)
     CHECK(chmod(torn_path, 0600) == 0);
     CHECK(transient_loaded && file_present(torn_path));
     browser_profile_destroy(transient);
+    /* Refuse only the primary's allocation, letting the older backup
+       load. Subsequent successful storage I/O is not authority to save
+       the stale image, even across several ordinary autosave attempts. */
+    CHECK(browser_profile_add_bookmark(
+              profile, "https://recent.example/bookmark", "Newer")
+          && browser_profile_save(profile, torn_path));
+    transient = browser_profile_create(&budget);
+    CHECK(transient != NULL);
+    budget_inject_failure_after(&budget, 0);
+    CHECK(browser_profile_load(transient, torn_path)
+          && browser_profile_bookmark_count(transient) == 2);
+    browser_profile_set_page_font_percent(transient, 140);
+    CHECK(!browser_profile_save(transient, torn_path)
+          && !browser_profile_save(transient, torn_path));
+    CHECK(browser_profile_load(transient, torn_path)
+          && browser_profile_bookmark_count(transient) == 3
+          && browser_profile_save(transient, torn_path));
+    browser_profile_destroy(transient);
+    CHECK(browser_profile_remove_bookmark(profile, "https://recent.example/bookmark")
+          && browser_profile_save(profile, torn_path)
+          && browser_profile_save(profile, torn_path));
     /* A syntactically valid prefix without its terminating newline is a torn
        primary too. It must not be accepted with defaulted-away tail records
        while a complete backup is available. */

@@ -54,10 +54,6 @@ a password, accepting only fills in the field: press Start on the focused
 field to send the form (in Danzeff, R+Start accepts and sends at once). A
 multi-line text box is never sent this way.
 
-Web pages see this typing as they see a phone's keyboard: the text you
-accept arrives as one finished entry, and pressing Cross on a link or button
-reaches the page as the Enter key, as on a TV browser.
-
 Address completion stays on the PSP. URL history contributes only when you
 have turned history on.
 
@@ -143,7 +139,7 @@ They solve different problems:
 |---|---|---|
 | Purpose | Nicer reading of a page that works | Rescuing a page that is broken |
 | What it keeps | Just the main article, listing or media | Nearly all real content: links, navigation, tables and simple search forms |
-| Turns on by itself | Only with **Auto Reader** (off by default), page by page, on clear article, listing or media pages (an article needs a title and mostly prose), even when nothing failed; a short note says so | When scripts failed and the page is blank, hidden or unusable, as set by **Basic view fallback** (Automatic, Ask or Off; Automatic by default) |
+| Turns on by itself | Only with **Auto Reader** (off by default), page by page, on clear article, listing or media pages, even when nothing failed; a short note says so | When scripts failed and the page is blank, hidden or unusable, and for a site whose scripts ran out of memory last time, as set by **Basic view fallback** (Automatic, Ask or Off; Automatic by default) |
 | Manual toggle | **Menu → Page tools → Reader mode** | **Menu → Page tools → Basic view** |
 | Settings | **Menu → Settings → Appearance → Auto Reader**; **Menu → Page tools → Site information → Permissions & controls → Always Reader** for one site | **Menu → Settings → Browsing & input → Basic view fallback** |
 
@@ -170,13 +166,12 @@ articles, apps, videos and files in all.
   file to the Memory Stick after you confirm. Common archive links,
   attachment responses and homebrew binary links offer this directly.
   Downloads never install or run automatically. **Save file?**, Downloads
-  and the saved file's page show the file's own name in any language, such
-  as an Arabic, Hebrew or Japanese name. On the Memory Stick each character
-  outside plain English letters, digits and punctuation is spelled as `%`
-  and two hexadecimal digits for each of its bytes (`صورة.jpg` is
-  `%D8%B5%D9%88%D8%B1%D8%A9.jpg`), after the item's number; the saved
-  file's page shows that path, which is where a USB copy finds it. A name
-  too long for the Library keeps its extension.
+  and the saved file's page show the file's own name in any language. On the
+  Memory Stick the name follows the item's number, and each character other
+  than plain English letters, digits and punctuation is spelled as `%` and
+  hexadecimal digits (`صورة.jpg` is stored as
+  `%D8%B5%D9%88%D8%B1%D8%A9.jpg`). The saved file's page shows that path,
+  which is where you find the file over USB.
 - **YouTube videos.** **Save video offline** on a video's page downloads it
   at your **Menu → Settings → Video → YouTube** quality.
 
@@ -189,18 +184,18 @@ A completed homebrew ZIP offers **Details → Install homebrew?**, with a
 separate confirmation that shows where it will go. It installs one checked
 app folder under `PSP/GAME`, refuses folders that already exist and keeps the
 ZIP. A ZIP with the app's files at its top level installs to a folder named
-after the download; when that name has letters other than plain English ones
-or is too long, the folder is `APP-` and a number instead, and the
-confirmation and **Installed homebrew** still show the download's name. Circle cancels and removes the current attempt's temporary files.
+after the download. When that name has letters other than plain English ones,
+or is too long, the folder is `APP-` and a number instead; the confirmation
+and **Installed homebrew** still show the download's name. Circle cancels
+and removes the current attempt's temporary files.
 **Downloads → Installed homebrew** removes a Tilefinch-installed app even
 after its ZIP is gone, with a separate confirmation warning that saved data
 inside the app folder is removed too. Other apps are not touched.
 
-While the Library holds a downloaded file, older Tilefinch versions cannot
-read it; while it holds a file whose name is not all plain English letters,
-digits and punctuation, versions before that name was kept cannot read it
-either. If you return to an earlier version with safe start or the update
-picker, that version does not show your saved items.
+Some earlier Tilefinch versions cannot read a Library that holds a
+downloaded file, or a file whose name uses other letters. If you return to
+such a version with safe start or the update picker, it does not show your
+saved items.
 
 [The offline library reference](OFFLINE_LIBRARY.md) has the formats and
 limits.
@@ -208,9 +203,8 @@ limits.
 ## Native video player
 
 YouTube results and compatible page videos open in the same native player.
-Some posterless video cards show the linked article's preview image instead
-of a blank box. This does not mean the video format is supported; unsupported
-videos still show the player's normal explanation when opened.
+A video card without a picture of its own may show the linked article's
+preview image; that does not mean the video can play.
 
 - Cross pauses or resumes. D-pad Left/Right previews a seek 10 seconds back
   or forward, L/R a minute, and the analog stick scrubs; Cross confirms the
@@ -271,22 +265,21 @@ directly. Audio gets a listening screen instead of an empty picture: the
 station or track name across the top (the station's own name when it sends
 one, otherwise the audio's or the page's title), whether it is playing,
 paused, buffering or reconnecting, the station's genre, and the server the
-audio comes from. A file shows its length and seeks if its server allows it;
-a radio stream shows **LIVE** with how long you have been listening and
-plays until you press Circle or leave the page. Cross pauses and resumes. A
-station that drops reconnects on its own and says **Reconnecting...**
-meanwhile. The player keeps only a few seconds of a stream in memory and
-never saves it to the Memory Stick. AAC radio streams (`audio/aacp`) and Ogg are not
-supported.
+audio comes from. A file shows its length and seeks if its server allows it; a
+radio stream shows **LIVE** with how long you have been listening and plays
+until you press Circle or leave the page. Cross pauses and resumes. A station
+that drops reconnects on its own and says **Reconnecting...** meanwhile. The
+player keeps only a few seconds of a stream in memory and never saves it to
+the Memory Stick. AAC radio streams (`audio/aacp`) and Ogg are not supported.
 
-Radio directories such as SHOUTcast are secure (HTTPS) pages whose stations
-often stream only over plain HTTP. When a station has no encrypted stream,
-the player asks **PLAY UNENCRYPTED AUDIO?** once for that site. **X Play
-anyway** plays it and lets that site's radio streams use plain HTTP until you
-exit Tilefinch; nothing else on the page loses its protection. **O Back**
-declines, and the site is not asked again until you exit or change it under
-**Permissions & controls → Unencrypted audio**. While such a station plays,
-the listening screen marks it **Not encrypted** beside the server's name.
+Many radio directories are secure (HTTPS) pages whose stations often stream
+only over plain HTTP. When a station has no encrypted stream, the player asks
+**PLAY UNENCRYPTED AUDIO?** once for that site. **X Play anyway** plays it and
+lets that site's radio streams use plain HTTP until you exit Tilefinch;
+nothing else on the page loses its protection. **O Back** declines, and the
+site is not asked again until you exit or change it under **Permissions &
+controls → Unencrypted audio**. While such a station plays, the listening
+screen marks it **Not encrypted** beside the server's name.
 
 ## YouTube
 
@@ -320,11 +313,8 @@ Search results, channel pages and feeds mark a live stream with a red
 scheduled stream or premiere with YouTube's **Upcoming** label and its start
 time. Selecting an upcoming stream opens its page rather than playing it.
 
-**Sign in** in the homepage header opens Google's sign-in page. On that page
-Tilefinch names itself plainly as Tilefinch on a PSP, for which Google sends
-a lighter sign-in page that fits the PSP's memory. The page runs a security
-check before it accepts your account, so it takes noticeably longer than
-other pages to settle. Once signed
+**Sign in** in the homepage header opens Google's sign-in page, which takes
+noticeably longer than other pages to settle. Once signed
 in, recommendations replace the generic topics, and **Subscriptions** opens
 your subscription feed. A status line shows when suggestions are reloading.
 If you have moved down into the page, new results wait behind **Refresh
@@ -333,17 +323,13 @@ appear automatically. When your most recent YouTube history entry is not
 already suggested, a **Recently watched** card shows it, with a resume link
 when YouTube supplies the position.
 
-Google decides which browsers may sign in. If it answers your email with
-its **Couldn't sign you in** page, Tilefinch shows that page and adds
-**Google refused sign-in from this browser**. Tilefinch does not try again
-or pretend to be another browser; YouTube keeps working without an account.
-
 If signing in ends on another Google page instead of returning to YouTube,
 choose **Menu → Page tools → Continue to YouTube**. It finishes the sign-in
 without sending your password again, and YouTube's homepage then checks the
-login.
-If sign-in still seems to do nothing, see
+login. If Google refuses to sign this browser in, or sign-in still seems to
+do nothing, see
 [YouTube sign-in does nothing](../TROUBLESHOOTING.md#youtube-sign-in-does-nothing).
+YouTube keeps working without an account.
 
 In the signed-in header, **Account** opens a small panel for feed navigation,
 switching accounts, **Watch Later**, **History**, **Playlists** and **Sign
@@ -371,27 +357,25 @@ offers **Sign in**. The bottom hint bar names the focused icon's action;
 when the bars have hidden themselves, moving to another icon brings the hint
 bar back until the controls go idle again.
 
-In the player, Cross pauses, D-pad Left/Right seeks 10 seconds, L/R a
-minute, Square turns captions on or off, Triangle opens chapters, audio and
-subtitles, and Circle closes the video. The player's hints list the same
-buttons; see [Native video player](#native-video-player).
+The player's buttons are those of the
+[native video player](#native-video-player), and its hints list them.
 
 When YouTube declares chapters, a collapsible **Chapters** list starts the
 video at the selected timestamp. **Up next** lists up to 12 suggestions,
 without ads, Shorts shelves or mixes; a suggested playlist appears as a
 playlist card.
 
-A channel page shows the channel's banner, picture, name, subscriber count
-and a line of its description. **Menu → Settings → Video → Channel banners**
+A channel page shows the channel's banner, picture, name, subscriber count and
+a line of its description. **Menu → Settings → Video → Channel banners**
 (**Show** by default) set to **Hide** leaves the banner out: it is not
-downloaded, which saves several hundred KiB of memory and brings the tabs
-onto the first screen. The change applies from the next channel page you
-open. Selecting the description line opens the full
-description with the channel's links, view count and join date; **Back to
-channel** returns. **Home**, **Videos**, **Shorts** and **Playlists** tabs sit
-under the header. Home shows the shelves the channel arranges, each under its
-own heading with **See all** where the shelf has one, named after the shelf; Videos lists the latest
-uploads, with **More videos** for the next page.
+downloaded, which saves memory and brings the tabs onto the first screen. The
+change applies from the next channel page you open. Selecting the description
+line opens the full description with the channel's links, view count and join
+date; **Back to channel** returns. **Home**, **Videos**, **Shorts** and
+**Playlists** tabs sit under the header. Home shows the shelves the channel
+arranges, each under its own heading with **See all** where the shelf has one,
+named after the shelf; Videos lists the latest uploads, with **More videos**
+for the next page.
 
 Signed in, the bell beside the channel name subscribes. On a channel page a
 lit bell means you are subscribed, and selecting it unsubscribes; when
@@ -449,9 +433,8 @@ emoji → Interface language**. Choose with Left/Right and press Cross to
 install; press Cross again while it installs to cancel. English, Spanish,
 French, German, Japanese, Russian, Ukrainian, Simplified Chinese, Korean,
 Hindi, Arabic, Portuguese, Bengali, Assamese and Hebrew are available. The
-Hebrew translation, and the newest labels in the other languages (the
-page's bottom bar, Collections, Settings descriptions), have not been
-reviewed by native speakers. Languages
+Hebrew translation, and some labels in the other languages, have not yet
+been reviewed by native speakers. Languages
 that need extra glyphs also download their font pack. Restart to apply. This
 is separate from page fonts and preferred audio/subtitle languages; it does
 not translate websites or games. Advanced messages not yet translated stay
@@ -515,12 +498,10 @@ Language & emoji**:
 - choose the **Language**, then select **Language pack** and press Cross
   (**X Download pack**). The menu downloads at once, without the size
   question. After any install the selected language and color-emoji packs
-  are attached again straight away, with no restart. If a download or install
-  fails, a notice gives the reason and the row offers **Try again**. The
-  reason names the cause: the server's HTTP status (for example `HTTP 404`),
-  **NOT ENOUGH MEMORY FOR FONT PACK**, **FONT PACK FOLDER COULD NOT BE
-  CREATED** when the Memory Stick refuses the pack's folder, or **FONT PACK
-  INSTALL COULD NOT START**;
+  are back straight away, with no restart. If a download or install fails,
+  a notice names the cause, such as the server's HTTP status (`HTTP 404`),
+  **NOT ENOUGH MEMORY FOR FONT PACK** or **FONT PACK FOLDER COULD NOT BE
+  CREATED**, and the row offers **Try again**;
 - Square removes an installed pack;
 - **Offer language packs** turns the notice off (**Off**) or back on
   (**Ask**, the default);
@@ -566,12 +547,11 @@ USB when space runs low.
 ## Pages that move on by themselves
 
 Some pages forward you elsewhere after a moment, or reload themselves every
-few minutes, with a refresh instruction rather than JavaScript (a link
-redirector's "Continue" page is a common one). Tilefinch follows these with
-JavaScript on or off, and the page it leaves is not kept as a step back
-(the same goes for a page that forwards you with JavaScript's
-`location.replace`). Typing into a box on the page, or opening another page,
-stops a pending refresh.
+few minutes, without needing JavaScript (a link redirector's "Continue" page
+is a common one). Tilefinch follows these with JavaScript on or off, and Back
+skips the page that forwarded you, as it does for a page whose script
+replaced itself with another. Typing into a box on the page, or opening
+another page, stops a pending refresh.
 
 A page that only reloads itself does so while you leave it alone. Once you
 have pressed any button on it, Tilefinch does not pull the page out from under
@@ -589,8 +569,9 @@ again.
 A page can stop and ask you something: an alert, an OK/Cancel question, or a
 line of text to type. It appears in a plain box under **Page message** with
 the site's address, so you can tell it is the page talking and not
-Tilefinch. X answers OK (for a text question, X opens the keyboard and Start
-answers OK), O cancels, and Triangle leaves the page. From a page's second
+Tilefinch. Cross answers OK (for a text question, Cross opens the keyboard
+and Start answers OK), Circle cancels, and Triangle leaves the page. From a
+page's second
 message on, Square stops that page showing any more until it is loaded
 again. A page that keeps asking without you clicking or typing on it gets no
 more than three messages, and none while it is in the background.
@@ -608,13 +589,13 @@ address so you can tell which site is asking. Up and Down choose:
   without asking.
 - **Block** refuses, and the site is not asked again.
 
-X chooses, and O cancels without remembering anything. X takes an Allow only
-once the box has been on screen for half a second, so a button pressed as it
-opens cannot allow by accident. A page that is not on screen never asks, a
-page whose question you cancelled asks again only after you click or type on
-it, and no more than three times per visit. A frame inside a page may ask
-only when the page lets it (`allow="microphone"`), and the box then names
-the page's site, which is the one that gets the answer.
+Cross chooses, and Circle cancels without remembering anything. Cross
+allows only once the box has been on screen for half a second, so a button
+pressed as it opens cannot allow by accident. A page that is not on screen
+never asks, a page whose question you cancelled asks again only after you
+click or type on it, and no more than three times per visit. A frame inside
+a page may ask only when the page lets it, and the box then names the page's
+site, which is the one that gets the answer.
 
 While a page listens, a red microphone shows at the top right of the screen,
 over the page, the menus and full screen alike; a page cannot cover or hide
@@ -664,35 +645,31 @@ gets the same sheet titled "Too heavy for the PSP", without Retry (see
 
 ## Heavy pages
 
-Some sites are large apps: before showing anything they load megabytes of
-script, and Tilefinch estimates that the PSP needs about 10 seconds for each
-megabyte to start it (often less, when the site splits its app into pieces
-it runs as needed). Tilefinch weighs every page's scripts as they arrive, and
-when a page's scripts would take 15 seconds or more to start, what you see
-depends on what the site sent (laying out and drawing what they build takes
-time on top):
+Some sites are large apps that load megabytes of script before they show
+anything, and the PSP takes a long time to start them. Tilefinch weighs each
+page's scripts as they arrive. When they would take a long time to start,
+what you see depends on what the site sent (laying out and drawing what the
+scripts build takes time on top):
 
 - **The page already shows its text**, as news front pages and most
   articles do. Its scripts keep running in the background and you can read
   and scroll at once. A status says how much script the page runs and
   roughly how long it takes; while it shows, Cross stops the page's scripts
-  (Circle keeps reading). It comes back once more, as "Page scripts are
-  running low on memory", if the page's scripts have been refused memory
-  and little is left; a page that is merely near its limit but got
-  everything it asked for is not warned. Stopping scripts keeps the page as it is; if that leaves it blank
-  or without links, **Basic view fallback** takes over as usual. If the
-  scripts run out of memory and wipe the page as they fail, Tilefinch puts
-  back the page the site sent, stops its scripts and says "Page scripts
-  stopped: not enough memory".
+  and Circle keeps reading. If the scripts are later refused memory and
+  little is left, the status comes back once as **PAGE SCRIPTS ARE RUNNING
+  LOW ON MEMORY**. Stopping scripts keeps the page as it is; if that leaves
+  it blank or without links, **Basic view fallback** takes over as usual. If
+  the scripts run out of memory and wipe the page as they fail, Tilefinch
+  puts back the page the site sent, stops its scripts and says **PAGE
+  SCRIPTS STOPPED: NOT ENOUGH MEMORY**.
 - **The page is an empty shell for an app**, as some social sites send when
   you are logged out. Basic view cannot help there, so Tilefinch asks first,
-  with the size and an estimate, for example "It needs about 5.1 MB of
-  script. It may take about 51 s to start." Cross starts it for this
-  session, Triangle always for this site, and Circle (or Select) does not
-  start it and leaves the page as it is. The app's big scripts wait while
-  you decide; nothing else on the page stops. When a shell's scripts all
-  came with the page itself, so there is nothing to hold back, you see the
-  status above instead, titled "Large app starting".
+  with the script's size and an estimate of how long it takes to start.
+  Cross starts it for this session, Triangle always for this site, and
+  Circle (or Select) leaves the page as it is without starting it. Only the
+  app's big scripts wait while you decide. When a shell's scripts all came
+  with the page itself, so there is nothing to hold back, you see the status
+  above instead, titled **LARGE APP STARTING**.
 - **The app cannot fit, even in the best case.** Tilefinch does not start
   it. On an empty app shell it says how much memory the app would need
   against what is free (or that its script is over the 4 MB limit) and
@@ -701,52 +678,45 @@ time on top):
   On a page that already shows its content, a status says a large page
   script was skipped and you keep reading.
 
-A frame inside a page (a bot check such as DataDome's, an embedded player)
-is weighed by itself: any of its scripts of 256 KB or more is asked about,
-whatever the rest of the page weighs, because such scripts often take far
-longer on the PSP than their size suggests. The question names the frame's
-site and its script's size ("A frame has a large script ... It may take a
-minute or more"); it comes after any question about the page itself, so a
-page whose own app cannot fit still asks about its frame. The frame stays
-empty while you decide. Cross starts it with the script; Circle (or Select)
-loads it without, so it shows what it would show without that script (a bot
-check then usually cannot be completed). There is no "always" for a frame,
-and the answer covers only the page's frames, so you are asked at most once
-per page about them; it does not answer the page's own scripts or change
-the site's Heavy pages choice.
+A frame inside a page, such as a bot check or an embedded player, is asked
+about by itself when it has a large script, whatever the rest of the page
+weighs, because such scripts often take far longer on the PSP than their
+size suggests. The question names the frame's site and its script's size,
+and comes after any question about the page itself. The frame stays empty
+while you decide. Cross starts it with the script; Circle (or Select) loads
+it without, so it shows what it would show without that script (a bot check
+then usually cannot be completed). You are asked at most once per page about
+its frames, and there is no "always" choice. The answer does not cover the
+page's own scripts or change the site's **Heavy pages** choice.
 
 When a page's scripts stop because they ran out of memory, Tilefinch
 remembers the site (only its name, for the last 8 such sites) while **URL
-history** is on; turning history off forgets these notes, and removing a page
-from history forgets its site's note. What the next page you open on that
-site does depends on **Basic view fallback**
-([Basic view](BASIC_VIEW.md#opening-in-basic-view-by-default)):
+history** is on. What the next page you open on that site does depends on
+**Basic view fallback**:
 
 - **Automatic** (the default) opens it in Basic view, loaded without its
-  scripts, with the note "Basic view: scripts ran out of memory last time".
-  Cross (**X Try full page**) loads the full page with its scripts this
-  once; Circle keeps Basic view. **Menu → Page tools → Try full page** does
-  the same while the page is open. Only the first such page of a site in a
-  session takes Cross and Circle; later ones show the note without taking
-  buttons. When the full page loads, the note is forgotten and the site
-  opens normally until its scripts run out of memory again. A form's result
-  (a POST) is never opened this way. A page whose form fields Basic view
-  would leave out, a page with almost no text without its scripts, or a
-  redirect to another site loads in full instead, and its site gets the
-  question below; the site is remembered (while **URL history** is on) so
-  later visits load in full at once.
-- **Ask** and **Off** say "This page ran out of script memory last time" and
-  ask **Load without scripts?**: Cross turns off JavaScript for the site and
-  reloads the page, which then opens as the server sent it, much faster and
-  in far less memory; Circle keeps scripts on and forgets the note until it
-  happens again. An offer you let pass without an answer (it runs out, or
-  you go on to another page) is not shown for that site again until the
-  browser restarts.
+  scripts, with the note **BASIC VIEW: SCRIPTS RAN OUT OF MEMORY LAST
+  TIME**. Cross (**X Try full page**) loads the full page with its scripts
+  this once; Circle keeps Basic view. **Menu → Page tools → Try full page**
+  does the same while the page is open, including on the site's later pages
+  in the same session, whose note does not take Cross or Circle. Once the
+  full page loads, the note is forgotten. A page that Basic view would not
+  serve well, such as one with form fields it would leave out, loads in full
+  instead and its site gets the question below.
+  [Opening in Basic view by default](BASIC_VIEW.md#opening-in-basic-view-by-default)
+  has the exact rules.
+- **Ask** and **Off** say **THIS PAGE RAN OUT OF SCRIPT MEMORY LAST TIME**
+  and ask **Load without scripts?**: Cross turns off JavaScript for the site
+  and reloads the page, which then opens as the server sent it, much faster
+  and in far less memory; Circle keeps scripts on and forgets the note until
+  it happens again. If you let the question pass without answering, it is
+  not shown for that site again until you restart Tilefinch.
 
 Neither turns the site's JavaScript setting off by itself. **Menu → Page
 tools → Site information → Permissions & controls → JavaScript** turns it
-back on after you chose **Load without scripts?**, and **Reset permissions**
-in **Site information** forgets the note.
+back on after you chose **Load without scripts?**. Turning **URL history**
+off, removing a page from history, or **Reset permissions** in **Site
+information** forgets the site's note.
 
 **Menu → Settings → Browsing & input → Heavy pages** chooses **Ask** (the
 default, as above), **Run** (never ask; scripts still show their status) or
@@ -755,11 +725,11 @@ cannot fit; the page stays as the server sent it). The sites you chose to
 always run are remembered on the Memory Stick with your settings; **Reset
 permissions** in a site's **Site information** forgets the choice.
 
-A single script may be up to 4 MB. Whether it runs depends on the memory its
-compile needs, usually about twice its size and sometimes much more. A script
-that needs more than the page has free is refused on its own, and the rest of
-the page's scripts keep running. If large sites stay empty with a script
-error, see
+A single script may be up to 4 MB. Whether it runs depends on the memory it
+needs to start, usually about twice its size and sometimes much more. A
+script that needs more than the page has free is refused on its own, and the
+rest of the page's scripts keep running. If large sites stay empty with a
+script error, see
 [A site misbehaves because of its scripts](../TROUBLESHOOTING.md#a-site-misbehaves-because-of-its-scripts).
 
 ## Faster revisits: Keep compiled scripts
@@ -795,18 +765,16 @@ that cannot change on the current page says why when you press Cross.
   JavaScript** applies to Wikipedia's language subdomains too, and **Reset
   permissions** restores the default. Other sites are unaffected.
 - **Ad blocking.** Basic blocking and conservative cosmetic hiding are on by
-  default. Basic refuses third-party ad hosts and the scripts of tag managers
-  (such as Google Tag Manager) and A/B testing services (such as Optimizely),
-  which are large and slow pages down while they load. **Menu → Settings →
-  Privacy & security → Content blocker** chooses Off, Basic, or Custom,
-  **Hide page ads** controls only the cosmetic hiding, and **Paywall scripts
-  → Block** makes Basic refuse paywall and subscription SDKs (such as Piano)
-  too; they are allowed by default. **Permissions & controls → Content
-  blocking** turns blocking off for the current site, and **Blocked here**
-  shows how many requests were blocked while the page loaded. Basic reads
-  no list from the Memory Stick; Custom reads
-  `data/adblock.txt`, and **Load allowlist** imports extra site exceptions
-  from `data/adblock-allow.txt`, up to 32 sites in all.
+  default. Basic refuses third-party ad hosts and the tag-manager and A/B
+  testing scripts that are large and slow pages down while they load.
+  **Menu → Settings → Privacy & security → Content blocker** chooses Off,
+  Basic, or Custom; **Hide page ads** controls only the cosmetic hiding; and
+  **Paywall scripts → Block** makes Basic refuse paywall and subscription
+  scripts too (they are allowed by default). **Permissions & controls →
+  Content blocking** turns blocking off for the current site, and **Blocked
+  here** shows how many requests were blocked while the page loaded. Custom
+  reads `data/adblock.txt`, and **Load allowlist** imports extra site
+  exceptions from `data/adblock-allow.txt`, up to 32 sites in all.
   [The content-blocking reference](CONTENT_BLOCKING.md) lists the built-in
   hosts and selectors, the accepted custom syntax, and the limits.
 - **Cookie notices.** Common consent overlays are hidden by default without

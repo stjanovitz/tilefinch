@@ -33,6 +33,8 @@ PspTabRequestResult psp_tabs_request(
 bool psp_tabs_finish(
     BrowserTabs *tabs, BrowserEngine *engine, PspTabTransition *transition,
     bool succeeded, bool hibernation_enabled, const char *hibernation_path);
+bool psp_tabs_restore_startup(BrowserTabs *tabs, BrowserEngine *engine,
+                              const char *path);
 bool psp_tabs_finish_native_home(
     BrowserTabs *tabs, PspTabTransition *transition, bool hibernation_enabled,
     const char *hibernation_path);

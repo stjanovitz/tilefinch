@@ -121,7 +121,10 @@
 #define PSP_VRAM_STRIDE 512
 #define MIB (1024u * 1024u)
 #define KIB 1024u
-#define PSP_STARTUP_BACKGROUND 0x0843u
+/* The ground behind startup and the first page frame: the selected
+   palette's (the default one until the profile names another), never a
+   fixed color from an older palette. */
+#define PSP_STARTUP_BACKGROUND (psp_ui_theme_active_palette->ground)
 
 #define PSP_MEDIA_PREVIEW_WIDTH 128
 #define PSP_MEDIA_PREVIEW_HEIGHT 72

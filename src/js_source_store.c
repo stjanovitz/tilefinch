@@ -583,6 +583,23 @@ size_t script_source_store_text_bytes(const ScriptSourceStore *store)
     return store == NULL ? 0 : store->stats.text_bytes;
 }
 
+size_t script_source_store_reclaimable(const ScriptSourceStore *store)
+{
+    if (store == NULL) return 0;
+    size_t total = store->stats.decode_buffer_bytes;
+    if (store->compression != SCRIPT_SOURCE_STORE_COMPRESS_NEVER)
+        total += store->stats.compressible_plain_bytes;
+    for (const SourceStoreEntry *entry = store->entries; entry != NULL;
+         entry = entry->next) {
+        if (entry->required || entry->leases != 0) continue;
+        total += entry_table_bytes(entry->block_count);
+        for (uint32_t i = 0; i < entry->block_count; i++)
+            if (entry->blocks[i].data != NULL)
+                total += block_held_bytes(entry, i);
+    }
+    return total;
+}
+
 void script_source_store_stats(const ScriptSourceStore *store,
                                ScriptSourceStoreStats *stats)
 {

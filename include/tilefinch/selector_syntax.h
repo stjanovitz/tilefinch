@@ -14,6 +14,11 @@
    capped at SELECTOR_SYNTAX_NESTING_LIMIT. */
 #define SELECTOR_SYNTAX_NESTING_LIMIT 16u
 
-bool selector_syntax_valid(const char *text, size_t length);
+bool selector_syntax_valid_mode(const char *text, size_t length, bool forgiving);
+
+static inline bool selector_syntax_valid(const char *text, size_t length)
+{
+    return selector_syntax_valid_mode(text, length, false);
+}
 
 #endif

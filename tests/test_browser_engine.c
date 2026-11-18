@@ -344,6 +344,8 @@ static bool capture_provisional_present(
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--scroll-after-growth-only") == 0)
+        return test_scroll_after_document_growth();
     if (argc == 2 && strcmp(argv[1], "--layout-jump-only") == 0)
         return test_layout_jump();
     if (argc == 2 && strcmp(argv[1], "--scroll-noop-only") == 0)
@@ -611,6 +613,7 @@ int main(int argc, char **argv)
     CHECK(test_grid_auto_row_stretch_and_focus_clip() == 0);
     CHECK(test_inset_pseudo_disc() == 0);
     CHECK(test_night_mode_prefers_dark() == 0);
+    CHECK(test_scroll_after_document_growth() == 0);
     CHECK(test_declared_var_and_script_form_submission() == 0);
     CHECK(test_native_form_submission_sends_script_entries() == 0);
     CHECK(test_native_form_submission_large_bodies() == 0);

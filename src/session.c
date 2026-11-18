@@ -3277,6 +3277,25 @@ static bool cache_entry_is_script_body(const BrowserSession *session,
         && entry->resource_grant.destination == TILEFINCH_DESTINATION_SCRIPT;
 }
 
+size_t browser_session_admission_reclaimable_bytes(
+    const BrowserSession *session)
+{
+    if (session == NULL) return 0;
+    size_t total = browser_session_script_disk_queue_bytes(session);
+    for (int k = 0; k < (int) BROWSER_SCRIPT_BYTECODE_KINDS; k++)
+        total += browser_session_script_bytecode_bytes(
+            session, (BrowserScriptBytecodeKind) k);
+    for (size_t i = 0; i < BROWSER_CACHE_ENTRIES; i++) {
+        const BrowserCacheEntry *entry = &session->cache[i];
+        if (entry->decoded_image_pixels != NULL
+            && entry->decoded_image_pixels->references == 1u)
+            total += entry->decoded_image_pixels->length;
+        if (cache_entry_is_script_body(session, entry))
+            total += entry->body->length;
+    }
+    return total;
+}
+
 size_t browser_session_cache_release_script_bodies(BrowserSession *session,
                                                    size_t target_bytes)
 {
@@ -3488,6 +3507,29 @@ size_t browser_session_cache_collect_offline_same_origin(
     if (total_bytes != NULL) *total_bytes = bytes;
     if (complete != NULL) *complete = all;
     return count;
+}
+
+bool browser_session_cache_offline_holds(
+    BrowserSession *session, const char *document_url, const char *url,
+    size_t *bytes, size_t *count)
+{
+    size_t total = 0, entries = 0;
+    bool held = false;
+    char origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
+    if (session != NULL && document_url != NULL
+        && tilefinch_url_origin(document_url, origin, sizeof(origin))
+        && offline_deferred_materialize_origin(session, origin))
+        for (size_t at = 0; at < BROWSER_CACHE_ENTRIES; at++) {
+            BrowserOfflineCacheView view;
+            if (!offline_cache_entry_view(&session->cache[at], origin,
+                                          &view)) continue;
+            total += view.length;
+            entries++;
+            if (url != NULL && strcmp(view.url, url) == 0) held = true;
+        }
+    if (bytes != NULL) *bytes = total;
+    if (count != NULL) *count = entries;
+    return held;
 }
 
 static bool offline_restore_resource_body(

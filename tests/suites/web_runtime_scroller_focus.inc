@@ -446,6 +446,62 @@ static int test_scroller_focus_hits_match_exact_path(void)
     return 0;
 }
 
+/* Hit tests reject regions before a node's sticky offset is found (it
+   walks every sticky range and the node's ancestors), widening the
+   rejection by how far the stuck ranges move content. A stuck top bar and
+   a bar stuck to the bottom must still be hit where the reader sees
+   them. */
+static int test_scroller_focus_stuck_sticky_hits(void)
+{
+    puts("test: pointer hits find stuck sticky bars at both edges");
+    Budget budget;
+    budget_init(&budget, 32 * MIB);
+    budget_install_lexbor(&budget);
+    static const char html[] =
+        "<!doctype html><meta name=viewport content='width=device-width'>"
+        "<style>body{margin:0}a{display:block;height:20px}"
+        "#head{position:sticky;top:0;background:#fff}"
+        "#foot{position:sticky;bottom:0;background:#fff}"
+        ".tall{height:2000px}</style>"
+        "<div id=head><a id=top href=/top>Top</a></div>"
+        "<div class=tall><a id=mid href=/mid>Mid</a></div>"
+        "<div id=foot><a id=bottom href=/bottom>Bottom</a></div>"
+        "<div class=tall></div>";
+    static ScrollerFocusPage page;
+    CHECK(scroller_focus_open(&page, &budget, html));
+    LayoutDocument *layout = &page.navigation.page.layout;
+    CHECK(layout->sticky_count == 2);
+    lxb_dom_node_t *top = scroller_focus_node(&page, "top");
+    lxb_dom_node_t *bottom = scroller_focus_node(&page, "bottom");
+    lxb_dom_node_t *mid = scroller_focus_node(&page, "mid");
+    const int scrolls[] = {0, 600, 1500};
+    for (size_t i = 0; i < sizeof(scrolls) / sizeof(scrolls[0]); i++) {
+        CHECK(navigation_set_scroll(&page.navigation, scrolls[i])
+              && scroller_focus_scroll(&page) == scrolls[i]);
+        int y = viewport_css_to_device(&layout->viewport, 5);
+        int low = viewport_css_to_device(&layout->viewport, 265);
+        bool activate = false;
+        CHECK(controller_pointer_event(&page.controller,
+                                       CONTROLLER_POINTER_MOVE, 40, y,
+                                       &activate)
+              && page.controller.pointer_hover_node == top);
+        CHECK(controller_pointer_event(&page.controller,
+                                       CONTROLLER_POINTER_MOVE, 40, low,
+                                       &activate)
+              && page.controller.pointer_hover_node == bottom);
+        if (scrolls[i] == 0)
+            CHECK(controller_pointer_event(&page.controller,
+                                           CONTROLLER_POINTER_MOVE, 40,
+                                           viewport_css_to_device(
+                                               &layout->viewport, 25),
+                                           &activate)
+                  && page.controller.pointer_hover_node == mid);
+    }
+    navigation_destroy(&page.navigation);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
 static int test_scroller_focus(void)
 {
     CHECK(test_scroller_focus_fixed_overlay() == 0);
@@ -454,5 +510,6 @@ static int test_scroller_focus(void)
     CHECK(test_scroller_focus_direction() == 0);
     CHECK(test_scroller_focus_pointer() == 0);
     CHECK(test_scroller_focus_hits_match_exact_path() == 0);
+    CHECK(test_scroller_focus_stuck_sticky_hits() == 0);
     return 0;
 }

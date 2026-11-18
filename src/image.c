@@ -988,10 +988,8 @@ void image_canvas_native_serial_advance(void)
 static void image_canvas_native_forget(ImageResource *resource)
 {
     IMAGE_CANVAS_NATIVE_SERIAL_ADVANCE();
-    if (resource == NULL || resource->canvas_native_surface == NULL) return;
-    memset(resource->canvas_native_surface, 0,
-           sizeof(*resource->canvas_native_surface));
-    resource->canvas_native_surface = NULL;
+    if (resource == NULL) return;
+    resource->canvas_native = (ImageCanvasNativeSurface) {0};
 }
 
 /* Frees the held-frame storage of `node`'s canvas (every canvas when node
@@ -1345,21 +1343,18 @@ bool image_resource_native_canvas_source(const ImageResource *image,
     if (pixels != NULL) *pixels = NULL;
     if (stride != NULL) *stride = 0u;
     if (image == NULL || pixels == NULL || stride == NULL
-        || !image->is_canvas || image->canvas_native_surface == NULL
-        || !image->canvas_native_surface->authoritative
-        || image->canvas_native_surface->pixels == NULL || image->width <= 0
+        || !image->is_canvas || !image->canvas_native.authoritative
+        || image->canvas_native.pixels == NULL || image->width <= 0
         || image->height <= 0
-        || image->canvas_native_surface->stride
-               < (size_t) image->width * 4u) {
+        || image->canvas_native.stride < (size_t) image->width * 4u) {
         return false;
     }
 #if defined(__PSP__)
-    if (image->canvas_native_surface->epoch
-        != psp_display_edram_content_epoch())
+    if (image->canvas_native.epoch != psp_display_edram_content_epoch())
         return false;
 #endif
-    *pixels = image->canvas_native_surface->pixels;
-    *stride = image->canvas_native_surface->stride;
+    *pixels = image->canvas_native.pixels;
+    *stride = image->canvas_native.stride;
     return true;
 }
 
@@ -1388,24 +1383,19 @@ bool images_set_canvas_native_surface(ImageResources *images,
         if (resource->node != node || !resource->is_canvas
             || resource->width <= 0
             || stride < (size_t) resource->width * 4u) continue;
-        size_t slot = 2u;
-        for (size_t native = 0; native < 2u; native++) {
-            if (images->canvas_native[native].node == node) {
-                slot = native;
-                break;
-            }
-            if (slot == 2u && images->canvas_native[native].node == NULL)
-                slot = native;
+        /* At most two canvases of a table borrow a native surface. */
+        size_t others = 0;
+        for (size_t j = 0; j < images->count; j++) {
+            if (images->items[j].node != node
+                && images->items[j].canvas_native.pixels != NULL) others++;
         }
-        if (slot == 2u) return false;
-        images->canvas_native[slot] = (ImageCanvasNativeSurface) {
-            .node = node,
+        if (others >= 2u) return false;
+        resource->canvas_native = (ImageCanvasNativeSurface) {
             .pixels = pixels,
             .stride = stride,
             .epoch = epoch,
             .authoritative = true
         };
-        resource->canvas_native_surface = &images->canvas_native[slot];
         IMAGE_CANVAS_NATIVE_SERIAL_ADVANCE();
         return true;
     }
@@ -1679,7 +1669,7 @@ static bool image_node_in_refresh_set(
    body, session lease, canvas or paint role. */
 static bool image_refresh_svg_lendable(const ImageResource *item)
 {
-    if (item->node == NULL || item->is_canvas || item->canvas_native_surface != NULL
+    if (item->node == NULL || item->is_canvas || item->canvas_native.pixels != NULL
         || item->width <= 0 || item->height <= 0) return false;
     if ((item->retarget_flags & IMAGE_RETARGET_VECTOR) != 0
         && item->encoded != NULL) return true;
@@ -5909,7 +5899,7 @@ bool image_resource_evictable(const ImageResource *image)
 {
     return image != NULL && !image->is_mask && !image->is_background
         && !image->is_canvas && !image->adopted_surface
-        && image->canvas_native_surface == NULL
+        && image->canvas_native.pixels == NULL
         && image->pseudo == PSEUDO_NONE && !image->borrows_previous
         && (image->retarget_flags & IMAGE_RETARGET_PINNED) == 0;
 }

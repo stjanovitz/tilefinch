@@ -1118,7 +1118,7 @@ static int test_newer_format_is_left_alone(void)
             else CHECK(newer_write(refusal_path,
                                    (const unsigned char *) "broken", 6));
         }
-        newer[8] = 2u; /* format version: the payload hash does not cover it */
+        newer[8] = 3u; /* format version: the payload hash does not cover it */
         CHECK(newer_write(newer_path, newer, newer_length));
 
         BrowserSession target;

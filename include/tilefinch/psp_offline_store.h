@@ -53,6 +53,10 @@ typedef struct {
        page again reuses the stored manifest metadata and icon. */
     char opened_app_url[OFFLINE_LIBRARY_URL_LIMIT];
     uint64_t opened_app_generation;
+    /* The Memory cache limit an app preview raised to keep the files it
+       downloaded again until the install; 0 when it raised none. Restored
+       with the preparation. */
+    size_t app_cache_limit;
 } PspOfflineStore;
 
 void psp_offline_store_init(

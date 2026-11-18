@@ -104,7 +104,8 @@ bool media_audio_source_label(const char *url, char *output, size_t size);
 /*
  * SHOUTcast's stream address. A SHOUTcast DNAS server picks what its root
  * address answers from the User-Agent: players get the stream, and web
- * browsers get a redirect to its status page, "index.html?sid=N". Both
+ * browsers get a redirect to its status page, "index.html?sid=N"; Accept,
+ * Range, Icy-MetaData and Accept-Encoding do not change that answer. Both
  * DNAS generations (v1 and v2) serve the first stream at "/;" to every
  * client; it is the address the server's own listen.pls and listen.m3u
  * playlists name. When page audio at a server root (`source`) ended at

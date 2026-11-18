@@ -4,8 +4,8 @@
      hardening.js captured, and publish private hooks with its
      defineProperty. */
   const { defineProperty, Error, TypeError, DOMException, Promise, Map, Set,
-    Array, ArrayBuffer, Uint8Array, Date, RegExp, Blob, claimHooks } =
-    globalThis.__tilefinchEventInterfaces;
+    Array, ArrayBuffer, Uint8Array, Date, RegExp, Blob, claimHooks,
+    apply: intrinsicApply } = globalThis.__tilefinchEventInterfaces;
   /* This module's hook publisher, claimed first (hardening.js); a realm
      without reserved hooks takes plain globals. */
   const publish = claimHooks?.()
@@ -32,9 +32,9 @@
   const OPEN_QUEUE_LIMIT = 32;
   const KEY_BINARY_BYTE_LIMIT = 4096;
   const databases = new Map();
+  const connectionQueues = new Map();
   const arrayIncludes = Array.prototype.includes;
   const arrayJoin = Array.prototype.join;
-  const intrinsicApply = Reflect.apply;
   /* Record identity must not be author-controllable. A page that replaces
      JSON.stringify makes records.delete(keyToken(...)) miss the entry while
      the byte and record subtraction still runs, so stats.bytes and
@@ -171,6 +171,8 @@
     } else if (value instanceof Error) {
       total += value.name.length * 2 + value.message.length * 2;
       if (typeof value.stack === "string") total += value.stack.length * 2;
+      if (Object.prototype.hasOwnProperty.call(value, "cause"))
+        total += retainedSize(value.cause, depth + 1, seen);
     } else if (
       value instanceof Boolean || value instanceof Number ||
       value instanceof String
@@ -350,7 +352,10 @@
     let current = value;
     for (let index = 0; index + 1 < parts.length; index++) {
       const part = parts[index];
-      let next = current[part];
+      /* Own properties only, as the specification injects a key: an
+         inherited step ("__proto__") would lead out of the value to
+         Object.prototype and define the page's name there. */
+      let next = Object.hasOwn(current, part) ? current[part] : undefined;
       if (next === undefined) {
         next = {};
         defineProperty(current, part, {
@@ -392,7 +397,7 @@
   };
   const assertUniqueIndexes = (store, value, primaryToken) => {
     for (const schema of store.indexes.values()) {
-      if (!schema.unique) continue;
+      if (!schema.unique || schema.building) continue;
       const wanted = new Set(
         indexKeysForValue(value, schema).map((key) => keyToken(key)),
       );
@@ -414,8 +419,9 @@
       return this[Number(index)] ?? null;
     }
   }
-  const nameList = (values) =>
-    new DOMStringList(...Array.from(values, String).sort());
+  const nameList = values =>
+    Object.freeze(new DOMStringList(...Array.from(values, String).sort()));
+  const copyKeyPath = path => Array.isArray(path) ? path.slice() : path;
   const copyStore = (store) => ({
     name: store.name,
     keyPath: Array.isArray(store.keyPath) ? [...store.keyPath] : store.keyPath,
@@ -434,6 +440,7 @@
     ),
     records: new Map(store.records),
     bytes: store.bytes,
+    revision: store.revision,
   });
   const stateUsage = (state) => {
     let records = 0,
@@ -542,13 +549,13 @@
     state.error = null;
     state.readyState = "pending";
   };
-  const succeedIDBRequest = (request, result, redispatch = false) => {
+  const succeedIDBRequest = (request, result, redispatch = false, init) => {
     const state = idbRequestState(request);
     if (state.readyState === "done" && !redispatch) return null;
     state.result = result;
     state.error = null;
     state.readyState = "done";
-    request._dispatch("success");
+    request._dispatch("success", init);
     return request._lastDispatchError;
   };
   const failIDBRequest = (request, error) => {
@@ -623,25 +630,31 @@
   }
 
   class IDBKeyRange {
+    #lower; #upper; #lowerOpen; #upperOpen;
+    #lowerValue; #upperValue;
     constructor(lower, upper, lowerOpen, upperOpen) {
-      this.lower = lower === undefined
+      this.#lower = lower === undefined
         ? undefined
         : cloneKey(validateKey(lower));
-      this.upper = upper === undefined
+      this.#upper = upper === undefined
         ? undefined
         : cloneKey(validateKey(upper));
-      this.lowerOpen = !!lowerOpen;
-      this.upperOpen = !!upperOpen;
+      this.#lowerOpen = !!lowerOpen;
+      this.#upperOpen = !!upperOpen;
     }
+    get lower() { return this.#lowerValue ??= cloneKey(this.#lower); }
+    get upper() { return this.#upperValue ??= cloneKey(this.#upper); }
+    get lowerOpen() { return this.#lowerOpen; }
+    get upperOpen() { return this.#upperOpen; }
     includes(key) {
       key = validateKey(key);
-      if (this.lower !== undefined) {
-        const compared = compareKeys(key, this.lower);
-        if (compared < 0 || (compared === 0 && this.lowerOpen)) return false;
+      if (this.#lower !== undefined) {
+        const compared = compareKeys(key, this.#lower);
+        if (compared < 0 || (compared === 0 && this.#lowerOpen)) return false;
       }
-      if (this.upper !== undefined) {
-        const compared = compareKeys(key, this.upper);
-        if (compared > 0 || (compared === 0 && this.upperOpen)) return false;
+      if (this.#upper !== undefined) {
+        const compared = compareKeys(key, this.#upper);
+        if (compared > 0 || (compared === 0 && this.#upperOpen)) return false;
       }
       return true;
     }
@@ -666,26 +679,53 @@
       return new IDBKeyRange(lower, upper, lowerOpen, upperOpen);
     }
   }
+  const keyRangeIncludes = IDBKeyRange.prototype.includes,
+    rangeIncludes = (range, key) => intrinsicApply(keyRangeIncludes, range, [key]);
   const snapshotQuery = (query) => {
     if (query === undefined || query === null) return query;
-    if (query instanceof IDBKeyRange)
-      return new IDBKeyRange(
-        query.lower,
-        query.upper,
-        query.lowerOpen,
-        query.upperOpen,
-      );
+    if (query instanceof IDBKeyRange) return query;
     return cloneKey(validateKey(query));
+  };
+  const requiredQuery = (query, count) => {
+    if (!count) throw new TypeError("A key or key range is required");
+    if (query == null) throw fail("Invalid key", "DataError");
+    return snapshotQuery(query);
+  };
+  const boundedCount = (value) => {
+    if (value === undefined) return 0;
+    const count = Math.trunc(+value);
+    if (!Number.isFinite(count) || count < 0 || count > 0xffffffff)
+      throw new TypeError("Invalid record count");
+    return count;
+  };
+  const storeFor = (source) => source.objectStore?._store ?? source._store;
+  /* Every record mutation bumps the store revision. keyRun spans the
+     latest unbroken run of mutations that all touched one key, so a store
+     cursor whose own record is the only one changed (update or delete, then
+     continue) keeps its snapshot instead of re-sorting every record. */
+  const noteStoreMutation = (store, key) => {
+    const run = store.keyRun;
+    if (key !== undefined && run && run.to === store.revision && !compareKeys(run.key, key))
+      run.to++;
+    else store.keyRun = key === undefined ? null
+      : { key, from: store.revision, to: store.revision + 1 };
+    store.revision++;
+  };
+  const assertSource = (source) => {
+    const store = storeFor(source), schema = source._schema;
+    if (source.transaction.db._state.stores.get(store.name) !== store ||
+        (schema && store.indexes.get(schema.name) !== schema))
+      throw fail("The store or index has been deleted", "InvalidStateError");
   };
   const matchesQuery = (key, query) =>
     query === undefined ||
     query === null ||
     (query instanceof IDBKeyRange
-      ? query.includes(key)
+      ? rangeIncludes(query, key)
       : compareKeys(key, query) === 0);
   const transactionScopesOverlap = (left, right) => {
-    for (const name of left.objectStoreNames) {
-      if (right.objectStoreNames.contains(name)) return true;
+    for (const name of left._scope) {
+      if (right._scope.has(name)) return true;
     }
     return false;
   };
@@ -722,7 +762,8 @@
       this.oncomplete = null;
       this.onerror = null;
       this.onabort = null;
-      this.objectStoreNames = nameList(stores);
+      this._scope = new Set(stores);
+      this._storeHandles = null;
       this._upgrade = upgrade;
       this._state = upgrade ? "active" : "pending";
       this._pending = 0;
@@ -731,6 +772,8 @@
       this._commitRequested = false;
       this._acceptingRequests = true;
       this._abortSequence = null;
+      this._operationTasks = 0;
+      this._abortEventPending = false;
       this._snapshots = new Map();
       this._lockedStores = [];
       this._upgradeSnapshot = null;
@@ -773,26 +816,41 @@
       if (upgrade) queueMicrotask(() => this._maybeComplete());
       else runTransactionQueue(state);
     }
+    get objectStoreNames() {
+      return this._objectStoreNames ??= nameList(this._upgrade
+        ? this.db._state.stores.keys() : this._scope);
+    }
+    _storeHandle(store) {
+      const handles = this._storeHandles ??= new WeakMap();
+      let handle = handles.get(store);
+      if (!handle) {
+        handle = new IDBObjectStore(this, store);
+        handles.set(store, handle);
+      }
+      return handle;
+    }
     _scheduleOperation(operation, sequence = null) {
-      return scheduleDatabaseTask(() => {
-        if (sequence && sequence.aborting) {
-          this._drainAbortSequence(sequence, false);
-          return;
-        }
-        if (this._state === "finished") {
+      const accepted = scheduleDatabaseTask(() => {
+        try {
+          if (sequence && sequence.aborting) {
+            this._drainAbortSequence(sequence, false);
+            return;
+          }
+          if (this._state !== "finished") {
+            this._acceptingRequests = true;
+            /* Close after promise jobs of the request, before the next task. */
+            if (!scheduleActivityClose(this))
+              this._abort(fail(
+                "Database task quota exceeded", "QuotaExceededError"));
+          }
           operation();
-          return;
+        } finally {
+          this._operationTasks--;
+          this._queueAbortEvent();
         }
-        this._acceptingRequests = true;
-        /* Close after all promise jobs spawned by author success/error
-           listeners, but before any previously or newly queued timer task. */
-        if (!scheduleActivityClose(this)) {
-          this._abort(fail(
-            "Database task quota exceeded", "QuotaExceededError"));
-          return;
-        }
-        operation();
       });
+      if (accepted) this._operationTasks++;
+      return accepted;
     }
     _activate() {
       if (this._state !== "pending") return;
@@ -800,7 +858,7 @@
       const state = this.db._state;
       state.activeTransactions.add(this);
       if (this.mode === "readwrite") {
-        for (const name of this.objectStoreNames) {
+        for (const name of this._scope) {
           state.writeLocks.set(name, this);
           this._lockedStores.push(name);
         }
@@ -847,6 +905,12 @@
       ) {
         sequence.continuationScheduled = scheduleDatabaseTask(() =>
           this._drainAbortSequence(sequence, true));
+        if (!sequence.continuationScheduled && !scheduleActivityClose(this)) {
+          while (sequence.cursor < sequence.operations.length)
+            sequence.operations[sequence.cursor++]();
+          this._finishAbortSequence(sequence);
+          return;
+        }
       }
       const operation = sequence.operations[sequence.cursor++];
       operation();
@@ -859,22 +923,34 @@
       this._releaseLocks();
       this._dispatch("abort");
     }
+    _queueAbortEvent() {
+      if (!this._abortEventPending || this._operationTasks) return;
+      this._abortEventPending = false;
+      const dispatch = () => {
+        this._releaseLocks();
+        this._dispatch("abort");
+      };
+      if (!scheduleDatabaseTask(dispatch)) dispatch();
+    }
     objectStore(name) {
       name = boundedName(name, 128, "Object store name");
       if (this._state === "finished" || this._state === "committing"
           || this._commitRequested || !this._acceptingRequests)
         throw fail("Transaction is inactive", "TransactionInactiveError");
-      if (!this._upgrade && !this.objectStoreNames.contains(name))
+      if (!this._upgrade && !this._scope.has(name))
         throw fail(
           "Object store is outside transaction scope",
           "NotFoundError",
         );
       const store = this.db._state.stores.get(name);
       if (!store) throw fail("Object store does not exist", "NotFoundError");
-      return new IDBObjectStore(this, store);
+      return this._storeHandle(store);
     }
     abort() {
-      this._abort(fail("Transaction aborted", "AbortError"));
+      if (this._state === "finished" || this._state === "committing" ||
+          this._commitRequested)
+        throw fail("Transaction cannot be aborted", "InvalidStateError");
+      this._abort(null);
     }
     commit() {
       if (this._state !== "active" && this._state !== "pending")
@@ -897,6 +973,7 @@
       });
     }
     _request(source, operation, write = false) {
+      assertSource(source);
       if (this._state === "finished" || this._state === "committing"
           || this._commitRequested || !this._acceptingRequests)
         throw fail("Transaction is inactive", "TransactionInactiveError");
@@ -949,6 +1026,7 @@
       return request;
     }
     _openCursor(source, entriesFactory, withValue, direction) {
+      assertSource(source);
       if (this._state === "finished" || this._state === "committing"
           || this._commitRequested || !this._acceptingRequests)
         throw fail("Transaction is inactive", "TransactionInactiveError");
@@ -993,6 +1071,7 @@
           withValue,
           direction,
           this,
+          entriesFactory,
         );
         cursor._emit();
       };
@@ -1028,6 +1107,7 @@
         this._state = "committing";
         this._state = "finished";
         this._snapshots.clear();
+        if (this._upgrade) void this.objectStoreNames;
         this._upgradeSnapshot = null;
         this._releaseLocks();
         this._dispatch("complete");
@@ -1042,10 +1122,11 @@
       const wasPending = this._state === "pending";
       this._state = "finished";
       this.error =
-        error instanceof DOMException
+        error === null || error instanceof DOMException
           ? error
           : fail(String(error), "AbortError");
       if (this._upgradeSnapshot) {
+        this._rolledBackSchema = true;
         const before = stateUsage(this.db._state),
           restored = { records: 0, bytes: 0 };
         for (const store of this._upgradeSnapshot.stores.values()) {
@@ -1056,6 +1137,8 @@
         stats.bytes += restored.bytes - before.bytes;
         this.db._state.stores = this._upgradeSnapshot.stores;
         this.db._state.version = this._upgradeSnapshot.version;
+        this.db._refreshStoreNames();
+        void this.objectStoreNames;
       } else {
         for (const [store, snapshot] of this._snapshots) {
           stats.records += snapshot.records.size - store.records.size;
@@ -1063,6 +1146,7 @@
           store.records = snapshot.records;
           store.bytes = snapshot.bytes;
           store.nextKey = snapshot.nextKey;
+          store.revision++;
         }
       }
       this._snapshots.clear();
@@ -1072,11 +1156,20 @@
         const operations = this._operations;
         this._operations = [];
         if (wasPending) this.db._state.pendingRequests -= operations.length;
-        for (const operation of operations)
-          if (!this._scheduleOperation(operation)) operation();
+        /* Reuse the ordered drain: a refused timer must never deliver a
+           later request ahead of one that was already admitted. */
+        const pending = {operations, cursor: 0, aborting: true,
+          continuationScheduled: false, finished: false};
+        this._abortSequence = pending;
+        if (!scheduleDatabaseTask(() => this._drainAbortSequence(pending, false))
+            && !scheduleActivityClose(this)) {
+          for (const operation of operations) operation();
+          this._finishAbortSequence(pending);
+        }
+        return;
       }
-      this._releaseLocks();
-      this._dispatch("abort");
+      this._abortEventPending = true;
+      this._queueAbortEvent();
     }
     _releaseLocks() {
       const state = this.db._state;
@@ -1092,15 +1185,51 @@
   }
 
   class IDBObjectStore {
+    #name; #initialName; #keyPath; #indexNames; #initialIndexNames;
     constructor(transaction, store) {
       this.transaction = transaction;
       this._store = store;
-      this.name = store.name;
-      this.keyPath = store.keyPath;
       this.autoIncrement = store.autoIncrement;
+      this.#name = this.#initialName = store.name;
+      this.#indexNames = nameList(store.indexes.keys());
+      if (transaction._upgrade) this.#initialIndexNames = this.#indexNames;
+    }
+    get name() { return this.transaction._rolledBackSchema ? this.#initialName : this.#name; }
+    set name(value) {
+      const tx = this.transaction, store = this._store, db = tx.db;
+      assertSource(this);
+      if (!tx._upgrade)
+        throw fail("Stores can only be renamed during upgrade", "InvalidStateError");
+      if (tx._state !== "active" || tx._commitRequested || !tx._acceptingRequests)
+        throw fail("Transaction is inactive", "TransactionInactiveError");
+      const name = boundedName(value, 128, "Object store name");
+      if (name === store.name) return;
+      const stores = db._state.stores;
+      if (stores.has(name)) throw fail("Object store already exists", "ConstraintError");
+      stores.set(name, store);
+      stores.delete(store.name);
+      store.name = this.#name = name;
+      db._refreshStoreNames();
+    }
+    get keyPath() {
+      return this.#keyPath === undefined
+        ? this.#keyPath = copyKeyPath(this._store.keyPath) : this.#keyPath;
     }
     get indexNames() {
-      return nameList(this._store.indexes.keys());
+      return this.transaction._rolledBackSchema
+        ? this.#initialIndexNames : this.#indexNames;
+    }
+    _refreshIndexNames() {
+      this.#indexNames = nameList(this._store.indexes.keys());
+    }
+    _indexHandle(schema) {
+      const handles = this._indexHandles ??= new WeakMap();
+      let handle = handles.get(schema);
+      if (!handle) {
+        handle = new IDBIndex(this.transaction, this, schema);
+        handles.set(schema, handle);
+      }
+      return handle;
     }
     _entries(query, count = 0) {
       const entries = [...this._store.records.values()]
@@ -1112,14 +1241,14 @@
     }
     _key(value, supplied) {
       let key = supplied;
-      if (key === undefined && this.keyPath !== null)
-        key = keyAtPath(value, this.keyPath);
+      const path = this._store.keyPath;
+      if (key === undefined && path !== null) key = keyAtPath(value, path);
       const generated = key === undefined && this.autoIncrement;
       if (generated) {
         if (!Number.isFinite(this._store.nextKey))
           throw fail("The key generator is exhausted", "ConstraintError");
         key = this._store.nextKey;
-        if (this.keyPath !== null) injectKeyAtPath(value, this.keyPath, key);
+        if (path !== null) injectKeyAtPath(value, path, key);
       }
       if (key === undefined) throw fail("A key is required", "DataError");
       return validateKey(key);
@@ -1147,6 +1276,7 @@
         value,
         bytes,
       });
+      noteStoreMutation(this._store, key);
       if (
         this.autoIncrement && typeof key === "number" &&
         Number.isFinite(key) && key >= this._store.nextKey
@@ -1156,12 +1286,19 @@
           : Math.floor(key) + 1;
       }
       this._store.bytes += delta;
-      stats.bytes += delta;
-      if (!previous) stats.records++;
-      stats.peakBytes = Math.max(stats.peakBytes, stats.bytes);
+      /* Work accepted before an in-task schema deletion can still finish.
+         The detached store is already absent from the database's totals. */
+      if (!this._store.deleted) {
+        stats.bytes += delta;
+        if (!previous) stats.records++;
+        stats.peakBytes = Math.max(stats.peakBytes, stats.bytes);
+      }
       return cloneKey(key);
     }
-    _preparedWrite(value, key, overwrite) {
+    _preparedWrite(value, key, overwrite, cursor = false) {
+      assertSource(this);
+      if (!cursor && this._store.keyPath !== null && key !== undefined)
+        throw fail("Inline keys cannot be supplied separately", "DataError");
       /* Refuse an obviously over-bound BufferSource in the queued request
          without first allocating a second multi-megabyte copy. This keeps a
          normal quota refusal recoverable under the PSP heap while ordinary
@@ -1180,6 +1317,11 @@
           true,
         );
       const copied = clone(value);
+      if (!cursor && Array.isArray(this._store.keyPath))
+        validateKey(keyAtPath(copied, this._store.keyPath));
+      if (cursor && this._store.keyPath !== null &&
+          compareKeys(validateKey(keyAtPath(copied, this._store.keyPath)), copiedKey) !== 0)
+        throw fail("The cursor key cannot change", "DataError");
       return this.transaction._request(
         this,
         () => this._storeValue(copied, copiedKey, overwrite),
@@ -1193,7 +1335,7 @@
       return this._preparedWrite(value, key, false);
     }
     get(query) {
-      query = snapshotQuery(query);
+      query = requiredQuery(query, arguments.length);
       return this.transaction._request(this, () => {
         const record =
           query instanceof IDBKeyRange
@@ -1203,7 +1345,7 @@
       });
     }
     getKey(query) {
-      query = snapshotQuery(query);
+      query = requiredQuery(query, arguments.length);
       return this.transaction._request(this, () => {
         const record =
           query instanceof IDBKeyRange
@@ -1214,14 +1356,14 @@
     }
     getAll(query, count) {
       query = snapshotQuery(query);
-      count = count === undefined ? undefined : Number(count);
+      count = boundedCount(count);
       return this.transaction._request(this, () =>
         this._entries(query, count).map((record) => clone(record.value)),
       );
     }
     getAllKeys(query, count) {
       query = snapshotQuery(query);
-      count = count === undefined ? undefined : Number(count);
+      count = boundedCount(count);
       return this.transaction._request(this, () =>
         this._entries(query, count).map((record) => cloneKey(record.key)),
       );
@@ -1235,7 +1377,7 @@
           return this._store.records.has(keyToken(validateKey(query))) ? 1 : 0;
         let count = 0;
         for (const record of this._store.records.values())
-          if (query.includes(record.key)) count++;
+          if (rangeIncludes(query, record.key)) count++;
         return count;
       });
     }
@@ -1254,9 +1396,14 @@
           for (const record of records) {
             this._store.records.delete(keyToken(record.key));
             this._store.bytes -= record.bytes;
-            stats.bytes -= record.bytes;
-            stats.records--;
+            if (!this._store.deleted) {
+              stats.bytes -= record.bytes;
+              stats.records--;
+            }
           }
+          if (records.length)
+            noteStoreMutation(this._store, query instanceof IDBKeyRange ? undefined
+              : records[0].key);
           return undefined;
         },
         true,
@@ -1267,8 +1414,11 @@
         this,
         () => {
           this.transaction._snapshot(this._store);
-          stats.records -= this._store.records.size;
-          stats.bytes -= this._store.bytes;
+          if (!this._store.deleted) {
+            stats.records -= this._store.records.size;
+            stats.bytes -= this._store.bytes;
+          }
+          if (this._store.records.size) noteStoreMutation(this._store);
           this._store.records.clear();
           this._store.bytes = 0;
           return undefined;
@@ -1277,12 +1427,14 @@
       );
     }
     index(name) {
+      assertSource(this);
       name = boundedName(name, 128, "Index name");
       const schema = this._store.indexes.get(name);
       if (!schema) throw fail("Index does not exist", "NotFoundError");
-      return new IDBIndex(this.transaction, this, schema);
+      return this._indexHandle(schema);
     }
     createIndex(name, keyPath, options = {}) {
+      assertSource(this);
       if (!this.transaction._upgrade)
         throw fail(
           "Indexes can only be created during upgrade",
@@ -1294,6 +1446,9 @@
         throw fail("Index already exists", "ConstraintError");
       if (this._store.indexes.size >= INDEX_LIMIT)
         throw fail("Index quota exceeded", "QuotaExceededError");
+      const tx = this.transaction, store = this._store;
+      if (tx._state !== "active" || tx._commitRequested || !tx._acceptingRequests)
+        throw fail("Transaction is inactive", "TransactionInactiveError");
       const schema = {
         name,
         keyPath,
@@ -1301,30 +1456,52 @@
         unique: !!options.unique,
       };
       if (schema.unique) {
-        const seen = new Set();
-        for (const record of this._store.records.values())
-          for (const key of indexKeysForValue(record.value, schema)) {
-            const token = keyToken(key);
-            if (seen.has(token))
-              throw fail(
-                "Existing records violate the unique index",
-                "ConstraintError",
-              );
-            seen.add(token);
+        /* Index population follows previously queued writes. On failure the
+           version change rolls back, even if the upgrade handler returned. */
+        schema.building = true;
+        if (tx._pending >= REQUEST_LIMIT || !tx._scheduleOperation(() => {
+          tx._pending--;
+          if (tx._state === "finished") return;
+          if (tx.db._state.stores.get(store.name) === store &&
+              store.indexes.get(schema.name) === schema) {
+            try {
+              const seen = new Set();
+              for (const record of store.records.values())
+                for (const key of indexKeysForValue(record.value, schema)) {
+                  const token = keyToken(key);
+                  if (seen.has(token)) throw fail("Duplicate index key", "ConstraintError");
+                  seen.add(token);
+                }
+            } catch (error) {
+              tx._abort(fail("Could not populate the index",
+                error?.name === "ConstraintError" ? "ConstraintError" : "AbortError"));
+              return;
+            }
+            schema.building = false;
           }
+          tx._maybeComplete();
+        }))
+          throw fail("Database task quota exceeded", "QuotaExceededError");
+        tx._pending++;
       }
       this._store.indexes.set(name, schema);
-      return new IDBIndex(this.transaction, this, schema);
+      this._refreshIndexNames();
+      return this._indexHandle(schema);
     }
     deleteIndex(name) {
-      if (!this.transaction._upgrade)
+      assertSource(this);
+      const tx = this.transaction;
+      if (!tx._upgrade)
         throw fail(
           "Indexes can only be deleted during upgrade",
           "InvalidStateError",
         );
+      if (tx._state !== "active" || tx._commitRequested || !tx._acceptingRequests)
+        throw fail("Transaction is inactive", "TransactionInactiveError");
       name = boundedName(name, 128, "Index name");
       if (!this._store.indexes.delete(name))
         throw fail("Index does not exist", "NotFoundError");
+      this._refreshIndexNames();
     }
     openCursor(query, direction = "next") {
       return this._cursorRequest(query, direction, true);
@@ -1349,14 +1526,34 @@
   }
 
   class IDBIndex {
+    #name; #initialName; #keyPath;
     constructor(transaction, objectStore, schema) {
       this.transaction = transaction;
       this.objectStore = objectStore;
       this._schema = schema;
-      this.name = schema.name;
-      this.keyPath = schema.keyPath;
+      this.#name = this.#initialName = schema.name;
       this.multiEntry = schema.multiEntry;
       this.unique = schema.unique;
+    }
+    get keyPath() { return this.#keyPath ??= copyKeyPath(this._schema.keyPath); }
+    get name() {
+      return this.transaction._rolledBackSchema ? this.#initialName : this.#name;
+    }
+    set name(value) {
+      const tx = this.transaction, schema = this._schema,
+        indexes = this.objectStore._store.indexes;
+      assertSource(this);
+      if (!tx._upgrade)
+        throw fail("Indexes can only be renamed during upgrade", "InvalidStateError");
+      if (tx._state !== "active" || tx._commitRequested || !tx._acceptingRequests)
+        throw fail("Transaction is inactive", "TransactionInactiveError");
+      const name = boundedName(value, 128, "Index name");
+      if (schema.name === name) return;
+      if (indexes.has(name)) throw fail("Index already exists", "ConstraintError");
+      indexes.set(name, schema);
+      indexes.delete(schema.name);
+      schema.name = this.#name = name;
+      this.objectStore._refreshIndexNames();
     }
     _entries(query, count = 0) {
       const output = [];
@@ -1376,14 +1573,14 @@
       return output.slice(0, maximum);
     }
     get(query) {
-      query = snapshotQuery(query);
+      query = requiredQuery(query, arguments.length);
       return this.transaction._request(this, () => {
         const entry = this._entries(query, 1)[0];
         return entry ? clone(entry.record.value) : undefined;
       });
     }
     getKey(query) {
-      query = snapshotQuery(query);
+      query = requiredQuery(query, arguments.length);
       return this.transaction._request(this, () => {
         const entry = this._entries(query, 1)[0];
         return entry ? cloneKey(entry.record.key) : undefined;
@@ -1391,14 +1588,14 @@
     }
     getAll(query, count) {
       query = snapshotQuery(query);
-      count = count === undefined ? undefined : Number(count);
+      count = boundedCount(count);
       return this.transaction._request(this, () =>
         this._entries(query, count).map((entry) => clone(entry.record.value)),
       );
     }
     getAllKeys(query, count) {
       query = snapshotQuery(query);
-      count = count === undefined ? undefined : Number(count);
+      count = boundedCount(count);
       return this.transaction._request(this, () =>
         this._entries(query, count).map((entry) => cloneKey(entry.record.key)),
       );
@@ -1408,42 +1605,45 @@
       return this.transaction._request(this, () => this._entries(query).length);
     }
     openCursor(query, direction = "next") {
-      query = snapshotQuery(query);
-      direction = String(direction);
-      return this.transaction._openCursor(
-        this,
-        () => {
-          const entries = this._entries(query);
-          if (direction.startsWith("prev")) entries.reverse();
-          return entries;
-        },
-        true,
-        direction,
-      );
+      return this._cursorRequest(query, direction, true);
     }
     openKeyCursor(query, direction = "next") {
+      return this._cursorRequest(query, direction, false);
+    }
+    _cursorRequest(query, direction, withValue) {
       query = snapshotQuery(query);
       direction = String(direction);
       return this.transaction._openCursor(
         this,
         () => {
           const entries = this._entries(query);
+          /* Both unique directions choose the lowest primary key. */
+          if (direction.endsWith("unique")) {
+            let kept = 0;
+            for (const entry of entries)
+              if (!kept || compareKeys(entries[kept - 1].indexKey, entry.indexKey))
+                entries[kept++] = entry;
+            entries.length = kept;
+          }
           if (direction.startsWith("prev")) entries.reverse();
           return entries;
         },
-        false,
+        withValue,
         direction,
       );
     }
   }
 
   class IDBCursor {
-    constructor(request, source, entries, withValue, direction, transaction) {
+    constructor(request, source, entries, withValue, direction, transaction,
+                entriesFactory) {
       this.request = request;
       this.source = source;
       this.direction = direction;
       this._transaction = transaction;
       this._entries = entries;
+      this._entriesFactory = entriesFactory;
+      this._storeRevision = storeFor(source).revision;
       this._withValue = withValue;
       this._position = 0;
       this._continued = false;
@@ -1493,64 +1693,128 @@
         if (generation === this._generation && !this._continued) this._finish();
       })) this._finish();
     }
-    _move(position) {
+    _checkMove() {
       if (this._finished || this._transaction._state !== "active"
           || !this._transaction._acceptingRequests)
         throw fail("Transaction is inactive", "TransactionInactiveError");
       if (this._continued)
         throw fail("Cursor is already iterating", "InvalidStateError");
+      assertSource(this.source);
+    }
+    _move(count, target, primary) {
+      this._checkMove();
+      const revision = this._storeRevision, store = storeFor(this.source),
+        old = this._entries[this._position], record = old.record || old,
+        indexed = old.record !== undefined,
+        unique = indexed && this.direction.endsWith("unique"),
+        order = this.direction.startsWith("prev") ? -1 : 1,
+        key = target === undefined ? old.indexKey ?? record.key : target,
+        tie = target === undefined && indexed && !unique ? record.key : primary;
+      /* Compare against an internal key, not the mutable public cursor.key. */
+      const compare = entry => order * (
+        compareKeys(entry.indexKey ?? (entry.record || entry).key, key) ||
+        (tie === undefined ? 0 : compareKeys(entry.record.key, tie)));
+      const strictlyAfter = target === undefined;
       this._continued = true;
-      this._position = position;
-      if (!this._transaction._scheduleOperation(() => this._emit())) {
+      if (!this._transaction._scheduleOperation(() => {
+        if (this._transaction._state === "finished") {
+          failIDBRequest(this.request, fail("Transaction aborted", "AbortError"));
+          this._finish();
+          return;
+        }
+        try {
+          assertSource(this.source);
+          const run = store.keyRun;
+          if (revision !== store.revision && !indexed && run && run.from <= revision &&
+              run.to === store.revision && !compareKeys(run.key, record.key))
+            this._storeRevision = store.revision;
+          if (this._storeRevision === store.revision && strictlyAfter) {
+            this._position += count;
+          } else {
+            if (this._storeRevision !== store.revision) {
+              this._entries = this._entriesFactory();
+              this._storeRevision = store.revision;
+            }
+            let lo = 0, hi = this._entries.length;
+            while (lo < hi) {
+              const mid = (lo + hi) >>> 1, compared = compare(this._entries[mid]);
+              if (compared < 0 || (strictlyAfter && !compared)) lo = mid + 1;
+              else hi = mid;
+            }
+            this._position = lo + count - 1;
+          }
+        } catch (error) {
+          resetIDBRequest(this.request);
+          if (failIDBRequest(this.request, error))
+            this._transaction._abort(this.request.error);
+          this._finish();
+          return;
+        }
+        this._emit();
+      })) {
         this._continued = false;
         throw fail("Database task quota exceeded", "QuotaExceededError");
       }
+      resetIDBRequest(this.request);
     }
     continue(key) {
-      let position = this._position + 1;
-      if (key !== undefined)
-        while (position < this._entries.length) {
-          const entry = this._entries[position],
-            record = entry.record || entry,
-            cursorKey =
-              entry.indexKey === undefined ? record.key : entry.indexKey;
-          const compared = compareKeys(cursorKey, key);
-          if (
-            String(this.direction).startsWith("prev")
-              ? compared <= 0
-              : compared >= 0
-          )
-            break;
-          position++;
-        }
-      this._move(position);
+      if (key === undefined) return this._move(1);
+      this._checkMove();
+      key = cloneKey(validateKey(key));
+      const order = this.direction.startsWith("prev") ? -1 : 1,
+        compare = entry => order *
+          compareKeys(entry.indexKey ?? (entry.record || entry).key, key);
+      if (compare(this._entries[this._position]) >= 0)
+        throw fail("The key must advance the cursor", "DataError");
+      this._move(1, key);
     }
-    continuePrimaryKey() {
-      this.continue();
+    continuePrimaryKey(key, primaryKey) {
+      if (arguments.length < 2) throw new TypeError("Two keys are required");
+      this._checkMove();
+      const reverse = this.direction === "prev";
+      if (!(this.source instanceof IDBIndex) ||
+          (!reverse && this.direction !== "next"))
+        throw fail("An index cursor with next or prev is required",
+                   "InvalidAccessError");
+      key = cloneKey(validateKey(key));
+      primaryKey = cloneKey(validateKey(primaryKey));
+      const order = reverse ? -1 : 1;
+      const compare = entry => order * (
+        compareKeys(entry.indexKey, key) ||
+        compareKeys(entry.record.key, primaryKey));
+      if (compare(this._entries[this._position]) >= 0)
+        throw fail("The key pair must advance the cursor", "DataError");
+      this._move(1, key, primaryKey);
     }
     advance(count) {
       count = Number(count);
       if (!Number.isInteger(count) || count <= 0)
         throw new TypeError("Count must be positive");
-      this._move(this._position + count);
+      this._move(count);
     }
     update(value) {
+      this._checkMove();
+      if (!this._withValue) throw fail("Key-only cursor", "InvalidStateError");
       const store =
         this.source instanceof IDBIndex ? this.source.objectStore : this.source;
-      return store.put(value, this.primaryKey);
+      const entry = this._entries[this._position];
+      return store._preparedWrite(value, (entry.record || entry).key, true, true);
     }
     delete() {
+      this._checkMove();
+      if (!this._withValue) throw fail("Key-only cursor", "InvalidStateError");
       const store =
         this.source instanceof IDBIndex ? this.source.objectStore : this.source;
-      return store.delete(this.primaryKey);
+      const entry = this._entries[this._position];
+      return store.delete((entry.record || entry).key);
     }
   }
   class IDBCursorWithValue extends IDBCursor {}
 
-  const resumeBlockedDatabaseOpen = (state) => {
-    if (state.connections.size || !state.blockedOpen) return;
-    const resume = state.blockedOpen;
-    state.blockedOpen = null;
+  const resumeBlockedConnection = (state) => {
+    if (state.connections.size || !state.blockedConnection) return;
+    const resume = state.blockedConnection;
+    state.blockedConnection = null;
     resume();
   };
 
@@ -1566,9 +1830,16 @@
     /* close() refuses new work immediately, but accepted transactions keep
        the connection blocking an upgrade until their ownership is retired. */
     state.connections.delete(database);
-    resumeBlockedDatabaseOpen(state);
+    resumeBlockedConnection(state);
   };
 
+  /* Schema changes need the upgrade transaction (InvalidStateError), and
+     an active one (TransactionInactiveError). */
+  const assertUpgradeActive = (tx, message) => {
+    if (!tx || tx._state === "finished") throw fail(message, "InvalidStateError");
+    if (tx._state !== "active" || tx._commitRequested || !tx._acceptingRequests)
+      throw fail("Transaction is inactive", "TransactionInactiveError");
+  };
   class IDBDatabase extends TilefinchIDBEventTarget {
     constructor(state) {
       super();
@@ -1584,17 +1855,14 @@
       state.connections.add(this);
     }
     get objectStoreNames() {
-      return nameList(this._state.stores.keys());
+      return this._objectStoreNames ??= nameList(this._state.stores.keys());
+    }
+    _refreshStoreNames() {
+      this._objectStoreNames = null;
+      if (this._upgradeTransaction) this._upgradeTransaction._objectStoreNames = null;
     }
     createObjectStore(name, options = {}) {
-      if (
-        !this._upgradeTransaction ||
-        this._upgradeTransaction._state !== "active"
-      )
-        throw fail(
-          "Object stores can only be created during upgrade",
-          "InvalidStateError",
-        );
+      assertUpgradeActive(this._upgradeTransaction, "Object stores can only be created during upgrade");
       name = boundedName(name, 128, "Object store name");
       if (this._state.stores.has(name))
         throw fail("Object store already exists", "ConstraintError");
@@ -1611,31 +1879,22 @@
         indexes: new Map(),
         records: new Map(),
         bytes: 0,
+        revision: 0,
       };
       this._state.stores.set(name, store);
-      this._upgradeTransaction.objectStoreNames = nameList(
-        this._state.stores.keys(),
-      );
-      return new IDBObjectStore(this._upgradeTransaction, store);
+      this._refreshStoreNames();
+      return this._upgradeTransaction._storeHandle(store);
     }
     deleteObjectStore(name) {
-      if (
-        !this._upgradeTransaction ||
-        this._upgradeTransaction._state !== "active"
-      )
-        throw fail(
-          "Object stores can only be deleted during upgrade",
-          "InvalidStateError",
-        );
+      assertUpgradeActive(this._upgradeTransaction, "Object stores can only be deleted during upgrade");
       name = boundedName(name, 128, "Object store name");
       const store = this._state.stores.get(name);
       if (!store) throw fail("Object store does not exist", "NotFoundError");
       stats.records -= store.records.size;
       stats.bytes -= store.bytes;
+      store.deleted = true;
       this._state.stores.delete(name);
-      this._upgradeTransaction.objectStoreNames = nameList(
-        this._state.stores.keys(),
-      );
+      this._refreshStoreNames();
     }
     transaction(storeNames, mode = "readonly") {
       if (this._closed)
@@ -1659,39 +1918,93 @@
     }
     close() {
       if (this._closed) return;
+      void this.objectStoreNames;
       this._closed = true;
       finishIDBClose(this);
     }
   }
-  const forceCloseIDBDatabase = (database) => {
-    if (database._closed) return;
-    database._closed = true;
-    database._state.connections.delete(database);
-    database._dispatch("close");
+  /* One FIFO for both open and delete, independent of the database state
+     (which delete can retire while a later open is already queued). */
+  const connectionTaskError = () =>
+    fail("Database task quota exceeded", "QuotaExceededError");
+  const enqueueConnection = (name, request, run) => {
+    if (!scheduleDatabaseTask(() => {
+      let queue = connectionQueues.get(name);
+      const perform = () => run(() => {
+        for (let i = 0; i < OPEN_QUEUE_LIMIT && queue.length; i++) {
+          const next = queue.shift();
+          if (scheduleDatabaseTask(next.perform)) return;
+          failIDBRequest(next.request, connectionTaskError());
+        }
+        if (queue.length === 0) connectionQueues.delete(name);
+      });
+      if (queue) {
+        if (queue.length >= OPEN_QUEUE_LIMIT) {
+          failIDBRequest(request, fail(
+            "Database connection queue quota exceeded", "QuotaExceededError"));
+          return;
+        }
+        queue.push({ request, perform });
+      } else if (connectionQueues.size >= DATABASE_LIMIT) {
+        failIDBRequest(request, connectionTaskError());
+      } else {
+        queue = [];
+        connectionQueues.set(name, queue);
+        perform();
+      }
+    })) throw connectionTaskError();
+  };
+  const afterConnectionsClose = (state, request, newVersion, done, finish) => {
+    if (!state.connections.size) {
+      done();
+      return;
+    }
+    const init = { oldVersion: state.version, newVersion };
+    const checkBlocked = () => {
+      if (!state.connections.size) {
+        done();
+        return;
+      }
+      state.blockedConnection = () => {
+        if (!scheduleDatabaseTask(done)) {
+          failIDBRequest(request, connectionTaskError());
+          finish();
+        }
+      };
+      request._dispatch("blocked", init);
+    };
+    let notified = false;
+    for (const existing of [...state.connections]) {
+      if (existing._closed) continue;
+      notified = true;
+      existing._dispatch("versionchange", init);
+    }
+    /* Only owners that received versionchange have a listener checkpoint.
+       A close-pending owner with accepted writes still blocks immediately. */
+    if (!notified) checkBlocked();
+    else if (!scheduleDatabaseTask(checkBlocked)) {
+      failIDBRequest(request, connectionTaskError());
+      finish();
+    }
   };
 
   class IDBFactory {
     open(name, version) {
       name = boundedName(name, 256, "Database name");
+      const requestedVersion = version === undefined ? undefined : Number(version);
+      if (requestedVersion !== undefined &&
+          (!Number.isInteger(requestedVersion) || requestedVersion <= 0))
+        throw new TypeError("Version must be a positive integer");
       const request = new IDBOpenDBRequest();
       stats.opens++;
-      if (!scheduleDatabaseTask(() => {
+      enqueueConnection(name, request, (finish) => {
         let state = databases.get(name);
-        const requestedVersion =
-          version === undefined ? undefined : Number(version);
-        if (
-          requestedVersion !== undefined &&
-          (!Number.isInteger(requestedVersion) || requestedVersion <= 0)
-        ) {
-          failIDBRequest(
-            request, new TypeError("Version must be a positive integer"));
-          return;
-        }
         if (!state) {
           if (databases.size >= DATABASE_LIMIT) {
             failIDBRequest(request,
               fail("Database quota exceeded", "QuotaExceededError"),
             );
+            finish();
             return;
           }
           state = {
@@ -1704,61 +2017,23 @@
             activeTransactions: new Set(),
             transactionQueue: [],
             pendingRequests: 0,
-            opening: false,
-            openQueue: [],
-            blockedOpen: null,
+            blockedConnection: null,
           };
           databases.set(name, state);
         }
         const finishOpen = (removeFailedDatabase) => {
-          state.opening = false;
-          const next = state.openQueue.shift();
-          if (next) {
-            state.opening = true;
-            if (!scheduleDatabaseTask(next))
-              failIDBRequest(request, fail(
-                "Database task quota exceeded", "QuotaExceededError"));
-          } else if (removeFailedDatabase && state.version === 0) {
+          if (removeFailedDatabase && state.version === 0)
             databases.delete(name);
-          }
+          finish();
         };
+        const requested = requestedVersion ?? (state.version || 1);
+        if (requested < state.version) {
+          failIDBRequest(request, fail(
+            "Requested version is too old", "VersionError"));
+          finishOpen(false);
+          return;
+        }
         const performOpen = () => {
-          const requested =
-            requestedVersion === undefined
-              ? state.version || 1
-              : requestedVersion;
-          if (requested < state.version) {
-            failIDBRequest(request,
-              fail("Requested version is too old", "VersionError"),
-            );
-            finishOpen(false);
-            return;
-          }
-          if (requested > state.version && state.connections.size) {
-            for (const existing of [...state.connections])
-              if (!existing._closed)
-                existing._dispatch("versionchange", {
-                  oldVersion: state.version,
-                  newVersion: requested,
-                });
-            if (state.connections.size) {
-              state.blockedOpen = () => {
-                if (!scheduleDatabaseTask(performOpen)) {
-                  failIDBRequest(request, fail(
-                    "Database task quota exceeded",
-                    "QuotaExceededError",
-                  ));
-                  finishOpen(false);
-                }
-              };
-              /* A blocked listener may close the final connection inline. */
-              request._dispatch("blocked", {
-                oldVersion: state.version,
-                newVersion: requested,
-              });
-              return;
-            }
-          }
           const connection = new IDBDatabase(state);
           if (requested > state.version) {
             const oldVersion = state.version;
@@ -1776,11 +2051,10 @@
               finishOpen(oldVersion === 0);
               return;
             }
+            state.version = connection.version = requested;
             connection._upgradeTransaction = transaction;
             prepareIDBUpgradeRequest(request, connection, transaction);
             addListener(transaction, "complete", () => {
-              state.version = requested;
-              connection.version = requested;
               connection._upgradeTransaction = null;
               setIDBRequestTransaction(request, null);
               if (connection._closed) {
@@ -1793,13 +2067,14 @@
               finishOpen(false);
             });
             addListener(transaction, "abort", () => {
+              connection.version = oldVersion;
               connection._upgradeTransaction = null;
               setIDBRequestTransaction(request, null);
               resetIDBRequest(request);
               connection.close();
-              failIDBRequest(request,
-                transaction.error || fail("Upgrade aborted", "AbortError"),
-              );
+              /* Whatever aborted the upgrade (transaction.error), the open
+                 request fails with AbortError. */
+              failIDBRequest(request, fail("Upgrade aborted", "AbortError"));
               finishOpen(oldVersion === 0);
             });
             request._dispatch("upgradeneeded", {
@@ -1818,47 +2093,32 @@
             finishOpen(false);
           }
         };
-        if (state.opening) {
-          if (state.openQueue.length >= OPEN_QUEUE_LIMIT) {
-            failIDBRequest(request,
-              fail("Database open queue quota exceeded", "QuotaExceededError"),
-            );
-            return;
-          }
-          state.openQueue.push(performOpen);
-        } else {
-          state.opening = true;
-          performOpen();
-        }
-      })) throw fail("Database task quota exceeded", "QuotaExceededError");
+        if (requested > state.version)
+          afterConnectionsClose(state, request, requested, performOpen, finish);
+        else performOpen();
+      });
       return request;
     }
     deleteDatabase(name) {
       name = boundedName(name, 256, "Database name");
       const request = new IDBOpenDBRequest();
       stats.deletes++;
-      if (!scheduleDatabaseTask(() => {
+      enqueueConnection(name, request, (finish) => {
         const state = databases.get(name);
-        if (state) {
-          for (const connection of [...state.connections])
-            forceCloseIDBDatabase(connection);
-          const cancellation = fail(
-            "Database was deleted", "AbortError");
-          if (state.upgrading) state.upgrading._abort(cancellation);
-          for (const transaction of [...state.activeTransactions])
-            transaction._abort(cancellation);
-          for (const transaction of [...state.transactionQueue])
-            transaction._abort(cancellation);
-          state.transactionQueue = [];
-          for (const store of state.stores.values()) {
-            stats.records = Math.max(
-              0, stats.records - store.records.size);
-            stats.bytes = Math.max(0, stats.bytes - store.bytes);
+        const remove = () => {
+          if (state) {
+            const usage = stateUsage(state);
+            stats.records -= usage.records;
+            stats.bytes -= usage.bytes;
+            databases.delete(name);
           }
-          databases.delete(name);
-        }
-        succeedIDBRequest(request, undefined);
-      })) throw fail("Database task quota exceeded", "QuotaExceededError");
+          succeedIDBRequest(request, undefined, false,
+                            { oldVersion: state?.version ?? 0, newVersion: null });
+          finish();
+        };
+        if (state) afterConnectionsClose(state, request, null, remove, finish);
+        else remove();
+      });
       return request;
     }
     cmp(first, second) {

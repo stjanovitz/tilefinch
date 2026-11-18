@@ -37,8 +37,13 @@
 #define PSP_THEME_TEXT_MUTED     PSP_THEME_RGB(0x89, 0x84, 0x80) /* secondary */
 #define PSP_THEME_TEXT_FAINT     PSP_THEME_RGB(0x68, 0x63, 0x60) /* disabled */
 
-/* Accents. Midnight is the blue default; Ember remains available. */
-#define PSP_THEME_ACCENT_MIDNIGHT PSP_THEME_RGB(0x3D, 0x78, 0xB6)
+/* Accents. Midnight is the blue default; Ember remains available.
+   ON_ACCENT is the ink on an accent fill (the highlighted row, buttons,
+   the selected key); every built-in accent and accent HI gives it at
+   least 4.5:1 after RGB565 reduction. Midnight's accent sits nearest
+   that floor (4.59:1); it reads at 4.68:1 on the grounds, where it also
+   draws text, chevrons and the focus ring. */
+#define PSP_THEME_ACCENT_MIDNIGHT PSP_THEME_RGB(0x3D, 0x80, 0xBA)
 #define PSP_THEME_ACCENT_MIDNIGHT_HI PSP_THEME_RGB(0x72, 0xAA, 0xE2)
 #define PSP_THEME_ACCENT_EMBER   PSP_THEME_RGB(0xE8, 0x82, 0x3C)
 #define PSP_THEME_ACCENT_EMBER_HI PSP_THEME_RGB(0xF4, 0xA5, 0x6F)
@@ -48,9 +53,13 @@
 #define PSP_THEME_ACCENT_SLATE_HI PSP_THEME_RGB(0xC2, 0xCE, 0xD8)
 #define PSP_THEME_ON_ACCENT      PSP_THEME_RGB(0x17, 0x12, 0x0E)
 
-/* Semantic (not accents; identical across themes). */
+/* Semantic (not accents; identical across the dark themes). WARN marks a
+   warning; DANGER marks an action that destroys data (Clear, Delete,
+   Remove, Reset). DANGER is 6.4:1 on the panel and 5.4:1 on the focused
+   row; Daylight carries its own darker pair. */
 #define PSP_THEME_OK             PSP_THEME_RGB(0x7F, 0xD6, 0xA2)
 #define PSP_THEME_WARN           PSP_THEME_RGB(0xE0, 0x8A, 0x52)
+#define PSP_THEME_DANGER         PSP_THEME_RGB(0xEF, 0x6B, 0x75)
 
 /* Type scale (pixel sizes at 1x on the 480x272 panel).
    TITLE/BODY/LIST render with the proportional FreeType faces

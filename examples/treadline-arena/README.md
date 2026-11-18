@@ -55,12 +55,15 @@ library and played without Wi-Fi.
 
 1. Host this repository—or just the contents of this directory—over HTTPS.
 2. Open `examples/treadline-arena/index.html` in Tilefinch.
-3. Open **Page tools → Install offline app**.
-4. Review the installation preview, then choose **Install**.
+3. Open **Menu → Page tools → Install offline app**.
+4. Review the installation preview, then press X to confirm.
 5. Launch **Treadline Arena** from the Library's **Saved** section.
 
 Everything the game needs comes from the same site and is installed with
-it. Once installed, ordinary single-player launch and play require no Wi-Fi
+it. Files the browser's memory cache has already dropped are downloaded again
+while the preview is prepared, so this works at the default settings. If the
+preview reports any unavailable resources, a file could not be downloaded:
+go back and install again once the connection is working. Once installed, ordinary single-player launch and play require no Wi-Fi
 connection. Reinstall or Update from the installation screen after changing
 the packaged files.
 

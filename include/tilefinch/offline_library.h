@@ -113,6 +113,12 @@ typedef struct {
     /* The index was normalized at load but could not be written (a full or
        read-only card); later loads retry until a save succeeds. */
     bool save_pending;
+    /* Recovery from an older generation after a damaged newer one may
+       omit that generation's entries. Unlisted files of ids up to this one
+       are kept for manual recovery, and new items take higher ids, until
+       a complete sweep finds none left (library.bin.recovered); 0 when
+       there is no such generation. Orphans of higher ids are swept. */
+    uint32_t recovery_floor;
     OfflineLibraryProgress progress;
     void *progress_context;
     /* Bytecode a preview compiled, kept for the confirming install. */

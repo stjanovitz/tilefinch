@@ -442,36 +442,37 @@ char output[BROWSER_MODULE_REFERRER_POLICY_LIMIT])
  *
  * QuickJS keeps each function's source text so Function.prototype.toString()
  * can return it; with shared source spans that is close to one copy of every
- * compiled module in the page heap (dropping it saves about 1 MB of
- * chatgpt.com's 11 MB realm, and 1.5 MB of its first-load peak because the
- * parser no longer copies each nested function's text). JS_STRIP_SOURCE
- * drops only that text. It keeps the line/column table and file name, so
- * Error.stack, our uncaught-error reports and the client-fatal-error beacons
- * some sites send still carry file:line:col. JS_STRIP_DEBUG would also drop
- * those and is not used for page code.
+ * compiled module in the page heap, plus a copy of each nested function's
+ * text while the parser runs. A module of at least
+ * SCRIPT_MODULE_STRIP_SOURCE_MINIMUM_BYTES therefore compiles with
+ * JS_STRIP_SOURCE, and its text goes to the realm's function-source store
+ * in the page Budget instead, as a large classic script's does
+ * (evaluation.inc, "Function source outside the heap"): toString() returns
+ * exactly the text, lazily compiled functions read their bodies from the
+ * store, and the line/column table and file name stay, so Error.stack and
+ * uncaught-error reports carry file:line:col.
  *
- * What a page loses: toString() of a function compiled from a stripped
- * module returns QuickJS's NativeFunction form, "function name() {\n
+ * When the store cannot take the text (the Budget refused the copy, or the
+ * lab switch TILEFINCH_JS_MODULE_SOURCE_STORE=0 turns modules off), the
+ * module is still stripped and keeps no text: toString() of its functions
+ * returns QuickJS's NativeFunction form, "function name() {\n
  * [native code]\n}" (as the specification allows when no source text is
- * retained). Code that parses its own functions' text - dependency-injection
- * argument parsing, building a Worker from fn.toString(), self-integrity
- * checks - would see that form instead. Those patterns belong to classic
- * scripts and eval/Function bodies far more than to bundled ES modules, and
- * none of those are stripped. On chatgpt.com's startup (the site that set
- * this policy) no function compiled from a module had toString() called on it
- * at all; the one module that reads its own functions' text falls back
- * cleanly when it finds no location marker. Modules smaller than the
- * threshold keep their source: they hold under a tenth of a typical graph's
- * bytes, and a small helper module is where a stringified worker body is
- * most likely to live.
+ * retained). Modules smaller than the threshold keep their source in the
+ * heap.
  *
  * A small module's bytecode therefore carries its text, as every classic
  * script's does. That is why a no-store module response, like a classic
  * one, is compiled and run but its bytecode never kept: retaining it would
  * retain the response. Cacheable responses keep their text in bytecode just
- * as the HTTP cache may keep the response itself.
+ * as the HTTP cache may keep the response itself. A large module's record
+ * names its stored text by offset instead: it is keyed apart
+ * (SCRIPT_MODULE_KEY_SOURCE_STORE), and its restore registers the module's
+ * text with the store; a restore whose text the store refuses is dropped
+ * and the module compiled from source.
  */
 #define SCRIPT_MODULE_STRIP_SOURCE_MINIMUM_BYTES (8u * 1024u)
+/* Key flag of a record whose functions read their text from the store. */
+#define SCRIPT_MODULE_KEY_SOURCE_STORE 0x100u
 
 static int script_module_strip_flags(size_t source_length)
 {
@@ -666,8 +667,22 @@ static bool module_bytecode_restore(ScriptRuntime *runtime,
     }
     *admitted = true;
     uint64_t started_ns = js_rt_monotonic_time_ns();
+    bool store_backed =
+        (key->compile_flags & SCRIPT_MODULE_KEY_SOURCE_STORE) != 0;
+    uint32_t restore_source = store_backed
+        ? js_rt_source_store_begin_restore(
+              runtime, (const char *) key->source, key->source_length)
+        : 0;
     JSValue restored = JS_ReadObject(context, cached->data, cached->length,
                                      JS_READ_OBJ_BYTECODE);
+    /* Restored functions that cannot read their text: a failed restore. */
+    if (store_backed
+        && !js_rt_source_store_end_restore(runtime, restore_source,
+                                           (const char *) key->source)
+        && !JS_IsException(restored)) {
+        JS_FreeValue(context, restored);
+        restored = JS_EXCEPTION;
+    }
     uint64_t read_ns = js_rt_monotonic_time_ns();
     /* Deserialization, successful or not. */
     result->module_bytecode_restore_us += (read_ns - started_ns) / 1000u;
@@ -724,7 +739,9 @@ JSValue js_rt_module_compile_external(
     uint64_t key_started_ns = js_rt_monotonic_time_ns();
     bool cacheable = module_bytecode_key_init(
         runtime, &key, partition, source, source_length, module_name,
-        response_url, strip_flags);
+        response_url,
+        strip_flags | (strip_flags != 0 && js_rt_module_source_store_enabled()
+                           ? (int) SCRIPT_MODULE_KEY_SOURCE_STORE : 0));
     result->module_key_us +=
         (js_rt_monotonic_time_ns() - key_started_ns) / 1000u;
     if (cacheable) {

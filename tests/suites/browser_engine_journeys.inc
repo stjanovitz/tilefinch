@@ -1201,6 +1201,51 @@ int test_inset_pseudo_disc(void)
     return 0;
 }
 
+int test_scroll_after_document_growth(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = false;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    static const char page[] =
+        "<!doctype html><meta name=viewport content='width=device-width'>"
+        "<style>body{margin:0} .tall{height:1500px}</style>"
+        "<button id=grow>Grow</button><div id=space></div><script>"
+        "const space=document.getElementById('space');"
+        "const setPosition=()=>{window.scrollTo({top:800,behavior:'instant'});"
+        "globalThis.observedScroll=scrollY};"
+        "document.getElementById('grow').addEventListener('click',()=>{"
+        "space.className=space.className?'':'tall';setPosition()});"
+        "</script>";
+    CHECK(browser_engine_commit_html(engine, "https://grow-scroll.test/",
+                                    page, sizeof(page) - 1u, true));
+    NavigationSession *nav = browser_engine_navigation(engine);
+    CHECK(nav->page.runtime != NULL && navigation_current(nav)->scroll_y == 0);
+    CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+        "setTimeout(()=>{space.className='tall';setPosition()},1)",
+        "<schedule-grow-and-scroll>", &nav->page.script_result));
+    CHECK(browser_engine_advance_runtime(engine, 16, 4, NULL));
+    CHECK(navigation_current(nav)->scroll_y == 800);
+    CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+        "if(observedScroll!==800||scrollY!==800)throw Error('grow scroll')",
+        "<check-grow-and-scroll>", &nav->page.script_result));
+    CHECK(navigation_dispatch_event(nav, "#grow", "click")
+          && navigation_current(nav)->scroll_y == 0);
+    CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+        "if(observedScroll!==0||scrollY!==0)throw Error('shrink scroll')",
+        "<check-shrink-and-scroll>", &nav->page.script_result));
+    CHECK(navigation_dispatch_event(nav, "#grow", "click")
+          && navigation_current(nav)->scroll_y == 800);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
 /* Night mode is the reader's colour-scheme preference: a site's own
    prefers-color-scheme:dark theme applies (chatgpt.com's white wordmark and
    menu icon stayed black under the forced-dark pixel transform), both in
@@ -1244,6 +1289,30 @@ int test_night_mode_prefers_dark(void)
             probe, "<scheme>", &navigation->page.script_result));
         browser_engine_destroy(engine);
     }
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL && browser_engine_set_forced_dark(engine, true));
+    static const char late_scheme[] = "<!doctype html><p>Content</p><script>"
+        "setTimeout(()=>{let m=document.createElement('meta');"
+        "m.name='color-scheme';m.content='light dark';"
+        "document.head.appendChild(m);globalThis.pocSummary='declared';"
+        "setTimeout(()=>{m.content='light';globalThis.pocSummary='withdrawn'},120)"
+        "},80)</script>";
+    CHECK(browser_engine_commit_html(engine, "https://scheme.test/",
+        late_scheme, sizeof(late_scheme) - 1u, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    CHECK(browser_engine_render_frame(engine, NULL)
+          && browser_engine_render_metrics_view(engine)->forced_dark);
+    for (unsigned step = 0; step < 6u; step++)
+        CHECK(browser_engine_advance_runtime(engine, 16u, 16u, NULL));
+    CHECK(strcmp(navigation->page.script_result.summary, "declared") == 0);
+    CHECK(browser_engine_render_frame(engine, NULL)
+          && !browser_engine_render_metrics_view(engine)->forced_dark);
+    for (unsigned step = 0; step < 8u; step++)
+        CHECK(browser_engine_advance_runtime(engine, 16u, 16u, NULL));
+    CHECK(strcmp(navigation->page.script_result.summary, "withdrawn") == 0);
+    CHECK(browser_engine_render_frame(engine, NULL)
+          && browser_engine_render_metrics_view(engine)->forced_dark);
+    browser_engine_destroy(engine);
     stylesheet_set_prefers_dark_color_scheme(false);
     return 0;
 }

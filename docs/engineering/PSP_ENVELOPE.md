@@ -24,30 +24,11 @@ pressure profile:
 | decoded tile capacity | up to 24 (8 reserved) | up to 24 (8 reserved) |
 
 The PSP application admits a page script by the memory its compile needs,
-not by its size: a compile unit (a whole script, or the largest factory or
-statement of a bundle the browser splits) is admitted when twice its source
-plus 256 KiB fits the QuickJS heap the realm can still grow to while the page
-keeps a 3 MiB presentation reserve. A script may be up to 4 MiB
-(`BROWSER_PSP_APP_SCRIPT_FILE_KB`), a page's scripts up to 16 MiB in all
-(`BROWSER_PSP_APP_SCRIPT_TOTAL_MB`); both are sanity ceilings for hostile
-input. A compile that needs more than planned is stopped by the heap limit
-and refused alone. A unit of 1 MiB or more is also refused before it
-compiles unless the heap it can obtain is at least 4 times its source: such
-units compile either near their source size or at 7-10 times it, and a
-failed compile that large costs 6-10 s of PSP time. "The heap the realm can still grow to" is the heap a
-compile can really reach: the heap left under its limit and the growth the
-free page Budget can back, which come out of the same free Budget and are
-not added (after the Budget has given an inline compile its copy of the
-text, when it needs one). Inline, external and module scripts, module
-imports and scripts a page inserts are all admitted this way. One that does
-not fit is refused before it compiles: a document script is counted as
-memory pressure (the census tag `script-memory-pressure`), an inserted one
-fails with an `error` event. Once the text the parser has so far of an
-inline script could not be admitted, the rest is dropped as it streams, so
-the element reads as empty and the page carries on without it. The
-admission contract is in
-`include/tilefinch/script_admission.h`. Experiment measurements are kept in a
-private maintainer ledger outside the repository.
+not by its size; the rule, its formula and the per-script and per-page
+ceilings in the table are in [Script memory](SCRIPT_MEMORY.md#admission).
+
+Experiment measurements are kept in a private maintainer ledger outside the
+repository.
 
 Tiles are 128x128 RGB565 (32 KiB). A 480x272 screen touches twelve to
 sixteen; the first eight are reserved when a page's render shell is built.
@@ -157,9 +138,10 @@ the first real navigation.
 Wi-Fi warm-up starts after HOME's first paint, and the highlighted built-in
 provider can preconnect once association completes. Secure entropy, the
 bounded TLS-session store, the trust bundle (4 KiB reads), and the shared
-HTTP worker are prepared in separate post-paint units during association.
-The same owner continues those units if an immediate first navigation adopts
-the foreground connection wait, including a native provider open. Optional
+HTTP worker are prepared in separate post-paint units during association
+([entropy cost](PSP_TRANSPORT.md#entropy) has the seeding paths). The same
+owner continues those units if an immediate first navigation adopts the
+foreground connection wait, including a native provider open. Optional
 provider work yields until this preparation completes or refuses; ordinary
 demand remains the fallback. No extra host is contacted. The provider's local
 YouTube search screen can open before association finishes; explicit

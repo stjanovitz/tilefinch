@@ -16,10 +16,10 @@
   if (!ext) { globalThis.pocSummary = "WEBGL-BIG-DRAWS-NO-EXT"; return; }
   const failures = [];
   const warnings = [];
-  const originalWarn = console.warn;
-  console.warn = function (...args) {
-    warnings.push(args.join(" "));
-    return originalWarn.apply(console, args);
+  /* The browser's own warnings do not pass through a page's console.warn;
+     host and validation realms hand them to this sink. */
+  globalThis.__tilefinchTestConsoleSink = function (level, ...args) {
+    if (level === "warn") warnings.push(args.join(" "));
   };
   let seed = 0x1d872b41;
   const random = () => {
@@ -350,7 +350,7 @@
           && expected[at].test(text)))
       failures.push("warnings=" + JSON.stringify(warnings).slice(0, 600));
   }
-  console.warn = originalWarn;
+  delete globalThis.__tilefinchTestConsoleSink;
   if (gl.isContextLost()) failures.push("lost");
   globalThis.pocSummary = failures.length === 0 ? "WEBGL-BIG-DRAWS-PASS"
     : `WEBGL-BIG-DRAWS-FAIL:${failures.length}:${failures.slice(0, 8).join(",")}`;

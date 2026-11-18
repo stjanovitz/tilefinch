@@ -639,7 +639,8 @@ static bool runtime_dispatch_viewport_resize(ScriptRuntime *runtime, bool visual
             "});"
             "})";
         JSValue function = JS_Eval(runtime->context, source, sizeof(source) - 1u,
-                                   "<viewport-resize>", JS_EVAL_TYPE_GLOBAL);
+                                   "<viewport-resize>",
+                                   JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_TRUSTED);
         if (JS_IsException(function)) {
             js_rt_record_exception(runtime->context, &runtime->result);
             return false;
@@ -917,9 +918,11 @@ bool script_runtime_configure_messaging(
         return false;
     }
     js_rt_runtime_arm_watchdog(runtime);
-    bool ok = js_rt_evaluate_source(runtime->context, child_setup,
-                              child_setup_length,
-                              "<frame-messaging>", &runtime->result);
+    /* The messaging set-up below is the browser's code: what it defines
+       (parent, top) is the browser's binding, not a page's replacement. */
+    bool ok = js_rt_evaluate_browser_source(
+        runtime->context, child_setup, child_setup_length,
+        "<frame-messaging>", &runtime->result);
     if (ok) ok = js_rt_runtime_run_jobs(runtime);
     if (ok && child_opaque_origin) {
         static const char opaque_setup[] =
@@ -935,7 +938,7 @@ bool script_runtime_configure_messaging(
             "try{Object.defineProperty(document,'domain',{get(){return ''},"
             "set(){throw new DOMException('Opaque origin','SecurityError')},"
             "configurable:false})}catch(_){}})();";
-        ok = js_rt_evaluate_source(
+        ok = js_rt_evaluate_browser_source(
             runtime->context, opaque_setup, sizeof(opaque_setup) - 1,
             "<frame-opaque-origin>", &runtime->result);
         if (ok) ok = js_rt_runtime_run_jobs(runtime);

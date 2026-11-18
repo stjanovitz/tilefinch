@@ -1366,13 +1366,20 @@ bool js_lazy_webpack_install(ScriptRuntime *runtime,
                context, global, "__tilefinchLazyWebpackWrap", function, 0)
                < 0) return false;
     JSValue constructor = JS_GetPropertyStr(context, global, "Function");
-    JSValue prototype = JS_GetPropertyStr(context, constructor, "prototype");
-    JSValue original = JS_GetPropertyStr(context, prototype, "toString");
-    function = JS_NewCFunction(
-        context, js_lazy_function_to_string, "toString", 0);
-    bool ok = !JS_IsException(constructor) && !JS_IsException(prototype)
-        && JS_IsFunction(context, original) && !JS_IsException(function)
-        && JS_SetPropertyStr(context, prototype, "toString", function) >= 0;
+    JSValue prototype = JS_IsException(constructor) ? JS_UNDEFINED
+        : JS_GetPropertyStr(context, constructor, "prototype");
+    JSValue original = JS_IsUndefined(prototype) || JS_IsException(prototype)
+        ? JS_UNDEFINED : JS_GetPropertyStr(context, prototype, "toString");
+    /* Materializing the original intrinsic can fail on allocation. Only
+       create the wrapper when the property setter can take ownership of it;
+       an unconsumed native function retains a reference to this realm. */
+    bool ok = false;
+    if (JS_IsFunction(context, original)) {
+        function = JS_NewCFunction(
+            context, js_lazy_function_to_string, "toString", 0);
+        ok = !JS_IsException(function)
+            && JS_SetPropertyStr(context, prototype, "toString", function) >= 0;
+    }
     if (ok) runtime->function_to_string = original;
     else JS_FreeValue(context, original);
     JS_FreeValue(context, prototype);
@@ -1520,7 +1527,8 @@ static bool lazy_store_factory_sources(
     if (table == NULL) return false;
     /* No factory is compiled here: each one is compiled, and so checked,
        when it first runs (lazy_factory_compile). A factory that never runs
-       is never checked; see docs/ARCHITECTURE.md, "Lazy webpack bundles". */
+       is never checked; see docs/engineering/SCRIPT_MEMORY.md, "Syntax errors:
+       a deliberate deviation". */
     bool preflight = lazy_preflight_requested();
     uint32_t line = 1, column = 1;
     size_t position = 0;

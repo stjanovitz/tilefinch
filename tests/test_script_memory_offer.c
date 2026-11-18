@@ -82,6 +82,14 @@ static int test_engine_stop_reason(void)
     CHECK(browser_engine_commit_html(engine, ARTICLE_URL, article,
                                      sizeof(article) - 1u, true));
     CHECK(browser_engine_page_loaded(engine));
+    if (!browser_engine_page_scripts_stopped_for_memory(engine)) {
+        const NavigationSession *nav = browser_engine_navigation(engine);
+        const ScriptResult *script = &nav->page.script_result;
+        fprintf(stderr, "memory stop: reason=%d attempted=%zu failed=%zu memory=%d error=%s\n",
+                (int) nav->page.script_stop.reason, (size_t) nav->script_attempted,
+                (size_t) nav->script_failed, nav->page.script_memory_limited,
+                script->error);
+    }
     CHECK(browser_engine_page_scripts_stopped_for_memory(engine));
     CHECK(!browser_engine_page_is_visually_blank(engine));
     /* A page whose scripts fit, and one whose scripts the reader stopped,

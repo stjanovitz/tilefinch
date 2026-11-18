@@ -87,7 +87,7 @@ bool tile_cache_validation_canvas_setup_probe(FILE *output)
         ImageCanvasNativeSurface native = { .pixels = source,
             .stride = fixture == 0 ? 2048u : 1280u, .authoritative = true };
         ImageResource image = { .pixels = source, .width = 320, .height = 180,
-            .is_canvas = true, .canvas_native_surface = &native };
+            .is_canvas = true, .canvas_native = native };
         DrawCommand command = { .width = 480, .height = 272 };
         RasterTarget target = { .pixels = a + 8, .stride = 512,
             .width = 480, .height = 272, .right = 480, .bottom = 272 };

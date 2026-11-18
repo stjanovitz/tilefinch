@@ -90,6 +90,8 @@ static void psp_apply_engine_env_knobs(const PspBootConfig *config)
         snprintf(scratch, sizeof(scratch), "%ld", config->lazy_functions);
         setenv("TILEFINCH_JS_LAZY_FUNCTIONS", scratch, 1);
     }
+    if (config->interface_snapshot == 0)
+        setenv("TILEFINCH_JS_INTERFACE_SNAPSHOT", "0", 1);
     /* Device profile: bound any single JS array's value buffer; a page
        once grouped a multi-megabyte binary string per character, which
        can never fit beside hydration on the 50MB heap. */

@@ -3,7 +3,7 @@
      errors, promises and platform objects with the constructors
      hardening.js captured. */
   const { defineProperty, Error, TypeError, DOMException, Promise,
-    ArrayBuffer, Uint8Array, Blob, TextEncoder } =
+    ArrayBuffer, Uint8Array, Blob, TextEncoder, apply } =
     globalThis.__tilefinchEventInterfaces;
   const command = globalThis.__tilefinchOpfsCommand,
     createPrivateWeakMap = globalThis.__tilefinchCreatePrivateWeakMap,
@@ -28,16 +28,15 @@
   delete globalThis.__tilefinchOpfsWritableStream;
 
   const OP_STAT = 0, OP_CREATE = 1, OP_READ = 2, OP_WRITE = 3,
-    OP_REMOVE = 4, OP_LIST = 5,
+    OP_REMOVE = 4, OP_LIST = 5, OP_LOCK = 6, OP_UNLOCK = 7,
     KIND_FILE = 1, KIND_DIRECTORY = 2,
     STATUS_OK = 0, STATUS_UNAVAILABLE = 1, STATUS_NOT_FOUND = 2,
     STATUS_TYPE = 3, STATUS_EXISTS = 4, STATUS_NOT_EMPTY = 5,
-    STATUS_QUOTA = 6, STATUS_STALE = 8,
+    STATUS_QUOTA = 6, STATUS_STALE = 8, STATUS_LOCKED = 9,
     FILE_LIMIT = 64 * 1024, WRITER_LIMIT = 4,
     token = {}, handleStates = createPrivateWeakMap(),
-    writerStates = createPrivateWeakMap(), syncStates = createPrivateWeakMap(),
-    activeWriterPaths = [];
-  let bufferGrowths = 0,
+    writerStates = createPrivateWeakMap(), syncStates = createPrivateWeakMap();
+  let activeWriters = 0, bufferGrowths = 0,
     bufferCopiedBytes = 0;
   if (globalThis.__tilefinchTestProbes && globalThis.__tilefinchRootCensus)
     Object.defineProperties(globalThis.__tilefinchRootCensus, {
@@ -74,6 +73,9 @@
         return new DOMException("Storage quota exceeded", "QuotaExceededError");
       if (status === STATUS_STALE)
         return new DOMException("File was replaced", "InvalidStateError");
+      if (status === STATUS_LOCKED)
+        return new DOMException("File is already being modified",
+                               "NoModificationAllowedError");
       return new TypeError("Invalid file-system path");
     },
     checked = (result) => {
@@ -101,13 +103,6 @@
       if (!state || (kind && state.kind !== kind))
         throw new TypeError("Illegal invocation");
       return state;
-    },
-    bytesFor = (value) => {
-      if (value instanceof Blob) return blobBytes(value);
-      if (value instanceof ArrayBuffer) return new Uint8Array(value.slice(0));
-      if (ArrayBuffer.isView(value)) return new Uint8Array(
-        value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
-      return new TextEncoder().encode(String(value));
     },
     mutableBytesFor = (value) => {
       if (value instanceof ArrayBuffer) return new Uint8Array(value);
@@ -147,10 +142,27 @@
     releaseWriter = (state) => {
       if (state.closed) return;
       state.closed = true;
-      const at = activeWriterPaths.indexOf(state.path);
-      if (at >= 0) activeWriterPaths.splice(at, 1);
-      state.bytes = new Uint8Array();
+      command(OP_UNLOCK, "", state.lease);
+      activeWriters--;
+      state.bytes = null;
       state.length = 0;
+    },
+    openWriter = (path, keep, Constructor, shared = false) => {
+      if (activeWriters >= WRITER_LIMIT) throw errorFor(STATUS_LOCKED);
+      const lease = checked(command(OP_LOCK, path, shared))[1];
+      try {
+        const opened = checked(command(keep ? OP_READ : OP_STAT, path));
+        const bytes = keep ? new Uint8Array(opened[1]) : new Uint8Array(),
+          generation = Number(opened[keep ? 3 : 4]);
+        if (!Number.isSafeInteger(generation) || generation <= 0)
+          throw new DOMException("File generation is unavailable", "InvalidStateError");
+        const writer = new Constructor(token, path, bytes, generation, lease, shared);
+        activeWriters++;
+        return writer;
+      } catch (error) {
+        command(OP_UNLOCK, "", lease);
+        throw error;
+      }
     },
     writerState = (stream) => {
       const state = writerStates.get(stream);
@@ -178,28 +190,41 @@
       state.position = position;
     },
     writerTruncate = (state, size) => resize(state, size),
-    writerWrite = (state, value) => {
-      const isBytes = value instanceof Blob || value instanceof ArrayBuffer
-        || ArrayBuffer.isView(value);
-      if (!isBytes && value && typeof value === "object"
-          && typeof value.type === "string") {
-        if (value.type === "seek") {
-          writerSeek(state, value.position);
-          return;
-        }
-        if (value.type === "truncate") {
-          writerTruncate(state, value.size);
-          return;
-        }
-        if (value.type !== "write") throw new TypeError("Unknown write command");
-        if (!("data" in value))
-          throw new TypeError("Write command requires data");
-        if (value.position !== undefined) writerSeek(state, value.position);
+    prepareWrite = (value) => {
+      let position;
+      if (value && typeof value === "object" && !(value instanceof Blob)
+          && !(value instanceof ArrayBuffer) && !ArrayBuffer.isView(value)) {
+        const type = String(value.type);
+        if (type === "seek") return { type, position: Number(value.position) };
+        if (type === "truncate") return { type, size: Number(value.size) };
+        if (type !== "write") throw new TypeError("Unknown write command");
+        const at = value.position;
+        position = at === undefined ? undefined : Number(at);
         value = value.data;
       }
-      const bytes = bytesFor(value), end = state.position + bytes.byteLength;
-      if (end > FILE_LIMIT)
+      if (value == null) throw new TypeError("Write command requires data");
+      const bytes = value instanceof ArrayBuffer || ArrayBuffer.isView(value)
+        ? mutableBytesFor(value) : null;
+      const data = bytes || (value instanceof Blob ? value : String(value)),
+        charge = bytes ? bytes.byteLength
+          : typeof data === "string" ? data.length * 2 : data.size;
+      /* Check the bounded file size before making a defensive copy. Blobs
+         and strings are immutable; their bytes needn't be staged twice. */
+      if ((typeof data === "string" ? data.length : charge) > FILE_LIMIT)
         throw new DOMException("File exceeds bounded size", "QuotaExceededError");
+      return { type: "write", position, data: bytes ? bytes.slice() : data, charge };
+    },
+    writerWrite = (state, chunk) => {
+      if ("error" in chunk) throw chunk.error;
+      if (chunk.type === "seek") return writerSeek(state, chunk.position);
+      if (chunk.type === "truncate") return writerTruncate(state, chunk.size);
+      const { data, position } = chunk,
+        bytes = typeof data === "string" ? new TextEncoder().encode(data)
+          : data instanceof Blob ? blobBytes(data) : data;
+      if (position !== undefined) writerSeek(state, position);
+      if (state.position > FILE_LIMIT || bytes.byteLength > FILE_LIMIT - state.position)
+        throw new DOMException("File exceeds bounded size", "QuotaExceededError");
+      const end = state.position + bytes.byteLength;
       if (end > state.length) resize(state, end);
       state.bytes.set(bytes, state.position);
       state.position = end;
@@ -254,49 +279,17 @@
     createWritable(options = {}) {
       return task(() => {
         const state = requireHandle(this, KIND_FILE),
-          keep = !!options?.keepExistingData;
-        if (activeWriterPaths.includes(state.path)
-            || activeWriterPaths.length >= WRITER_LIMIT)
-          throw new DOMException("File is already being modified",
-                                 "NoModificationAllowedError");
-        const opened = checked(command(keep ? OP_READ : OP_STAT, state.path));
-        if (!keep && Number(opened[1]) !== KIND_FILE)
-          throw errorFor(STATUS_TYPE);
-        const bytes = keep ? new Uint8Array(opened[1]) : new Uint8Array(),
-          generation = Number(opened[keep ? 3 : 4]);
-        if (!Number.isSafeInteger(generation) || generation <= 0)
-          throw new DOMException("File generation is unavailable", "InvalidStateError");
-        activeWriterPaths.push(state.path);
-        try {
-          return new FileSystemWritableFileStream(
-            token, state.path, bytes, generation);
-        } catch (error) {
-          activeWriterPaths.pop();
-          throw error;
-        }
+          keep = !!options?.keepExistingData,
+          rawMode = options?.mode,
+          mode = rawMode === undefined ? "siloed" : String(rawMode);
+        if (mode !== "siloed" && mode !== "exclusive")
+          throw new TypeError("Invalid writable mode");
+        return openWriter(state.path, keep, FileSystemWritableFileStream, mode === "siloed");
       });
     }
     createSyncAccessHandle() {
-      return task(() => {
-        const state = requireHandle(this, KIND_FILE);
-        if (activeWriterPaths.includes(state.path)
-            || activeWriterPaths.length >= WRITER_LIMIT)
-          throw new DOMException("File is already being modified",
-                                 "NoModificationAllowedError");
-        const opened = checked(command(OP_READ, state.path)),
-          generation = Number(opened[3]);
-        if (!Number.isSafeInteger(generation) || generation <= 0)
-          throw new DOMException(
-            "File generation is unavailable", "InvalidStateError");
-        activeWriterPaths.push(state.path);
-        try {
-          return new FileSystemSyncAccessHandle(
-            token, state.path, new Uint8Array(opened[1]), generation);
-        } catch (error) {
-          activeWriterPaths.pop();
-          throw error;
-        }
-      });
+      return task(() => openWriter(requireHandle(this, KIND_FILE).path, true,
+                                  FileSystemSyncAccessHandle));
     }
   }
 
@@ -391,8 +384,10 @@
     [Symbol.asyncIterator]() { return this.entries(); }
   }
 
+  const streamWrite = WritableStream.prototype._write,
+    writeChunk = (stream, chunk, charge) => apply(streamWrite, stream, [chunk, charge]);
   class FileSystemWritableFileStream extends WritableStream {
-    constructor(value, path, bytes, generation) {
+    constructor(value, path, bytes, generation, lease, shared) {
       if (value !== token) throw new TypeError("Illegal constructor");
       let stream = null;
       super({
@@ -405,7 +400,8 @@
             try {
               checked(command(
                 OP_WRITE, state.path,
-                state.bytes.subarray(0, state.length), state.generation));
+                state.bytes.subarray(0, state.length), state.generation,
+                state.shared ? state.lease : 0));
             } finally { releaseWriter(state); }
           });
         },
@@ -416,8 +412,18 @@
       stream = this;
       writerStates.set(this, {
         path, bytes, length: bytes.byteLength,
-        generation, position: 0, closed: false,
+        generation, lease, shared, position: 0, closed: false,
       });
+      /* Only the actual file stream has this admission step. A Worker
+         facade shares the interface prototype but owns a local stream. */
+      defineProperty(this, "_write", { value(value) {
+        try { writerState(this); }
+        catch (error) { return trustedPromiseReject(error); }
+        let chunk;
+        try { chunk = prepareWrite(value); }
+        catch (error) { chunk = { error }; }
+        return writeChunk(this, chunk, chunk.charge ?? 64);
+      }});
     }
     write(value) {
       if (this.locked)
@@ -436,11 +442,11 @@
   }
 
   class FileSystemSyncAccessHandle {
-    constructor(value, path, bytes, generation) {
+    constructor(value, path, bytes, generation, lease) {
       if (value !== token) throw new TypeError("Illegal constructor");
       syncStates.set(this, {
         path, bytes, length: bytes.byteLength,
-        generation, position: 0, closed: false, dirty: false,
+        generation, lease, position: 0, closed: false, dirty: false,
       });
     }
     read(buffer, options = {}) {

@@ -1700,6 +1700,7 @@ const char *navigation_active_document_url(
  * string is copied before the incumbent list is changed, so OOM leaves the
  * active page and its history untouched.
  */
+void navigation_clear_history(NavigationSession *session);
 bool navigation_replace_history(
     NavigationSession *session, const NavigationHistoryRecord *records,
     size_t count, size_t current_index);

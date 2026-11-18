@@ -8,6 +8,10 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.53 — 2026-11-18
+
+- Improved compatibility and reliability.
+
 ## 0.1.52 — 2026-11-16
 
 - More reliable YouTube sign-in, with clearer diagnostics when enabled.

@@ -133,6 +133,19 @@ if(PSP_BROWSER_BUILD_TESTS)
     add_test(NAME tilefinch-dom-native-reentry-tests COMMAND tilefinch-dom-native-reentry-tests)
     set_tests_properties(tilefinch-dom-native-reentry-tests PROPERTIES
         LABELS "tilefinch;unit;script;dom" TIMEOUT 30)
+    tilefinch_add_test_binary(tilefinch-interface-snapshot-tests tests/test_interface_snapshot.c)
+    target_link_libraries(tilefinch-interface-snapshot-tests PRIVATE tilefinch_core)
+    target_compile_definitions(tilefinch-interface-snapshot-tests PRIVATE
+        TILEFINCH_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME tilefinch-interface-snapshot-tests COMMAND tilefinch-interface-snapshot-tests)
+    set_tests_properties(tilefinch-interface-snapshot-tests PROPERTIES
+        LABELS "tilefinch;unit;script;dom" TIMEOUT 60)
+    # The same pages with every host native behind the JS profiler's
+    # trampoline, which must stay browser code.
+    add_test(NAME tilefinch-interface-snapshot-profile-tests COMMAND tilefinch-interface-snapshot-tests)
+    set_tests_properties(tilefinch-interface-snapshot-profile-tests PROPERTIES
+        LABELS "tilefinch;unit;script;dom" TIMEOUT 120
+        ENVIRONMENT "TILEFINCH_TRACE_JS_PROFILE=1")
     tilefinch_add_test_binary(tilefinch-ui-language-tests tests/test_ui_language.c)
     target_link_libraries(tilefinch-ui-language-tests PRIVATE tilefinch_core)
     target_compile_definitions(tilefinch-ui-language-tests PRIVATE
@@ -200,6 +213,14 @@ if(PSP_BROWSER_BUILD_TESTS)
                 ${CMAKE_CURRENT_SOURCE_DIR})
         set_tests_properties(tilefinch-ui-toast-catalog-tests PROPERTIES
             LABELS "tilefinch;unit;ui;tooling" TIMEOUT 60)
+        # Chrome colors come from the selected theme: no built-in accent
+        # token, Ember hex or unlisted literal color in the painters.
+        add_test(NAME tilefinch-ui-theme-color-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ui_theme_colors.py
+                ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(tilefinch-ui-theme-color-tests PROPERTIES
+            LABELS "tilefinch;unit;ui;tooling" TIMEOUT 30)
         add_test(NAME tilefinch-ui-translation-resources-tests
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ui_translation_resources.py)
@@ -287,6 +308,12 @@ if(PSP_BROWSER_BUILD_TESTS)
                     $<TARGET_FILE:psp-browser-interactive-lab>)
             set_tests_properties(tilefinch-interactive-until-tests PROPERTIES
                 LABELS "tilefinch;unit;performance;tooling" TIMEOUT 30)
+            add_test(NAME tilefinch-form-state-regression-tests
+                COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_form_state_audit.py
+                    $<TARGET_FILE:psp-browser-interactive-lab>)
+            set_tests_properties(tilefinch-form-state-regression-tests PROPERTIES
+                LABELS "tilefinch;unit;javascript;forms" TIMEOUT 30)
             add_test(NAME tilefinch-js-profile-accounting-tests
                 COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_js_profile_accounting.py
@@ -2138,6 +2165,16 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;javascript;allocator;sanitizer"
         TIMEOUT 30)
 
+    tilefinch_add_test_binary(tilefinch-quickjs-interface-snapshot-tests
+        tests/test_quickjs_interface_snapshot.c)
+    target_link_libraries(tilefinch-quickjs-interface-snapshot-tests
+        PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-quickjs-interface-snapshot-tests
+        COMMAND tilefinch-quickjs-interface-snapshot-tests)
+    set_tests_properties(tilefinch-quickjs-interface-snapshot-tests PROPERTIES
+        LABELS "tilefinch;unit;javascript;allocator;sanitizer"
+        TIMEOUT 60)
+
     tilefinch_add_test_binary(tilefinch-quickjs-oom-tests
         tests/test_quickjs_oom.c)
     target_link_libraries(tilefinch-quickjs-oom-tests PRIVATE tilefinch_core)
@@ -2180,6 +2217,18 @@ if(PSP_BROWSER_BUILD_TESTS)
     set_tests_properties(tilefinch-quickjs-line-table-tests PROPERTIES
         LABELS "tilefinch;unit;javascript;sanitizer"
         TIMEOUT 60)
+
+    # Class-field initializer positions: unchanged stacks, and a compile
+    # time that does not grow with the class's offset in the file.
+    tilefinch_add_test_binary(tilefinch-quickjs-class-field-position-tests
+        tests/test_quickjs_class_field_positions.c)
+    target_link_libraries(tilefinch-quickjs-class-field-position-tests
+        PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-quickjs-class-field-position-tests
+        COMMAND tilefinch-quickjs-class-field-position-tests)
+    set_tests_properties(tilefinch-quickjs-class-field-position-tests PROPERTIES
+        LABELS "tilefinch;unit;javascript"
+        TIMEOUT 120)
 
     tilefinch_add_test_binary(tilefinch-quickjs-native-call-tests
         tests/test_quickjs_native_calls.c)
@@ -3149,6 +3198,51 @@ if(PSP_BROWSER_BUILD_TESTS)
     set_tests_properties(tilefinch-lab-image-queue-tests PROPERTIES
         LABELS "tilefinch;lab"
         TIMEOUT 60)
+
+    add_test(NAME tilefinch-dom-layout-correctness-tests
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_dom_layout_correctness.py
+            $<TARGET_FILE:psp-browser-interactive-lab>)
+    set_tests_properties(tilefinch-dom-layout-correctness-tests PROPERTIES
+        LABELS "tilefinch;lab"
+        TIMEOUT 60)
+
+    add_test(NAME tilefinch-web-state-regressions-tests
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_web_state_regressions.py
+            $<TARGET_FILE:psp-browser-interactive-lab>)
+    set_tests_properties(tilefinch-web-state-regressions-tests PROPERTIES
+        LABELS "tilefinch;lab" TIMEOUT 60)
+    add_test(NAME tilefinch-web-storage-dom-regressions-tests
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_web_state_regressions.py
+            $<TARGET_FILE:psp-browser-interactive-lab> --extended)
+    set_tests_properties(tilefinch-web-storage-dom-regressions-tests PROPERTIES
+        LABELS "tilefinch;lab" TIMEOUT 60)
+    add_test(NAME tilefinch-web-layout-lifecycle-regressions-tests
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_web_state_regressions.py
+            $<TARGET_FILE:psp-browser-interactive-lab> --layout-lifecycle)
+    set_tests_properties(tilefinch-web-layout-lifecycle-regressions-tests PROPERTIES
+        LABELS "tilefinch;lab" TIMEOUT 60)
+    add_test(NAME tilefinch-web-geometry-storage-regressions-tests
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_web_state_regressions.py
+            $<TARGET_FILE:psp-browser-interactive-lab> --geometry-storage)
+    set_tests_properties(tilefinch-web-geometry-storage-regressions-tests PROPERTIES
+        LABELS "tilefinch;lab" TIMEOUT 60)
+    add_test(NAME tilefinch-web-flex-grid-regressions-tests
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_web_state_regressions.py
+            $<TARGET_FILE:psp-browser-interactive-lab> --flex-grid)
+    set_tests_properties(tilefinch-web-flex-grid-regressions-tests PROPERTIES
+        LABELS "tilefinch;lab" TIMEOUT 60)
+    add_test(NAME tilefinch-web-correctness-js-regressions-tests
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_web_state_regressions.py
+            $<TARGET_FILE:psp-browser-interactive-lab> --correctness-js)
+    set_tests_properties(tilefinch-web-correctness-js-regressions-tests PROPERTIES
+        LABELS "tilefinch;lab" TIMEOUT 60)
 
     add_test(NAME selected-web-platform-tests
         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/run-web-platform-correctness.sh

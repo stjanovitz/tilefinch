@@ -29,7 +29,7 @@ AlignItems flex_item_alignment(const ComputedStyle *container,
 static void stretch_flex_item_cross(LayoutContext *context,
                                     const FlatItem *item,
                                     const ComputedStyle *style,
-                                    int target_height)
+                                    int target_height, bool definite_percent)
 {
     LayoutDocument *layout = context->layout;
     lxb_dom_node_t *node = item->node;
@@ -45,7 +45,7 @@ static void stretch_flex_item_cross(LayoutContext *context,
     /* A column's flexible scroll viewport may shrink while its retained
        contents keep their natural extent. Ordinary cross-axis stretching
        still never shrinks non-scrollable content. */
-    if (target_height < box->height
+    if (target_height < box->height && !definite_percent
         && (!style->overflow_y_scroll || style->overflow_y_clip_only)) return;
     bool generated = item->generated_pseudo != PSEUDO_NONE;
     size_t box_index = generated ? 0 : (size_t) (box - layout->node_boxes);
@@ -178,12 +178,19 @@ static void translate_flex_item(LayoutDocument *layout, const FlatItem *item,
 /* Final content-sized grid tracks are definite for stretched items. Carry
    that size through percentage-height descendants, including lifted
    display:contents children, without laying out the entire row twice. */
-static void stretch_grid_item_depth(LayoutContext *context,
-                                    const FlatItem *item,
-                                    int target_height, unsigned depth)
+static void stretch_definite_item(LayoutContext *context, const FlatItem *item,
+                                  int target_height, unsigned depth,
+                                  bool flex_cross, bool definite_percent)
 {
     const LayoutNodeBox *box = flex_item_box(context->layout, item);
-    if (box == NULL || target_height <= box->height || depth >= 16) return;
+    if (box == NULL || target_height < 0 || depth >= 16 ||
+        (!flex_cross && target_height <= box->height) ||
+        (target_height < box->height && !definite_percent)) return;
+    if (flex_cross && !box->unresolved_descendant_height) {
+        stretch_flex_item_cross(context, item, &item->style,
+                                target_height, definite_percent);
+        return;
+    }
     int old_height = box->height;
     ComputedStyle style = item->style;
     resolve_padding(context->sheet, &style, box->width);
@@ -195,7 +202,8 @@ static void stretch_grid_item_depth(LayoutContext *context,
     sized.height = target_height - (style.box_sizing_border_box ? 0 : edges);
     target_height = style_content_height(context->sheet, &sized, box->width,
                                          target_height) + edges;
-    if (target_height <= old_height) return;
+    if ((!flex_cross && target_height <= old_height)
+        || (target_height < old_height && !definite_percent)) return;
     int old_content = old_height > edges ? old_height - edges : 0;
     int content = target_height > edges ? target_height - edges : 0;
     bool column = (style.display == DISPLAY_FLEX
@@ -207,7 +215,7 @@ static void stretch_grid_item_depth(LayoutContext *context,
         && !column && !style.flex_wrap;
     FlexOrderPlan order = {0};
     if (column && !flex_order_plan_build(&order, context, item->node, &style)) return;
-    stretch_flex_item_cross(context, item, &style, target_height);
+    stretch_flex_item_cross(context, item, &style, target_height, definite_percent);
     box = flex_item_box(context->layout, item);
     if (box == NULL || box->height != target_height) {
         flex_order_plan_destroy(&order);
@@ -250,8 +258,8 @@ static void stretch_grid_item_depth(LayoutContext *context,
             && child.style.has_height && child.style.height_percent) {
             int height = style_content_height(context->sheet, &child.style,
                                               box->width, reference);
-            stretch_grid_item_depth(context, &child, height + child_edges,
-                                    depth + 1);
+            stretch_definite_item(context, &child, height + child_edges,
+                                  depth + 1, flex_cross, flex_cross);
         } else if (positioned && !child.style.has_height
                    && child.style.has_top && child.style.has_bottom
                    && !child.anonymous_text && child.generated_pseudo == PSEUDO_NONE) {
@@ -262,16 +270,18 @@ static void stretch_grid_item_depth(LayoutContext *context,
                 (child.style.inset_percent_mask & STYLE_INSET_BOTTOM_PERCENT) != 0, padding_height);
             int height = padding_height - top - bottom
                 - child.style.margin.top - child.style.margin.bottom;
-            stretch_grid_item_depth(context, &child, height, depth + 1);
+            stretch_definite_item(context, &child, height, depth + 1,
+                                  flex_cross, flex_cross);
         } else if (row && !child.style.out_of_flow && !child.style.has_height
                    && !child.style.margin_top_auto && !child.style.margin_bottom_auto
                    && flex_item_alignment(&style, &child.style) == ALIGN_STRETCH) {
-            stretch_grid_item_depth(context, &child, content
-                - child.style.margin.top - child.style.margin.bottom, depth + 1);
+            stretch_definite_item(context, &child, content
+                - child.style.margin.top - child.style.margin.bottom, depth + 1,
+                flex_cross, false);
         }
         child_box = flex_item_box(context->layout, &child);
         int added = child_box != NULL ? child_box->height - old_child_height : 0;
-        if (row && !child.style.out_of_flow && added > 0) {
+        if (row && !child.style.out_of_flow && added != 0) {
             int old_outer = old_child_height + child.style.margin.top + child.style.margin.bottom;
             int before = content > old_outer ? content - old_outer : 0;
             int after = content > old_outer + added ? content - old_outer - added : 0;
@@ -284,7 +294,7 @@ static void stretch_grid_item_depth(LayoutContext *context,
                     : alignment == ALIGN_END ? after - before : 0;
             if (offset) translate_flex_item(context->layout, &child, 0, offset);
         }
-        if (column && !child.style.out_of_flow) {
+        if ((column || (flex_cross && !row)) && !child.style.out_of_flow) {
             int offset = reverse ? -growth - added : growth;
             if (offset) translate_flex_item(context->layout, &child, 0, offset);
             growth = layout_add_coordinate(growth, added);
@@ -294,6 +304,10 @@ static void stretch_grid_item_depth(LayoutContext *context,
         size_t index = 0, seen_margins = 0;
         int before = old_content > used ? old_content - used : 0;
         int after = content > used + growth ? content - used - growth : 0;
+        /* `end`/`start` follow the writing mode, not the reversed main axis;
+           unsafe center keeps centering when nothing overflows. */
+        JustifyContent justify = style_align_content_in_axis(style.justify_content, reverse);
+        if (justify == JUSTIFY_UNSAFE_CENTER) justify = JUSTIFY_CENTER;
         flex_iterator_init(&iterator, context, item->node, &style, &order);
         while (flex_iterator_next(&iterator, &child)) {
             if (child.style.out_of_flow || child.style.fixed_position
@@ -305,15 +319,15 @@ static void stretch_grid_item_depth(LayoutContext *context,
                                         : child.style.margin_top_auto;
                 offset = tilefinch_mul_div_int(after, seen_margins, auto_margins)
                     - tilefinch_mul_div_int(before, seen_margins, auto_margins);
-            } else if (style.justify_content == JUSTIFY_CENTER) offset = after / 2 - before / 2;
-            else if (style.justify_content == JUSTIFY_END) offset = extra;
-            else if (style.justify_content == JUSTIFY_SPACE_BETWEEN && count > 1)
+            } else if (justify == JUSTIFY_CENTER) offset = after / 2 - before / 2;
+            else if (justify == JUSTIFY_END) offset = extra;
+            else if (justify == JUSTIFY_SPACE_BETWEEN && count > 1)
                 offset = tilefinch_mul_div_int(after, index, count - 1)
                     - tilefinch_mul_div_int(before, index, count - 1);
-            else if (style.justify_content == JUSTIFY_SPACE_AROUND)
+            else if (justify == JUSTIFY_SPACE_AROUND)
                 offset = tilefinch_mul_div_int(after, 2 * index + 1, 2 * count)
                     - tilefinch_mul_div_int(before, 2 * index + 1, 2 * count);
-            else if (style.justify_content == JUSTIFY_SPACE_EVENLY)
+            else if (justify == JUSTIFY_SPACE_EVENLY)
                 offset = tilefinch_mul_div_int(after, index + 1, count + 1)
                     - tilefinch_mul_div_int(before, index + 1, count + 1);
             if (reverse) offset = target_height - old_height - offset;
@@ -329,7 +343,22 @@ static void stretch_grid_item_depth(LayoutContext *context,
 void layout_stretch_grid_item(LayoutContext *context, const FlatItem *item,
                               int target_height)
 {
-    stretch_grid_item_depth(context, item, target_height, 0);
+    stretch_definite_item(context, item, target_height, 0, false, false);
+}
+
+void layout_expand_table_cell(LayoutContext *context, lxb_dom_node_t *cell,
+                              const ComputedStyle *style, int height)
+{
+    const LayoutNodeBox *box = layout_box_for_node(context->layout, cell);
+    if (box == NULL || height <= box->height) return;
+    int free_height = height - box->height;
+    FlatItem item = {.node = cell};
+    stretch_flex_item_cross(context, &item, style, height, false);
+    if (style->vertical_align == VERTICAL_MIDDLE
+        || style->vertical_align == VERTICAL_BOTTOM)
+        translate_table_cell_contents(context->layout, cell,
+            style->vertical_align == VERTICAL_MIDDLE
+                ? (free_height + 1) / 2 : free_height);
 }
 
 int layout_fit_column_scroller(LayoutContext *context, lxb_dom_node_t *node,
@@ -377,7 +406,7 @@ int layout_fit_column_scroller(LayoutContext *context, lxb_dom_node_t *node,
             int edges = item.style.padding.top + item.style.padding.bottom
                 + item.style.border.top + item.style.border.bottom;
             if (target < edges) target = edges;
-            stretch_flex_item_cross(context, &item, &item.style, target);
+            stretch_flex_item_cross(context, &item, &item.style, target, false);
             const LayoutNodeBox *box = flex_item_box(context->layout, &item);
             if (box == NULL) return 0;
             delta = box->height - old_height;
@@ -537,10 +566,16 @@ void flex_order_plan_destroy(FlexOrderPlan *plan)
     if (plan->values != NULL && plan->values != plan->inline_values) {
         budget_free(plan->budget, plan->values);
     }
+    budget_free(plan->budget, plan->baselines);
+    budget_free(plan->budget, plan->main_items);
+    plan->main_items = NULL;
+    plan->baselines = NULL;
+    plan->baseline_count = 0;
     plan->values = NULL;
     plan->count = 0;
     plan->capacity = 0;
     plan->active = false;
+    plan->item_count = 0;
 }
 
 bool flex_order_plan_build(FlexOrderPlan *plan,
@@ -558,6 +593,7 @@ bool flex_order_plan_build(FlexOrderPlan *plan,
     flex_iterator_init(&scan, context, container, style, plan);
     while (flex_iterator_next(&scan, &item)) {
         if (item.style.out_of_flow || item.style.fixed_position) continue;
+        plan->item_count++;
         size_t insert = 0;
         while (insert < plan->count && plan->values[insert] < item.style.order) {
             insert++;
@@ -830,8 +866,8 @@ bool layout_anonymous_text(LayoutContext *context,
     return true;
 }
 
-int flex_child_basis(LayoutContext *context, const FlatItem *item,
-                            int content_width)
+static int flex_measure_basis(LayoutContext *context, const FlatItem *item,
+                     int content_width, int content_height, bool clamp)
 {
     context->flex_basis_resolutions++;
     ComputedStyle resolved_style = item->style;
@@ -888,6 +924,14 @@ int flex_child_basis(LayoutContext *context, const FlatItem *item,
             context->sheet, child_style->width,
             child_style->width_percent, content_width);
         explicit_size = true;
+    } else if (child_style->aspect_width > 0 && child_style->aspect_height > 0
+               && child_style->has_height && child_style->height >= 0
+               && (!child_style->height_percent || content_height > 0)) {
+        int cross = resolve_declared_length(context->sheet, child_style->height,
+            child_style->height_percent, content_height);
+        basis = tilefinch_mul_div_int(cross, child_style->aspect_width,
+                                    child_style->aspect_height);
+        explicit_size = true;
     } else {
         basis = intrinsic_text_width(context, item->node,
                                      &item->parent_style, content_width);
@@ -917,9 +961,11 @@ int flex_child_basis(LayoutContext *context, const FlatItem *item,
         }
     }
     if (basis < margins) basis = margins;
-    basis = constrain_border_box_width(
-        context, item->node, &item->parent_style, child_style,
-        content_width, basis - margins, NULL) + margins;
+    if (clamp) {
+        basis = constrain_border_box_width(
+            context, item->node, &item->parent_style, child_style,
+            content_width, basis - margins, NULL) + margins;
+    }
     /* Flex bases are box sizes, not text-flow widths. Empty and explicitly
        zero-width items may consume no main-axis space; a text safety floor
        here silently shrinks their neighbours inside intrinsic containers. */
@@ -929,9 +975,165 @@ int flex_child_basis(LayoutContext *context, const FlatItem *item,
        contract. Wrapped lines do not run that container-wide shrink pass,
        however, so retain the historical per-line bound there. Without it a
        content-box `width:100%` item plus padding can overflow the viewport. */
-    if ((!explicit_size || item->parent_style.flex_wrap)
+    if (clamp && (!explicit_size || item->parent_style.flex_wrap)
         && basis > content_width) basis = content_width;
     return basis;
+}
+
+int flex_child_basis(LayoutContext *context, const FlatItem *item,
+                     int content_width, int content_height)
+{
+    return flex_measure_basis(context, item, content_width, content_height, true);
+}
+
+static int flex_limit_main(const FlexMainItem *item, int value)
+{
+    if (value > item->maximum) value = item->maximum;
+    return value < item->minimum ? item->minimum : value;
+}
+
+int layout_content_offset(JustifyContent alignment, int space, int tracks,
+                          int *gap)
+{
+    if (alignment == JUSTIFY_UNSAFE_CENTER) return space / 2;
+    if (space <= 0 || tracks <= 0) return 0;
+    switch (alignment) {
+    case JUSTIFY_CENTER: return space / 2;
+    case JUSTIFY_END: return space;
+    case JUSTIFY_SPACE_BETWEEN:
+        if (tracks > 1) *gap += space / (tracks - 1);
+        return 0;
+    case JUSTIFY_SPACE_AROUND: {
+        int each = space / tracks;
+        *gap += each;
+        return each / 2;
+    }
+    case JUSTIFY_SPACE_EVENLY: {
+        int each = space / (tracks + 1);
+        *gap += each;
+        return each;
+    }
+    default: return 0;
+    }
+}
+
+static int flex_free_space(int available, int64_t occupied)
+{
+    int64_t space = (int64_t) available - occupied;
+    const int64_t limit = INT64_C(1) << 28;
+    return (int) (space > limit ? limit : (space < -limit ? -limit : space));
+}
+
+/* Flexbox 9.7. Keep the unclamped base separate from the hypothetical size:
+   a min/max violation freezes a target, not its original flex weight. */
+int flex_resolve_main(FlexMainItem *items, size_t count, int available)
+{
+    int64_t hypothetical = 0, occupied = 0;
+    for (size_t i = 0; i < count; i++) {
+        FlexMainItem *item = &items[i];
+        item->result = flex_limit_main(item, item->basis);
+        hypothetical += item->result;
+    }
+    bool growing = hypothetical < available;
+    for (size_t i = 0; i < count; i++) {
+        FlexMainItem *item = &items[i];
+        item->frozen = growing ? item->grow == 0 || item->basis > item->result
+                               : item->shrink == 0 || item->basis < item->result;
+        occupied += item->frozen ? item->result : item->basis;
+    }
+    /* Free space saturates at 2^28, not the coordinate limit: clipping it
+       there left huge bases (a sum of up to FLEX_MAIN_LIMIT clamped sizes)
+       mostly unshrunk. */
+    int initial = flex_free_space(available, occupied);
+    for (size_t pass = 0; pass < count; pass++) {
+        int factor = 0;
+        int64_t weight = 0;
+        for (size_t i = 0; i < count; i++) {
+            const FlexMainItem *item = &items[i];
+            if (!item->frozen) {
+                factor += growing ? item->grow : (int) item->shrink;
+                weight += growing ? item->grow : (int64_t) item->shrink * item->inner;
+            }
+        }
+        if (factor == 0) break;
+        int space = flex_free_space(available, occupied);
+        int unit = growing ? 1000 : 512;
+        if (factor < unit) {
+            int scaled = tilefinch_mul_div_int(initial, factor, unit);
+            if (abs(scaled) < abs(space)) space = scaled;
+        }
+        if ((growing && space < 0) || (!growing && space > 0)) space = 0;
+        /* Keep space * weight inside int64 (|space| <= 2^28): drop low weight
+           bits once the weight reaches 2^34, far beyond ordinary pages. */
+        unsigned weight_shift = 0;
+        while ((weight >> weight_shift) >= (INT64_C(1) << 34)) weight_shift++;
+        weight >>= weight_shift;
+        int64_t next_weight = 0, violation = 0;
+        int previous_share = 0;
+        for (size_t i = 0; i < count; i++) {
+            FlexMainItem *item = &items[i];
+            if (item->frozen) continue;
+            next_weight += growing ? item->grow : (int64_t) item->shrink * item->inner;
+            int share = weight == 0 ? 0 : (int) (((int64_t) space
+                * (next_weight >> weight_shift)
+                + (space < 0 ? -weight / 2 : weight / 2)) / weight);
+            item->result = layout_clamp_coordinate(
+                (int64_t) item->basis + share - previous_share);
+            previous_share = share;
+            violation += (int64_t) flex_limit_main(item, item->result) - item->result;
+        }
+        for (size_t i = 0; i < count; i++) {
+            FlexMainItem *item = &items[i];
+            if (item->frozen) continue;
+            int limited = flex_limit_main(item, item->result);
+            if (violation > 0 ? limited > item->result
+                : violation < 0 ? limited < item->result : true) {
+                item->frozen = true;
+                occupied += (int64_t) limited - item->basis;
+            }
+            item->result = limited;
+        }
+        if (violation == 0) break;
+    }
+    int64_t total = 0;
+    for (size_t i = 0; i < count; i++) total += items[i].result;
+    return layout_clamp_coordinate(total);
+}
+
+void flex_measure_row_main(LayoutContext *context, FlatItem *item,
+                           FlexMainItem *main, int width, int height,
+                           bool stretch_height)
+{
+    int basis = flex_measure_basis(context, item, width, height, false);
+    ComputedStyle *s = &item->style;
+    resolve_padding(context->sheet, s, width);
+    resolve_margin(context->sheet, s, width);
+    int edge = s->padding.left + s->padding.right + s->border.left + s->border.right;
+    int margin = s->margin.left + s->margin.right;
+    if (stretch_height && !s->has_height && !s->has_width && !s->has_flex_basis
+        && s->aspect_width > 0 && s->aspect_height > 0
+        && !s->margin_top_auto && !s->margin_bottom_auto) {
+        int cross = height - s->margin.top - s->margin.bottom;
+        if (!s->box_sizing_border_box)
+            cross -= s->padding.top + s->padding.bottom + s->border.top + s->border.bottom;
+        if (cross > 0) basis = layout_add_coordinate(
+            tilefinch_mul_div_int(cross, s->aspect_width, s->aspect_height),
+            margin + (s->box_sizing_border_box ? 0 : edge));
+    }
+    int maximum = 0;
+    bool has_max = style_maximum_width(context->sheet, s, width, &maximum);
+    int minimum = flex_child_row_minimum(context, item, width, false);
+    int noncontent = margin + edge;
+    if (minimum < noncontent) minimum = noncontent;
+    *main = (FlexMainItem){
+        .basis = basis,
+        .inner = basis > noncontent
+            ? layout_subtract_coordinate(basis, noncontent) : 0,
+        .minimum = minimum, .maximum = has_max
+            ? layout_add_coordinate(maximum, margin + (s->box_sizing_border_box ? 0 : edge))
+            : LAYOUT_COORDINATE_LIMIT,
+        .grow = s->flex_grow, .shrink = s->flex_shrink
+    };
 }
 
 static int flex_child_minimum(LayoutContext *context, const FlatItem *item,
@@ -989,6 +1191,10 @@ static int flex_child_minimum(LayoutContext *context, const FlatItem *item,
         int minimum = intrinsic_min_text_width_internal(
             context, item->node, &item->parent_style,
             measurement_limit, true);
+        if (!style->has_width && measurement_limit > 0
+            && minimum >= measurement_limit && measurement_limit < LAYOUT_COORDINATE_LIMIT)
+            minimum = intrinsic_min_text_width_internal(context, item->node,
+                &item->parent_style, LAYOUT_COORDINATE_LIMIT, true);
         bool replaced = document_node_is_tag(item->node, LXB_TAG_IMG)
             || document_node_is_tag(item->node, LXB_TAG_SVG)
             || document_node_is_tag(item->node, LXB_TAG_VIDEO)
@@ -1045,14 +1251,15 @@ int flex_child_row_minimum(LayoutContext *context,
 FlexLineMetrics flex_line_metrics(LayoutContext *context,
                                          FlexItemIterator *iterator,
                                          FlatItem *item,
-                                         int content_width, int gap)
+                                         int content_width, int content_height,
+                                         int gap)
 {
     FlexLineMetrics metrics = {0};
     while (flex_iterator_next(iterator, item)) {
         if (item->style.out_of_flow || item->style.fixed_position) {
             continue;
         }
-        int basis = flex_child_basis(context, item, content_width);
+        int basis = flex_child_basis(context, item, content_width, content_height);
         int occupied = metrics.basis;
         if (metrics.count != 0) {
             int gaps = layout_clamp_coordinate(
@@ -1087,6 +1294,7 @@ static bool flex_item_cross_metrics(const LayoutDocument *layout,
    top, measured as inline layout measures it (half-leading included). A
    textless flex item synthesizes its baseline at the margin-box end. */
 static bool flex_item_baseline(LayoutContext *context, const FlatItem *item,
+                               const FlexOrderPlan *plan,
                                int origin, int height, int *baseline)
 {
     const LayoutNodeBox *box = flex_item_box(context->layout, item);
@@ -1094,6 +1302,16 @@ static bool flex_item_baseline(LayoutContext *context, const FlatItem *item,
     int text = 0;
     if (!layout_box_first_text_baseline(context->layout, box, &text)) {
         *baseline = height;
+        /* Textless atomic inlines still establish a line baseline. Use the
+           one measured by their own formatting context before synthesizing. */
+        for (size_t i = 0; i < plan->baseline_count; i++) {
+            if (plan->baselines[i].node != item->node) continue;
+            text = box->y + plan->baselines[i].offset;
+            *baseline = text - origin;
+            if (*baseline < 0) *baseline = 0;
+            if (*baseline > height) *baseline = height;
+            break;
+        }
         return true;
     }
     *baseline = text - origin;
@@ -1108,7 +1326,8 @@ void reverse_flex_row_items(LayoutContext *context,
                                    const FlexOrderPlan *order_plan,
                                    int content_x, int content_width)
 {
-    if (style->flex_direction != FLEX_ROW_REVERSE) return;
+    if ((style->flex_direction == FLEX_ROW_REVERSE)
+        == computed_style_direction_rtl(style)) return;
     FlexItemIterator iterator;
     FlatItem item;
     flex_iterator_init(&iterator, context, container, style, order_plan);
@@ -1236,30 +1455,21 @@ bool place_wrapped_flex_columns(LayoutContext *context,
     }
     used_heights[column] = used_height;
     size_t column_count = column + 1;
+    JustifyContent justify = style_align_content_in_axis(style->justify_content,
+        style->flex_direction == FLEX_COLUMN_REVERSE);
     int natural_width = style->gap * (int) (column_count - 1);
     for (size_t i = 0; i < column_count; i++) {
         natural_width = layout_add_coordinate(natural_width, widths[i]);
     }
     int free_width = content_width - natural_width;
-    if (free_width < 0) free_width = 0;
-    int initial_offset = 0;
     int between_extra = 0;
     int stretch_each = 0;
     int stretch_remainder = 0;
-    if (style->align_content == JUSTIFY_CENTER) {
-        initial_offset = free_width / 2;
-    } else if (style->align_content == JUSTIFY_END) {
-        initial_offset = free_width;
-    } else if (style->align_content == JUSTIFY_SPACE_BETWEEN
-               && column_count > 1) {
-        between_extra = free_width / (int) (column_count - 1);
-    } else if (style->align_content == JUSTIFY_SPACE_AROUND) {
-        between_extra = free_width / (int) column_count;
-        initial_offset = between_extra / 2;
-    } else if (style->align_content == JUSTIFY_SPACE_EVENLY) {
-        between_extra = free_width / (int) (column_count + 1);
-        initial_offset = between_extra;
-    } else if (style->align_content == JUSTIFY_STRETCH) {
+    JustifyContent align = style_align_content_in_axis(style->align_content,
+                                                      style->flex_wrap_reverse);
+    int initial_offset = layout_content_offset(align, free_width, (int) column_count,
+                                              &between_extra);
+    if (align == JUSTIFY_STRETCH && free_width > 0) {
         stretch_each = free_width / (int) column_count;
         stretch_remainder = free_width % (int) column_count;
     }
@@ -1309,27 +1519,27 @@ bool place_wrapped_flex_columns(LayoutContext *context,
         int before = used_height == 0 ? 0 : style->row_gap;
         used_height += before;
         int free_height = content_height - used_heights[column];
-        if (free_height < 0) free_height = 0;
+        if (free_height < 0 && justify != JUSTIFY_UNSAFE_CENTER) free_height = 0;
         int main_offset = 0;
-        if (auto_margins[column] != 0) {
+        if (auto_margins[column] != 0 && free_height > 0) {
             bool auto_before = style->flex_direction == FLEX_COLUMN_REVERSE
                 ? item.style.margin_bottom_auto
                 : item.style.margin_top_auto;
             if (auto_before) auto_margin_seen++;
             main_offset = tilefinch_mul_div_int(
                 free_height, auto_margin_seen, auto_margins[column]);
-        } else if (style->justify_content == JUSTIFY_CENTER) {
+        } else if (justify == JUSTIFY_CENTER || justify == JUSTIFY_UNSAFE_CENTER) {
             main_offset = free_height / 2;
-        } else if (style->justify_content == JUSTIFY_END) {
+        } else if (justify == JUSTIFY_END) {
             main_offset = free_height;
-        } else if (style->justify_content == JUSTIFY_SPACE_BETWEEN
+        } else if (justify == JUSTIFY_SPACE_BETWEEN
                    && item_counts[column] > 1) {
             main_offset = tilefinch_mul_div_int(
                 free_height, item_index, item_counts[column] - 1);
-        } else if (style->justify_content == JUSTIFY_SPACE_AROUND) {
+        } else if (justify == JUSTIFY_SPACE_AROUND) {
             main_offset = tilefinch_mul_div_int(
                 free_height, 2 * item_index + 1, 2 * item_counts[column]);
-        } else if (style->justify_content == JUSTIFY_SPACE_EVENLY) {
+        } else if (justify == JUSTIFY_SPACE_EVENLY) {
             main_offset = tilefinch_mul_div_int(
                 free_height, item_index + 1, item_counts[column] + 1);
         }
@@ -1373,6 +1583,8 @@ int distribute_flex_rows(LayoutContext *context,
     *stretch_free = 0;
     *stretch_lines = 0;
     if (!style->flex_wrap || declared <= 0) return declared;
+    JustifyContent align = style_align_content_in_axis(style->align_content,
+                                                      style->flex_wrap_reverse);
     FlexItemIterator scan;
     FlatItem item;
     flex_iterator_init(&scan, context, container, style, order_plan);
@@ -1394,7 +1606,7 @@ int distribute_flex_rows(LayoutContext *context,
     }
     int free_cross = declared - (natural_bottom - natural_top);
     if (line_count == 0
-        || style->align_content == JUSTIFY_START) return declared;
+        || align == JUSTIFY_START) return declared;
     if (free_cross > 0
         && style->align_content == JUSTIFY_STRETCH) {
         *stretch_free = free_cross;
@@ -1418,9 +1630,9 @@ int distribute_flex_rows(LayoutContext *context,
             line_index++;
         }
         int offset = 0;
-        if (style->align_content == JUSTIFY_CENTER) {
+        if (align == JUSTIFY_CENTER || align == JUSTIFY_UNSAFE_CENTER) {
             offset = free_cross / 2;
-        } else if (style->align_content == JUSTIFY_END) {
+        } else if (align == JUSTIFY_END) {
             offset = free_cross;
         } else if (style->align_content == JUSTIFY_SPACE_BETWEEN) {
             if (free_cross > 0 && line_count > 1) {
@@ -1496,7 +1708,7 @@ void align_flex_row_items(LayoutContext *context,
                 && !item.style.margin_top_auto
                 && !item.style.margin_bottom_auto) {
                 int baseline = 0;
-                if (flex_item_baseline(context, &item, origin, height,
+                if (flex_item_baseline(context, &item, order_plan, origin, height,
                                        &baseline)) {
                     if (baseline > baseline_ascent) {
                         baseline_ascent = baseline;
@@ -1546,6 +1758,13 @@ void align_flex_row_items(LayoutContext *context,
                               && !item.anonymous_text
                               && item.style.display == DISPLAY_TABLE_CELL;
             if (table_cell) {
+                if (table_cell_row_span(item.node) > 1
+                    && table_cell_row_span_placed(context, item.node)) {
+                    /* The table knows the final height of every row spanned;
+                       aligning here would center the content twice. */
+                    placed++;
+                    continue;
+                }
                 int target_height = line_height - item.style.margin.top
                                     - item.style.margin.bottom;
                 int content_offset = 0;
@@ -1559,7 +1778,7 @@ void align_flex_row_items(LayoutContext *context,
                 }
                 if (target_height > 0) {
                     stretch_flex_item_cross(context, &item,
-                                            &item.style, target_height);
+                                            &item.style, target_height, false);
                 }
                 if (content_offset > 0) {
                     translate_table_cell_contents(context->layout,
@@ -1587,15 +1806,19 @@ void align_flex_row_items(LayoutContext *context,
                 int target_height = line_height - item.style.margin.top
                                     - item.style.margin.bottom;
                 if (target_height > 0) {
-                    stretch_flex_item_cross(context, &item,
-                                            &item.style, target_height);
+                    if (item.anonymous_text || item.generated_pseudo != PSEUDO_NONE)
+                        stretch_flex_item_cross(context, &item, &item.style,
+                                                target_height, false);
+                    else
+                        stretch_definite_item(context, &item, target_height, 0,
+                                              true, false);
                 }
                 placed++;
                 continue;
             }
             if (alignment == ALIGN_BASELINE) {
                 int baseline = 0;
-                if (flex_item_baseline(context, &item, origin, height,
+                if (flex_item_baseline(context, &item, order_plan, origin, height,
                                        &baseline)) {
                     int offset = baseline_ascent - baseline;
                     if (offset > 0) {

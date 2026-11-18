@@ -1318,6 +1318,9 @@ typedef struct {
     size_t maximum_script_bytes;
     size_t maximum_script_file_bytes;
     bool defer_document_scripts;
+    /* A navigation will publish layout after its early script callbacks.
+       Standalone realms have no layout owner and must not wait for it. */
+    bool expect_navigation_layout;
     /* Host-test seam for deterministic transport fakes. Production and lab
        callers must leave this false: native realm primitives are otherwise
        installed non-writable, non-configurable, and non-enumerable. */
@@ -1325,6 +1328,12 @@ typedef struct {
     /* Host-test seam: build the realm without the bootstrap's test-only
        probes, as the shipping PSP build always does. Ignored there. */
     bool omit_test_probes;
+    /* Build the realm without the interface snapshot: the browser's own
+       script then reads the built-ins as the page left them. Host tests
+       that inject a fault by replacing a built-in set it; the PSP app's
+       boot.cfg `interface_snapshot=0` reaches every realm through
+       TILEFINCH_JS_INTERFACE_SNAPSHOT instead. */
+    bool interface_snapshot_disabled;
     /* Trusted audio backend selection, not a page-visible capability. Browser
        configuration selects native slots; zero-initialized standalone callers
        retain the reference JavaScript implementation for differential tests.
@@ -1574,6 +1583,21 @@ void script_runtime_preloaded_response_release(
    HTTP cache still shares frees nothing). */
 size_t script_runtime_release_preloaded_scripts(ScriptRuntime *runtime,
                                                 size_t needed);
+/* Before a script is refused for memory: the releases the heap growth hook
+   makes before it refuses growth (optional caches, then the cached bodies
+   of classic scripts, unconsumed preload responses, and, with
+   `include_store`, function text no uncompiled function needs), until about
+   `needed` more Budget bytes are free. The body of a running script is
+   kept. Allocates no QuickJS heap; returns the Budget bytes freed. */
+size_t script_runtime_reclaim_for_admission(ScriptRuntime *runtime,
+                                            size_t needed, bool include_store);
+/* At most what script_runtime_reclaim_for_admission() could free now. */
+size_t script_runtime_admission_reclaimable(const ScriptRuntime *runtime,
+                                            bool include_store);
+/* script_runtime_heap_reachable() once `budget_freed` more Budget bytes are
+   free. */
+size_t script_runtime_heap_reachable_after_release(
+    const ScriptRuntime *runtime, size_t budget_freed);
 /* Fixed numeric diagnostics only; never includes script or account text. */
 void script_runtime_last_allocation_refusal(const ScriptRuntime *runtime,
     size_t *old_bytes, size_t *new_bytes, size_t *live_bytes);
@@ -1590,7 +1614,7 @@ void script_runtime_enable_heap_growth(ScriptRuntime *runtime,
    script_runtime_heap_remaining so a realm collects before it grows. */
 size_t script_runtime_heap_available(const ScriptRuntime *runtime);
 /* The same, as if script text kept outside the heap (the function-source
-   store, docs/ARCHITECTURE.md) were still in it: what admission and
+   store, docs/engineering/SCRIPT_MEMORY.md) were still in it: what admission and
    loading-pressure decisions use, so moving text out of the heap leaves
    which scripts a page admits as it was, and the room it frees goes to
    the scripts the page already runs. */
@@ -2290,6 +2314,8 @@ void script_runtime_notify_user_activation(ScriptRuntime *runtime);
    page_dialog_frame_allowed() admits; NULL withdraws it. */
 void script_runtime_set_dialog_parent(ScriptRuntime *child,
                                       ScriptRuntime *parent);
+void script_runtime_inherit_storage_scope(ScriptRuntime *child,
+                                         const ScriptRuntime *parent);
 /* True for a top-level document realm, or a frame realm whose parent chain
    reaches one. */
 bool script_runtime_dialogs_allowed(ScriptRuntime *runtime);

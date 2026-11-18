@@ -11,7 +11,7 @@
    is followed like a page-script navigation: synchronously when the owner
    lets navigation load in place, otherwise handed to the frontend through
    navigation_take_refresh_navigation. It replaces the current history
-   entry. See docs/ARCHITECTURE.md, "Declarative refresh". */
+   entry. See docs/engineering/PAGE_NAVIGATIONS.md. */
 
 static bool navigation_urls_share_document(const char *left,
                                             const char *right);

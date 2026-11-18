@@ -987,10 +987,10 @@ static bool test_frame_window_setup_oom_commits_top_document(void)
         "<iframe id=victim src='https://frame-oom.test/a.html'></iframe>"
         "<iframe id=later src='https://frame-oom.test/b.html'></iframe>"
         "<script>" FRAME_OOM_EXHAUST_JS
-        "let armed=true;Object.defineProperty(Object.getPrototypeOf("
-        "document.getElementById('victim')),'isConnected',{configurable:true,"
+        "let armed=true;__tilefinchTestBrowserPatch(Object.getPrototypeOf("
+        "document.getElementById('victim')),'isConnected',{"
         "get(){if(armed&&this.id==='victim'){armed=false;exhaust()}"
-        "return true}})"
+        "return true}},true)"
         "</script></body>";
     Budget budget;
     bool lexbor_installed = false;
@@ -998,6 +998,8 @@ static bool test_frame_window_setup_oom_commits_top_document(void)
     bool ready = frame_oom_session_init(&budget, &navigation,
                                         &lexbor_installed);
     uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    /* The exhausting isConnected accessor is installed through the test
+       seam (__tilefinchTestBrowserPatch). */
     bool committed = ready && navigation_commit_html(
         &navigation, generation, "https://frame-oom.test/", html,
         sizeof(html) - 1u, 480, NULL, NULL, true);
@@ -1268,21 +1270,25 @@ static bool frame_completion_window_state_failure_keeps_page(unsigned failure)
        this step however much is left. */
     static const char arm[] =
         "const frameWindow=globalThis.__tilefinchFrameWindow;"
-        "globalThis.__tilefinchFrameWindow=h=>{exhaust();"
-        "const w=frameWindow(h);for(;;)globalThis.hoard={n:globalThis.hoard,w}};";
+        "__tilefinchTestBrowserPatch(globalThis,'__tilefinchFrameWindow',h=>{exhaust();"
+        "const w=frameWindow(h);for(;;)globalThis.hoard={n:globalThis.hoard,w}});";
     static const char recover_arm[] =
         "const frameWindow=globalThis.__tilefinchFrameWindow;let failed=false;"
-        "globalThis.__tilefinchFrameWindow=h=>{if(!failed){failed=true;"
-        "exhaust();globalThis.hoard=null;throw null}return frameWindow(h)};";
+        "__tilefinchTestBrowserPatch(globalThis,'__tilefinchFrameWindow',"
+        "h=>{if(!failed){failed=true;"
+        "exhaust();globalThis.hoard=null;throw null}return frameWindow(h)});";
     static const char author_arm[] =
         "const frameWindow=globalThis.__tilefinchFrameWindow;let failed=false;"
-        "globalThis.__tilefinchFrameWindow=h=>{if(!failed){failed=true;"
-        "throw null}return frameWindow(h)};";
+        "__tilefinchTestBrowserPatch(globalThis,'__tilefinchFrameWindow',"
+        "h=>{if(!failed){failed=true;"
+        "throw null}return frameWindow(h)});";
     Budget budget;
     bool lexbor_installed = false;
     NavigationSession navigation = {0};
     bool ready = frame_oom_session_init(&budget, &navigation,
                                         &lexbor_installed);
+    /* The page injects the failure by replacing __tilefinchFrameWindow
+       through the test seam (__tilefinchTestBrowserPatch). */
     bool committed = ready && frame_completion_oom_commit(
         &navigation, html, sizeof(html) - 1u,
         failure == 2u ? author_arm : failure == 1u ? recover_arm : arm);

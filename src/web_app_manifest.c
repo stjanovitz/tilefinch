@@ -128,7 +128,8 @@ static bool parse_icons(JsonCursor *json, const char *manifest_url,
             bool supported = type[0] == '\0'
                 || strcasecmp(type, "image/png") == 0
                 || strcasecmp(type, "image/jpeg") == 0
-                || strcasecmp(type, "image/webp") == 0;
+                || strcasecmp(type, "image/webp") == 0
+                || strcasecmp(type, "image/svg+xml") == 0;
             if (src[0] != '\0' && supported
                 && fetch_resolve_url(manifest_url, src, resolved,
                                      sizeof(resolved))

@@ -86,9 +86,7 @@ are kept in `build-preset-psp-validation/perf-journeys-latest/<journey>/`.
       the reader is looking at shows visible text or a decoded image.
       `first_text_ms` (`first-text=`) counts text only. Each is the load's
       end when the preview never showed it, and `never` (no metric) when
-      the loaded page's screen does not show it either. The journeys
-      recorded with `--record` since these fields existed have baseline
-      rows for them; the older ones do not.
+      the loaded page's screen does not show it either.
     - `reading_hint_ms` (`reading-hint=`) is when the "preview ready" hint
       showed, when it did.
   - `scroll.*`: press-to-first-visible and press-to-complete-frame, at p50,
@@ -144,6 +142,9 @@ trade, raise that row by hand in the same commit, and give the reason in the
 commit message. This is the same rule the fidelity floors follow.
 `--record` rewrites the baselines of the journeys it ran. Use it for a new
 journey, or for a deliberate reset explained in its commit message.
+A metric with no baseline row is printed (`no baseline`) but not gated, so a
+new metric gates a journey only once it has a row: `--record-missing PREFIX`
+adds rows for the metrics starting with PREFIX and compares the rest as usual.
 
 Tolerances are set when a baseline is recorded. Load and layout times repeat
 exactly under trace replay, so they get 2-5%. Frame composition and latency
@@ -191,18 +192,15 @@ The census traces start from the site census corpus
 
 | Trace | Journeys | What it holds |
 | --- | --- | --- |
-| `wikipedia-article` | `article-*` | a PSP capture (2026-11-11) of `scroll-during-load-live` from the search URL: the article, its reload, its stylesheets, icons and the images the scrolled screens asked for |
+| `wikipedia-article` | `article-*` | a PSP capture of `scroll-during-load-live` from the search URL: the article, its reload, its stylesheets, icons and the images the scrolled screens asked for |
 | `wikipedia-article-psp` | `press-during-preview` | a PSP capture of the PlayStation Portable article and its first-screen images |
 | `wiki-abc` | `wiki-revisit*` | the same article URL served three times, as three articles that share their `<head>` stylesheets |
 | `ia-search-thumbs` | `ia-search` | Internet Archive search results for "psp", with stand-in thumbnails |
-| `bbc-home`, `www-reddit` | `bbc-home-load*`, `www-reddit-load` | census captures (2026-10-06) |
+| `bbc-home`, `www-reddit` | `bbc-home-load*`, `www-reddit-load` | census captures |
 | `youtube-bbb` | `youtube-bbb` | see below |
 | `chatgpt-ask-send76` | `chatgpt-ask` | a PSP capture of the chatgpt.com journey |
 
-The `wikipedia-article` capture also holds three image requests that made
-no progress on the live network (status 0), each followed by its
-successful retry. Re-capturing a trace is a new baseline (`--record`), not
-a ratchet.
+Re-capturing a trace is a new baseline (`--record`), not a ratchet.
 
 The `wiki-revisit*` journeys reload one URL; with keyed replay each reload
 is served the next of the trace's three document records. A fourth load of
@@ -211,13 +209,14 @@ the URL finds none.
   the first (`sheets.c-settled.head_takes` 1, `sheet_compiles` 2).
 - `wiki-revisit-dark` runs at 22:00, so all three articles load dark.
 - `wiki-revisit-night` turns Night mode to Dark through the menu after the
-  first article. The only cached sheet is then the first article's light
-  one, and the compiled-sheet keys carry night mode, so
-  `sheets.c-settled.head_takes` is pinned at 0. Without the key, the
-  third article takes that light `<head>`. Its frames must equal
-  `wiki-revisit-dark`'s. On this trace the frames match even with a light
-  sheet: Wikipedia gates its dark rules on a class its scripts set, and
-  with JavaScript off only the forced-dark transform applies.
+  first article, and its frames must equal `wiki-revisit-dark`'s. The only
+  cached sheet is then the first article's light one. Compiled-sheet keys
+  carry night mode, so `sheets.c-settled.head_takes` is pinned at 0; a key
+  without it would let the third article take that light `<head>`. The pin,
+  not the frame comparison, guards the key: on this trace the frames match
+  even with a light sheet, because the article gates its dark rules on a
+  class its scripts set, and with JavaScript off only the forced-dark
+  transform applies.
 
 `bbc-home-load` and `bbc-home-load-night` are the same load at 12:00 and
 22:00. `www-reddit-load`'s initial load is the site's challenge page; the
@@ -240,8 +239,8 @@ list's thumbnails that the capture never saw. They fail the same way on
 every run. The list restored by Back (`load.follow2`) takes its sheet from
 the compiled-sheet cache and compiles none: the journey pins
 `sheets.returned.unrestored` at 0 and `sheet_compiles` at 2 (the results
-and watch pages). Playback is not part of it: PPSSPP stops at the firmware decoder
-boundary, so video is measured on hardware.
+and watch pages). Playback is not part of it: PPSSPP stops at the firmware
+decoder boundary, so video is measured on hardware.
 
 ## Adding a journey
 
@@ -272,10 +271,10 @@ scripts/run-psplink-offline-youtube.sh       # PSPLink loop; host0 only
   (a frame counter over a test pattern, plus a tone). It is shaped like the
   split streams the resolver picks: 640x360 H.264 Main level 3.0 (itag 134)
   and AAC-LC 128 kbit/s (itag 140), both DASH-fragmented. It uses at most
-  three reference frames. libx264's default preset writes a four-reference
-  SPS, which the PSP-3000 Media Engine refuses on the first access unit
-  with 0x80628002 (logged as `wide-program-rejected`). Encoders are not
-  byte-reproducible across versions, so the generator prints the digests.
+  three reference frames, because the PSP-3000 Media Engine refuses the
+  four-reference stream libx264 writes by default (the generator's header
+  has the details). Encoders are not byte-reproducible across versions, so
+  the generator prints the digests.
 - The run starts at `https://tilefinch.local/offline`. Wi-Fi is deferred for
   an offline start URL. `tests/input-scripts/offline-youtube-live.txt` then:
   1. focuses Play and opens the video;

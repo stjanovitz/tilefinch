@@ -23,7 +23,7 @@ struct YoutubePlaylistQueue {
     char root[2048], next[2048], request[2048];
     char error[160];
     char expected_video[YOUTUBE_VIDEO_ID_CAPACITY];
-    bool initialized, selecting, relative, ready, failed;
+    bool initialized, selecting, relative, ready, failed, retry_requested;
     unsigned pages;
     uint64_t initial_start_us;
 };
@@ -58,6 +58,7 @@ void youtube_playlist_destroy(YoutubePlaylistQueue *q)
 static bool playlist_fail(YoutubePlaylistQueue *q, const char *error)
 {
     q->failed = true;
+    q->retry_requested = false;
     snprintf(q->error, sizeof(q->error), "%s", error);
     return false;
 }
@@ -102,6 +103,7 @@ bool youtube_playlist_accept_page(YoutubePlaylistQueue *q, const YoutubePlaylist
     q->count += p->count;
     snprintf(q->next, sizeof(q->next), "%s", p->next_url);
     q->request[0] = 0; q->failed = false; q->error[0] = 0;
+    q->retry_requested = false;
     if (q->selecting && q->target >= q->first && q->target - q->first < q->count) {
         q->current = q->target; q->selecting = false; q->ready = true;
     } else if (q->selecting && !q->next[0])
@@ -117,6 +119,7 @@ bool youtube_playlist_select(YoutubePlaylistQueue *q, size_t position)
     q->initial_start_us = 0;
     q->target = position; q->selecting = true; q->relative = false;
     q->failed = false; q->error[0] = 0; q->ready = false; q->pages = 0;
+    q->retry_requested = false;
     if (q->initialized && position >= q->first && position - q->first < q->count) {
         q->current = position; q->selecting = false; q->ready = true; q->request[0] = 0;
     } else if (!q->initialized || position < q->first) {
@@ -139,15 +142,24 @@ void youtube_playlist_retry(YoutubePlaylistQueue *q)
     /* A terminal empty page has no request to retry. Keep its failure visible
        instead of turning it into an unscheduled, forever-loading selection. */
     if (q && q->failed && (q->request[0] || q->next[0])) {
-        youtube_lite_forget_playlist_page(q->session,
-            q->request[0] ? q->request : q->next);
+        if (!q->request[0])
+            snprintf(q->request, sizeof(q->request), "%s", q->next);
+        youtube_lite_forget_playlist_page(q->session, q->request);
         q->failed = false; q->error[0] = 0; q->pages = 0;
+        q->retry_requested = true;
     }
 }
 
 void youtube_playlist_set_initial_start(YoutubePlaylistQueue *q, uint64_t start_us)
 {
     if (q && !q->initialized) q->initial_start_us = start_us;
+}
+
+bool youtube_playlist_should_pump(const YoutubePlaylistQueue *q,
+                                  bool allow_prefetch)
+{
+    return q && !q->failed && (q->selecting || q->retry_requested
+                              || allow_prefetch);
 }
 
 bool youtube_playlist_pump(YoutubePlaylistQueue *q, const FetchPumpQuota *quota)
@@ -169,7 +181,11 @@ bool youtube_playlist_pump(YoutubePlaylistQueue *q, const FetchPumpQuota *quota)
         }
         q->job = youtube_lite_load_begin(q->budget, q->session, q->request,
             YOUTUBE_LITE_MAXIMUM_SOURCE_BYTES, 30000, q->error, sizeof(q->error));
-        if (!q->job) { q->failed = true; return true; }
+        if (!q->job) {
+            q->retry_requested = false;
+            q->failed = true;
+            return true;
+        }
         started = true;
     }
     YoutubeLiteLoadStatus status = youtube_lite_load_pump(q->job, quota);

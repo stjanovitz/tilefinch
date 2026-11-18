@@ -32,6 +32,7 @@ static bool grid_placement_in_window(const GridPlacementState *state,
 {
     return row >= state->row_base && row_span >= 1
         && row_span <= GRID_PLACEMENT_ROW_LIMIT
+        && (!state->inherited_rows || row + row_span <= state->rows)
         && row <= state->row_limit - row_span
         && row - state->row_base <= GRID_PLACEMENT_ROW_LIMIT - row_span;
 }
@@ -91,7 +92,8 @@ static bool grid_row_flow_search(GridPlacementState *state, int row,
                                  int row_span, int column_span,
                                  int *found_row, int *found_column)
 {
-    while (row <= state->row_limit - row_span) {
+    int limit = state->inherited_rows ? state->rows : state->row_limit;
+    while (row <= limit - row_span) {
         if (row - state->row_base > GRID_PLACEMENT_ROW_LIMIT - row_span) {
             grid_placement_slide(state, row);
         }
@@ -126,6 +128,15 @@ typedef struct {
     bool explicit_row;
     bool explicit_column;
 } GridResolvedArea;
+
+static void grid_clip_to_subgrid(int *start, int *span, int limit)
+{
+    int end = *start + *span;
+    if (*start < 0) *start = 0;
+    if (*start >= limit) *start = limit - 1;
+    if (end > limit) end = limit;
+    *span = end > *start ? end - *start : 1;
+}
 
 /* Resolve an item's definite lines and spans against the state's explicit
    grid and origin, clamped into the bounded placement envelope. Axes
@@ -180,6 +191,10 @@ static void grid_resolve_area(const GridPlacementState *state,
             state->explicit_rows);
         if (end > row) row_span = end - row;
     }
+    if (state->inherited_columns && explicit_column)
+        grid_clip_to_subgrid(&column, &column_span, state->columns);
+    if (state->inherited_rows)
+        grid_clip_to_subgrid(&row, &row_span, state->rows);
     if (column_span > state->columns) column_span = state->columns;
     if (row_span > GRID_PLACEMENT_ROW_LIMIT) {
         row_span = GRID_PLACEMENT_ROW_LIMIT;
@@ -397,7 +412,8 @@ bool grid_place_item(GridPlacementState *state, const ComputedStyle *style,
     if (!found) {
         /* Explicit collisions and documents beyond the bounded row envelope
            retain content deterministically in the window's final cell. */
-        row = state->row_base + GRID_PLACEMENT_ROW_LIMIT - row_span;
+        row = state->inherited_rows ? state->rows - row_span
+                                   : state->row_base + GRID_PLACEMENT_ROW_LIMIT - row_span;
         column = state->columns - column_span;
     }
     grid_placement_mark(state, row, column, row_span, column_span);

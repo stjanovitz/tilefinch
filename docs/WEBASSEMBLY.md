@@ -107,7 +107,7 @@ cannot detach that buffer itself: `transfer()`, `structuredClone` and
 | Resource | Limit |
 | --- | ---: |
 | Module binary | 512 KiB |
-| Interpreter pool, charged to the page budget | 4 MiB |
+| Interpreter memory, charged to the page budget as modules use it | 4 MiB |
 | Execution stack per instance | 64 KiB |
 | Linear memory | 16 pages / 1 MiB |
 | Imports per module | 32 |
@@ -154,8 +154,8 @@ The boot EBOOT contains only a small versioned adapter. On first namespace
 activation it loads `tilefinch-wasm.prx` from the active signed slot and
 verifies the component ABI before publishing `WebAssembly`. A missing,
 incompatible, or refused component leaves the namespace unavailable rather
-than partially installing it. The runtime pool is allocated lazily through
-`Budget`. It is released once no module operation or instance remains, at
+than partially installing it. The runtime takes its memory from `Budget` as
+modules need it, up to 4 MiB in all. It is released once no module operation or instance remains, at
 the next task boundary, memory-pressure collection, or realm teardown rather
 than immediately after each operation, so a `validate()`, `compile()`, and
 `instantiate()` sequence within one task initializes the runtime once.

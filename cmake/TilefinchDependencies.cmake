@@ -434,9 +434,9 @@ endif()
 # updates the two pins in the same commit.
 set(tilefinch_quickjs_vendor_dir "${CMAKE_CURRENT_SOURCE_DIR}/third_party/quickjs")
 set(tilefinch_quickjs_vendor_c_sha256
-        "2074b9adeddd2742617a430ed852a5e5bf968edc782d9b07f6585afd6772feef")
+        "6f71f582c00cec9b2cc13180c85117a9eb584120f761541ef5b07a6051ac19b2")
 set(tilefinch_quickjs_vendor_h_sha256
-        "a951c14c4089512121c4d5bab256c8f8ac7e0283153741439734d17cad25069c")
+        "5d0eaf813ad992413d710786bac7a926f8a3daae5f7af62e3550d132e197c81c")
 file(SHA256 "${tilefinch_quickjs_vendor_dir}/quickjs.c" tilefinch_quickjs_c_sha256)
 file(SHA256 "${tilefinch_quickjs_vendor_dir}/quickjs.h" tilefinch_quickjs_h_sha256)
 if(NOT tilefinch_quickjs_c_sha256 STREQUAL tilefinch_quickjs_vendor_c_sha256
@@ -494,7 +494,9 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-native-string-gc.patch"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-property-fault-trace.patch"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-external-source.patch"
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-compact-line-tables.patch")
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-compact-line-tables.patch"
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-interface-snapshot.patch"
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-class-field-position.patch")
 set(quickjs_SOURCE_DIR "${tilefinch_quickjs_vendor_dir}")
 # Lab variants (a capture-getter control, compact character/byte-array
 # control, the property-fault trace) are the only remaining patch users.
@@ -511,19 +513,19 @@ if(NOT PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH
         "${PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH}-${PSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY}-${PSP_BROWSER_JS_PROPERTY_FAULT_TRACE}")
     # capture-getter, compact-char-array, property-fault-trace -> quickjs.c
     set(tilefinch_quickjs_variant_ON-OFF-OFF
-        "25f9d623d697f868fe5d1e8f4168c8ca2ed7b084236e59823ba512b650687ddc")
+        "a907b7a259a19d10015b0cc2bb2605f08407cab585c11a73b4ecc3eeb60dcd78")
     set(tilefinch_quickjs_variant_ON-ON-ON
-        "b2d9ff657e3aa24a99f8d751d57db6ea1bdff068fabd3c611bdb11bb677d03f2")
+        "7d7dd1941fe783f9aaa75e4a6a7c63173186374ba079f7effc68be98ef851204")
     set(tilefinch_quickjs_variant_ON-OFF-ON
-        "acbea4fe32099a73c6ea76980dd3459f241b03f6c2d1bba3a6a9990ae3760264")
+        "d1fa61079da7887b1f0a415c11d6b9efd9717740066ffcce670be06fc1da9dd0")
     set(tilefinch_quickjs_variant_OFF-ON-OFF
-        "c4bbdba47548a508ea4f37fa31112138bf3596c7d68c3213924114272949d7bb")
+        "aa2bc07bc8f119638b571067f402affbddfa45bca1485302dc96481606bee667")
     set(tilefinch_quickjs_variant_OFF-ON-ON
-        "bc38a4322e81847ee44c00605821eeb431cda0c67c4b06339f0a0d5b9853de53")
+        "b1b3348f28bd7063664c51a8673c4edf466ba2a6fbfcfa24b2bbe9d1fe89af3c")
     set(tilefinch_quickjs_variant_OFF-OFF-OFF
-        "9090b9743c5f5d8f9cd46a7255dfdfb2c28de11edf915344da2230b898ac7a82")
+        "f0df1bde0869cf90de1987e77daeb37f45aa83ebcc52f927d7a0961b430a397f")
     set(tilefinch_quickjs_variant_OFF-OFF-ON
-        "1a11bc1cef8eb35330fe06e2b873539a60270457f02c3ce937586b9d6a6922b3")
+        "e76408ff909495f135a12d0f49254550eea9dfa298b5637cdab5cffd0778e9b4")
     if(NOT DEFINED tilefinch_quickjs_variant_${tilefinch_quickjs_variant_key})
         message(FATAL_ERROR
             "No pinned QuickJS variant for capture-getter/compact/property-fault "
@@ -552,6 +554,8 @@ if(NOT PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH
         endforeach()
         # Reverse the default stack above the shared bounded baseline.
         foreach(layer
+                class-field-position
+                interface-snapshot
                 compact-line-tables
                 allocation-safety
                 external-source
@@ -611,7 +615,8 @@ if(NOT PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH
         else()
             list(APPEND tilefinch_quickjs_forward allocation-safety-ordinary)
         endif()
-        list(APPEND tilefinch_quickjs_forward compact-line-tables)
+        list(APPEND tilefinch_quickjs_forward compact-line-tables
+            interface-snapshot class-field-position)
         foreach(layer IN LISTS tilefinch_quickjs_forward)
             execute_process(COMMAND "${PATCH_EXECUTABLE}" --force --forward --silent -p1
                 -i "${tilefinch_quickjs_patches}/bellard-quickjs-04be246-${layer}.patch"

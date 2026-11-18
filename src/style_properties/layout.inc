@@ -14,6 +14,7 @@ static bool style_property_grid_template_columns(const StylePropertyParse *parse
             || span_case_equal(value, value_length, "revert")
             || span_case_equal(value, value_length, "revert-layer")) {
             computed_style_set_grid_column_count(style, 0);
+            computed_style_set_grid_auto_fill(style, false);
             computed_style_set_grid_subgrid_columns(style, false);
             computed_style_set_grid_column_template_id(style, 0);
             style->grid_min_column_width = 0;
@@ -297,6 +298,8 @@ static bool style_property_grid_template(const StylePropertyParse *parse)
         parse->style, computed_style_grid_column_count(&candidate));
     parse->style->grid_min_column_width =
         candidate.grid_min_column_width;
+    computed_style_set_grid_auto_fill(parse->style,
+        computed_style_grid_auto_fill(&candidate));
     computed_style_set_grid_subgrid_columns(
         parse->style, computed_style_grid_subgrid_columns(&candidate));
     computed_style_set_grid_subgrid_rows(
@@ -1785,6 +1788,7 @@ static bool style_parse_align_self_keyword(const char *value,
 static bool style_parse_align_content_keyword(const char *value,
                                               unsigned *result)
 {
+    bool unsafe = strncmp(value, "unsafe ", 7) == 0;
     value = style_alignment_position(value);
     if (strcmp(value, "normal") == 0 || strcmp(value, "initial") == 0
         || strcmp(value, "stretch") == 0) {
@@ -1796,12 +1800,14 @@ static bool style_parse_align_content_keyword(const char *value,
     } else if (strcmp(value, "space-evenly") == 0) {
         *result = JUSTIFY_SPACE_EVENLY;
     } else if (strcmp(value, "center") == 0) {
-        *result = JUSTIFY_CENTER;
-    } else if (strcmp(value, "end") == 0
-               || strcmp(value, "flex-end") == 0) {
+        *result = unsafe ? JUSTIFY_UNSAFE_CENTER : JUSTIFY_CENTER;
+    } else if (strcmp(value, "end") == 0) {
+        *result = JUSTIFY_END_LOGICAL;
+    } else if (strcmp(value, "flex-end") == 0) {
         *result = JUSTIFY_END;
-    } else if (strcmp(value, "start") == 0
-               || strcmp(value, "flex-start") == 0
+    } else if (strcmp(value, "start") == 0) {
+        *result = JUSTIFY_START_EXPLICIT;
+    } else if (strcmp(value, "flex-start") == 0
                || strcmp(value, "baseline") == 0
                || strcmp(value, "first baseline") == 0
                || strcmp(value, "last baseline") == 0) {
@@ -1817,12 +1823,18 @@ static bool style_parse_align_content_keyword(const char *value,
 static bool style_parse_justify_content_keyword(const char *value,
                                                 unsigned *result)
 {
+    bool unsafe = strncmp(value, "unsafe ", 7) == 0;
     value = style_alignment_position(value);
-    if (strcmp(value, "normal") == 0 || strcmp(value, "initial") == 0
-        || strcmp(value, "start") == 0
-        || strcmp(value, "flex-start") == 0
-        || strcmp(value, "left") == 0) {
+    if (strcmp(value, "normal") == 0 || strcmp(value, "initial") == 0) {
         *result = JUSTIFY_START;
+    } else if (strcmp(value, "start") == 0) {
+        *result = JUSTIFY_START_EXPLICIT;
+    } else if (strcmp(value, "flex-start") == 0) {
+        *result = JUSTIFY_FLEX_START;
+    } else if (strcmp(value, "left") == 0) {
+        *result = JUSTIFY_LEFT;
+    } else if (strcmp(value, "right") == 0) {
+        *result = JUSTIFY_RIGHT;
     } else if (strcmp(value, "space-between") == 0) {
         *result = JUSTIFY_SPACE_BETWEEN;
     } else if (strcmp(value, "space-around") == 0) {
@@ -1830,10 +1842,10 @@ static bool style_parse_justify_content_keyword(const char *value,
     } else if (strcmp(value, "space-evenly") == 0) {
         *result = JUSTIFY_SPACE_EVENLY;
     } else if (strcmp(value, "center") == 0) {
-        *result = JUSTIFY_CENTER;
-    } else if (strcmp(value, "end") == 0
-               || strcmp(value, "flex-end") == 0
-               || strcmp(value, "right") == 0) {
+        *result = unsafe ? JUSTIFY_UNSAFE_CENTER : JUSTIFY_CENTER;
+    } else if (strcmp(value, "end") == 0) {
+        *result = JUSTIFY_END_LOGICAL;
+    } else if (strcmp(value, "flex-end") == 0) {
         *result = JUSTIFY_END;
     } else if (strcmp(value, "stretch") == 0) {
         *result = JUSTIFY_STRETCH;
@@ -2000,10 +2012,6 @@ static bool style_property_justify_content(const StylePropertyParse *parse)
     if (style_resolve_value(parse->sheet, parse->value, parse->value_length,
                             resolved, sizeof(resolved), 0)
         && style_parse_justify_content_keyword(resolved, &value)) {
-        const char *keyword = style_alignment_position(resolved);
-        if (value == JUSTIFY_START && strcmp(keyword, "normal") != 0
-            && strcmp(keyword, "initial") != 0)
-            value = JUSTIFY_START_EXPLICIT;
         parse->style->justify_content = (JustifyContent) value;
         *parse->mask |= S_JUSTIFY_CONTENT;
     }

@@ -31,17 +31,24 @@ scripts/try-signin.py --google   # plain Google sign-in
 
 One command for checking a sign-in fix. It rebuilds the release host lab if
 sources changed, opens the sign-in page in the private lab, asks for the
-email (shown as typed) and the password (hidden) in macOS dialogs, and submits each once. It then
-lets redirects and the landing page finish and saves the sign-in diagnostics
-report: the same counts and fixed classes as the PSP's Diagnostic QR
-([DIAGNOSTIC_QR.md](../DIAGNOSTIC_QR.md)), with the commit, the class of the
+email (shown as typed) and the password (hidden) in macOS dialogs, and
+submits each once. It then lets redirects and the landing page finish and
+saves the sign-in diagnostics report: the same counts and fixed classes as
+the PSP's Diagnostic QR ([DIAGNOSTIC_QR.md](../DIAGNOSTIC_QR.md)), with the commit, the class of the
 final origin (`accounts`, `youtube` or `other`, so a third-party identity
 provider is not named) and the step names. Reports go to
 `.private-investigations/signin-tests/`, one folder per run. No URL path,
 form value or cookie value is written.
 
 A short menu follows:
-- `b` lists the page's buttons (Continue, Not now, ...) and presses the one you pick; after the password this list comes up by itself while the page is still on Google. Only buttons you could reach on the PSP are listed (shown, enabled, on the page and not clipped away), with control characters removed. The lab writes the labels to an owner-only file in the run's private folder; the script reads and deletes it at once and shows the labels only in the terminal, never in a report;
+
+- `b` lists the page's buttons (Continue, Not now, ...) and presses the one
+  you pick; after the password the list comes up by itself while the page
+  is still on Google. Only buttons you could reach on the PSP are listed
+  (shown, enabled, on the page and not clipped away), with control
+  characters removed. The labels reach the terminal only, never a report:
+  the lab writes them to an owner-only file in the run's private folder,
+  which the script reads and deletes at once;
 - `v` views the page with form contents blanked;
 - `w` waits longer, for example after approving a phone prompt, and saves a
   new report;

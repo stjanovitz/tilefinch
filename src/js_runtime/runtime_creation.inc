@@ -163,6 +163,103 @@ static uint64_t bootstrap_source_hash(const char *source, size_t length)
     return fnv1a64(UINT64_C(1469598103934665603), source, length);
 }
 
+#ifdef JS_RT_TEST_INSTRUMENTS
+/* __tilefinchTestBrowserPatch(target, key, value) and, for an accessor,
+   (target, key, {get, set}, true). Host and validation realms only.
+
+   The interface snapshot keeps a page's replacement of a built-in, a
+   global or a platform member from the browser's own script, so a test
+   page can no longer inject a fault into the browser, or count its work,
+   by patching one. This is the seam for that: it makes the change as the
+   browser's own (as a module load does), and makes the functions it is
+   given browser code, so the browser's script reads and calls them. A test
+   restores the original through it too. Shipping builds compile it out. */
+static JSValue js_runtime_test_browser_patch(
+    JSContext *context, JSValueConst this_value, int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    if (argc < 3 || !JS_IsObject(argv[0]))
+        return JS_ThrowTypeError(context, "browser patch needs a target");
+    bool accessor = argc > 3 && JS_ToBool(context, argv[3]) > 0;
+    JSAtom key = JS_ValueToAtom(context, argv[1]);
+    if (key == JS_ATOM_NULL) return JS_EXCEPTION;
+    JSValue getter = JS_UNDEFINED, setter = JS_UNDEFINED;
+    int defined;
+    if (accessor) {
+        getter = JS_GetPropertyStr(context, argv[2], "get");
+        setter = JS_GetPropertyStr(context, argv[2], "set");
+        JS_MarkBrowserFunction(context, getter);
+        JS_MarkBrowserFunction(context, setter);
+    } else {
+        JS_MarkBrowserFunction(context, argv[2]);
+    }
+    void *previous = JS_EnterBrowserCode(context);
+    if (accessor)
+        defined = JS_DefinePropertyGetSet(
+            context, argv[0], key, getter, setter,
+            JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE | JS_PROP_THROW);
+    else
+        defined = JS_SetProperty(context, argv[0], key,
+                                 JS_DupValue(context, argv[2]));
+    JS_LeaveBrowserCode(context, previous);
+    JS_FreeAtom(context, key);
+    return defined < 0 ? JS_EXCEPTION : JS_UNDEFINED;
+}
+#endif
+
+/* TILEFINCH_JS_INTERFACE_SNAPSHOT=0 builds every realm without the
+   interface snapshot. The PSP app exports it from boot.cfg's
+   `interface_snapshot`, so one binary runs both ways. */
+static bool runtime_interface_snapshot_switch(void)
+{
+    const char *value = getenv("TILEFINCH_JS_INTERFACE_SNAPSHOT");
+    return value == NULL || value[0] != '0';
+}
+
+/* The namespace objects below as they are now, with the constructors
+   they hold and those constructors' prototypes (JS_SnapshotObject); one
+   still behind its lazy accessor is marked when its module loads. With
+   `only`, just that one, if it is in the list. Each is read as the
+   browser's own binding (JS_GetBrowserGlobalProperty): where a page
+   replaced the binding before the module loaded, even with one the
+   module could not remove, the page's object is the page's. */
+static void runtime_snapshot_namespaces(JSContext *context,
+                                        const char *only)
+{
+    static const char *const names[] = {
+        "Math", "JSON", "Reflect", "Atomics", "Intl", "WebAssembly", "CSS",
+        "console",
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (only != NULL && strcmp(only, names[i]) != 0) continue;
+        JSPropertyDescriptor descriptor;
+        JSAtom atom = JS_NewAtom(context, names[i]);
+        if (atom == JS_ATOM_NULL) continue;
+        if (JS_GetBrowserGlobalProperty(context, &descriptor, atom) > 0) {
+            if (!(descriptor.flags & JS_PROP_GETSET))
+                JS_SnapshotObject(context, descriptor.value);
+            JS_FreeValue(context, descriptor.value);
+            JS_FreeValue(context, descriptor.getter);
+            JS_FreeValue(context, descriptor.setter);
+        }
+        JS_FreeAtom(context, atom);
+    }
+}
+
+/* The realm's start-up script has ended and no author code has run:
+   from here on, what author code does to the interfaces (the
+   constructors, their prototypes and methods, and with `namespaces` the
+   namespace objects above) is invisible to the browser's own script,
+   which keeps reading them as they are now. The engine copies an
+   interface only when author code first changes it
+   (JS_SnapshotInterfaces). `console` is one of them: the browser's own
+   warnings do not pass through a page's replacement of console.warn. */
+static void runtime_snapshot_interfaces(JSContext *context, bool namespaces)
+{
+    JS_SnapshotInterfaces(context);
+    if (namespaces) runtime_snapshot_namespaces(context, NULL);
+}
+
 /* Trusted bytecode avoids QuickJS parsing, but the embedder's explicit
    source-admission contract still applies to the source it represents.
    Record the same bounded admission attempt as the source compiler without
@@ -372,8 +469,12 @@ static bool runtime_evaluate_bootstrap_profiled(
                      "embedded JavaScript bytecode could not be restored: %s",
                      source_url == NULL ? "<bootstrap>" : source_url);
         } else {
-            evaluated = runtime_evaluate_checkpointed(
-                runtime, source, length, source_url);
+            /* The source fallback is the browser's code as its bytecode
+               is: it reads the interface snapshot. */
+            evaluated = js_rt_evaluate_browser_source(
+                    runtime->context, source, length, source_url,
+                    &runtime->result)
+                && js_rt_runtime_script_checkpoint(runtime, 1);
         }
     }
     uint64_t finished = js_rt_monotonic_time_ns();
@@ -523,6 +624,8 @@ static const LazyBootstrapProperty lazy_bootstrap_properties[] = {
     {"ReadableStreamDefaultReader", LAZY_BOOTSTRAP_STREAMS,
      LAZY_BOOTSTRAP_GLOBAL},
     {"WritableStream", LAZY_BOOTSTRAP_STREAMS, LAZY_BOOTSTRAP_GLOBAL},
+    {"WritableStreamDefaultController", LAZY_BOOTSTRAP_STREAMS,
+     LAZY_BOOTSTRAP_GLOBAL},
     {"WritableStreamDefaultWriter", LAZY_BOOTSTRAP_STREAMS,
      LAZY_BOOTSTRAP_GLOBAL},
     {"TransformStream", LAZY_BOOTSTRAP_STREAMS, LAZY_BOOTSTRAP_GLOBAL},
@@ -624,6 +727,10 @@ static const LazyBootstrapProperty lazy_bootstrap_properties[] = {
     {"outerText", LAZY_BOOTSTRAP_SERIALIZE,
      LAZY_BOOTSTRAP_HTML_ELEMENT_PROTOTYPE}
 };
+_Static_assert(sizeof(lazy_bootstrap_properties)
+                   / sizeof(lazy_bootstrap_properties[0])
+               <= 8u * sizeof(((ScriptRuntime *) 0)->lazy_assigning),
+               "a lazy_assigning bit per placeholder");
 
 static const char *runtime_lazy_bootstrap_name(LazyBootstrapFeature feature)
 {
@@ -1092,7 +1199,23 @@ static bool runtime_platform_window_open(ScriptRuntime *runtime);
 static void runtime_platform_window_close(ScriptRuntime *runtime,
                                           bool opened, bool mark);
 
+static bool runtime_load_lazy_bootstrap_module(
+    ScriptRuntime *runtime, LazyBootstrapFeature feature);
+
+/* Loading a module on first use is the browser's work even when a page's
+   read of a lazy global started it: the placeholders it removes and the
+   members it defines are the browser's changes (JS_EnterBrowserCode). */
 static bool runtime_load_lazy_bootstrap(
+    ScriptRuntime *runtime, LazyBootstrapFeature feature)
+{
+    if (runtime == NULL) return false;
+    void *previous = JS_EnterBrowserCode(runtime->context);
+    bool loaded = runtime_load_lazy_bootstrap_module(runtime, feature);
+    JS_LeaveBrowserCode(runtime->context, previous);
+    return loaded;
+}
+
+static bool runtime_load_lazy_bootstrap_module(
     ScriptRuntime *runtime, LazyBootstrapFeature feature)
 {
     if (runtime == NULL || feature >= LAZY_BOOTSTRAP_COUNT) return false;
@@ -1402,30 +1525,34 @@ static bool runtime_load_lazy_bootstrap(
             false, trace, &total_us, &compile_us);
     } else if (feature == LAZY_BOOTSTRAP_INTL) {
         /* Hand intl.js the time zone Date's local time uses through a
-           temporary global, deleted as soon as the module has captured it. */
+           temporary global, deleted as soon as the module has captured it.
+           Only TRUE counts: a page's non-configurable binding of the name
+           refuses the definition, and the module would read the page's
+           value (or call its getter) in its place. */
         char time_zone[64];
         js_rt_default_time_zone(&runtime->bridge, time_zone,
                                 sizeof(time_zone));
         JSValue global = JS_GetGlobalObject(runtime->context);
         JSAtom zone_atom = JS_NewAtom(
             runtime->context, "__tilefinchDefaultTimeZone");
-        if (!JS_IsException(global) && zone_atom != JS_ATOM_NULL) {
-            (void) JS_DefinePropertyValue(
-                runtime->context, global, zone_atom,
-                JS_NewString(runtime->context, time_zone),
-                JS_PROP_CONFIGURABLE);
-        }
-        evaluated = runtime_evaluate_bootstrap_profiled(
-            runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
-                         browser_bootstrap_intl,
-                         browser_bootstrap_intl_bytecode),
-            "<browser-intl-lazy>", &browser_bootstrap_intl_bytecode,
-            false, trace, &total_us, &compile_us);
-        if (zone_atom != JS_ATOM_NULL) {
+        bool zone_ready = !JS_IsException(global)
+            && zone_atom != JS_ATOM_NULL
+            && JS_DefinePropertyValue(
+                   runtime->context, global, zone_atom,
+                   JS_NewString(runtime->context, time_zone),
+                   JS_PROP_CONFIGURABLE) > 0;
+        if (zone_ready) {
+            evaluated = runtime_evaluate_bootstrap_profiled(
+                runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
+                             browser_bootstrap_intl,
+                             browser_bootstrap_intl_bytecode),
+                "<browser-intl-lazy>", &browser_bootstrap_intl_bytecode,
+                false, trace, &total_us, &compile_us);
             (void) JS_DeleteProperty(
                 runtime->context, global, zone_atom, 0);
-            JS_FreeAtom(runtime->context, zone_atom);
         }
+        if (zone_atom != JS_ATOM_NULL)
+            JS_FreeAtom(runtime->context, zone_atom);
         JS_FreeValue(runtime->context, global);
     } else if (feature == LAZY_BOOTSTRAP_TRAVERSAL) {
         evaluated = runtime_evaluate_bootstrap_profiled(
@@ -1559,12 +1686,12 @@ static bool runtime_load_lazy_bootstrap(
                    runtime->context, global, storage_atom,
                    JS_DupValue(runtime->context,
                                runtime->opfs_storage_manager),
-                   JS_PROP_CONFIGURABLE) >= 0
+                   JS_PROP_CONFIGURABLE) > 0
             && JS_DefinePropertyValue(
                    runtime->context, global, writable_atom,
                    JS_DupValue(runtime->context,
                                runtime->streams_writable_stream),
-                   JS_PROP_CONFIGURABLE) >= 0;
+                   JS_PROP_CONFIGURABLE) > 0;
         if (bridge_ready) {
             evaluated = runtime_evaluate_bootstrap_profiled(
                 runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
@@ -1640,6 +1767,25 @@ static bool runtime_load_lazy_bootstrap(
             &runtime->result.bootstrap_lazy_module_loads, 1);
         runtime_mark_lazy_platform_members(runtime, feature);
         runtime->platform_window_loaded = true;
+        /* A namespace this module published (Intl, WebAssembly) was an
+           accessor when the interfaces were snapshotted: mark it now,
+           before author code can reach it. The browser's binding of
+           the name is the module's namespace, also where the page's own
+           binding refused the module's (a page's non-configurable Intl
+           is the page's); another name in the list may hold a page's
+           object (console = logger), which is the page's to change. */
+        if (runtime->interface_snapshot) {
+            for (size_t i = 0;
+                 i < sizeof(lazy_bootstrap_properties)
+                         / sizeof(lazy_bootstrap_properties[0]); i++) {
+                const LazyBootstrapProperty *property =
+                    &lazy_bootstrap_properties[i];
+                if (property->feature == feature
+                    && property->target == LAZY_BOOTSTRAP_GLOBAL)
+                    runtime_snapshot_namespaces(runtime->context,
+                                                property->name);
+            }
+        }
     } else {
         js_rt_saturating_add_size(
             &runtime->result.bootstrap_lazy_module_failures, 1);
@@ -1664,6 +1810,100 @@ bool script_runtime_game_audio_status(
     status->native_present = runtime->game_audio_slots != NULL;
     status->failed = state == 3;
     return true;
+}
+
+/* A placeholder's setter, once its module has loaded: the assignment
+   made through it, as the member the module defined answers it. Where
+   the browser's view of the target holds an accessor, its setter is
+   called with the original receiver. Otherwise the value is defined on
+   the receiver, as an assignment over a writable data member defines it,
+   in the view of the code that assigned: a page's assignment is the
+   page's own change whatever receiver it names
+   (`setter.call(Object.prototype, value)`), never the browser's, so the
+   interface snapshot keeps it from the browser's script; that holds for a
+   global too, whose binding the page then replaces for itself alone.
+   The member is read in the browser's view: a prototype's twin, or for a
+   global the browser's own binding (JS_GetBrowserGlobalProperty), never a
+   page's wrapper of the placeholder. And it ends here when such a wrapper
+   calls the placeholder back, with or without the interface snapshot:
+   while an assignment through placeholder `index` calls a setter, one
+   that comes back to it takes the member as a writable data property. */
+static int runtime_lazy_bootstrap_assign(
+    ScriptRuntime *runtime, size_t index, JSContext *context,
+    JSValueConst target, JSAtom atom, JSValueConst value,
+    JSValueConst receiver)
+{
+    JSPropertyDescriptor member;
+    uint8_t *assigning = &runtime->lazy_assigning[index / 8u];
+    const uint8_t bit = (uint8_t) (1u << (index % 8u));
+    int found = 0;
+    if (*assigning & bit) {
+        /* a setter this assignment called came back */
+    } else if (lazy_bootstrap_properties[index].target
+               == LAZY_BOOTSTRAP_GLOBAL) {
+        found = JS_GetBrowserGlobalProperty(context, &member, atom);
+    } else {
+        void *previous = JS_EnterBrowserCode(context);
+        found = JS_GetOwnProperty(context, &member, target, atom);
+        JS_LeaveBrowserCode(context, previous);
+    }
+    if (found < 0) return -1;
+    if (found > 0 && (member.flags & JS_PROP_GETSET)) {
+        JS_FreeValue(context, member.getter);
+        if (!JS_IsFunction(context, member.setter)) {
+            JS_FreeValue(context, member.setter);
+            JS_ThrowTypeError(context, "no setter for property");
+            return -1;
+        }
+        *assigning |= bit;
+        JSValue result = JS_Call(context, member.setter, receiver, 1, &value);
+        *assigning &= (uint8_t) ~bit;
+        JS_FreeValue(context, member.setter);
+        if (JS_IsException(result)) return -1;
+        JS_FreeValue(context, result);
+        return 0;
+    }
+    if (found > 0) {
+        JS_FreeValue(context, member.value);
+        if (!(member.flags & JS_PROP_WRITABLE)) {
+            JS_ThrowTypeError(context, "property is read-only");
+            return -1;
+        }
+    }
+    if (!JS_IsObject(receiver)) {
+        JS_ThrowTypeError(context, "cannot define a property on a primitive");
+        return -1;
+    }
+    JSPropertyDescriptor own;
+    int flags = JS_PROP_THROW | JS_PROP_HAS_VALUE;
+    int has = JS_GetOwnProperty(context, &own, receiver, atom);
+    if (has < 0) return -1;
+    if (has > 0) {
+        bool accessor = (own.flags & JS_PROP_GETSET) != 0;
+        bool writable = (own.flags & JS_PROP_WRITABLE) != 0;
+        JS_FreeValue(context, own.value);
+        JS_FreeValue(context, own.getter);
+        JS_FreeValue(context, own.setter);
+        if (accessor
+            && JS_VALUE_GET_PTR(receiver) != JS_VALUE_GET_PTR(target)) {
+            JS_ThrowTypeError(context, "setter is forbidden");
+            return -1;
+        }
+        if (!accessor && !writable) {
+            JS_ThrowTypeError(context, "property is read-only");
+            return -1;
+        }
+        /* the target's own accessor here is the placeholder, or a page's
+           wrapper of it: the member becomes the value */
+        if (accessor)
+            flags |= JS_PROP_C_W_E | JS_PROP_HAS_CONFIGURABLE
+                | JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE;
+    } else {
+        flags |= JS_PROP_C_W_E | JS_PROP_HAS_CONFIGURABLE
+            | JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE;
+    }
+    return JS_DefineProperty(context, receiver, atom, value, JS_UNDEFINED,
+                             JS_UNDEFINED, flags) < 0 ? -1 : 0;
 }
 
 static JSValue js_runtime_lazy_bootstrap_property(
@@ -1704,23 +1944,28 @@ static JSValue js_runtime_lazy_bootstrap_property(
            receiver too. */
         JSAtom atom = JS_NewAtom(context, property->name);
         int result = atom == JS_ATOM_NULL ? -1
-            : JS_SetPropertyInternal(
-                  context, target, atom, JS_DupValue(context, argv[0]),
+            : runtime_lazy_bootstrap_assign(
+                  runtime, (size_t) magic, context, target, atom, argv[0],
                   property->target == LAZY_BOOTSTRAP_GLOBAL
-                      ? target : this_value,
-                  JS_PROP_THROW);
+                      ? target : this_value);
         if (atom != JS_ATOM_NULL) JS_FreeAtom(context, atom);
         JS_FreeValue(context, target);
         return result < 0 ? JS_EXCEPTION : JS_UNDEFINED;
     }
-    /* A prototype accessor (document.fonts) reads with the original
+    /* The placeholder passes a read on to the member the module defined,
+       which is in the browser's view of the target: a page that wrapped
+       this placeholder still holds its wrapper on its own view (the
+       interface snapshot), and reading that would come back here. A
+       prototype accessor (document.fonts) reads with the original
        receiver; the receiver does not matter for prototype methods. */
+    void *previous = JS_EnterBrowserCode(context);
     JSAtom atom = JS_NewAtom(context, property->name);
     JSValue result = atom == JS_ATOM_NULL ? JS_EXCEPTION
         : JS_GetPropertyInternal(
               context, target, atom,
               property->target == LAZY_BOOTSTRAP_GLOBAL ? target : this_value,
               0);
+    JS_LeaveBrowserCode(context, previous);
     if (atom != JS_ATOM_NULL) JS_FreeAtom(context, atom);
     JS_FreeValue(context, target);
     return result;
@@ -1830,6 +2075,8 @@ RUNTIME_ENSURE_NATIVE(documents, LAZY_BOOTSTRAP_DOCUMENTS,
                       "Secondary documents could not be initialized")
 RUNTIME_ENSURE_NATIVE(forms, LAZY_BOOTSTRAP_FORMS,
                       "Form collections could not be initialized")
+RUNTIME_ENSURE_NATIVE(traversal, LAZY_BOOTSTRAP_TRAVERSAL,
+                      "DOM traversal could not be initialized")
 RUNTIME_ENSURE_NATIVE(rule, LAZY_BOOTSTRAP_CSSOM_RULES,
                       "CSSOM rules could not be initialized")
 RUNTIME_ENSURE_NATIVE(frame_clone, LAZY_BOOTSTRAP_FRAME_CLONE,
@@ -1949,6 +2196,7 @@ static JSValue js_runtime_create_worker_realm(
         return JS_ThrowOutOfMemory(context);
     }
     JS_SetContextOpaque(realm, bridge);
+    if (host->interface_snapshot) JS_PlanInterfaceSnapshot(realm);
 #if defined(TILEFINCH_QUICKJS_DYNAMIC_CODE_POLICY)
     JS_SetDynamicCodeEnabled(realm, bridge->dynamic_code_allowed);
     JS_SetHostGetCodeForEval(
@@ -1964,11 +2212,14 @@ static JSValue js_runtime_create_worker_realm(
                JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) >= 0;
     JSValue initializer_result = JS_UNDEFINED;
     if (ok && initializer != NULL) {
+        /* The worker platform initializer is the browser's code. */
         initializer_result = JS_Eval(
             realm, initializer, initializer_length, "<worker-platform>",
-            JS_EVAL_TYPE_GLOBAL);
+            JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_TRUSTED);
         ok = !JS_IsException(initializer_result);
     }
+    if (ok && host->interface_snapshot)
+        runtime_snapshot_interfaces(realm, true);
     if (initializer != NULL) JS_FreeCString(context, initializer);
     if (!ok) {
         JSValue exception = JS_IsException(initializer_result)
@@ -2294,6 +2545,8 @@ static const JsRtNative runtime_entry_natives[] = {
       js_runtime_ensure_documents_bootstrap, 0, 0 },
     { "__tilefinchEnsureFormsBootstrap",
       js_runtime_ensure_forms_bootstrap, 0, 0 },
+    { "__tilefinchEnsureTraversalBootstrap",
+      js_runtime_ensure_traversal_bootstrap, 0, 0 },
     { "__tilefinchEnsureRuleBootstrap",
       js_runtime_ensure_rule_bootstrap, 0, JS_RT_NATIVE_UNPROFILED },
     { "__tilefinchEnsureFrameCloneBootstrap",
@@ -2327,6 +2580,7 @@ static const JsRtNative runtime_natives_first[] = {
     { "__tilefinchQuery", js_dom_query, 1, 0 },
     { "__tilefinchQueryAll", js_dom_query_all, 2, 0 },
     { "__tilefinchRegisterShadowRoot", js_dom_register_shadow_root, 1, 0 },
+    { "__tilefinchAssignSlot", js_dom_assign_slot, 1, 0 },
     { "__tilefinchConstructedSheetText",
       js_dom_constructed_sheet_text, 2, JS_RT_NATIVE_TRANSIENT },
     { "__tilefinchSheetRevision",
@@ -2421,6 +2675,10 @@ static const JsRtNative runtime_natives_second[] = {
     { "__tilefinchMediaCapturePermission", js_media_capture_permission, 0,
       JS_RT_NATIVE_TRANSIENT },
     { "__tilefinchSetControlValue", js_dom_set_control_value, 2, 0 },
+    { "__tilefinchControlChecked", js_dom_control_checked, 1,
+      JS_RT_NATIVE_TRANSIENT },
+    { "__tilefinchFormDirection", js_dom_form_direction, 1,
+      JS_RT_NATIVE_TRANSIENT },
     { "__tilefinchParserFormOwner", js_dom_parser_form_owner, 1, 0 },
     { "__tilefinchHasParserFormOwners", js_dom_has_parser_form_owners, 0, 0 },
     { "__tilefinchDomVersion", js_dom_version, 0, 0 },
@@ -2729,6 +2987,7 @@ static ScriptRuntime *runtime_create_host(
     host->bridge.current_script = JS_NULL;
     host->page_visibility_desired = true;
     host->document = document;
+    if (document != NULL) document->script_realm_bound = true;
     host->document_scope = options->document_scope;
     host->timeout_ms = timeout_ms;
     host->session = options->session;
@@ -2737,6 +2996,8 @@ static ScriptRuntime *runtime_create_host(
     host->bridge.dynamic_code_allowed = !options->dynamic_code_disabled;
     host->bridge.allow_test_network_primitive_overrides =
         options->allow_test_network_primitive_overrides;
+    host->interface_snapshot = !options->interface_snapshot_disabled
+        && runtime_interface_snapshot_switch();
 #ifdef JS_RT_TEST_INSTRUMENTS
     host->test_probes = !options->omit_test_probes;
 #endif
@@ -2903,6 +3164,9 @@ static bool runtime_create_engine(ScriptRuntime *host, Budget *budget,
         snprintf(result->error, sizeof(result->error), "could not create QuickJS context");
         return false;
     }
+    /* Before any bootstrap code exists in the realm: its closures bind
+       the globals they name apart from page closures. */
+    if (host->interface_snapshot) JS_PlanInterfaceSnapshot(host->context);
     if (!js_wasm_runtime_init(host->runtime)
         || !js_wasm_guard_buffer_transfer(host->context)) {
         snprintf(result->error, sizeof(result->error),
@@ -2932,6 +3196,9 @@ static bool runtime_create_bind_bridge(
     host->bridge.result = &host->result;
     host->bridge.relayout_dirty = &host->relayout_dirty;
     host->bridge.session = options->session;
+    if (options->session != NULL)
+        host->bridge.session_storage_scope = options->session->session_storage_scope;
+    host->bridge.expect_navigation_layout = options->expect_navigation_layout;
     host->bridge.fonts = options->fonts;
     host->bridge.document_url = host->document_url;
     host->bridge.top_level_url = host->top_level_url;
@@ -3635,8 +3902,13 @@ static void runtime_mark_lazy_platform_members(ScriptRuntime *runtime,
                                                        property->target);
         JSAtom atom = JS_NewAtom(context, property->name);
         JSPropertyDescriptor descriptor;
+        /* a global as the browser's binding (JS_GetBrowserGlobalProperty):
+           a page's binding the module could not replace is the page's */
         if (JS_IsObject(target) && atom != JS_ATOM_NULL
-            && JS_GetOwnProperty(context, &descriptor, target, atom) > 0) {
+            && (property->target == LAZY_BOOTSTRAP_GLOBAL
+                    ? JS_GetBrowserGlobalProperty(context, &descriptor, atom)
+                    : JS_GetOwnProperty(context, &descriptor, target, atom))
+                   > 0) {
             if (property->target != LAZY_BOOTSTRAP_GLOBAL) {
                 JS_SetPlatformMember(context, descriptor.value, 1);
                 JS_SetPlatformMember(context, descriptor.getter, 1);
@@ -4033,6 +4305,16 @@ static ScriptRuntime *script_runtime_create_internal(
         if (evaluated) runtime_mark_platform_interfaces(host);
         if (evaluated)
             evaluated = runtime_capture_trusted_hooks(host, global);
+#ifdef JS_RT_TEST_INSTRUMENTS
+        if (evaluated && host->test_probes)
+            evaluated = JS_DefinePropertyValueStr(
+                host->context, global, "__tilefinchTestBrowserPatch",
+                JS_NewCFunction(host->context, js_runtime_test_browser_patch,
+                                "__tilefinchTestBrowserPatch", 3),
+                JS_PROP_CONFIGURABLE) > 0;
+#endif
+        if (evaluated && host->interface_snapshot)
+            runtime_snapshot_interfaces(host->context, true);
 #if !defined(TILEFINCH_BOOTSTRAP_BYTECODE_ONLY)
         if (evaluated && tilefinch_trace_eval_source()) {
 #ifndef TILEFINCH_NO_TRACE

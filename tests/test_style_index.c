@@ -2943,11 +2943,13 @@ static int test_grid_minmax_arguments(void)
         {"minmax( auto ,1fr )", true, GRID_TRACK_FLEX, 1000, 0},
         {"minmax(0, 1fr)", true, GRID_TRACK_FLEX, 1000, 0},
         {"minmax(min-content, 200px)", true, GRID_TRACK_FIXED, 200, 0},
-        {"minmax(10%, 2fr)", true, GRID_TRACK_FLEX, 2000, 0},
+        {"minmax(10%, 2fr)", true, GRID_TRACK_FLEX, 2000,
+         GRID_TRACK_PERCENT_MINIMUM | 1000u},
+        {"minmax(12.34%, 2fr)", true, GRID_TRACK_FLEX, 2000,
+         GRID_TRACK_PERCENT_MINIMUM | 1234u},
         {"minmax(max(10px, 5px), 1fr)", true, GRID_TRACK_FLEX, 1000, 10},
-        /* A floor mixing a percentage with a length is a valid
-           <length-percentage>; like a percentage it leaves the pixel
-           minimum 0. */
+        /* Mixed percent/length floors stay valid; only fixed and pure
+           percentage floors have a representation in the bounded track. */
         {"minmax(calc(50% - 1rem), 1fr)", true, GRID_TRACK_FLEX, 1000, 0},
         {"minmax(min(100%, 20rem), 1fr)", true, GRID_TRACK_FLEX, 1000, 0},
         {"minmax(max(100px, 20%), 1fr)", true, GRID_TRACK_FLEX, 1000, 0},
@@ -6639,6 +6641,195 @@ static int test_document_attribute_matches_by_name(void)
     return 0;
 }
 
+/* A clone shares its original's node->user pointer until it gets its own
+   control state; resetting the clone's checkedness never touches the
+   original's. */
+static int test_cloned_control_checked_reset(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    static const char html[] = "<body><input id=box type=checkbox></body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    lxb_dom_node_t *box = find_id(lxb_dom_interface_node(document.html), "box");
+    CHECK(box != NULL && document_control_checked_set(&document, box, 1));
+    CHECK(document_control_checked_state(box) == 1 && document_control_checked(box));
+    lxb_dom_node_t *clone = lxb_dom_node_clone(box, false);
+    CHECK(clone != NULL && clone->user == box->user);
+    CHECK(document_control_checked_set(&document, clone, -1));
+    CHECK(document_control_checked_state(box) == 1 && document_control_checked(box));
+    CHECK(document_control_checked_state(clone) == -1);
+    clone->user = NULL;
+    lxb_dom_node_destroy(clone);
+    document_destroy(&document);
+    CHECK(budget.current == 0u && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* The flat-tree children of a manual slot, in assignment order. */
+static size_t manual_slot_children(lxb_dom_node_t *slot, lxb_dom_node_t **out,
+                                   size_t capacity)
+{
+    size_t count = 0;
+    for (lxb_dom_node_t *child = document_flat_first_child(slot);
+         child != NULL && count <= capacity; child = document_flat_next_sibling(child))
+        out[count < capacity ? count : capacity - 1u] = child, count++;
+    return count;
+}
+
+/* Native manual slot assignment (slot.assign()): lists, moves between
+   slots, duplicate entries, the per-document quotas, refusal, retirement of
+   a reclaimed subtree, and teardown. */
+static int test_manual_slot_assignment(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    enum { LIGHT = 1100, SLOTS = 130 };
+    size_t capacity = 64u * 1024u;
+    char *html = malloc(capacity);
+    CHECK(html != NULL);
+    size_t used = (size_t) snprintf(html, capacity,
+        "<body><div id=host><b id=a>A</b><i id=b>B</i><u id=c>C</u>");
+    for (int i = 0; i < LIGHT; i++)
+        used += (size_t) snprintf(html + used, capacity - used, "<s id=l%d></s>", i);
+    used += (size_t) snprintf(html + used, capacity - used,
+        "<div id=carrier><p id=fallback-parent><slot id=s1><em id=fb>F</em></slot>"
+        "</p><slot id=s2></slot>");
+    for (int i = 0; i < SLOTS; i++)
+        used += (size_t) snprintf(html + used, capacity - used, "<slot id=q%d></slot>", i);
+    used += (size_t) snprintf(html + used, capacity - used,
+        "</div></div><div id=plain-host><b id=plain-light></b>"
+        "<div id=plain-carrier><slot></slot></div></div></body>");
+    CHECK(used < capacity);
+    PocDocument document = {0};
+    CHECK(document_parse(&document, &budget, html, used, 17));
+    free(html);
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *carrier = find_id(root, "carrier");
+    lxb_dom_node_t *s1 = find_id(root, "s1"), *s2 = find_id(root, "s2");
+    lxb_dom_node_t *a = find_id(root, "a"), *b = find_id(root, "b");
+    lxb_dom_node_t *c = find_id(root, "c"), *fb = find_id(root, "fb");
+    CHECK(carrier != NULL && s1 != NULL && s2 != NULL && a != NULL && b != NULL
+          && c != NULL && fb != NULL);
+    /* A named-slot carrier in a document with no manual carrier keeps the
+       named path: its light child is slotted by the default slot. */
+    lxb_dom_node_t *plain_carrier = find_id(root, "plain-carrier");
+    CHECK(document_mark_shadow_carrier(plain_carrier));
+    CHECK(!document_manual_shadow_excludes(find_id(root, "plain-light")));
+    CHECK(document_mark_manual_shadow_carrier(&document, carrier));
+    CHECK(!document_manual_shadow_excludes(find_id(root, "plain-light")));
+    size_t baseline = budget.current;
+
+    lxb_dom_node_t *seen[8];
+    /* Nothing assigned: the slot shows its fallback, light children none. */
+    CHECK(manual_slot_children(s1, seen, 8) == 1 && seen[0] == fb);
+    CHECK(document_manual_shadow_excludes(a) && document_manual_shadow_excludes(b));
+
+    lxb_dom_node_t *list[DOCUMENT_MANUAL_SLOT_LIST_LIMIT];
+    list[0] = b, list[1] = a;
+    CHECK(document_shadow_assign_manually(&document, s1, list, 2));
+    CHECK(manual_slot_children(s1, seen, 8) == 2 && seen[0] == b && seen[1] == a);
+    CHECK(!document_manual_shadow_excludes(a) && document_manual_shadow_excludes(c));
+
+    /* Assigning a node to another slot moves it; repeats are assigned once
+       and the successor walk ends. */
+    list[0] = a, list[1] = c, list[2] = a, list[3] = c;
+    CHECK(document_shadow_assign_manually(&document, s2, list, 4));
+    CHECK(manual_slot_children(s2, seen, 8) == 2 && seen[0] == a && seen[1] == c);
+    CHECK(manual_slot_children(s1, seen, 8) == 1 && seen[0] == b);
+
+    /* A refused allocation keeps the published lists. */
+    list[0] = b, list[1] = c;
+    budget_inject_failure_after(&budget, 0);
+    bool refused = !document_shadow_assign_manually(&document, s2, list, 2);
+    budget_clear_failure_injection(&budget);
+    CHECK(refused);
+    CHECK(manual_slot_children(s2, seen, 8) == 2 && seen[0] == a && seen[1] == c);
+    CHECK(manual_slot_children(s1, seen, 8) == 1 && seen[0] == b);
+
+    /* An empty assignment clears the slot and frees its entry. */
+    CHECK(document_shadow_assign_manually(&document, s1, list, 0));
+    CHECK(manual_slot_children(s1, seen, 8) == 1 && seen[0] == fb);
+    CHECK(document_shadow_assign_manually(&document, s2, list, 0));
+    CHECK(budget.current == baseline);
+
+    /* Quotas: DOCUMENT_MANUAL_SLOT_LIMIT slots with an assignment and
+       DOCUMENT_MANUAL_SLOT_NODE_LIMIT assigned nodes per document. */
+    char id[16];
+    for (int i = 0; i < SLOTS; i++) {
+        snprintf(id, sizeof(id), "q%d", i);
+        lxb_dom_node_t *slot = find_id(root, id);
+        snprintf(id, sizeof(id), "l%d", i);
+        list[0] = find_id(root, id);
+        CHECK(slot != NULL && list[0] != NULL);
+        CHECK(document_shadow_assign_manually(&document, slot, list, 1)
+              == ((unsigned) i < DOCUMENT_MANUAL_SLOT_LIMIT));
+    }
+    for (int i = 0; i < SLOTS; i++) {
+        snprintf(id, sizeof(id), "q%d", i);
+        CHECK(document_shadow_assign_manually(&document, find_id(root, id), list, 0));
+    }
+    CHECK(budget.current == baseline);
+    size_t assigned = 0;
+    for (int group = 0; group < 5; group++) {
+        for (size_t i = 0; i < DOCUMENT_MANUAL_SLOT_LIST_LIMIT; i++) {
+            snprintf(id, sizeof(id), "l%zu", (size_t) group * 200u + i);
+            list[i] = find_id(root, id);
+            CHECK(list[i] != NULL);
+        }
+        snprintf(id, sizeof(id), "q%d", group);
+        bool fits = assigned + DOCUMENT_MANUAL_SLOT_LIST_LIMIT
+            <= DOCUMENT_MANUAL_SLOT_NODE_LIMIT;
+        CHECK(document_shadow_assign_manually(&document, find_id(root, id), list,
+                                              DOCUMENT_MANUAL_SLOT_LIST_LIMIT) == fits);
+        /* Reassigning a slot does not count its own previous list. */
+        if (fits) {
+            CHECK(document_shadow_assign_manually(&document, find_id(root, id),
+                                                  list, DOCUMENT_MANUAL_SLOT_LIST_LIMIT));
+            assigned += DOCUMENT_MANUAL_SLOT_LIST_LIMIT;
+        }
+    }
+    CHECK(assigned == DOCUMENT_MANUAL_SLOT_NODE_LIMIT);
+    for (int group = 0; group < 5; group++) {
+        snprintf(id, sizeof(id), "q%d", group);
+        CHECK(document_shadow_assign_manually(&document, find_id(root, id), list, 0));
+    }
+    CHECK(budget.current == baseline);
+
+    /* Remove and reclaim an assigned node, then a subtree holding a slot:
+       the lists drop what is about to be freed, and the flat tree and a
+       fresh layout never reach it. */
+    list[0] = a, list[1] = b, list[2] = c;
+    CHECK(document_shadow_assign_manually(&document, s1, list, 3));
+    list[0] = find_id(root, "l0");
+    CHECK(document_shadow_assign_manually(&document, s2, list, 1));
+    lxb_dom_node_remove(b);
+    CHECK(manual_slot_children(s1, seen, 8) == 2 && seen[0] == a && seen[1] == c);
+    CHECK(document_control_state_discard_subtree(&document, b));
+    lxb_dom_node_destroy_deep(b);
+    CHECK(manual_slot_children(s1, seen, 8) == 2 && seen[0] == a && seen[1] == c);
+    lxb_dom_node_t *fallback_parent = find_id(root, "fallback-parent");
+    lxb_dom_node_remove(fallback_parent);
+    CHECK(document_control_state_discard_subtree(&document, fallback_parent));
+    lxb_dom_node_destroy_deep(fallback_parent);
+    CHECK(manual_slot_children(s2, seen, 8) == 1 && document_manual_shadow_excludes(a));
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(stylesheet_build(&sheet, &budget, &document, 480)
+          && layout_build(&layout, &budget, &document, &sheet, NULL, NULL, 480));
+    CHECK(layout_box_for_node(&layout, a) == NULL
+          && layout_box_for_node(&layout, find_id(root, "l0")) != NULL);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+
+    /* Teardown frees the remaining lists with the document. */
+    document_destroy(&document);
+    CHECK(budget.current == 0u && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 /* The marker decides, not the attribute's name: a page's own attribute of that
    name is no carrier, and the check has no name to look up, which it would
    otherwise do for every child of every flat-tree step. */
@@ -7921,6 +8112,10 @@ int main(int argc, char **argv)
         return test_document_attribute_matches_by_name();
     if (argc == 2 && strcmp(argv[1], "--shadow-carrier-marker-only") == 0)
         return test_shadow_carrier_is_the_marker();
+    if (argc == 2 && strcmp(argv[1], "--cloned-checked-only") == 0)
+        return test_cloned_control_checked_reset();
+    if (argc == 2 && strcmp(argv[1], "--manual-slots-only") == 0)
+        return test_manual_slot_assignment();
     if (argc == 2 && strcmp(argv[1], "--attribute-bench-only") == 0)
         return benchmark_selector_attribute_names();
     if (argc == 2 && strcmp(argv[1], "--escaped-utilities-only") == 0)
@@ -7932,6 +8127,8 @@ int main(int argc, char **argv)
     CHECK(test_shadow_scope_allocation_refusal() == 0);
     CHECK(test_shadow_carrier_scan_memo() == 0);
     CHECK(test_shadow_carrier_is_the_marker() == 0);
+    CHECK(test_manual_slot_assignment() == 0);
+    CHECK(test_cloned_control_checked_reset() == 0);
     CHECK(test_document_attribute_matches_by_name() == 0);
     CHECK(test_computed_style_payload_storage() == 0);
     CHECK(test_computed_style_shared_payloads() == 0);

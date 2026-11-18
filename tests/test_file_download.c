@@ -17,6 +17,8 @@
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #x); return false; } } while (0)
 #define URL "https://downloads.example.test/releases/homebrew.zip"
 static const char *trace_url = URL;
+static const char *trace_effective_url;
+static const char *trace_last_modified;
 
 /* Distinguishes two entities served at the same URL. */
 static unsigned entity_salt;
@@ -47,10 +49,12 @@ static bool trace(const char *directory, size_t total, size_t offset,
         "request-send-client-hints=0\nrequest-send-low-client-hints=0\n"
         "request-sec-fetch-user=0\nrequest-upgrade-insecure=0\n"
         "status=%u\nlength=%zu\neffective-url=%s\n"
-        "content-type=%s\netag=%s\nlast-modified=\n"
+        "content-type=%s\netag=%s\nlast-modified=%s\n"
         "response-header-count=%u\nset-cookie-count=0\n"
         "response-header-0=content-type: application/zip\n",
-        trace_url, status, total - offset, trace_url, content_type, etag,
+        trace_url, status, total - offset,
+        trace_effective_url == NULL ? trace_url : trace_effective_url, content_type, etag,
+        trace_last_modified == NULL ? "" : trace_last_modified,
         1u + (content_length ? 1u : 0u) + (extra != NULL ? 1u : 0u));
     unsigned header = 1;
     if (content_length) fprintf(file, "response-header-%u=content-length: %zu\n", header++, total - offset);
@@ -182,6 +186,77 @@ static bool transfers(const char *directory, const char *corpus)
     CHECK(offline_library_find(&library, id)->state == OFFLINE_ITEM_READY);
     CHECK(exact_file(&library, id, 262144));
     CHECK(offline_library_remove(&library, id));
+
+    /* The same original URL and ETag are not proof that the same resource
+       answered the range. Record different final redirect destinations. */
+    CHECK(file_download_enqueue(&library, URL, NULL, &id, error, sizeof(error)));
+    trace_effective_url = "https://cdn.example.test/object-a";
+    CHECK(trace(corpus, 262144, 0, 200, "\"same\"", NULL, true));
+    CHECK(offline_download_manager_start(&manager, id));
+    for (unsigned i = 0; i < 20; i++) {
+        (void) offline_download_manager_pump(&manager);
+        CHECK(offline_download_manager_snapshot(&manager, id, &snapshot));
+        if (snapshot.downloaded_bytes != 0) break;
+    }
+    CHECK(snapshot.active && snapshot.downloaded_bytes > 0);
+    CHECK(offline_download_manager_pause(&manager, id)); fetch_trace_end();
+    offset = (size_t) offline_library_find(&library, id)->downloaded_bytes;
+    snprintf(range, sizeof(range), "content-range: bytes %zu-262143/262144", offset);
+    trace_effective_url = "https://cdn.example.test/object-b";
+    CHECK(trace(corpus, 262144, offset, 206, "\"same\"", range, true));
+    CHECK(offline_download_manager_start(&manager, id) && complete(&manager));
+    CHECK(offline_library_find(&library, id)->state == OFFLINE_ITEM_PAUSED);
+    CHECK(offline_library_find(&library, id)->downloaded_bytes == offset);
+    CHECK(trace(corpus, 42, 0, 200, "\"same\"", NULL, true));
+    CHECK(offline_download_manager_start(&manager, id) && complete(&manager));
+    CHECK(exact_file(&library, id, 42) && offline_library_remove(&library, id));
+
+    /* A signed CDN redirect carries a new signature and expiry on every
+       attempt. Under the same strong ETag the same path is the same
+       resource, so the range is appended. */
+    CHECK(file_download_enqueue(&library, URL, NULL, &id, error, sizeof(error)));
+    trace_effective_url = "https://cdn.example.test/object-a?Expires=1&Signature=one";
+    CHECK(trace(corpus, 262144, 0, 200, "\"signed\"", NULL, true));
+    CHECK(offline_download_manager_start(&manager, id));
+    for (unsigned i = 0; i < 20; i++) {
+        (void) offline_download_manager_pump(&manager);
+        CHECK(offline_download_manager_snapshot(&manager, id, &snapshot));
+        if (snapshot.downloaded_bytes != 0) break;
+    }
+    CHECK(snapshot.active && snapshot.downloaded_bytes > 0);
+    CHECK(offline_download_manager_pause(&manager, id)); fetch_trace_end();
+    offset = (size_t) offline_library_find(&library, id)->downloaded_bytes;
+    snprintf(range, sizeof(range), "content-range: bytes %zu-262143/262144", offset);
+    trace_effective_url = "https://cdn.example.test/object-a?Expires=2&Signature=two";
+    CHECK(trace(corpus, 262144, offset, 206, "\"signed\"", range, true));
+    CHECK(offline_download_manager_start(&manager, id) && complete(&manager));
+    CHECK(offline_library_find(&library, id)->state == OFFLINE_ITEM_READY);
+    CHECK(exact_file(&library, id, 262144) && offline_library_remove(&library, id));
+
+    /* Files uploaded together share a Last-Modified date, and a query can
+       name the file: with only a date the whole URL must match. */
+    CHECK(file_download_enqueue(&library, URL, NULL, &id, error, sizeof(error)));
+    trace_last_modified = "Tue, 17 Nov 2026 10:00:00 GMT";
+    trace_effective_url = "https://cdn.example.test/get?file=a";
+    CHECK(trace(corpus, 262144, 0, 200, "", NULL, true));
+    CHECK(offline_download_manager_start(&manager, id));
+    for (unsigned i = 0; i < 20; i++) {
+        (void) offline_download_manager_pump(&manager);
+        CHECK(offline_download_manager_snapshot(&manager, id, &snapshot));
+        if (snapshot.downloaded_bytes != 0) break;
+    }
+    CHECK(snapshot.active && snapshot.downloaded_bytes > 0);
+    CHECK(offline_download_manager_pause(&manager, id)); fetch_trace_end();
+    offset = (size_t) offline_library_find(&library, id)->downloaded_bytes;
+    snprintf(range, sizeof(range), "content-range: bytes %zu-262143/262144", offset);
+    trace_effective_url = "https://cdn.example.test/get?file=b";
+    CHECK(trace(corpus, 262144, offset, 206, "", range, true));
+    CHECK(offline_download_manager_start(&manager, id) && complete(&manager));
+    CHECK(offline_library_find(&library, id)->state == OFFLINE_ITEM_PAUSED);
+    CHECK(offline_library_find(&library, id)->downloaded_bytes == offset);
+    CHECK(offline_library_remove(&library, id));
+    trace_last_modified = NULL;
+    trace_effective_url = NULL;
 
     /* A server that ignores Range starts fresh; it must not double the file. */
     CHECK(file_download_enqueue(&library, URL, NULL, &id, error, sizeof(error)));

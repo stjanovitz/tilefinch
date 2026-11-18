@@ -27,15 +27,7 @@ stepper owns those facts and produces a deterministic trace:
 
 Visual marks enter a bounded RAM capture queue and are flushed only after the
 scenario ends. Device timing therefore does not include per-frame Memory Stick
-writes.
-
-The mark name capacity is 20 bytes including the terminator, and only
-three distinct mark images are retained. Validate generated names against
-`PSP_INPUT_SCRIPT_MARK_CAPACITY` before a launch. Extra diagnostic marks can
-consume image slots: require the matching `tilefinch-input-capture:` record
-and a successful current-run write before inspecting a named file. A file
-left by a previous run is not evidence. Keep expensive pixel comparisons in
-warm-up or after the measured window, not in startup or timed gameplay.
+writes ([Captures](#captures)).
 
 Qualification-only boots should have an empty `input_script`: otherwise the
 report waiter correctly demands completion of a script the qualification
@@ -96,8 +88,9 @@ ordinary browser loop is ready to accept scripted input.
 
 `BUTTONS` joins names with `+`: `up`, `down`, `left`, `right`, `cross`,
 `circle`, `triangle`, `square`, `ltrigger`, `rtrigger`, `start`, and `select`.
-The parser accepts at most 256 steps, 19 characters per mark, and 8 KiB per
-file. The boot key accepts only a leaf filename—no separators or `..`.
+The parser accepts at most 256 steps, 19 characters per mark name
+(`PSP_INPUT_SCRIPT_MARK_CAPACITY` is 20 bytes with the terminator; validate
+generated names against it before a launch), and 8 KiB per file. The boot key accepts only a leaf filename—no separators or `..`.
 
 `hold` holds one chord continuously for the requested frame count. `press`
 emits that many distinct press/release pairs. `stick` accepts `up`, `down`,
@@ -145,6 +138,12 @@ no DOM input dispatch occurs inside request preparation.
 Visible, in-viewport targets can emit `tilefinch-focus-first-visible` before
 author styling completes; an offscreen target must use the later complete
 frame. A `visible=0` completion is not a successful focus-feedback sample.
+`tilefinch-focus-feedback` measures an accepted focus publication from the
+frame's input sample, including a repaint that finishes in later render
+slices; it requires a newer completed frame, the same navigation generation,
+and a successful display publication, and reports a superseded input as
+incomplete. A later marked screenshot includes runtime and frame scheduling
+and is not that latency.
 
 ### Marks
 
@@ -189,9 +188,8 @@ to whatever Play would act on, so the d-pad path, which differs per site and
 between the lab and the device, does not decide what a following `tap cross`
 plays. It prefers the declared media card when the page has one, then the
 first author `<video>` or `<audio>` in document order with a source page media
-can open (a non-empty, non-`blob:` `src` or `<source>`: the same
-`browser_engine_author_media_openable` rule the card uses to decide that a page
-has its own video), then the first other author media element, whose
+can open (a non-empty, non-`blob:` `src` or `<source>`: the same rule the card
+uses to decide that a page has its own video), then the first other author media element, whose
 activation builds the same declared or discovered candidates as the page's
 Play. An element that is not itself a focus target (hidden or covered by its
 player's chrome) is reached through the first focus target of its nearest
@@ -207,7 +205,7 @@ user path. Like the rest of the harness it is compiled out of shipping builds
 ### Answering the player's question
 
 `answer-question COUNT BUTTONS` waits up to COUNT frames (at least 2) on the
-visible player. If the player asks a question (today only the
+visible player. If the player asks a question (the only one is the
 unencrypted-audio "Play anyway"), it presses BUTTONS once as an ordinary tap,
 logs `tilefinch-input-script: step=N action=answer-question
 outcome=answered`, and queues a live capture named `question`. If the media
@@ -244,8 +242,10 @@ validation-only device diagnostic.
 
 ## Captures
 
-Named device captures have a fixed three-entry queue. Reserve a slot for the
-answer rather than requesting more marks and later trusting an old file. For
+Named device captures have a fixed three-entry queue, and extra diagnostic
+marks consume its slots. Reserve a slot for the answer rather than requesting
+more marks and later trusting an old file. Keep expensive pixel comparisons in
+warm-up or after the measured window, not in startup or timed gameplay. For
 each claimed image, require both `tilefinch-input-capture: mark=... at-us=...`
 and the matching `capture=... written=1` completion, and verify that the artifact
 was newly written by that run. Prefer a previously absent per-run output path;
@@ -261,8 +261,9 @@ automatically the first-answer frame.
 For small-text or emoji inspection, the validation build also honors
 `dump_frame=1` after the interactive scenario finishes. It writes
 `frame-device-final.ppm` from the current 480×272 RGB565 front buffer before
-teardown (the PPSSPP runner copies it into `run-N/` beside the mark images), preserving full spatial resolution rather than the mark queue's
-240×136 RGB332 samples. This opt-in write happens after the measured sequence;
+teardown (the PPSSPP runner copies it into `run-N/` beside the mark images),
+preserving full spatial resolution rather than the mark queue's 240×136
+RGB332 samples. This opt-in write happens after the measured sequence;
 use a host0 launch to keep it off the Memory Stick. It does not capture the
 separate RGB8888 video surface and reports `final-frame-dumped=0` when that
 surface owns scanout. Ordinary release builds do not contain this final dump.
@@ -302,7 +303,21 @@ same emulated time on every run. `--measure` accepts a scenario with no golden
 
 `--record-video DIR` dumps the run's presented frames (lossless FFV1 AVI at
 480x272) and audio into `DIR` for `scripts/analyze-game-video.py`; see
-[Treadline visual QA](../DEVELOPMENT.md#treadline-visual-qa-camera-track-and-recorded-gameplay).
+[Treadline visual QA](../../examples/treadline-arena/QUALIFICATION.md#treadline-visual-qa-camera-track-and-recorded-gameplay).
+
+`TILEFINCH_PPSSPP_CPU_MHZ=166` or `111` gives a deterministic pressure
+bracket (the default `0` is normal emulation); the runner writes PPSSPP's
+`[CPU] CPUSpeed` setting, so check the run's generated `ppsspp.ini` before
+trusting a new clock experiment.
+
+If a background PPSSPP launch hangs before PSP boot on macOS, check PPSSPP's
+own log for a fresh `Booted` line before blaming the EBOOT, and retry with
+`TILEFINCH_PPSSPP_GRAPHICS=vulkan` (default `opengl`); the OpenGL path can
+block while the window is occluded. The runner sets both the command-line
+option and `GraphicsBackend` in the appended configuration, so confirm Vulkan
+initialization in PPSSPP's log rather than trusting the variable. Keep the
+backend identical across A/B captures. This is an emulator-window workaround,
+not a PSP rendering change.
 
 Use `--debug-log` when the question is which PSP call PPSSPP accepted or
 rejected. The wrapper launches PPSSPP through the macOS-safe path described in

@@ -406,7 +406,10 @@ static int test_import_map_cache_rebinding(void)
     return 0;
 }
 
-static int test_large_module_source_is_not_retained(void)
+/* A module of 8 KiB or more keeps its text in the function-source store,
+   not the heap: toString() of its functions returns the text, a smaller
+   module's keeps it in the heap, and stacks keep file:line:col. */
+static int test_large_module_source_is_in_store(void)
 {
     ModuleFixture fixture;
     CHECK(fixture_open(&fixture));
@@ -439,9 +442,9 @@ static int test_large_module_source_is_not_retained(void)
     ScriptResult result;
     bool ran = run_root(&fixture, &map, root, &runtime, &result);
     static const char expected[] =
-        "{\"big\":\"function big() {\\n    [native code]\\n}\","
+        "{\"big\":\"function big(){return 1}\","
         "\"small\":\"function small(){return 2}\","
-        "\"root\":\"function rootFn() {\\n    [native code]\\n}\","
+        "\"root\":\"function rootFn(){return 3}\","
         "\"line\":true,"
         "\"dynamic\":\"function evaluated(){return 4}|"
         "function anonymous(\\n) {\\nreturn 5\\n}\"}";
@@ -505,9 +508,9 @@ static int test_large_module_heap_excludes_source(void)
 }
 
 /* Page scripts compile functions lazily (only on their first call). In a
-   module whose text is stripped a deferred function keeps a copy of its own
-   text until it compiles; one whose text is mostly comment stays eager,
-   so the policy above still holds when it is never called. */
+   large module a deferred function reads its body from the function-source
+   store when it compiles; one whose text is mostly comment stays eager, so
+   the heap still holds none of its text when it is never called. */
 static int test_uncalled_commented_function_keeps_no_text(void)
 {
     ModuleFixture fixture;
@@ -560,7 +563,7 @@ static int test_page_functions_compile_on_first_call(void)
     ModuleFixture fixture;
     CHECK(fixture_open(&fixture));
     ModuleMap map = {0};
-    /* thrower() is on line 3 of lazy.js; the module is stripped */
+    /* thrower() is on line 3 of lazy.js; its text is in the store */
     CHECK(module_map_add(&map, "https://mod.test/lazy.js",
               "https://mod.test/lazy.js",
               padded_source(
@@ -585,7 +588,7 @@ static int test_page_functions_compile_on_first_call(void)
     bool ran = run_root(&fixture, &map, root, &runtime, &result);
     static const char expected[] =
         "{\"used\":\"2-used0243354\","
-        "\"text\":\"function used() {\\n    [native code]\\n}\","
+        "\"text\":\"function used(a){const parts=[a,'-used'];for(let i=0;i<3;i++)parts.push(i*a);return parts.join('')+['one','two','three','four'].map(w=>w.length).join('')}\","
         "\"frame\":\"at thrower (https://mod.test/lazy.js:3:44)\","
         "\"small\":\"function small(c){return ['small',c,'text','kept','for','toString','of','this','function'].join('-')}\","
         "\"eval\":41,\"kinds\":\"function\"}";
@@ -1312,17 +1315,17 @@ static int test_lazy_module_leaves_page_classes_alone(void)
                   "jQuery.extend=jQuery.fn.extend=function(){return 'extended'};"
                   "jQuery.fn.each=function(){return this.tag};"
                   "window.Foo=Foo;window.jQuery=jQuery;"
-                  "export const stripped=String(Foo.prototype.m)"
+                  "export const nativeText=String(Foo.prototype.m)"
                   ".includes('[native code]');",
                   9u * 1024u)));
     char *root = padded_source(
-        "import {stripped} from './lib.js';"
+        "import {nativeText} from './lib.js';"
         "void Intl.DateTimeFormat;document.createTreeWalker(document.body);"
         "new WritableStream();document.createElement('canvas')"
         ".getContext('2d');"
         "const ok=(f)=>{try{return String(f())}catch(e){"
         "return 'throw:'+e.message}};"
-        "globalThis.pocSummary=[stripped,"
+        "globalThis.pocSummary=[nativeText,"
         "ok(()=>Foo.prototype.m.call({tag:'x'})),"
         "ok(()=>Object.getOwnPropertyDescriptor(Foo.prototype,'g')"
         ".get.call({tag:'y'})),"
@@ -1339,7 +1342,7 @@ static int test_lazy_module_leaves_page_classes_alone(void)
         9u * 1024u);
     CHECK(root != NULL);
     static const char expected[] =
-        "true|m:x|y|extended|z|extended|[object Object]|[object Object]|en|"
+        "false|m:x|y|extended|z|extended|[object Object]|[object Object]|en|"
         "throw:Illegal invocation|throw:Illegal invocation|"
         "throw:Illegal invocation";
     for (unsigned load = 0; load < 2u; load++) {
@@ -1377,7 +1380,7 @@ int main(void)
     CHECK(test_module_allocation_refusal_recovery() == 0);
     CHECK(test_import_map_cache_rebinding() == 0);
     CHECK(test_large_module_heap_excludes_source() == 0);
-    CHECK(test_large_module_source_is_not_retained() == 0);
+    CHECK(test_large_module_source_is_in_store() == 0);
     CHECK(test_uncalled_commented_function_keeps_no_text() == 0);
     puts("module source retention: PASS");
     CHECK(test_page_functions_compile_on_first_call() == 0);

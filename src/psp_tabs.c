@@ -136,16 +136,12 @@ bool psp_tabs_finish(
         url = entry == NULL ? NULL : entry->url;
     }
     if (title == NULL) title = "";
-    if (!browser_tabs_update_active_document(tabs, url, title)) {
-        memset(transition, 0, sizeof(*transition));
-        return false;
-    }
-
     const BrowserTabSnapshot *tab = browser_tabs_active(tabs);
     NavigationHistoryRecord records[BROWSER_TAB_HISTORY_LIMIT];
     size_t count = 0;
     size_t current = 0;
-    if (!browser_tab_history_records(tab, records, &count, &current)
+    if (!browser_tabs_update_active_document(tabs, url, title)
+        || !browser_tab_history_records(tab, records, &count, &current)
         || !browser_engine_replace_history(
                engine, records, count, current)) {
         /*
@@ -154,8 +150,8 @@ bool psp_tabs_finish(
          * copy is refused under extreme memory pressure; retain a truthful
          * one-entry tab and let the user continue from the committed page.
          */
-        size_t active = browser_tabs_active_index(tabs);
-        (void) browser_tabs_reset(tabs, active, url, title);
+        browser_engine_recover_tab_history(engine);
+        (void) browser_tabs_capture_active(tabs, navigation);
         if (transition->close_after_success != PSP_TAB_INDEX_NONE)
             (void) browser_tabs_remove(
                 tabs, transition->close_after_success);
@@ -164,8 +160,9 @@ bool psp_tabs_finish(
     }
     const BrowserTabHistoryEntry *entry =
         &tab->history[tab->history_index];
-    (void) browser_engine_restore_view(
-        engine, entry->scroll_y, entry->focus_kind, entry->focus_index);
+    (void) browser_engine_restore_view_with_identity(
+        engine, entry->scroll_y, entry->focus_kind, entry->focus_index,
+        entry->focus_identity);
     if (transition->close_after_success != PSP_TAB_INDEX_NONE) {
         (void) browser_tabs_remove(
             tabs, transition->close_after_success);
@@ -185,6 +182,18 @@ bool psp_tabs_finish(
             browser_tabs_resident_bytes(tabs));
     }
     memset(transition, 0, sizeof(*transition));
+    return true;
+}
+
+bool psp_tabs_restore_startup(BrowserTabs *tabs, BrowserEngine *engine,
+                              const char *path)
+{
+    if (!browser_tabs_restore_session(tabs, path)) return false;
+    /* A redirect replaces the active entry only, just as a tab switch. */
+    PspTabTransition transition = {
+        .pending = true, .close_after_success = PSP_TAB_INDEX_NONE,
+    };
+    (void) psp_tabs_finish(tabs, engine, &transition, true, false, NULL);
     return true;
 }
 

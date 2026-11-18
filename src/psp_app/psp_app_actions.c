@@ -1110,11 +1110,19 @@ static void psp_app_dispatch_heavy_action(
                 &app->browser->offline_store, engine);
             bool cancelled = psp_navigation_cancel_requested();
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
+            const PspUiOfflineAppPreview *shown =
+                psp_offline_store_app_preview(&app->browser->offline_store);
             printf("tilefinch-offline-app-op: op=preview ok=%u "
-                   "cancelled=%u elapsed=%lluus status=\"%s\"\n",
+                   "cancelled=%u elapsed=%lluus captured=%u unavailable=%u "
+                   "bytes=%llu status=\"%s\"\n",
                    prepared ? 1u : 0u, cancelled ? 1u : 0u,
                    (unsigned long long) (sceKernelGetSystemTimeWide()
                                          - preview_started_us),
+                   shown == NULL ? 0u : (unsigned) shown->captured_resources,
+                   shown == NULL ? 0u
+                                 : (unsigned) shown->unavailable_resources,
+                   shown == NULL ? 0ull
+                       : (unsigned long long) shown->estimated_bytes,
                    psp_offline_store_status(&app->browser->offline_store));
 #endif
             psp_navigation_cooperate_end_adopting_buttons(

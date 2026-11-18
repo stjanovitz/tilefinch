@@ -79,6 +79,7 @@ typedef struct {
     uint8_t spacing_x;
     uint8_t spacing_y;
     bool border_collapse;
+    bool has_row_spans;
     /* LayoutContext.table_track_clock at the last lookup that found it. */
     uint32_t last_use;
 } TableTracks;
@@ -200,14 +201,37 @@ static inline int layout_clamp_coordinate(int64_t value)
     return (int) value;
 }
 
+/* layout_clamp_coordinate of the exact sum or difference. The overflow
+   builtins keep this in 32-bit arithmetic: an int overflow lies beyond the
+   limit on the side of the true result, which is the side of `left`. */
+static inline int layout_clamp_int_coordinate(int value)
+{
+    return value > LAYOUT_COORDINATE_LIMIT ? LAYOUT_COORDINATE_LIMIT
+        : (value < -LAYOUT_COORDINATE_LIMIT ? -LAYOUT_COORDINATE_LIMIT : value);
+}
+
 static inline int layout_add_coordinate(int left, int right)
 {
+#if defined(__GNUC__) || defined(__clang__)
+    int sum;
+    if (__builtin_add_overflow(left, right, &sum))
+        return left < 0 ? -LAYOUT_COORDINATE_LIMIT : LAYOUT_COORDINATE_LIMIT;
+    return layout_clamp_int_coordinate(sum);
+#else
     return layout_clamp_coordinate((int64_t) left + right);
+#endif
 }
 
 static inline int layout_subtract_coordinate(int left, int right)
 {
+#if defined(__GNUC__) || defined(__clang__)
+    int difference;
+    if (__builtin_sub_overflow(left, right, &difference))
+        return left < 0 ? -LAYOUT_COORDINATE_LIMIT : LAYOUT_COORDINATE_LIMIT;
+    return layout_clamp_int_coordinate(difference);
+#else
     return layout_clamp_coordinate((int64_t) left - right);
+#endif
 }
 
 static inline int layout_scale_dimension(int value, int numerator, int denominator)
@@ -576,6 +600,7 @@ struct LayoutReuseCache {
    bounded stack per layout: a line owns the entries above the depth it
    started at and pops them when it flushes. */
 #define LINE_ATOMIC_LIMIT 64
+#define LINE_RELATIVE_LIMIT 4
 enum {
     LINE_ATOMIC_BASELINE,
     LINE_ATOMIC_TOP,
@@ -740,6 +765,7 @@ typedef struct {
     lxb_dom_node_t *assigned_flex_node;
     int assigned_flex_height;
     bool assigned_flex_minimum;
+    uint32_t unresolved_height_count;
     /* Floats and inline-blocks are laid out at their own (shrink-to-fit or
        declared) width, but their percentage margins, padding and
        min/max-width still refer to the containing block (CSS 2.1 10.2,
@@ -868,54 +894,16 @@ void layout_flow_scope_leave(LayoutFlowScope *scope);
 #define LAYOUT_FLOW_SCOPE(context, phase) \
     LayoutFlowScope flow_scope __attribute__((cleanup(layout_flow_scope_leave))) \
         = layout_flow_scope_enter((context), (phase))
-static inline ComputedStyle layout_style_for_pseudo(
-    LayoutContext *context, lxb_dom_node_t *node, PseudoElement pseudo,
-    const ComputedStyle *parent)
-{
-    context->pseudo_resolutions++;
-    if (!style_pseudo_may_generate(context->sheet, pseudo)) {
-        context->pseudo_absence_hits++;
-        return (ComputedStyle) {0};
-    }
-    LAYOUT_FLOW_SCOPE(context, LAYOUT_FLOW_PSEUDO);
-    if (layout_reuse_pseudo_absent(context->reuse, context->sheet, node,
-                                   pseudo, parent)) {
-        context->pseudo_absence_hits++;
-        return (ComputedStyle) {0};
-    }
-    StyleRetainedMatches *previous_matches = style_retained_matches_attach(
-        context->sheet,
-        context->reuse != NULL && context->reuse->sheet == context->sheet
-            ? context->reuse->matches : NULL);
-    ((Stylesheet *) context->sheet)->variable_read_names = 0;
-    ComputedStyle result = style_for_layout_pseudo(context->sheet, node, pseudo, parent);
-    (void) style_retained_matches_attach(context->sheet, previous_matches);
-    layout_reuse_note_pseudo(context->reuse, context->sheet, node, pseudo,
-                             parent, &result);
-    context->pseudo_generated += result.generated_content;
-    return result;
-}
 #else
 #define LAYOUT_FLOW_SCOPE(context, phase) ((void) 0)
 #define layout_flow_profile_begin(context) ((void) 0)
 #define layout_flow_profile_end(context) ((void) 0)
 #define layout_flow_profile_report(context) ((void) 0)
-static inline ComputedStyle layout_style_for_pseudo(
-    LayoutContext *context, lxb_dom_node_t *node, PseudoElement pseudo,
-    const ComputedStyle *parent)
-{
-    if (!style_pseudo_may_generate(context->sheet, pseudo)
-        || layout_reuse_pseudo_absent(context->reuse, context->sheet, node,
-                                      pseudo, parent))
-        return (ComputedStyle) {0};
-    ((Stylesheet *) context->sheet)->variable_read_names = 0;
-    ComputedStyle result =
-        style_for_layout_pseudo(context->sheet, node, pseudo, parent);
-    layout_reuse_note_pseudo(context->reuse, context->sheet, node, pseudo,
-                             parent, &result);
-    return result;
-}
 #endif
+ComputedStyle layout_style_for_pseudo(LayoutContext *context,
+                                      lxb_dom_node_t *node,
+                                      PseudoElement pseudo,
+                                      const ComputedStyle *parent);
 
 /* Records the target (or finds its earlier record); NULL when the layout
    keeps no record of it. */
@@ -1004,6 +992,8 @@ typedef struct {
     /* A minimum height is a provisional padding-box bound, not the final
        containing-block height for bottom-positioned descendants. */
     bool height_provisional;
+    bool direction_rtl;
+    bool fixed_direction_rtl;
     /* CSS transforms, filters, perspective, containment, and an authored
        will-change establish a separate containing block for fixed
        descendants. Keep it alongside the ordinary positioned ancestor: a
@@ -1117,6 +1107,8 @@ typedef struct {
     bool x_fixed_valid;
     bool y_fixed_valid;
     uint32_t text_generation;
+    struct InlineCssomOpenBox *cssom_open;
+    uint16_t cssom_line;
     LayoutDocument *layout;
     size_t command_start;
     size_t link_start;
@@ -1144,45 +1136,51 @@ typedef struct {
     FloatExclusion floats[ACTIVE_FLOAT_LIMIT];
     LayoutBidiFlow *bidi_flow;
     bool bidi_pipeline_expected;
+    /* Relative inline offsets already applied to this line's commands
+       [start, end); line alignment discounts them from the line height. */
+    uint8_t relative_count;
+    uint32_t relative_start[LINE_RELATIVE_LIMIT];
+    uint32_t relative_end[LINE_RELATIVE_LIMIT];
+    int relative_dy[LINE_RELATIVE_LIMIT];
 } LineState;
 
 bool layout_line_clamp_overflow(LineState *line);
 
+/* 26.6 fixed-point helpers. They saturate at the int range and stay in
+   32-bit arithmetic (no soft 64-bit operations on the PSP); right shifts of
+   negative values are arithmetic on every supported compiler. */
 static inline int layout_fixed_from_integer(int value)
 {
-    int64_t fixed = (int64_t) value * 64;
-    return fixed > INT_MAX ? INT_MAX
-           : (fixed < INT_MIN ? INT_MIN : (int) fixed);
+    if (value >= (1 << 25)) return INT_MAX;
+    if (value < -(1 << 25)) return INT_MIN;
+    return value * 64;
 }
 
 static inline int layout_fixed_floor(int value)
 {
-    int quotient = value / 64;
-    if (value < 0 && value % 64 != 0) quotient--;
-    return quotient;
+    return value >> 6;
 }
 
 static inline int layout_fixed_ceil(int value)
 {
-    int quotient = value / 64;
-    if (value > 0 && value % 64 != 0) quotient++;
-    return quotient;
+    return (value >> 6) + ((value & 63) != 0);
 }
 
 static inline int layout_fixed_fraction(int value)
 {
-    int floor = layout_fixed_floor(value);
-    return value - floor * 64;
+    return value & 63;
 }
 
-static inline int layout_fixed_add(int left, int right)
+/* Out of line: the saturating 64-bit form is larger than a call. */
+__attribute__((noinline)) static inline int layout_fixed_add(int left, int right)
 {
     int64_t sum = (int64_t) left + right;
     return sum > INT_MAX ? INT_MAX
            : (sum < INT_MIN ? INT_MIN : (int) sum);
 }
 
-static inline int layout_fixed_subtract(int left, int right)
+__attribute__((noinline)) static inline int layout_fixed_subtract(
+    int left, int right)
 {
     int64_t difference = (int64_t) left - right;
     return difference > INT_MAX ? INT_MAX
@@ -1226,6 +1224,18 @@ typedef struct {
 } FlatItem;
 
 typedef struct {
+    const lxb_dom_node_t *node;
+    int offset;
+} FlexBaseline;
+
+#define FLEX_MAIN_LIMIT 128u
+typedef struct {
+    int basis, inner, minimum, maximum, grow, result;
+    unsigned shrink;
+    bool frozen;
+} FlexMainItem;
+
+typedef struct {
     Budget *budget;
     int *values;
     size_t count;
@@ -1234,6 +1244,10 @@ typedef struct {
     int inline_values[4];
     LayoutNodeBox *generated_boxes;
     LayoutNodeBox inline_generated_boxes[2];
+    FlexBaseline *baselines;
+    size_t baseline_count;
+    FlexMainItem *main_items;
+    size_t item_count;
 } FlexOrderPlan;
 
 typedef struct {
@@ -1289,6 +1303,8 @@ typedef struct {
     uint8_t cursor_column;
     bool flow_column;
     bool dense;
+    bool inherited_columns;
+    bool inherited_rows;
     uint16_t cursor_row;
     uint16_t row_base;
     /* Rows placement may use in all: GRID_IMPLICIT_ROW_LIMIT, or the window
@@ -1420,6 +1436,28 @@ static inline size_t layout_pointer_hash(const void *pointer)
    the layout subsystem. */
 
 AlignItems flex_item_alignment(const ComputedStyle *container, const ComputedStyle *item);
+void layout_record_box_transform(LayoutDocument *layout, LayoutNodeBox *box,
+                                 int x, int y);
+enum { INLINE_FRAGMENT_LIMIT = 2048, INLINE_FRAGMENT_BUCKETS = 256 };
+struct LayoutInlineFragments {
+    uint16_t heads[INLINE_FRAGMENT_BUCKETS];
+    uint16_t count, capacity, line;
+    /* The table filled: elements laid out after that have no fragments. */
+    bool truncated;
+    LayoutInlineFragment entries[];
+};
+void layout_add_inline_fragment(LineState *line, lxb_dom_node_t *node,
+                                int x, int y, int width, int height);
+void layout_align_inline_fragments(LineState *line, int offset,
+                                  bool mirror, int right);
+void layout_move_inline_fragments(LayoutDocument *layout,
+    const lxb_dom_node_t *source, size_t start, int dx, int dy);
+void layout_move_node_inline_fragments(LayoutDocument *layout,
+    const lxb_dom_node_t *node, int dx, int dy);
+void layout_adjust_inline_fragment_commands(LayoutDocument *layout,
+                                             size_t at, size_t count);
+void layout_trim_inline_fragments(LayoutDocument *layout);
+void layout_clamp_inline_fragment_commands(LayoutDocument *layout);
 ComputedStyle layout_style_for_node(LayoutContext *context, lxb_dom_node_t *node, const ComputedStyle *parent);
 LayoutBidiFlow *layout_bidi_flow_create(
     LayoutContext *context, lxb_dom_node_t *node,
@@ -1499,7 +1537,7 @@ bool layout_insert_text_shadow_commands(
     LayoutContext *context, const ComputedStyle *style,
     const DrawCommand *text, size_t index, size_t *inserted);
 bool layout_intern_gradient(LayoutDocument *layout, const StyleGradient *gradient, size_t *slot);
-FlexLineMetrics flex_line_metrics(LayoutContext *context, FlexItemIterator *iterator, FlatItem *item, int content_width, int gap);
+FlexLineMetrics flex_line_metrics(LayoutContext *context, FlexItemIterator *iterator, FlatItem *item, int content_width, int content_height, int gap);
 GeneratedPseudoFlow generated_pseudo_flow( LayoutContext *context, lxb_dom_node_t *node, const ComputedStyle *parent, PseudoElement pseudo, int width, int containing_height);
 bool add_fixed_range(LayoutDocument *layout, size_t start, size_t end, size_t link_start, size_t link_end, size_t control_start, size_t control_end, int origin_y, int height, int inset, bool from_bottom);
 void layout_record_grid_columns(LayoutDocument *layout,
@@ -1525,9 +1563,10 @@ bool add_node_box(LayoutDocument *layout, lxb_dom_node_t *node, int x, int y,
 LayoutNodeBox *layout_box_for_node_mutable(
     LayoutDocument *layout, const lxb_dom_node_t *node);
 bool add_sticky_range(LayoutDocument *layout, size_t start, size_t end,
-                      int origin_y, int top, int bottom_y);
+                      const lxb_dom_node_t *node, int origin_y, int bottom_y,
+                      int top, int bottom_inset);
 void layout_bound_sticky_ranges(LayoutDocument *layout, size_t start,
-                                size_t end, int containing_bottom);
+                                size_t end, int containing_top, int containing_bottom);
 bool attribute_is(lxb_dom_node_t *node, const char *name, const char *wanted);
 bool layout_node_is_hidden_input(lxb_dom_node_t *node);
 bool build_paint_order(LayoutDocument *layout, LayoutContext *context);
@@ -1676,7 +1715,13 @@ const char *first_text_data(lxb_dom_node_t *node, size_t *length);
    text the flat tree leaves out (document_shadow_text_rendered). */
 const char *layout_text_data(lxb_dom_node_t *node, size_t *length);
 int distribute_flex_rows(LayoutContext *context, lxb_dom_node_t *container, const ComputedStyle *style, const FlexOrderPlan *order_plan, int declared, int *stretch_free, size_t *stretch_lines);
-int flex_child_basis(LayoutContext *context, const FlatItem *item, int content_width);
+int flex_child_basis(LayoutContext *context, const FlatItem *item, int content_width, int content_height);
+int flex_resolve_main(FlexMainItem *items, size_t count, int available);
+/* Align in layout's increasing-coordinate axis before any final mirroring. */
+int layout_content_offset(JustifyContent alignment, int space, int tracks,
+                          int *gap);
+void flex_measure_row_main(LayoutContext *context, FlatItem *item,
+    FlexMainItem *main, int width, int height, bool definite_height);
 int flex_child_row_minimum(LayoutContext *context, const FlatItem *item, int content_width, bool css_table_row);
 int grid_item_minimum_contribution(
     LayoutContext *context, const FlatItem *item, int available,
@@ -1820,6 +1865,12 @@ int style_pixel_height(const Stylesheet *sheet, const ComputedStyle *style, int 
 lxb_dom_node_t *select_display_option(lxb_dom_node_t *select);
 size_t table_cell_span(lxb_dom_node_t *cell);
 size_t table_cell_row_span(lxb_dom_node_t *cell);
+bool table_cell_row_span_placed(const LayoutContext *context,
+                                lxb_dom_node_t *cell);
+void table_expand_row_spans(LayoutContext *context, const TableTracks *tracks,
+                            const ComputedStyle *table_style);
+void layout_expand_table_cell(LayoutContext *context, lxb_dom_node_t *cell,
+                              const ComputedStyle *style, int height);
 bool table_cell_placement(const TableTracks *tracks, lxb_dom_node_t *cell,
                           size_t *column, size_t *column_span,
                           size_t *row_span);

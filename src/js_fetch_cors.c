@@ -2110,9 +2110,11 @@ static bool script_event_source_headers(void *opaque,
 {
     ScriptEventSource *source = opaque;
     if (source == NULL || !source->active || metadata == NULL) return false;
+    static const char event_stream[] = "text/event-stream";
     source->headers_valid = metadata->status_code == 200
-        && strncasecmp(metadata->content_type, "text/event-stream",
-                       strlen("text/event-stream")) == 0
+        && strncasecmp(metadata->content_type, event_stream,
+                       sizeof(event_stream) - 1u) == 0
+        && strchr(" \t;", metadata->content_type[sizeof(event_stream) - 1u]) != NULL
         && js_rt_script_response_origin_allowed(
             source->bridge, metadata, source->target_origin,
             TILEFINCH_DESTINATION_FETCH, TILEFINCH_REQUEST_MODE_CORS,
@@ -2124,6 +2126,7 @@ static bool script_event_source_headers(void *opaque,
             sizeof(source->response_origin));
     }
     if (!source->headers_valid) {
+        source->terminal_response = true;
         snprintf(source->error, sizeof(source->error),
                  "EventSource requires HTTP 200 text/event-stream");
     }
@@ -2422,6 +2425,7 @@ bool js_rt_event_sources_deliver(ScriptRuntime *runtime,
                 TILEFINCH_DESTINATION_FETCH, TILEFINCH_REQUEST_MODE_CORS,
                 source->credentials)) {
             success = false;
+            source->terminal_response = true;
             snprintf(fetched->error, sizeof(fetched->error), "%s",
                      "EventSource CORS response blocked");
         }
@@ -2431,7 +2435,8 @@ bool js_rt_event_sources_deliver(ScriptRuntime *runtime,
         uint64_t id = source->id;
         JSValue arguments[4] = {
             JS_NewInt64(runtime->context, (int64_t) id),
-            JS_NewString(runtime->context, "finish"),
+            JS_NewString(runtime->context,
+                         source->terminal_response ? "terminal" : "finish"),
             JS_NewString(runtime->context, success ? "" : error),
             JS_NewString(runtime->context, source->response_origin)
         };

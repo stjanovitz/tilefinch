@@ -35,7 +35,8 @@ static int test_canvas_setup_publication(void)
             .pixels = packed + (unaligned && !use_native ? 1u : 0u),
             .width = sw, .height = sh, .source_width = sw, .source_height = sh,
             .is_canvas = true, .canvas_opaque = true,
-            .canvas_native_surface = use_native ? &native : NULL
+            .canvas_native = use_native ? native
+                                        : (ImageCanvasNativeSurface) {0}
         };
         DrawCommand command = {
             .image = &image, .x = x, .y = y, .width = dw, .height = dh,
@@ -56,7 +57,7 @@ static int test_canvas_setup_publication(void)
               && tile_cache_render_frame(&cache, scroll, W, H, NULL));
         /* Admit the borrowed surface only after the initial generic paint:
            that path deliberately materializes native canvases into RAM. */
-        native.authoritative = use_native;
+        image.canvas_native.authoritative = use_native;
         memcpy(expected, frame, sizeof(frame));
         for (int dy = 0; dy < H; dy++) {
             int local_y = scroll + dy - y;
@@ -110,7 +111,7 @@ static int test_canvas_setup_publication(void)
         /* Revoking native authority selects the canonical packed source,
            without retaining or materializing the borrowed native pointer. */
         if (use_native) {
-            native.authoritative = false;
+            image.canvas_native.authoritative = false;
             CHECK(tile_cache_sync_canvas_paint(&cache, x, y, x + dw, y + dh)
                   && tile_cache_render_canvas_frame_fast(&cache, scroll, W, H)
                      == RENDER_CANVAS_FRAME_COMPLETE);
@@ -125,7 +126,7 @@ static int test_canvas_setup_publication(void)
             CHECK(frame[GUARD + (size_t) top * W + (size_t) x]
                   == (uint16_t) (((unsigned) (packed[0] >> 3) << 11)
                                  | ((unsigned) (packed[1] >> 2) << 5) | (packed[2] >> 3))
-                  && image.canvas_native_surface == &native);
+                  && image.canvas_native.pixels == native.pixels);
         }
         tile_cache_destroy(&cache);
         CHECK(budget.current == 0);
@@ -176,7 +177,7 @@ static int test_canvas_deferred_publication(void)
             .pixels = packed, .width = 320, .height = 180,
             .source_width = 320, .source_height = 180,
             .is_canvas = true, .canvas_opaque = true,
-            .canvas_native_surface = &native
+            .canvas_native = native
         };
         DrawCommand commands[2] = {
             { .image = &image, .x = 0, .y = 0, .width = W, .height = H,
@@ -197,7 +198,7 @@ static int test_canvas_deferred_publication(void)
         CHECK(tile_cache_init(&cache, &budget, &layout, 1)
               && tile_cache_set_frame(&cache, frame, W * H)
               && tile_cache_render_frame(&cache, 0, W, H, NULL));
-        native.authoritative = true;
+        image.canvas_native.authoritative = true;
         /* Poison the canvas rectangle: a deferred frame must not touch it. */
         for (size_t i = 0; i < (size_t) W * H; i++) frame[i] = 0x5a5au;
         tile_cache_set_canvas_defer(scenario != 3u);
@@ -328,7 +329,7 @@ static bool canvas_presenter_frame(TileCache *cache, Budget *budget,
         .pixels = packed, .width = 320, .height = 180,
         .source_width = 320, .source_height = 180,
         .is_canvas = true, .canvas_opaque = true,
-        .canvas_native_surface = native };
+        .canvas_native = *native };
     *command = (DrawCommand) {
         .image = image, .x = 0, .y = 0, .width = 480, .height = 272,
         .opacity_scale = 256, .type = DRAW_IMAGE,
@@ -342,7 +343,7 @@ static bool canvas_presenter_frame(TileCache *cache, Budget *budget,
     if (!tile_cache_init(cache, budget, layout, 1)
         || !tile_cache_set_frame(cache, frame, 480u * 272u)
         || !tile_cache_render_frame(cache, 0, 480, 272, NULL)) return false;
-    native->authoritative = true;
+    image->canvas_native.authoritative = true;
     for (size_t i = 0; i < 480u * 272u; i++) frame[i] = 0x5a5au;
     cache->canvas_defer_allowed = true;
     return tile_cache_sync_canvas_paint(cache, 0, 0, 480, 272)
@@ -383,7 +384,7 @@ static int test_canvas_frame_in_progress(void)
             .pixels = live, .width = 320, .height = 180,
             .source_width = 320, .source_height = 180,
             .is_canvas = true, .canvas_opaque = true,
-            .canvas_native_surface = &native,
+            .canvas_native = native,
             .canvas_frame_open = scenario != 2u,
             .canvas_frame_published = scenario != 1u,
             .canvas_held_frame = scenario == 0u ? held : NULL
@@ -412,7 +413,7 @@ static int test_canvas_frame_in_progress(void)
                   && generic != 0x5a5au);
         else CHECK(generic == red);
         /* The GE has drawn into the EDRAM surface since. */
-        native.authoritative = true;
+        image.canvas_native.authoritative = true;
         tile_cache_set_canvas_defer(true);
         cache.canvas_defer_allowed = true;
         RenderCanvasFrameResult fast = RENDER_CANVAS_FRAME_FAILED;
@@ -781,6 +782,8 @@ static int test_web_runtime(void)
     if (test_overflow_cache_long_clipped_page(&budget) != 0) return 1;
     puts("test: fixed and sticky passes visit only their own commands");
     if (test_overlay_passes_skip_unrelated_commands(&budget) != 0) return 1;
+    puts("test: a stuck sticky header clips its overflow from the cache");
+    if (test_stuck_sticky_overflow_uses_cache(&budget) != 0) return 1;
     puts("test: a long text run stops past the tile it paints");
     if (test_long_text_run_stops_past_target(&budget) != 0) return 1;
     puts("test: moved copies of bidi text find their source directly");
@@ -1386,13 +1389,12 @@ static int test_web_runtime(void)
         0x00, 0xfc, 0x00, 0xff, 0x00, 0xfc, 0x00, 0xff, 0, 0, 0, 0
     };
     ImageCanvasNativeSurface canvas_native = {
-        .node = canvas_fast_image.node,
         .pixels = canvas_native_pixels,
         .stride = 12u,
         .epoch = 1u,
         .authoritative = true
     };
-    canvas_fast_image.canvas_native_surface = &canvas_native;
+    canvas_fast_image.canvas_native = canvas_native;
     CHECK(tile_cache_sync_canvas_paint(&canvas_fast_cache, 0, 0, 4, 4)
           && tile_cache_render_canvas_frame_fast(
               &canvas_fast_cache, 0, 4, 4)
@@ -1400,7 +1402,7 @@ static int test_web_runtime(void)
           && canvas_fast_frame[0] == test_rgb565(0xf80000)
           && canvas_fast_frame[12] == test_rgb565(0x00fc00)
           && image_resource_materialize_native_canvas(&canvas_fast_image)
-          && canvas_fast_image.canvas_native_surface == NULL
+          && canvas_fast_image.canvas_native.pixels == NULL
           && canvas_fast_pixels[0] == 0xf8
           && canvas_fast_pixels[2u * 4u] == 0x00
           && canvas_fast_pixels[2u * 4u + 1u] == 0xfc);

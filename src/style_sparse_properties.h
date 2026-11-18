@@ -17,6 +17,7 @@
 
    Lookup is a linear, case-insensitive scan in row order. */
 #define STYLE_SPARSE_PROPERTIES(X) \
+    X("clip-path", NULL, 0, 0, NONE, clip_path) \
     X("container", NULL, 0, 0, NONE, container) \
     X("container-name", NULL, 0, 0, NONE, container_name) \
     X("container-type", NULL, 0, 0, NONE, container_type) \

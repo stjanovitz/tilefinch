@@ -150,39 +150,56 @@ or profile setting is written by the switch.
 
 The report formatter accepts only fixed numeric, boolean and enum fields. It
 cannot accept an error string, account name, password, cookie value or hash,
-token, URL, header or response body. It reports the last native feed phase,
-handoff and feed HTTP status, transport/origin checks, session-cookie
-eligibility, server-confirmed authentication, script degradation and admission
-failures, cookie refusals/evictions and the recovery count. Parsed result
-count and pending publication distinguish an empty feed from results waiting
-for the user's Refresh action. No titles or video IDs appear.
+token, URL, header or response body. No titles or video IDs appear. The
+report's first line names its format, `Tilefinch YouTube sign-in diagnostics
+v5`; its fields are:
 
-Version 2 separates bootstrap, API and optional history HTTP statuses, fixed
-failure categories, configuration/signature/request admission, feed
-construction and publication outcomes. Authentication is independent of
-display success. Build/publication outcomes are 0 not attempted, 1 pending, 2
-successful, 3 refused/failed, and (publication only) 4 waiting for Refresh.
-Clock availability is a boolean, not a timestamp or proof that the clock is
-correctly set. Optional history outcomes are 0 not attempted, 1 pending, 2
-complete, 3 timed out, and 4 failed. Failure category 11 means the session
-changed before construction or publication completed. A definite server
-sign-out revokes confirmation; transport, parsing, allocation and display
-failures do not.
+- **Sign-in stage** (`stage`): 0 idle; 1 account page; 2 stable-entry
+  recovery; 3 session handoff; 4 native verification; 5 verified; 6 failed;
+  7 cancelled; 8 manual retry needed because entered text must be preserved.
+  A successful handoff or cookie receipt is not a verified login. Stage 2 is
+  the recovery that **Menu → Page tools → Continue to YouTube**
+  ([user guide](USER_GUIDE.md#home-search-and-sign-in)) starts: it opens the
+  stable account GET entry once to complete the current handoff, even if
+  cookies from an earlier session remain, and the native provider then
+  verifies the session. It never resubmits a password, repeats a single-use
+  handoff URL, or runs the full YouTube application.
+- **HTTP statuses**: the last native feed phase, the handoff and feed
+  statuses, and separate bootstrap, API and optional history statuses.
+- **Outcomes**: `failure-kind` is a fixed failure category; 11 means the
+  session changed before construction or publication completed. Build and
+  publication outcomes are 0 not attempted, 1 pending, 2 successful, 3
+  refused/failed, and (publication only) 4 waiting for Refresh. Optional
+  history outcomes are 0 not attempted, 1 pending, 2 complete, 3 timed out
+  and 4 failed. `parsed-results` and `pending-publication` distinguish an
+  empty feed from results waiting for the user's Refresh action.
+  Configuration, signature and request admission are separate flags.
+  `clock-available` is a boolean, not a timestamp or proof that the clock is
+  correctly set.
+- **Authentication**: session-cookie eligibility and server-confirmed
+  authentication, which is independent of display success. A definite
+  server sign-out revokes confirmation; transport, parsing, allocation and
+  display failures do not.
+- **Transport**: for the last completed feed hop, a numeric transport error,
+  timeout flag, TLS verification result and whether that result was
+  available. An unavailable TLS result is unknown, not evidence that
+  verification succeeded. These fields contain no URL, certificate identity,
+  cookie or response text.
+- **Page and cookie health**: transport/origin checks, script degradation and
+  admission failures, cookie refusals and evictions, and the recovery count.
+- **Google refusals**: `accounts-refusals` counts the top-level navigations
+  that ended on Google refusing the browser while the switch was on.
+  `refusal-class` names the last one: 1 Google's sign-in rejection page
+  ("Couldn't sign you in"), 2 its unusual-traffic interstitial, 3 HTTP 429
+  from the account site. `refusal-reason` is the reason number the rejection
+  page's address carried, at most four digits, or 0 when there was none.
+  Nothing else from that address is recorded: no account hint, no other
+  parameter.
 
-Version 4 adds Google refusing the browser during sign-in.
-`accounts-refusals` counts the top-level navigations that ended on such an
-answer while the switch was on. `refusal-class` names the last one: 1
-Google's sign-in rejection page ("Couldn't sign you in"), 2 its
-unusual-traffic interstitial, 3 HTTP 429 from the account site.
-`refusal-reason` is the reason number the rejection page's address carried,
-at most four digits, or 0 when there was none. Nothing else from that
-address is recorded: no account hint, no other parameter.
-
-Version 5 adds one line, `post-chain=`, for the redirect chain of the last
-form submitted on the account pages. It is twelve numbers, kept short so the
-report normally fits one QR code (one with many other non-zero fields, after
-a script stop or a feed failure, takes two); `tools/decode_diagnostic_qr.py`
-prints them with their names. In order:
+One line, `post-chain=`, describes the redirect chain of the last form
+submitted on the account pages. It is twelve numbers, kept short so the
+report usually fits one QR code; `tools/decode_diagnostic_qr.py` prints them
+with their names. In order:
 
 1. `class`: 0 the chain finished, 1 timeout, 2 name lookup failed, 3 could
    not connect, 4 TLS failure, 5 HTTP/2 failure, 6 broken transfer, 7 a
@@ -216,24 +233,6 @@ instead. It reads as finished (class 0, no failed hop, host or limit) with
 the counts it reached: its redirects, the YouTube response's headers and
 cookies, and the time to them. `post-http-status` is then that response's
 status; the native page's own request reports in `handoff-http-status`.
-
-The last completed feed hop also reports a numeric transport error, timeout
-flag, TLS verification result and whether that result was available. These
-fields contain no URL, certificate identity, cookie or response text. An
-unavailable TLS result is unknown, not evidence that verification succeeded.
-
-**Menu → Page tools → Continue to YouTube**
-([user guide](USER_GUIDE.md#home-search-and-sign-in)) uses the stable account
-GET entry to complete the current handoff, even if cookies from an earlier
-session remain. The native provider then verifies the session. It never
-repeats a password submission or a single-use handoff URL, and never runs the
-full YouTube application.
-
-Sign-in stages: 0 idle; 1 account page; 2 stable-entry recovery; 3 session
-handoff; 4 native verification; 5 verified; 6 failed; 7 cancelled; 8 manual
-retry needed because entered text must be preserved. A successful handoff or
-cookie receipt is not a verified login. Recovery retries only the stable GET
-entry once; it never resubmits a password or repeats single-use parameters.
 
 ## Recovering logs on a computer
 

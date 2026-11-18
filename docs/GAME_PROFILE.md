@@ -943,9 +943,17 @@ Hard snapshot limits are:
 
 Keep HTML, CSS, JavaScript, fonts, images, and PCM effects same-origin and make
 the game usable when an optional resource is listed as unavailable. The
-snapshot can only capture responses still held by the live memory cache, so a
-game larger than the **Memory cache** setting needs that setting raised
-(for example to 2 MB) before it is loaded for installation. Opening an
+installation preview downloads again any same-origin script or stylesheet the
+document declares that the memory cache no longer holds, so a game whose code
+is larger than the **Memory cache** setting still installs completely at the
+default setting (see
+[Offline web apps](OFFLINE_LIBRARY.md#offline-web-apps)). Declare every
+script with `<script src>` (or `document.write`) and every stylesheet with
+`<link rel=stylesheet>` in the document; a script inserted and then removed
+is not found. Images, fonts, audio and data the game fetches are captured
+only while the memory cache still holds them, so a game with many such
+assets needs that setting raised before it is loaded for installation, and
+the preview counts anything missing as unavailable. Opening an
 installed app does not itself require or start a network connection. Network
 work begins only when the page explicitly requests it, such as an opt-in
 multiplayer action.

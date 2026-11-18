@@ -93,14 +93,13 @@ text, links, or hit geometry.
 
 ## Glyph components
 
-Arabic and Hebrew are optional signed language packs, alongside Japanese,
-Simplified Chinese, Traditional Chinese, Korean, Cyrillic, Extended Latin,
-Devanagari (Hindi) and Bengali–Assamese. The default embedded Latin and
-fallback glyphs remain available through missing, damaged, interrupted, or
-removed components. Selecting a language keeps that pack attached; the parser
-may lazily attach at most two other installed language packs when the page
-actually uses their scripts. Color emoji is independent, and no more than
-four packs are attached at once.
+Arabic and Hebrew are optional signed language packs, like the other scripts
+listed in the [user guide](USER_GUIDE.md#other-languages-and-language-packs).
+The default embedded Latin and fallback glyphs remain available through
+missing, damaged, interrupted, or removed components. Selecting a language
+keeps that pack attached; the parser may lazily attach at most two other
+installed language packs when the page actually uses their scripts. Color
+emoji is independent, and no more than four packs are attached at once.
 
 The Arabic pack includes U+0600–U+08FF base/mark coverage and the contextual
 presentation forms emitted by the shaper. The Hebrew pack includes Hebrew
@@ -128,7 +127,8 @@ A pack cell has no metrics of its own, so a pack built by fitting each glyph to
 its cell draws lowercase as tall as capitals and shrinks its widest letters. That
 suits CJK, whose glyphs fill the em, but not an alphabet. A metric pack instead
 renders every glyph at one scale on a shared baseline, and declares that baseline
-and each glyph's column box in a form older browsers ignore
+and each glyph's column box in fields that releases without metric packs
+ignore, so one pack file serves every release
 (`include/tilefinch/glyph_component.h`). Its text is measured from the column
 boxes, so letters keep their own widths without reading the pack during layout.
 A combining mark in such a pack has no advance and its box ends at the pen, so it
@@ -136,8 +136,8 @@ draws back over the letter before it, which is the letter it follows in a
 right-to-left cluster's stored order too. Marks are not positioned per letter:
 the font's default placement is the only one a pack holds. That placement suits
 a lowercase letter, so a pack can also list a capital and its accent (U+0300-036F)
-as a shaped cluster, which draws the accent raised; a browser older than this
-ignores those entries.
+as a shaped cluster, which draws the accent raised; releases that look up
+clusters only for the scripts that need shaping ignore those entries.
 
 A pack stores one weight. Bold text reaches its monochrome glyphs through either
 a synthetic bold or a real bold face, and both embolden the cell by one column
@@ -189,7 +189,7 @@ Two rules decide where text sits in the browser's own panels:
 3. **A line built from parts reads in the interface language's order.**
    Catalog strings are stored in display order, but a line that joins one to
    a number, a size, a version or a host ("512 files | 2048 KB", "Current
-   version  0.1.49", "Downloading 45%") is put together in reading order
+   version  1.2.3", "Downloading 45%") is put together in reading order
    (`psp_ui_join_reading_order`). In a right-to-left interface language the
    parts are laid from the right, each kept whole, so a number and its unit
    still read left to right; the spaces and punctuation between them are

@@ -387,7 +387,7 @@ cat <<EOF
        --sequence $sequence --expires <unix-expiry> --version $version \\
        --tag v$version --asset $tfup_name \\
        --decoder-abi $decoder_abi \\
-       --notes "<signed release notes>" --output manifest.tfum-body
+       --notes <release-notes-file> --output manifest.tfum-body
      python3 tools/tilefinch_update_tool.py envelope \\
        --manifest manifest.tfum-body --release-key <offline-release-key> \\
        --output tilefinch-update-v1.tfum

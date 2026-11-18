@@ -600,16 +600,7 @@ static inline bool style_selector_last_combinator(
 }
 
 /* Where the rightmost compound of a complex selector begins. */
-static inline size_t style_selector_rightmost_compound_start(
-    const char *text, size_t length)
-{
-    size_t split = 0;
-    char combinator = 0;
-    size_t start = style_selector_last_combinator(
-        text, length, &split, &combinator) ? split + 1 : 0;
-    while (start < length && isspace((unsigned char) text[start])) start++;
-    return start;
-}
+size_t style_selector_rightmost_compound_start(const char *text, size_t length);
 
 /* style_match.c */
 bool style_tag_is(lxb_dom_node_t *node, const char *wanted);
@@ -659,16 +650,8 @@ static inline StyleMatchSubject style_match_subject(
     return subject;
 }
 
-static inline bool rule_fast_matches(const Stylesheet *sheet,
-                                     const StyleRule *rule,
-                                     const StyleMatchSubject *subject)
-{
-    if (!rule->has_fast_key) return true;
-    const char *fast_key = style_rule_fast_key(rule);
-    if (fast_key == NULL) return true;
-    return style_subject_key_matches(sheet, subject, rule->type, fast_key,
-                                     rule->fast_key_length);
-}
+bool rule_fast_matches(const Stylesheet *sheet, const StyleRule *rule,
+                       const StyleMatchSubject *subject);
 
 static inline bool rule_matches(const Stylesheet *sheet, size_t rule_index,
                                 const StyleRule *rule, lxb_dom_node_t *node,

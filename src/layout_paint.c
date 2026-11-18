@@ -137,6 +137,17 @@ void layout_scale_range(LayoutDocument *layout, size_t command_start,
                         lxb_dom_node_t *source)
 {
     if (scale_q14 == 16384) return;
+    LayoutInlineFragments *fragments = layout->inline_fragments;
+    for (size_t i = fragments == NULL ? 0 : fragments->count; i-- != 0;) {
+        LayoutInlineFragment *f = &fragments->entries[i];
+        if (f->command < command_start) break;
+        if (source != NULL
+            && !layout_node_within(f->node, source)) continue;
+        f->x = scale_around_center(f->x, origin_x_twice, scale_q14);
+        f->y = scale_around_center(f->y, origin_y_twice, scale_q14);
+        f->width = scale_dimension(f->width, scale_q14);
+        f->height = scale_dimension(f->height, scale_q14);
+    }
     layout_bidi_scale_commands(
         layout, command_start, origin_x_twice, scale_q14);
     for (size_t i = command_start; i < layout->count; i++) {
@@ -282,8 +293,11 @@ void layout_scale_range(LayoutDocument *layout, size_t command_start,
         if (source != NULL && !layout_node_within(box->node, source)) continue;
         if (box->command_start < command_start
             || box->command_end > layout->count) continue;
-        box->x = scale_around_center(box->x, origin_x_twice, scale_q14);
-        box->y = scale_around_center(box->y, origin_y_twice, scale_q14);
+        int x = scale_around_center(box->x, origin_x_twice, scale_q14);
+        int y = scale_around_center(box->y, origin_y_twice, scale_q14);
+        layout_record_box_transform(layout, box, x, y);
+        box->x = x;
+        box->y = y;
         box->width = scale_dimension(box->width, scale_q14);
         box->height = scale_dimension(box->height, scale_q14);
         box->client_width = scale_dimension(box->client_width, scale_q14);
@@ -387,6 +401,15 @@ void layout_rotate_range_quadrants(LayoutDocument *layout,
                                    lxb_dom_node_t *source)
 {
     if (layout == NULL || (quadrants &= 3u) == 0) return;
+    LayoutInlineFragments *fragments = layout->inline_fragments;
+    for (size_t i = fragments == NULL ? 0 : fragments->count; i-- != 0;) {
+        LayoutInlineFragment *f = &fragments->entries[i];
+        if (f->command < command_start) break;
+        if (source != NULL
+            && !layout_node_within(f->node, source)) continue;
+        rotate_rect_quadrants(&f->x, &f->y, &f->width, &f->height,
+                              origin_x_twice, origin_y_twice, quadrants);
+    }
     for (size_t i = command_start; i < layout->count; i++) {
         DrawCommand *command = &layout->commands[i];
         int old_text_x_fixed = command->type == DRAW_TEXT
@@ -424,9 +447,15 @@ void layout_rotate_range_quadrants(LayoutDocument *layout,
         if (source != NULL && !layout_node_within(box->node, source)) continue;
         if (box->command_start < command_start
             || box->command_end > layout->count) continue;
+        int x = box->x, y = box->y, width = box->width, height = box->height;
         rotate_rect_quadrants(
-            &box->x, &box->y, &box->width, &box->height,
+            &x, &y, &width, &height,
             origin_x_twice, origin_y_twice, quadrants);
+        layout_record_box_transform(layout, box, x, y);
+        box->x = x;
+        box->y = y;
+        box->width = width;
+        box->height = height;
         if ((quadrants & 1u) != 0) {
             int temporary = box->client_width;
             box->client_width = box->client_height;
@@ -640,6 +669,7 @@ bool layout_insert_commands(LayoutContext *context, size_t index,
                 layout_normalize_command(commands[i]);
         }
         layout_bidi_insert_commands(context, index, count);
+        layout_adjust_inline_fragment_commands(layout, index, count);
         for (size_t i = 0; i < layout->sticky_count; i++) {
             StickyRange *range = &layout->sticky_ranges[i];
             if (index <= range->command_start) range->command_start += count;
@@ -707,7 +737,8 @@ uint32_t blend_color_over(uint32_t foreground, uint8_t alpha,
 }
 
 bool add_sticky_range(LayoutDocument *layout, size_t start,
-                      size_t end, int origin_y, int top, int bottom_y)
+                      size_t end, const lxb_dom_node_t *node,
+                      int origin_y, int bottom_y, int top, int bottom_inset)
 {
     if (start >= end) return true;
     if (layout->sticky_count == LAYOUT_STICKY_RANGE_LIMIT) {
@@ -731,13 +762,17 @@ bool add_sticky_range(LayoutDocument *layout, size_t start,
         .origin_y = origin_y,
         .top = top,
         .bottom_y = bottom_y,
-        .maximum_offset = INT_MAX
+        .maximum_offset = INT_MAX,
+        .minimum_offset = INT_MIN,
+        .bottom_inset = bottom_inset,
+        .node = node
     };
     return true;
 }
 
 void layout_bound_sticky_ranges(LayoutDocument *layout, size_t start,
-                                size_t end, int containing_bottom)
+                                size_t end, int containing_top,
+                                int containing_bottom)
 {
     if (layout == NULL || start >= end) return;
     for (size_t i = 0; i < layout->sticky_count; i++) {
@@ -752,6 +787,9 @@ void layout_bound_sticky_ranges(LayoutDocument *layout, size_t start,
             available = LAYOUT_COORDINATE_LIMIT;
         }
         range->maximum_offset = (int) available;
+        range->minimum_offset = layout_subtract_coordinate(
+            containing_top, range->origin_y);
+        if (range->minimum_offset > 0) range->minimum_offset = 0;
 
         /* A fixed descendant retained inside a finite sticky scene is a
            common server-rendered shell for a scroll-driven animation.  When
@@ -1080,6 +1118,8 @@ void translate_node_subtree(LayoutDocument *layout,
             box->x += dx;
             box->y += dy;
         }
+        if (!box_fixed)
+            layout_move_node_inline_fragments(layout, at, dx, dy);
         if (at->first_child != NULL) {
             at = at->first_child;
             continue;
@@ -2127,6 +2167,11 @@ void layout_translate_range(LayoutDocument *layout, size_t command_start,
                             const char *phase,
                             lxb_dom_node_t *source)
 {
+    bool transform = source != NULL && phase != NULL && phase[0] == 't'
+        && strcmp(phase, "transform") == 0 && (dx != 0 || dy != 0);
+    if ((dx != 0 || dy != 0) && layout->inline_fragments != NULL
+        && (phase == NULL || strcmp(phase, "text-align") != 0))
+        layout_move_inline_fragments(layout, source, command_start, dx, dy);
     if (layout->count - command_start > 2000u)
         tilefinch_platform_trace_step("layout-translate-range");
     layout_bidi_translate_commands(layout, command_start, SIZE_MAX, dx);
@@ -2192,6 +2237,8 @@ void layout_translate_range(LayoutDocument *layout, size_t command_start,
                         box->x, box->width, dx, dy);
             }
         }
+        if (transform)
+            layout_record_box_transform(layout, box, box->x + dx, box->y + dy);
         box->x += dx;
         box->y += dy;
     }

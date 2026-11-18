@@ -30,15 +30,9 @@
        BroadcastChannel) dispatches with the methods targets inherit before
        author code runs, as in browsers: a page's replacement of
        dispatchEvent sees only its own calls. */
-    dispatchTarget = Function.call.bind(EventTarget.prototype.dispatchEvent),
-    dispatchDocument = document.dispatchEvent,
-    dispatchNode =
-      __tilefinchRealmGlobal.__tilefinchTrustedEventShare.dispatchNode,
+    browserDispatch =
+      __tilefinchRealmGlobal.__tilefinchTrustedEventShare.dispatchBrowser,
     isNode = Function.call.bind(Object.prototype.isPrototypeOf, Node.prototype),
-    browserDispatch = (target, event) => target === document
-      ? dispatchDocument(event)
-      : isNode(target) ? dispatchNode(target, event)
-        : dispatchTarget(target, event),
     /* Input focuses, unfocuses and activates with the steps themselves,
        never a page's replacement of focus(), blur() or click(). */
     isElement = Function.call.bind(Object.prototype.isPrototypeOf,
@@ -635,7 +629,7 @@
                   } catch (error) {
                     __tilefinchReportUncaught(error, "broadcast channel");
                   }
-                dispatchTarget(target, event);
+                browserDispatch(target, event);
               },
               0,
               false,
@@ -701,7 +695,7 @@
   __tilefinchRealmGlobal.cancelIdleCallback = cancelIdleCallback;
   const deliverViewportEvent = (viewport, event) => {
     const type = String(event.type);
-    dispatchTarget(viewport, event);
+    browserDispatch(viewport, event);
     const handler = viewport["on" + type];
     if (typeof handler === "function")
       try {
@@ -799,7 +793,7 @@
       hostState[HOST_SCROLL_PENDING] = 0;
       /* Viewport scrolling targets Document and bubbles to Window. Dispatching
          directly on Window skips document listeners used by sticky controls. */
-      dispatchDocument(trusted(newEvent("scroll", { bubbles: true })));
+      browserDispatch(document, trusted(newEvent("scroll", { bubbles: true })));
       deliverViewportEvent(viewport, trusted(newEvent("scroll")));
       return true;
     };

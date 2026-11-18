@@ -345,6 +345,9 @@ static inline JSValue __JS_NewShortBigInt(JSContext *ctx, int64_t d)
 /* allow top-level await in normal script. JS_Eval() returns a
    promise. Only allowed with JS_EVAL_TYPE_GLOBAL */
 #define JS_EVAL_FLAG_ASYNC (1 << 7)
+/* Tilefinch: browser code, which reads the interfaces as they were at
+   JS_SnapshotInterfaces() */
+#define JS_EVAL_FLAG_TRUSTED (1 << 12)
 
 typedef JSValue JSCFunction(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 typedef JSValue JSCFunctionMagic(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
@@ -405,6 +408,17 @@ JS_BOOL JS_IsProxy(JSValueConst obj);
 
 JSContext *JS_NewContext(JSRuntime *rt);
 void JS_FreeContext(JSContext *s);
+/* Tilefinch interface snapshot: see quickjs.c. */
+void JS_PlanInterfaceSnapshot(JSContext *ctx);
+void JS_SnapshotInterfaces(JSContext *ctx);
+void JS_SnapshotObject(JSContext *ctx, JSValueConst obj);
+void JS_LeaveGlobalToPage(JSContext *ctx, const char *name);
+void JS_SetEmbedderPageView(JSRuntime *rt, int page_view);
+void JS_MarkBrowserNative(JSContext *ctx, JSValueConst func);
+void JS_MarkBrowserFunction(JSContext *ctx, JSValueConst func);
+void *JS_EnterBrowserCode(JSContext *ctx);
+void JS_LeaveBrowserCode(JSContext *ctx, void *previous);
+void JS_GetSnapshotCounts(JSContext *ctx, uint32_t *pmembers, uint32_t *ptwins);
 JSContext *JS_DupContext(JSContext *ctx);
 void *JS_GetContextOpaque(JSContext *ctx);
 void JS_SetContextOpaque(JSContext *ctx, void *opaque);
@@ -898,6 +912,9 @@ void JS_FreePropertyEnum(JSContext *ctx, JSPropertyEnum *tab,
                          uint32_t len);
 int JS_GetOwnProperty(JSContext *ctx, JSPropertyDescriptor *desc,
                       JSValueConst obj, JSAtom prop);
+/* Tilefinch interface snapshot: the global as browser code reads it. */
+int JS_GetBrowserGlobalProperty(JSContext *ctx, JSPropertyDescriptor *desc,
+                                JSAtom prop);
 
 JSValue JS_Call(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
                 int argc, JSValueConst *argv);

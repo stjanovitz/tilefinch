@@ -74,7 +74,9 @@ bool browser_tabs_rehydrate(
     BrowserTabs *tabs, size_t index, const char *path);
 /* Session snapshots contain only bounded navigation facts. They are written
    transactionally on controlled persistence points and never read unless the
-   user's existing restore-last-page option is enabled. */
+   user's existing restore-last-page option is enabled. A temporarily refused
+   restore prevents saving over that unread session until a later restore
+   succeeds or establishes that no readable session exists. */
 bool browser_tabs_save_session(
     const BrowserTabs *tabs, const char *path, const char *hibernation_path);
 bool browser_tabs_restore_session(BrowserTabs *tabs, const char *path);

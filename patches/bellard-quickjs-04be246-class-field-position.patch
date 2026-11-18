@@ -1,0 +1,24 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -42401,13 +42401,19 @@
+     return js_parse_error(s, "duplicate argument names not allowed in this context");
+ }
+ 
+-/* create a function to initialize class fields */
++/* create a function to initialize class fields. Tilefinch: it starts at
++   the token inside the class that first needs it (a field, a static block
++   or the private brand), not at the start of the buffer. Its line table is
++   built relative to that position; from offset 0, each class with fields
++   made the line/column cache walk back to the start of the file and
++   forward again, which is quadratic in a long module. Reported positions
++   are unchanged: every field opcode carries its own source position. */
+ static JSFunctionDef *js_parse_function_class_fields_init(JSParseState *s)
+ {
+     JSFunctionDef *fd;
+ 
+     fd = js_new_function_def(s->ctx, s->cur_func, FALSE, FALSE,
+-                             s->filename, s->buf_start,
++                             s->filename, s->token.ptr,
+                              &s->get_line_col_cache);
+     if (!fd)
+         return NULL;

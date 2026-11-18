@@ -1,5 +1,5 @@
 tilefinch-theme
-format=1
+format=2
 name=Violet
 ground=#110F17
 ground_reader=#16121B
@@ -15,6 +15,7 @@ text_muted=#8C8595
 text_faint=#696170
 accent=#826BC5
 accent_high=#B5A1EA
-on_accent=#100B1B
+on_accent=#100418
 ok=#7FD6A2
 warn=#E08A52
+danger=#EF6B75

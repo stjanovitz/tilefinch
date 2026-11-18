@@ -402,6 +402,11 @@ void psp_log_set_phase(PspLogPhase phase)
 {
     current_phase = phase < PSP_LOG_PHASE_COUNT
         ? (uint32_t) phase : (uint32_t) PSP_LOG_PHASE_HALTED;
+    /* A measurement window a scenario never closed (no webgl-measure-end
+       mark) must not swallow shutdown: once its bounded capture is full it
+       drops every line, including the outcome record the runners wait for.
+       Cleanup reports are not frame-timed, so they go to the log directly. */
+    if (phase == PSP_LOG_PHASE_CLEANUP) psp_log_end_timing_window();
     psp_log_heartbeat();
 }
 

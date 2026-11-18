@@ -873,6 +873,134 @@
       const number = Number(value);
       return Number.isFinite(number) && number >= 0 ? String(number) : null;
     };
+  const sizingProperty = /^(?:(?:min|max)-)?(?:width|height|inline-size|block-size)$/,
+    sizingKeyword = /^(?:auto|none|min-content|max-content|fit-content|stretch|contain|inherit|initial|unset|revert|revert-layer|-(?:webkit|moz|ms|o)-[a-z-]+)$/i,
+    importantSuffix = /\s*!\s*important\s*$/i;
+  /* An inline declaration retains authored shorthands instead of
+     allocating an expanded block. Resolve a requested physical width
+     when read, in declaration order and with its authored priority. */
+  const borderWidthIndex = {
+    __proto__: null,
+    "border-top-width": 0, "border-right-width": 1,
+    "border-bottom-width": 2, "border-left-width": 3,
+  };
+  const marginSides = ["margin-top", "margin-right", "margin-bottom", "margin-left"],
+    marginSideIndex = {
+      __proto__: null,
+      "margin-top": 0, "margin-right": 1, "margin-bottom": 2, "margin-left": 3,
+    },
+    paddingSides = ["padding-top", "padding-right", "padding-bottom", "padding-left"],
+    paddingSideIndex = {
+      __proto__: null,
+      "padding-top": 0, "padding-right": 1, "padding-bottom": 2, "padding-left": 3,
+    },
+    wideValue = /^(?:inherit|initial|unset|revert|revert-layer)$/i,
+    marginToken = /^(?:(?:auto|[+-]?0|[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?(?:[a-z]+|%))$|(?:calc|min|max|clamp|anchor-size|env|attr)\()/i;
+  /* Every name readBoxSide can match holds its group's word: a style
+     attribute without it (most of them) skips the scan. */
+  const boxSideWord = { __proto__: null, margin: /margin/i, padding: /padding/i, "": /border/i };
+  const readBoxSide = (source, longhand, side, group = "") => {
+    source = source.slice(0, 16 * 1024);
+    if (!source || !boxSideWord[group].test(source)) return null;
+    const shorthand = group || longhand.slice(0, -6),
+      widthToken = /^(?:(?:thin|medium|thick|\+?0|\+?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?[a-z]+)$|(?:calc|min|max|clamp)\()/i;
+    const valid = group === "padding"
+      ? token => marginToken.test(token) && !/^(?:auto$|-(?!0$))/i.test(token)
+      : token => (group ? marginToken : widthToken).test(token);
+    let start = 0, depth = 0, quote = "", winner = null;
+    for (let at = 0; at <= source.length; at++) {
+      const ch = source[at];
+      if (at < source.length) {
+        if (ch === "\\") { at++; continue; }
+        if (quote) {
+          if (ch === quote) quote = "";
+          continue;
+        }
+        if (ch === "'" || ch === '"') { quote = ch; continue; }
+        if (ch === "(") depth++;
+        else if (ch === ")" && depth) depth--;
+        if (ch !== ";" || depth) continue;
+      }
+      const colon = source.indexOf(":", start), from = start;
+      start = at + 1;
+      if (colon < from || colon >= at) continue;
+      const property = source.slice(from, colon).trim().toLowerCase();
+      if (property !== longhand && property !== shorthand &&
+          (group || property !== "border-width" && property !== "border")) continue;
+      let value = source.slice(colon + 1, at).trim();
+      const important = importantSuffix.test(value);
+      if (!important && winner?.important) continue;
+      if (important) value = value.replace(importantSuffix, "").trim();
+      if (!value) continue;
+      if (property !== longhand && !wideValue.test(value)) {
+        if (/\bvar\(/i.test(value)) {
+          /* Pending shorthand substitution cannot expose a longhand. */
+          value = "";
+        } else {
+          const tokens = splitTopLevel(value);
+          if (group || property === "border-width") {
+            if (tokens.length < 1 || tokens.length > 4 ||
+                !tokens.every(valid))
+              continue;
+            value = tokens[side] ?? tokens[side % 2] ?? tokens[0];
+          } else {
+            if (tokens.length > 3) continue;
+            value = tokens.find(token => widthToken.test(token)) || "medium";
+          }
+        }
+      } else if (group && !wideValue.test(value) &&
+          !valid(value) && !/^var\(/i.test(value)) continue;
+      winner = { value: value === "0" ? "0px" : value, important };
+    }
+    return winner;
+  };
+  /* Find only a top-level declaration delimiter, not one in a quoted
+     string, comment, escape, function, or custom property's component block. */
+  const declarationEnd = (text, start = 0) => {
+    let depth = 0, quote = "";
+    for (let at = start; at < text.length; at++) {
+      const ch = text[at];
+      if (ch === "\\") { at++; continue; }
+      if (quote) {
+        if (ch === quote) quote = "";
+      } else if (ch === "'" || ch === '"') quote = ch;
+      else if (ch === "/" && text[at + 1] === "*") {
+        const end = text.indexOf("*/", at + 2);
+        if (end < 0) return text.length;
+        at = end + 1;
+      } else if (ch === "(" || ch === "[" || ch === "{") depth++;
+      else if ((ch === ")" || ch === "]" || ch === "}") && depth) depth--;
+      else if (ch === ";" && !depth) return at;
+    }
+    return text.length;
+  };
+  const withoutBoxSide = (source, name, group, names) => {
+    if (source.length > 16 * 1024) return null;
+    const parts = [];
+    let expanded = false;
+    for (let at = 0; at < source.length;) {
+      const end = declarationEnd(source, at), part = source.slice(at, end),
+        colon = part.indexOf(":"), property = part.slice(0, colon).trim().toLowerCase();
+      at = end + 1;
+      if (property === name) continue;
+      if (property !== group) {
+        parts.push(part);
+        continue;
+      }
+      const value = part.slice(colon + 1).trim(), important = importantSuffix.test(value),
+        tokens = splitTopLevel(value.replace(importantSuffix, ""));
+      /* Pending substitution cannot be expanded into independent values. */
+      if (tokens.length < 1 || tokens.length > 4 || /\bvar\(/i.test(value)) return null;
+      expanded = true;
+      for (let side = 0; side < 4; side++)
+        if (names[side] !== name)
+          parts.push(names[side] + ": " + (tokens[side] ?? tokens[side % 2] ?? tokens[0])
+            + (important ? " !important" : ""));
+    }
+    if (!expanded) return null;
+    const updated = parts.join(";");
+    return updated.length <= 16 * 1024 ? updated : null;
+  };
   const canonicalFlex = (value) => {
     const raw = String(value).trim().toLowerCase();
     if (raw === "none") return { grow: "0", shrink: "0", basis: "auto" };
@@ -1295,9 +1423,31 @@
     name = cssName(name);
     const raw = String(value),
       trimmed = raw.trim();
+    if (trimmed.includes(";") &&
+        (trimmed.length > 256 * 1024 || declarationEnd(trimmed) < trimmed.length)) return null;
+    if ((name === "color" || name.endsWith("-color") && !name.startsWith("--")) &&
+        /^[a-z-]+$/i.test(trimmed) && !wideValue.test(trimmed) &&
+        !/^(?:currentcolor|accentcolor(?:text)?|activetext|button(?:border|face|text)|canvas(?:text)?|field(?:text)?|graytext|highlight(?:text)?|linktext|mark(?:text)?|selecteditem(?:text)?|visitedtext|invert|auto)$/i.test(trimmed) &&
+        parseColorNative(trimmed) === null) return null;
     const modern = canonicalModernMobile(name, trimmed);
     if (modern !== undefined) return modern;
     if (name === "display") return canonicalDisplay(raw);
+    if (name === "font-weight") {
+      const lower = trimmed.toLowerCase();
+      if (wideValue.test(lower) || /^(?:normal|bold|bolder|lighter)$/.test(lower)) return lower;
+      if (/^(?:var|calc|min|max|clamp|env|attr)\(/.test(lower) || trimmed.includes("/*"))
+        return trimmed;
+      const numeric = Number(lower);
+      return numberPattern.test(lower) && numeric >= 1 && numeric <= 1000
+        ? String(numeric) : null;
+    }
+    /* Reject invalid bare sizing keywords without gating valid functions,
+       CSS-wide keywords, custom properties, or unsupported length units
+       on the device layout engine's feature coverage. */
+    if (sizingProperty.test(name) && /^[a-z-]+$/i.test(trimmed) &&
+        (!sizingKeyword.test(trimmed) ||
+         trimmed.toLowerCase() === "none" && !name.startsWith("max-")))
+      return null;
     if (scrollBoxLonghands[name]) return canonicalScrollBox(name, trimmed);
     if (
       name.startsWith("scroll-margin-") ||
@@ -1642,26 +1792,27 @@
         const state = states.get(this), oldValue = state.observedStyle();
         try {
         name = cssName(name);
-        if (name === "--") return false;
+        if (name === "--") return;
         /* [LegacyNullToEmptyString]: `style.x = null` removes x. */
         value = value === null ? "" : String(value);
-        priority = String(priority).trim().toLowerCase();
+        priority = priority === null ? "" : String(priority).toLowerCase();
         if (value === "") {
           this.removeProperty(name);
-          return true;
+          return;
         }
-        if (priority !== "" && priority !== "important") return false;
+        if (priority !== "" && priority !== "important") return;
         const prioritized = (canonical) =>
           canonical + (priority === "important" ? " !important" : "");
         if (name === "flex") {
           const parsed = canonicalFlex(value);
-          if (parsed === null) return false;
+          if (parsed === null) return;
           state.write("flex", "");
-          return (
+          (
             state.write("flex-grow", prioritized(parsed.grow)) &&
             state.write("flex-shrink", prioritized(parsed.shrink)) &&
             state.write("flex-basis", prioritized(parsed.basis))
           );
+          return;
         }
         if (placeLonghands[name]) {
           const longhands = placeLonghands[name],
@@ -1670,24 +1821,26 @@
               longhands[0],
               longhands[1],
             );
-          if (parsed === null) return false;
+          if (parsed === null) return;
           state.write(name, "");
-          return (
+          (
             state.write(longhands[0], prioritized(parsed[0])) &&
             state.write(longhands[1], prioritized(parsed[1]))
           );
+          return;
         }
         if (scrollBoxLonghands[name]) {
           const parsed = canonicalScrollBox(name, value);
-          if (parsed === null) return false;
+          if (parsed === null) return;
           const expanded = expandScrollBox(parsed);
           state.write(name, "");
-          return scrollBoxLonghands[name].every((longhand, index) =>
+          scrollBoxLonghands[name].every((longhand, index) =>
             state.write(longhand, prioritized(expanded[index])),
           );
+          return;
         }
         const canonical = canonicalValue(name, value);
-        return canonical === null ? false : state.write(name, prioritized(canonical));
+        if (canonical !== null) state.write(name, prioritized(canonical));
         } finally {
           state.notifyStyle(oldValue);
         }
@@ -1721,7 +1874,29 @@
               this.getPropertyValue(longhand),
             ),
           );
+        if (name === "margin" || name === "padding") {
+          const source = state.authoredStyle();
+          const sides = (name === "margin" ? marginSides : paddingSides).map((longhand, side) =>
+            readBoxSide(source, longhand, side, name));
+          if (sides.every(side => side && side.important === sides[0].important)) {
+            const values = sides.map(side => side.value);
+            if (values.every(value => !wideValue.test(value) || value === values[0]) &&
+                (!wideValue.test(values[0]) || values.every(value => value === values[0]))) {
+              if (values.some(Boolean)) return serializeScrollBox(values);
+              return __tilefinchStyleGet(state.handle, name) ??
+                state.cssomFallback?.get(name) ?? "";
+            }
+          }
+          return "";
+        }
         const target = authoredTargets.get(effectKey(state.handle, name));
+        const marginSide = marginSideIndex[name], paddingSide = paddingSideIndex[name],
+          side = marginSide ?? paddingSide ?? borderWidthIndex[name];
+        if (target === undefined && side !== undefined) {
+          const declaration = readBoxSide(state.authoredStyle(), name, side,
+            marginSide !== undefined ? "margin" : paddingSide !== undefined ? "padding" : "");
+          if (declaration !== null) return declaration.value;
+        }
         const value = (
           target ??
           __tilefinchStyleGet(state.handle, name) ??
@@ -1733,8 +1908,16 @@
       getPropertyPriority(name) {
         const state = states.get(this);
         name = cssName(name);
+        const marginSide = marginSideIndex[name], paddingSide = paddingSideIndex[name],
+          side = marginSide ?? paddingSide ?? borderWidthIndex[name];
+        if (side !== undefined) {
+          const declaration = readBoxSide(state.authoredStyle(), name, side,
+            marginSide !== undefined ? "margin" : paddingSide !== undefined ? "padding" : "");
+          if (declaration !== null) return declaration.important ? "important" : "";
+        }
         const longhands = name === "flex"
           ? ["flex-grow", "flex-shrink", "flex-basis"]
+          : name === "margin" ? marginSides : name === "padding" ? paddingSides
           : placeLonghands[name] || scrollBoxLonghands[name] || null;
         if (longhands)
           return longhands.every((longhand) =>
@@ -1759,7 +1942,13 @@
             for (const longhand of scrollBoxLonghands[name])
               state.write(longhand, "");
           }
-          else state.write(name, "");
+          else if (marginSideIndex[name] !== undefined || paddingSideIndex[name] !== undefined) {
+            const margin = marginSideIndex[name] !== undefined,
+              updated = withoutBoxSide(state.authoredStyle(), name,
+                margin ? "margin" : "padding", margin ? marginSides : paddingSides);
+            if (updated === null) state.write(name, "");
+            else this.cssText = updated;
+          } else state.write(name, "");
           return old;
         } finally {
           state.notifyStyle(oldStyle);
@@ -1826,7 +2015,7 @@
         setProperty(name, value, priority = "") {
           name = cssName(name);
           value = value === null ? "" : String(value);
-          priority = String(priority).trim().toLowerCase();
+          priority = priority === null ? "" : String(priority).toLowerCase();
           const present = name in values;
           if (!name || (!present && count >= limit)) return;
           if (value === "") {

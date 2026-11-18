@@ -40,7 +40,7 @@ script heap report.
 Each of the 150 frames is a lab `pump` turn, one PSP loop frame: it advances
 the page runtime, then runs the engine's page-idle work and one unit of the
 post-commit image queue, as the PSP loop does after presenting a frame
-(`psp_deferred_image_after_present` in `src/psp_script_main.c`). The queue
+(`src/psp_script_main.c`). The queue
 matters on every page that runs scripts: the commit leaves that page's
 parser `<img>` elements to it, nearest the screen first, so the frames show
 what a PSP shows after about that many frames. The PSP loop's frame-pump
@@ -50,14 +50,13 @@ lab's `image-queue queued=N batches=M pending=yes|no` line says what the
 queue still held when the summary was printed (`extract.py`:
 `images.queue_queued`, `queue_batches`, `queue_pending`).
 
-Runs before 2026-11-16 used the lab's `tick` instead, which advances only
-the page runtime: their frames never loaded the queued images, so their
-image counts on scripted pages are zero or near it (`batches=0`), and
-judging them needed an `--idle` pass. `--runtime-ticks` restores that loop
-for comparison with such runs; `run.json` records which one a run used
-(`ticks`). Compare runs only within one mode: pump turns also add the idle
-work's time, memory and relayouts to the visit. A capture uses the same
-frames, so it records the image responses the queue requests.
+`--runtime-ticks` runs the frames as the lab's `tick` instead, which
+advances only the page runtime: its frames never load the queued images, so
+image counts on scripted pages stay at or near zero (`batches=0`). It exists
+for comparison with runs made that way; `run.json` records which loop a run
+used (`ticks`). Compare runs only within one mode: pump turns also add the
+idle work's time, memory and relayouts to the visit. A capture uses the
+same frames, so it records the image responses the queue requests.
 
 There are five replay passes, each writing its own JSONL:
 
@@ -82,8 +81,9 @@ There are five replay passes, each writing its own JSONL:
   (`go URL`) and measured. This is the closer model of a reader returning to
   a page; it takes about twice as long. The idle turns matter: the PSP loop
   keeps running the engine's idle work whenever the page is quiet, past the
-  150 frames, and classic bytecode is stored there (a page left with stores still queued stores at most 256 KiB
-  of them as it closes and drops the rest).
+  150 frames, and classic bytecode is stored there (a page closed with
+  stores still queued stores the oldest, up to 256 KiB of their source,
+  and drops the rest).
 - `--restart`: a browser restart between the visits. The first visit
   (with its ticks and idle turns) runs in its own lab process with a fresh
   persistent compiled-script directory (`--script-cache-dir RUN/script-cache
@@ -174,10 +174,10 @@ that presented a frame), `focus_move_hashes` (each presented move's frame)
 and `focus_after_hashes` (the `frame-hash` render after each move and after
 the idle turns), both keyed by label (`focus-1`, ..., `focus-final`).
 `--focus-hashes final` skips the per-move `frame-hash` renders, which add
-1-2% to `focus_ms`; compare focus timings only between runs of one mode.
-`compare.py` also reads the older positional `focus_frames` list. Move
-hashes come from the lab's `frame-fnv1a` field, the same FNV-1a as
-`frame-hash`; a base lab without that field reports none.
+to `focus_ms`; compare focus timings only between runs of one mode.
+`compare.py` also reads the positional `focus_frames` list of records that
+lack the keyed fields. Move hashes come from the lab's `frame-fnv1a` field,
+the same FNV-1a as `frame-hash`; a lab without that field reports none.
 
 ## Capturing (live network)
 

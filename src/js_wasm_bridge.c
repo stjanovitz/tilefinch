@@ -138,7 +138,9 @@ JSValue js_wasm_detach_buffer(
 }
 
 #define TILEFINCH_WASM_MODULE_BYTES (512u * 1024u)
-#define TILEFINCH_WASM_POOL_BYTES (4u * 1024u * 1024u)
+/* The most the interpreter may hold at once: its own structures and, on the
+   PSP, linear memory (os_mmap there allocates through the runtime). */
+#define TILEFINCH_WASM_RUNTIME_BYTES (4u * 1024u * 1024u)
 #define TILEFINCH_WASM_STACK_BYTES (64u * 1024u)
 #define TILEFINCH_WASM_MAX_MEMORY_PAGES 16u
 #define TILEFINCH_WASM_MAX_EXPORTS 64u
@@ -261,7 +263,8 @@ typedef struct {
 
 typedef struct {
     Budget *budget;
-    void *pool;
+    /* Bytes the interpreter's allocator holds (see wasm_runtime_malloc_budget). */
+    size_t bytes;
     size_t live_instances;
     size_t active_operations;
     TilefinchWasmInstance *native_instances;
@@ -516,13 +519,57 @@ static bool wasm_trace_enabled(void)
     return tilefinch_trace_wasm();
 }
 
+/* The interpreter allocates from the Budget's JavaScript category as it
+   needs to, up to TILEFINCH_WASM_RUNTIME_BYTES in all. A fixed pool of that
+   size took 4 MiB from the page for a module of a few hundred bytes. */
+static void wasm_runtime_count(size_t released, size_t taken)
+{
+    wasm_runtime_state.bytes += taken - released;
+#if !defined(__PSP__)
+    TilefinchTestFaults *faults = tilefinch_test_faults();
+    if (wasm_runtime_state.bytes > faults->wasm_runtime_bytes_peak)
+        faults->wasm_runtime_bytes_peak = wasm_runtime_state.bytes;
+#endif
+}
+
+static void *wasm_runtime_malloc_budget(unsigned int size)
+{
+    if (size > TILEFINCH_WASM_RUNTIME_BYTES - wasm_runtime_state.bytes)
+        return NULL;
+    void *memory = budget_malloc_category(
+        wasm_runtime_state.budget, BUDGET_CATEGORY_JAVASCRIPT, size);
+    if (memory != NULL) wasm_runtime_count(0, budget_usable_size(memory));
+    return memory;
+}
+
+static void wasm_runtime_free_budget(void *memory)
+{
+    if (memory == NULL) return;
+    wasm_runtime_count(budget_usable_size(memory), 0);
+    budget_free(wasm_runtime_state.budget, memory);
+}
+
+static void *wasm_runtime_realloc_budget(void *memory, unsigned int size)
+{
+    if (size == 0) {
+        wasm_runtime_free_budget(memory);
+        return NULL;
+    }
+    size_t held = memory != NULL ? budget_usable_size(memory) : 0;
+    if (size > TILEFINCH_WASM_RUNTIME_BYTES - (wasm_runtime_state.bytes - held))
+        return NULL;
+    void *moved = budget_realloc_category(
+        wasm_runtime_state.budget, BUDGET_CATEGORY_JAVASCRIPT, memory, size);
+    if (moved != NULL) wasm_runtime_count(held, budget_usable_size(moved));
+    return moved;
+}
+
 static void wasm_runtime_release_if_idle(void)
 {
     if (!wasm_runtime_state.initialized
         || wasm_runtime_state.live_instances != 0
         || wasm_runtime_state.active_operations != 0) return;
     wasm_runtime_destroy();
-    budget_free(wasm_runtime_state.budget, wasm_runtime_state.pool);
     memset(&wasm_runtime_state, 0, sizeof(wasm_runtime_state));
 }
 
@@ -537,22 +584,22 @@ static bool wasm_runtime_enter(Budget *budget)
         if (wasm_runtime_state.initialized) return false;
     }
     if (!wasm_runtime_state.initialized) {
-        void *pool = budget_malloc_category(
-            budget, BUDGET_CATEGORY_JAVASCRIPT, TILEFINCH_WASM_POOL_BYTES);
-        if (pool == NULL) return false;
         RuntimeInitArgs arguments;
         memset(&arguments, 0, sizeof(arguments));
-        arguments.mem_alloc_type = Alloc_With_Pool;
-        arguments.mem_alloc_option.pool.heap_buf = pool;
-        arguments.mem_alloc_option.pool.heap_size = TILEFINCH_WASM_POOL_BYTES;
+        arguments.mem_alloc_type = Alloc_With_Allocator;
+        arguments.mem_alloc_option.allocator.malloc_func =
+            (void *) wasm_runtime_malloc_budget;
+        arguments.mem_alloc_option.allocator.realloc_func =
+            (void *) wasm_runtime_realloc_budget;
+        arguments.mem_alloc_option.allocator.free_func =
+            (void *) wasm_runtime_free_budget;
         arguments.running_mode = Mode_Interp;
+        wasm_runtime_state.budget = budget;
         if (!wasm_runtime_full_init(&arguments)) {
-            budget_free(budget, pool);
+            memset(&wasm_runtime_state, 0, sizeof(wasm_runtime_state));
             return false;
         }
         wasm_runtime_set_log_level(WASM_LOG_LEVEL_ERROR);
-        wasm_runtime_state.budget = budget;
-        wasm_runtime_state.pool = pool;
         wasm_runtime_state.initialized = true;
     }
     if (wasm_runtime_state.active_operations == SIZE_MAX) {
@@ -565,8 +612,8 @@ static bool wasm_runtime_enter(Budget *budget)
 
 /* Operations and instance finalizers do not release an idle runtime
    themselves: a validate/compile/instantiate sequence within one task would
-   otherwise initialize the runtime and its pool once per step. The realm
-   releases it at task boundaries and teardown (js_wasm_release_idle_runtime). */
+   otherwise initialize the runtime once per step. The realm releases it at
+   task boundaries and teardown (js_wasm_release_idle_runtime). */
 static void wasm_runtime_leave(void)
 {
     if (wasm_runtime_state.active_operations != 0)

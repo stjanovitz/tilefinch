@@ -90,8 +90,9 @@
 
     puts("test: a transparent stuck sticky bar shows no static copy");
     CHECK(test_transparent_sticky_bar_has_no_ghost(&budget) == 0);
+    CHECK(test_nested_sticky_scrollport_pixels(&budget) == 0);
 
-    puts("test: a sticky box without top stays in flow");
+    puts("test: a sticky box without vertical insets stays in flow");
     CHECK(test_sticky_without_top_stays_in_flow(&budget) == 0);
 
     puts("test: inline replaced-element box model and decoration");

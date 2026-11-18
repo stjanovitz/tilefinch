@@ -3,12 +3,15 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 #include "tilefinch/web_app_manifest.h"
 #include "tilefinch/file_download.h"
 #include "tilefinch/url.h"
 #include "tilefinch/resources.h"
 #include "tilefinch/platform.h"
+#include "tilefinch/js_runtime.h"
+#include "tilefinch/request_context.h"
 #include "image_decode_internal.h"
 
 #define OFFLINE_ICON_DOWNLOAD_LIMIT (256u * 1024u)
@@ -179,6 +182,10 @@ static void offline_release_view(const PspOfflineStore *store,
 void psp_offline_store_discard_app_preparation(PspOfflineStore *store)
 {
     if (store == NULL) return;
+    if (store->app_cache_limit != 0)
+        (void) browser_session_cache_set_maximum_bytes(
+            store->session, store->app_cache_limit);
+    store->app_cache_limit = 0;
     offline_library_discard_staged(&store->library);
     if (store->app_preparation == NULL) return;
     offline_release_view(store, &store->app_preparation->view);
@@ -207,6 +214,176 @@ static uint16_t offline_known_unavailable_resources(
         + page->external_fonts.unsupported
         + page->external_fonts.skipped_limit;
     return count > UINT16_MAX ? UINT16_MAX : (uint16_t) count;
+}
+
+/* Download `url` again as the page requested it and leave it in the
+   session cache with the same authority the page's own response had, so
+   the capture (and the installed app's launch) treats it like that one.
+   The cache limit is raised, never past the Budget, so the response does
+   not evict another file of the app; the preparation restores it. */
+static bool offline_refetch_source(
+    PspOfflineStore *store, NavigationSession *navigation,
+    const char *page_url, const char *url, lxb_dom_node_t *node,
+    TilefinchRequestDestination destination, size_t maximum)
+{
+    TilefinchCorsSettings settings = document_cors_settings(node);
+    bool cors = settings != TILEFINCH_CORS_SETTINGS_NONE;
+    TilefinchRequestContext context = {
+        .target_url = url, .initiator_url = page_url,
+        .top_level_url = page_url, .method = "GET",
+        .mode = cors ? TILEFINCH_REQUEST_MODE_CORS
+                     : TILEFINCH_REQUEST_MODE_NO_CORS,
+        .credentials = tilefinch_cors_settings_credentials(settings, cors),
+        .destination = destination
+    };
+    FetchRequest transport = {
+        .allow_http_errors = true,
+        .accept = destination == TILEFINCH_DESTINATION_STYLE
+            ? "text/css,*/*;q=0.1" : "*/*"
+    };
+    FetchPreparedPageRequest prepared;
+    BrowserSession *session = store->session;
+    FetchResult *fetch = fetch_result_create(session->budget);
+    char policy[FETCH_REFERRER_POLICY_LIMIT];
+    char cache_control[256] = {0}, vary[128] = {0};
+    bool present = false;
+    bool okay = fetch != NULL && navigation->page.resource_scheduler != NULL
+        && fetch_prepare_page_request_context(
+               &context, page_url, navigation->page.referrer_policy,
+               session, &navigation->page.document.content_security_policy,
+               NULL, &transport, &prepared, NULL)
+        && fetch_scheduler_request(
+               navigation->page.resource_scheduler, url,
+               fetch_prepared_page_request(&prepared), maximum, 15000, fetch)
+        && fetch->status_code >= 200 && fetch->status_code < 300
+        && fetch->length != 0
+        && fetch_response_referrer_policy(fetch, &present, policy);
+    if (okay && fetch->effective_url[0] == '\0')
+        snprintf(fetch->effective_url, sizeof(fetch->effective_url), "%s",
+                 url);
+    TilefinchResourceGrant grant;
+    okay = okay && fetch_resource_grant_create(
+        fetch, &context, cors,
+        destination == TILEFINCH_DESTINATION_STYLE
+            ? strncasecmp(fetch->content_type, "text/css", 8) == 0
+            : script_module_mime_type_allowed(fetch->content_type),
+        false, &grant, NULL)
+        && fetch_result_share_body(fetch);
+    if (okay) {
+        (void) fetch_response_header_value(fetch, "cache-control",
+                                           cache_control,
+                                           sizeof(cache_control));
+        (void) fetch_response_header_value(fetch, "vary", vary,
+                                           sizeof(vary));
+        size_t limit = session->maximum_cache_bytes;
+        if (fetch->length <= SIZE_MAX - session->cache_bytes
+            && session->cache_bytes + fetch->length > limit
+            && browser_session_cache_ensure_maximum_bytes(
+                   session, session->cache_bytes + fetch->length)
+            && store->app_cache_limit == 0)
+            store->app_cache_limit = limit;
+        okay = browser_session_cache_put_http_shared_resource(
+                   session, url, fetch->shared_body, fetch->etag,
+                   fetch->last_modified, fetch->content_type, cache_control,
+                   vary, tilefinch_platform_monotonic_time_ns(), &context,
+                   &grant)
+            && browser_session_cache_set_resource_response_provenance(
+                   session, url, &context, fetch->effective_url, policy);
+    }
+    fetch_result_free(fetch);
+    return okay;
+}
+
+/* Same-origin external scripts and stylesheets the document declares that
+   an install would not capture. The page compiled its scripts and let their
+   sources go, so only the Memory cache keeps them, and it may have evicted
+   them. With `total` nonzero (the count a pass without it returned in
+   `fetchable`), each missing classic script and stylesheet is downloaded
+   again first, within the package's bounds; a module script is counted
+   but not fetched (its graph is not in the document). */
+static unsigned offline_app_missing_sources(
+    PspOfflineStore *store, NavigationSession *navigation,
+    const char *page_url, unsigned total, unsigned *fetchable,
+    bool *cancelled)
+{
+    PocDocument *document = &navigation->page.document;
+    const char *base = navigation->page.resource_base_url[0] == '\0'
+        ? page_url : navigation->page.resource_base_url;
+    size_t bytes = 0, records = 0;
+    (void) browser_session_cache_offline_holds(
+        store->session, page_url, NULL, &bytes, &records);
+    unsigned missing = 0, fetched = 0;
+    lxb_dom_node_t *root = document->html == NULL
+        ? NULL : lxb_dom_interface_node(document->html);
+    lxb_dom_node_t *node = root;
+    for (size_t visited = 0; node != NULL && visited < 16384u; visited++) {
+        bool script = document_element_name_is(node, "script");
+        bool module = false;
+        size_t length = 0;
+        const char *value = NULL;
+        if (script) {
+            const char *type = document_attribute(node, "type", &length);
+            if (script_type_attribute_classify(type, length, &module)
+                && (module || document_attribute(node, "nomodule", NULL)
+                                  == NULL))
+                value = document_attribute(node, "src", &length);
+        } else if (document_element_name_is(node, "link")) {
+            const char *rel = document_attribute(node, "rel", &length);
+            char tokens[64];
+            snprintf(tokens, sizeof(tokens), " %.*s ",
+                     rel == NULL || length > 60u ? 0 : (int) length,
+                     rel == NULL ? "" : rel);
+            for (char *at = tokens; *at != '\0'; at++)
+                *at = (char) tolower((unsigned char) *at);
+            if (strstr(tokens, " stylesheet ") != NULL
+                && strstr(tokens, " alternate ") == NULL)
+                value = document_attribute(node, "href", &length);
+        }
+        /* The reference, then the request key resolved through `resolved`. */
+        char key[OFFLINE_LIBRARY_URL_LIMIT];
+        char resolved[OFFLINE_LIBRARY_URL_LIMIT];
+        if (value != NULL && length != 0 && length < sizeof(key)) {
+            memcpy(key, value, length);
+            key[length] = '\0';
+            if (fetch_resolve_url(base, key, resolved, sizeof(resolved))
+                && tilefinch_url_request_key(resolved, key, sizeof(key))
+                && tilefinch_url_same_origin(page_url, key)
+                && !browser_session_cache_offline_holds(
+                       store->session, page_url, key, NULL, NULL)) {
+                bool recovered = false;
+                if (!module && fetchable != NULL) (*fetchable)++;
+                if (total != 0 && !module && !*cancelled) {
+                    snprintf(store->status, sizeof(store->status),
+                             "DOWNLOADING %u OF %u APP FILES  O STOP",
+                             ++fetched, total);
+                    if (store->show_progress != NULL)
+                        store->show_progress(store->show_progress_context,
+                                             store->status);
+                    *cancelled = !tilefinch_platform_cooperate(
+                        "offline-app-fetch", fetched);
+                    recovered = !*cancelled
+                        && records < BROWSER_OFFLINE_CACHE_ENTRY_LIMIT
+                        && bytes < OFFLINE_LIBRARY_APP_RESOURCE_LIMIT
+                        && offline_refetch_source(
+                               store, navigation, page_url, key, node,
+                               script ? TILEFINCH_DESTINATION_SCRIPT
+                                      : TILEFINCH_DESTINATION_STYLE,
+                               OFFLINE_LIBRARY_APP_RESOURCE_LIMIT - bytes);
+                    if (recovered)
+                        (void) browser_session_cache_offline_holds(
+                            store->session, page_url, NULL, &bytes,
+                            &records);
+                }
+                if (!recovered) missing++;
+            }
+        }
+        if (!script && node->first_child != NULL) node = node->first_child;
+        else {
+            while (node != root && node->next == NULL) node = node->parent;
+            node = node == root ? NULL : node->next;
+        }
+    }
+    return missing;
 }
 
 /* The library entry the current document was opened from, if this is
@@ -325,31 +502,50 @@ bool psp_offline_store_prepare_current_app(
     }
     if (icon != NULL) {
         int width = 0, height = 0, components = 0;
-        if (image_decode_probe_info(
+        bool raster = image_decode_probe_info(
                 browser_engine_budget(engine), icon, icon_length,
                 &width, &height, &components, NULL)
                 == IMAGE_DECODE_PROBE_SUPPORTED
-            && width > 0 && height > 0) {
-            ImageResource source = {
-                .encoded = icon, .encoded_length = icon_length,
-                .source_width = width, .source_height = height,
-                .width = OFFLINE_LIBRARY_APP_ICON_EDGE,
-                .height = OFFLINE_LIBRARY_APP_ICON_EDGE
-            };
-            unsigned char *pixels = NULL;
-            if (image_resource_decode_checked(
-                    &source, browser_engine_budget(engine), &pixels)
-                    == IMAGE_DECODE_SUCCEEDED) {
-                memcpy(thumbnail, pixels, sizeof(thumbnail));
-                thumbnail_length = sizeof(thumbnail);
-                image_resource_free_decoded(browser_engine_budget(engine),
-                                             pixels);
-            }
+            && width > 0 && height > 0;
+        /* Anything else is tried as SVG markup, rasterized at the icon's
+           size (bytes that are not SVG fail to parse). */
+        ImageResource source = {
+            .encoded = icon, .encoded_length = icon_length,
+            .source_width = width, .source_height = height,
+            .width = OFFLINE_LIBRARY_APP_ICON_EDGE,
+            .height = OFFLINE_LIBRARY_APP_ICON_EDGE,
+            .retarget_flags = raster ? 0u : IMAGE_RETARGET_VECTOR
+        };
+        unsigned char *pixels = NULL;
+        if (image_resource_decode_checked(
+                &source, browser_engine_budget(engine), &pixels)
+                == IMAGE_DECODE_SUCCEEDED) {
+            memcpy(thumbnail, pixels, sizeof(thumbnail));
+            thumbnail_length = sizeof(thumbnail);
+            image_resource_free_decoded(browser_engine_budget(engine),
+                                         pixels);
         }
     }
     budget_free(browser_engine_budget(engine), icon);
     icon = NULL;
 preview: ;
+    /* Files the page loaded that the Memory cache no longer holds are
+       downloaded again (the user is online to install); what still cannot
+       be captured is reported with the preview's unavailable count. */
+    bool cancelled = false;
+    unsigned fetchable = 0;
+    unsigned missing = offline_app_missing_sources(
+        store, navigation, entry->url, 0, &fetchable, &cancelled);
+    if (fetchable != 0) {
+        (void) offline_app_missing_sources(
+            store, navigation, entry->url, fetchable, NULL, &cancelled);
+        missing = offline_app_missing_sources(
+            store, navigation, entry->url, 0, NULL, &cancelled);
+    }
+    if (cancelled) {
+        offline_status(store, "APP PREVIEW STOPPED");
+        return false;
+    }
     PspOfflineAppPreparation *preparation = budget_calloc_category(
         browser_engine_budget(engine), BUDGET_CATEGORY_SESSION,
         1u, sizeof(*preparation));
@@ -378,8 +574,10 @@ preview: ;
         preparation->view.captured_resources =
             preview.resource_count > UINT16_MAX
                 ? UINT16_MAX : (uint16_t) preview.resource_count;
-        preparation->view.unavailable_resources =
-            offline_known_unavailable_resources(&navigation->page);
+        size_t unavailable = (size_t) offline_known_unavailable_resources(
+            &navigation->page) + missing;
+        preparation->view.unavailable_resources = unavailable > UINT16_MAX
+            ? UINT16_MAX : (uint16_t) unavailable;
         preparation->view.theme_color = manifest.theme_color;
         preparation->view.theme_alpha = manifest.theme_alpha;
         preparation->view.theme_color_valid = manifest.theme_color_valid;

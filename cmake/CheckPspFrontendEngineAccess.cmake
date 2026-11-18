@@ -128,7 +128,7 @@ endfunction()
 check_frontend_engine_access("engine-internals accessor calls" 13
     "browser_engine_(navigation|controller|session)(_view)?[ 	]*\\("
     "Add or use a BrowserEngine facade call instead of borrowing the engine's session or controller.")
-check_frontend_engine_access("NavigationSession alias reads" 104
+check_frontend_engine_access("NavigationSession alias reads" 103
     "(->|\\.)navigation->"
     "Copy the fact into a snapshot or facade query instead of reading the live NavigationSession.")
 check_frontend_engine_access("navigation_current() calls" 1

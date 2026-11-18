@@ -476,11 +476,13 @@
           && weighted_c_box->x == weighted_b_box->x + 88
           && weighted_c_box->x + weighted_c_box->width
              == weighted_a_box->x + 300);
+    /* A percentage track resolves against the content box (300px), not the
+       space left after gaps: 25% = 75px, and 1fr takes 300 - 8 - 75 - 50. */
     CHECK(percent_a_box != NULL && percent_b_box != NULL
-          && percent_c_box != NULL && percent_a_box->width == 73
-          && percent_b_box->width == 169 && percent_c_box->width == 50
-          && percent_b_box->x == percent_a_box->x + 77
-          && percent_c_box->x == percent_b_box->x + 173
+          && percent_c_box != NULL && percent_a_box->width == 75
+          && percent_b_box->width == 167 && percent_c_box->width == 50
+          && percent_b_box->x == percent_a_box->x + 79
+          && percent_c_box->x == percent_b_box->x + 171
           && percent_c_box->x + percent_c_box->width
              == percent_a_box->x + 300);
     CHECK(minimum_a_box != NULL && minimum_b_box != NULL
@@ -1110,7 +1112,7 @@
           && computed_style_grid_column_end(&area_a_style) == 4
           && placed_style.align_items == ALIGN_CENTER
           && placed_style.justify_items == ALIGN_END
-          && placed_style.align_content == JUSTIFY_END
+          && style_align_content_in_axis(placed_style.align_content, false) == JUSTIFY_END
           && placed_style.justify_content == JUSTIFY_CENTER
           && placed_b_style.align_self == ALIGN_SELF_START
           && computed_style_justify_self(&placed_b_style)

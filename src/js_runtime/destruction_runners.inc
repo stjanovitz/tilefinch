@@ -34,6 +34,7 @@ void script_runtime_destroy(ScriptRuntime *runtime)
     /* Defense in depth only: lookup admission also compares the unforgeable
        realm epoch, so correctness never depends on teardown running. */
     js_webgl_realm_epoch_release(&runtime->bridge);
+    browser_session_opfs_unlock(runtime->bridge.session, &runtime->bridge, 0);
     if (runtime->bridge.stylesheet != NULL)
         ((Stylesheet *) runtime->bridge.stylesheet)->fullscreen_node = NULL;
     runtime->bridge.fullscreen_node_handle = 0;

@@ -6,6 +6,7 @@
 #include "tilefinch/viewport.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -39,6 +40,9 @@ typedef struct {
 
 struct BrowserProfile {
     Budget *budget;
+    /* A newer on-disk profile may still exist. Backup/default settings
+       are readable in this session, but must not replace it. */
+    bool save_blocked;
     unsigned ui_scale;
     unsigned page_font_percent;
     unsigned page_zoom_percent;
@@ -959,7 +963,8 @@ bool browser_profile_save_fingerprinted(
     BrowserProfileFingerprint *written)
 {
     if (written != NULL) *written = (BrowserProfileFingerprint) {0};
-    if (profile == NULL || path == NULL || path[0] == '\0') return false;
+    if (profile == NULL || profile->save_blocked
+        || path == NULL || path[0] == '\0') return false;
     char temporary[1200], backup[1200];
     int length = snprintf(temporary, sizeof(temporary), "%s.tmp", path);
     if (length < 0 || (size_t) length >= sizeof(temporary)) return false;
@@ -1002,22 +1007,24 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path)
     return browser_profile_save_fingerprinted(profile, path, NULL);
 }
 
-/* *damaged is set only when the file was read to the end (or to the
-   record that broke it) and is not a valid profile; an open, memory or read
-   failure says nothing about its contents. */
-static bool profile_load_internal(
-    BrowserProfile *profile, const char *path, bool load_allowed_sites,
-    bool *damaged)
+/* Damage means the file was read and did not parse; an open, memory or
+   read failure says nothing about its contents. */
+typedef enum {
+    PROFILE_READ_OK, PROFILE_READ_MISSING, PROFILE_READ_DAMAGED,
+    PROFILE_READ_UNAVAILABLE
+} ProfileRead;
+
+static ProfileRead profile_load_internal(
+    BrowserProfile *profile, const char *path, bool load_allowed_sites)
 {
-    *damaged = false;
-    if (profile == NULL || path == NULL || path[0] == '\0') return false;
     FILE *file = fopen(path, "rb");
-    if (file == NULL) return false;
+    if (file == NULL) return errno == ENOENT
+        ? PROFILE_READ_MISSING : PROFILE_READ_UNAVAILABLE;
     BrowserProfile *loaded = budget_calloc_category(
         profile->budget, BUDGET_CATEGORY_SESSION, 1, sizeof(*loaded));
     if (loaded == NULL) {
         fclose(file);
-        return false;
+        return PROFILE_READ_UNAVAILABLE;
     }
     *loaded = (BrowserProfile) {
         .budget = profile->budget,
@@ -1618,7 +1625,6 @@ static bool profile_load_internal(
     bool read_ok = !ferror(file);
     bool closed = fclose(file) == 0;
     bool ok = closed && header && complete && footer_seen && read_ok;
-    *damaged = !ok && closed && read_ok;
     if (ok) {
         /* Builds before Compact became the default always wrote Detailed
            into MEDIA field 5, so it is a choice only once YTRESULTS says so;
@@ -1629,31 +1635,33 @@ static bool profile_load_internal(
         *profile = *loaded;
     }
     budget_free(profile->budget, loaded);
-    return ok;
+    return ok ? PROFILE_READ_OK : closed && read_ok
+        ? PROFILE_READ_DAMAGED : PROFILE_READ_UNAVAILABLE;
 }
 
 static bool profile_load_with_backup(
     BrowserProfile *profile, const char *path, bool load_allowed_sites)
 {
     if (profile == NULL || path == NULL || path[0] == '\0') return false;
-    bool primary_damaged = false, backup_damaged = false;
-    if (profile_load_internal(profile, path, load_allowed_sites,
-                              &primary_damaged)) return true;
+    ProfileRead primary = profile_load_internal(profile, path, load_allowed_sites);
+    if (primary == PROFILE_READ_OK) return true;
+    profile->save_blocked = primary == PROFILE_READ_UNAVAILABLE;
     char backup[1200];
     int length = snprintf(backup, sizeof(backup), "%s.bak", path);
     if (length < 0 || (size_t) length >= sizeof(backup)) return false;
-    if (!profile_load_internal(profile, backup, load_allowed_sites,
-                               &backup_damaged))
-        return false;
+    ProfileRead restored = profile_load_internal(profile, backup, load_allowed_sites);
     /*
      * The backup carried the settings. Drop a primary that was read and
      * does not parse so the next save's rotation cannot promote it over the
      * recovered generation. One that only failed to open or read (a
-     * transient card error) may be the newer, valid generation: keep it; the
-     * next save rotates it into .bak.
+     * transient card error) may be the newer, valid generation: keep both
+     * copies and refuse writes until a fresh load establishes the winner.
      */
-    if (primary_damaged) (void) remove(path);
-    return true;
+    profile->save_blocked = primary == PROFILE_READ_UNAVAILABLE
+        || restored == PROFILE_READ_UNAVAILABLE;
+    if (primary == PROFILE_READ_DAMAGED && restored == PROFILE_READ_OK
+        && remove(path) != 0 && errno != ENOENT) profile->save_blocked = true;
+    return restored == PROFILE_READ_OK;
 }
 
 bool browser_profile_load(BrowserProfile *profile, const char *path)

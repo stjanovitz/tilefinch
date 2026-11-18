@@ -161,6 +161,13 @@ bool navigation_url_is_same_document(
         && navigation_urls_are_distinct_same_request(current_url, url);
 }
 
+void navigation_clear_history(NavigationSession *session)
+{
+    for (size_t index = 0; index < session->history_count; index++)
+        entry_destroy(session->budget, &session->history[index]);
+    session->history_count = session->history_index = 0;
+}
+
 bool navigation_replace_history(
     NavigationSession *session, const NavigationHistoryRecord *records,
     size_t count, size_t current_index)
@@ -197,10 +204,7 @@ bool navigation_replace_history(
         staged[index].focus_index = source->focus_index;
         staged[index].focus_identity = source->focus_identity;
     }
-    for (size_t index = 0; index < session->history_count; index++)
-        entry_destroy(session->budget, &session->history[index]);
-    memset(session->history, 0,
-           session->history_capacity * sizeof(*session->history));
+    navigation_clear_history(session);
     memcpy(session->history, staged, count * sizeof(*staged));
     session->history_count = count;
     session->history_index = current_index;
@@ -288,6 +292,17 @@ bool navigation_restore_same_document_url(NavigationSession *session,
     return true;
 }
 
+/* Publish the last request against the layout the reader will see, not the
+   superseded box tree from before the callback. */
+static bool navigation_publish_script_scroll(NavigationSession *session)
+{
+    int requested = 0;
+    if (!script_runtime_consume_scroll(session->page.runtime, &requested))
+        return true;
+    int maximum = navigation_max_scroll(session);
+    return navigation_set_scroll(session, requested < maximum ? requested : maximum);
+}
+
 bool navigation_settle_same_document_events(NavigationSession *session)
 {
     if (session == NULL || !session->page.loaded) return false;
@@ -299,21 +314,8 @@ bool navigation_settle_same_document_events(NavigationSession *session)
        before BrowserEngine resolves fragment or restored-history geometry.
        A page scroll requested by the callback is applied against the new
        layout, then the user agent's fragment/history scroll may override it. */
-    int requested_scroll = 0;
-    bool has_requested_scroll = script_runtime_consume_scroll(
-        runtime, &requested_scroll);
-    bool relayout_requested = script_runtime_consume_relayout(runtime);
-    if (relayout_requested) {
-        bool relaid_out = navigation_relayout(session);
-        if (!relaid_out) return false;
-    }
-    if (has_requested_scroll) {
-        int maximum = navigation_max_scroll(session);
-        if (!navigation_set_scroll(
-                session, requested_scroll < maximum
-                    ? requested_scroll : maximum)) return false;
-    }
-    return true;
+    return (!script_runtime_consume_relayout(runtime) || navigation_relayout(session))
+        && navigation_publish_script_scroll(session);
 }
 
 static bool navigation_fragment_decode(const TilefinchUrl *parsed,

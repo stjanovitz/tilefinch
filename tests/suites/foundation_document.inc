@@ -1040,7 +1040,7 @@
         "channel.onpeerrequest=e=>{good&&=e.peerIdentity===7&&"
         "e.name==='Finch';good&&=channel.accept(e.peerIdentity);};"
         "channel.onopen=()=>{channel.send('hello');good&&="
-        "channel.bufferedAmount===5;};"
+        "channel.bufferedAmount===5&&!channel.addRemoteCode('123456789012');};"
         "channel.onmessage=e=>{good&&=e.data instanceof ArrayBuffer&&"
         "new Uint8Array(e.data).join(',')==='4,5'&&"
         "channel.bufferedAmount===0&&sends===1;channel.close(1000,'done');};"
@@ -2206,11 +2206,14 @@
     /* A page may copy any function onto an interface prototype: an
        ECMAScript builtin, a console method, a bound function. A lazy
        module loading later marks only what it defined itself, so those
-       keep accepting every receiver everywhere. A page's patched
+       keep accepting every receiver everywhere. A replaced
        Object.defineProperty or Array.prototype.push is not what a module
-       defines and pushes with, so the classes the patches define stay
-       unmarked too. What the modules define is marked: their members
-       throw "Illegal invocation" for a plain object. */
+       defines and pushes with, so the classes the replacements define
+       while the modules load stay unmarked too; they go in through the
+       test seam, since a page's own replacement does not reach the
+       browser's script (the interface snapshot), and "made" shows the
+       browser called them. What the modules define is marked: their
+       members throw "Illegal invocation" for a plain object. */
     const size_t borrowed_baseline = budget.current;
     const char borrowed_page[] =
         "<!doctype html><html><body><p id=p>x</p><script>"
@@ -2222,9 +2225,10 @@
         "HTMLElement.prototype.own=function(){return this.tag};"
         "const dp=Object.defineProperty,pu=Array.prototype.push;let made=0;"
         "const mk=()=>{globalThis['PageClass'+made++]=class{m(){return 1}}};"
-        "Object.defineProperty=function(o,k,d){mk();return dp(o,k,d)};"
-        "Array.prototype.push=function(...a){mk();"
-        "return Reflect.apply(pu,this,a)};"
+        "__tilefinchTestBrowserPatch(Object,'defineProperty',"
+        "function(o,k,d){mk();return dp(o,k,d)});"
+        "__tilefinchTestBrowserPatch(Array.prototype,'push',function(...a){"
+        "mk();return Reflect.apply(pu,this,a)});"
         /* Loads the lazy Intl, traversal, CSSOM rule, streams and canvas
            modules. */
         "void Intl.DateTimeFormat;"
@@ -2233,7 +2237,8 @@
         "void sheet.cssRules[0];"
         "new WritableStream();"
         "document.createElement('canvas').getContext('2d');"
-        "Object.defineProperty=dp;Array.prototype.push=pu;"
+        "__tilefinchTestBrowserPatch(Object,'defineProperty',dp);"
+        "__tilefinchTestBrowserPatch(Array.prototype,'push',pu);"
         "let marked=0;for(let i=0;i<made;i++){try{"
         "globalThis['PageClass'+i].prototype.m.call({})}catch(e){marked++}}"
         "const ill=(f)=>{try{f();return 'no throw'}catch(e){"
@@ -2247,7 +2252,7 @@
         "ok(()=>String(bound.call({}))),"
         "ok(()=>String(HTMLElement.prototype.own.call({tag:'t'}))),"
         "ok(()=>String(document.getElementById('p').has('id'))),"
-        "'marked '+marked,"
+        "'made '+(made>0),'marked '+marked,"
         "ill(()=>TreeWalker.prototype.nextNode.call({})),"
         "ill(()=>WritableStream.prototype.getWriter.call({})),"
         "ill(()=>CanvasRenderingContext2D.prototype.fillRect.call({}))];"
@@ -2260,7 +2265,7 @@
     CHECK(scripts_run_document_at(&borrowed_document, &budget, 8 * MIB, 2000,
                                   "https://borrowed.test/", &borrowed_result));
     static const char borrowed_expected[] =
-        "2,4|4|true|true|warned|7|t|false|marked 0|ILL|ILL|ILL";
+        "2,4|4|true|true|warned|7|t|false|made true|marked 0|ILL|ILL|ILL";
     if (strcmp(borrowed_result.summary, borrowed_expected) != 0)
         printf("borrowed natives: %s %s\n", borrowed_result.summary,
                borrowed_result.error);
@@ -2269,21 +2274,24 @@
     CHECK(budget.current == borrowed_baseline);
 
     puts("test: a lazy module that loads inside a failed one is marked");
-    /* Page code that runs while canvas.js loads (its Object.freeze call)
-       loads the CSSOM rule module in the same window, then fails the
-       canvas load. The rule module loaded all the same, so its members
-       reject a plain object. */
+    /* Code that runs while canvas.js loads (its Object.freeze call) loads
+       the CSSOM rule module in the same window, then fails the canvas
+       load. The rule module loaded all the same, so its members reject a
+       plain object. The replacement goes in through the test seam: a
+       page's own Object.freeze does not reach the browser's script (the
+       interface snapshot). */
     const size_t nested_baseline = budget.current;
     const char nested_page[] =
         "<!doctype html><html><body><script>"
         "const out=[],freeze=Object.freeze;let once=true;"
-        "Object.freeze=function(o){if(once){once=false;"
+        "__tilefinchTestBrowserPatch(Object,'freeze',function(o){"
+        "if(once){once=false;"
         "const s=new CSSStyleSheet();s.insertRule('a{color:red}');"
         "out.push(typeof s.cssRules[0]);throw new Error('refused')}"
-        "return freeze(o)};"
+        "return freeze(o)});"
         "try{document.createElement('canvas').getContext('2d');"
         "out.push('canvas loaded')}catch(e){out.push('canvas failed')}"
-        "Object.freeze=freeze;"
+        "__tilefinchTestBrowserPatch(Object,'freeze',freeze);"
         "try{Object.getOwnPropertyDescriptor(CSSStyleRule.prototype,"
         "'selectorText').get.call({});out.push('unmarked')}"
         "catch(e){out.push(e.message)}"
@@ -2686,6 +2694,111 @@
                     "WASM-LARGE-MEMORY-OK") == 0);
     document_destroy(&wasm_large_memory_document);
     CHECK(budget.current == wasm_large_memory_baseline);
+
+    /* The interpreter takes Budget as its modules need it, so a small module
+       instantiates with less room than the 4 MiB fixed pool it used to take
+       at its first use, and a large one is still bounded by that total. */
+    puts("test: a small WebAssembly module takes a small reservation");
+    {
+        const size_t baseline = budget.current;
+        PocDocument small_document;
+        const char small_page[] = "<!doctype html><html><body></body></html>";
+        CHECK(document_parse(&small_document, &budget, small_page,
+                             strlen(small_page), 17));
+        ScriptResult small_result;
+        ScriptRuntime *small_runtime = script_runtime_create_deferred(
+            &small_document, &budget, 8 * MIB, 2000,
+            "https://wasm-small.test/", NULL, &small_result);
+        CHECK(small_runtime != NULL);
+        const size_t limit = budget.limit;
+        budget.limit = budget.current + 2 * MIB;
+        tilefinch_test_faults()->wasm_runtime_bytes_peak = 0;
+        /* load(addr), store(addr, value); memory of 1..2 pages. */
+        bool small_ok = script_runtime_evaluate_diagnostic(small_runtime,
+            "const smallBytes=Uint8Array.from(["
+            "0,97,115,109,1,0,0,0,1,11,2,96,1,127,1,127,96,2,127,127,0,"
+            "3,3,2,0,1,5,4,1,1,1,2,7,25,3,6,109,101,109,111,114,121,2,0,"
+            "4,108,111,97,100,0,0,5,115,116,111,114,101,0,1,10,19,2,7,0,"
+            "32,0,45,0,0,11,9,0,32,0,32,1,58,0,0,11]);"
+            "const small=new WebAssembly.Instance("
+            "new WebAssembly.Module(smallBytes)).exports;"
+            "small.store(10,77);const stored=small.load(10),"
+            "grown=small.memory.grow(1),"
+            "view=new Uint8Array(small.memory.buffer);"
+            "globalThis.pocSummary=stored===77&&grown===1"
+            "&&view.length===131072&&view[10]===77&&small.load(10)===77"
+            "?'WASM-SMALL-OK':'WASM-SMALL-BAD:'+[stored,grown,view.length];",
+            "<wasm-small>", &small_result)
+            && strcmp(small_result.summary, "WASM-SMALL-OK") == 0;
+        const size_t small_peak = tilefinch_test_faults()->wasm_runtime_bytes_peak;
+        budget.limit = limit;
+        if (!small_ok || small_peak == 0 || small_peak >= 256u * 1024u)
+            printf("wasm small: %s %s peak=%zu\n", small_result.summary,
+                   small_result.error, small_peak);
+        script_runtime_destroy(small_runtime);
+        document_destroy(&small_document);
+        CHECK(small_ok);
+        CHECK(small_peak > 0 && small_peak < 256u * 1024u);
+        CHECK(budget.current == baseline);
+    }
+
+    puts("test: a large WebAssembly module grows the reservation and still runs");
+    {
+        const size_t baseline = budget.current;
+        PocDocument large_document;
+        const char large_page[] = "<!doctype html><html><body></body></html>";
+        CHECK(document_parse(&large_document, &budget, large_page,
+                             strlen(large_page), 17));
+        ScriptResult large_result;
+        ScriptRuntime *large_runtime = script_runtime_create_deferred(
+            &large_document, &budget, 8 * MIB, 4000,
+            "https://wasm-large.test/", NULL, &large_result);
+        CHECK(large_runtime != NULL);
+        tilefinch_test_faults()->wasm_runtime_bytes_peak = 0;
+        /* 1,024 functions x -> x+40 (forty local.get, i32.const 1, i32.add,
+           local.set each; about 290 KiB of code), and a 64 KiB data segment
+           in 2 pages of memory. */
+        bool large_ok = script_runtime_evaluate_diagnostic(large_runtime,
+            "const leb=n=>{const o=[];do{let b=n&127;n>>>=7;if(n)b|=128;"
+            "o.push(b)}while(n);return o};"
+            "const F=1024,R=40,D=65536,bodyLength=1+R*7+3,"
+            "body=new Uint8Array(bodyLength);"
+            "for(let i=0;i<R;i++)body.set([32,0,65,1,106,33,0],1+i*7);"
+            "body.set([32,0,11],1+R*7);"
+            "const code=new Uint8Array(F*(leb(bodyLength).length+bodyLength));"
+            "for(let i=0,at=0;i<F;i++){code.set(leb(bodyLength),at);"
+            "at+=leb(bodyLength).length;code.set(body,at);at+=bodyLength;}"
+            "const codeHead=leb(F),dataHead=[1,0,65,0,11,...leb(D)],"
+            "functions=[...leb(F),...new Array(F).fill(0)],"
+            "parts=[[0,97,115,109,1,0,0,0,1,6,1,96,1,127,1,127],"
+            "[3,...leb(functions.length)],functions,"
+            "[5,3,1,0,2,7,9,2,1,102,0,0,1,109,2,0],"
+            "[10,...leb(codeHead.length+code.length)],codeHead,code,"
+            "[11,...leb(dataHead.length+D)],dataHead,"
+            "Uint8Array.from({length:D},(_,i)=>i&255)];"
+            "const largeBytes=new Uint8Array(parts.reduce((n,p)=>n+p.length,0));"
+            "let at=0;for(const p of parts){largeBytes.set(p,at);at+=p.length;}"
+            "const large=new WebAssembly.Instance("
+            "new WebAssembly.Module(largeBytes)).exports;"
+            "const result=large.f(1234),before=new Uint8Array(large.m.buffer),"
+            "kept=before.length===131072&&before[1000]===(1000&255),"
+            "grown=large.m.grow(1),after=new Uint8Array(large.m.buffer);"
+            "globalThis.pocSummary=largeBytes.length>320000&&result===1274"
+            "&&kept&&grown===2&&after.length===196608&&after[65535]===255"
+            "?'WASM-LARGE-OK':'WASM-LARGE-BAD:'+[largeBytes.length,result,"
+            "kept,grown,after.length];",
+            "<wasm-large>", &large_result)
+            && strcmp(large_result.summary, "WASM-LARGE-OK") == 0;
+        const size_t large_peak = tilefinch_test_faults()->wasm_runtime_bytes_peak;
+        if (!large_ok || large_peak < 256u * 1024u || large_peak > 4 * MIB)
+            printf("wasm large: %s %s peak=%zu\n", large_result.summary,
+                   large_result.error, large_peak);
+        script_runtime_destroy(large_runtime);
+        document_destroy(&large_document);
+        CHECK(large_ok);
+        CHECK(large_peak >= 256u * 1024u && large_peak <= 4 * MIB);
+        CHECK(budget.current == baseline);
+    }
 
     puts("test: fixed-width WebAssembly SIMD follows the standard binary format");
     size_t wasm_simd_baseline = budget.current;

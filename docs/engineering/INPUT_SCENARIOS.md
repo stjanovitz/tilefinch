@@ -84,9 +84,8 @@ network worker, curl, TLS and the worker's slabs do not run.
 
 The run installs on the real Memory Stick and writes only below
 `<install_root>/components/`, in the installed pack's directory. If
-`components/` is absent it logs
-`tilefinch-glyph-replay: refused` and writes nothing, unless the sidecar has
-`make_components=1`. A pack that is already installed ends at `client=up-to-date`
+`components/` is absent it logs `tilefinch-glyph-replay: refused` and writes
+nothing, unless the sidecar has `make_components=1`. A pack that is already installed ends at `client=up-to-date`
 with nothing written, so a repeat run needs that directory removed by hand. The
 profile stays beside the program, and it remembers the page language the menu
 route selected, so remove it before repeating that route: its Page glyphs row
@@ -95,13 +94,15 @@ would otherwise move past Cyrillic.
 Pass requires `tilefinch-glyph-component: installed pack=5` with
 `attached=0x0020`, `tilefinch-glyph-stage: reattach-relayout` with `relaid=1`,
 and `client=` stages through `hash-verified` with one
-`tilefinch-update-hop` per recorded hop. With `rename_probe=1` in the sidecar,
-`tilefinch-glyph-replay: cross-dir-rename` reports what this firmware's rename
-does when the target is in another directory, using scratch files in
-`components/glyph-cyrillic`. It is information, not a criterion, and it is off
-by default because it writes to the Memory Stick on every armed run. With `dump_frame=1` the final
+`tilefinch-update-hop` per recorded hop. With `dump_frame=1` the final
 frame shows Russian text on the Cyrillic page. The 240x136 mark captures are too
 coarse to read body text.
+
+`rename_probe=1` in the sidecar adds `tilefinch-glyph-replay: cross-dir-rename`,
+which reports what this firmware's rename does when the target is in another
+directory, using scratch files in `components/glyph-cyrillic`. It is
+information, not a criterion, and it is off by default because it writes to
+the Memory Stick on every armed run.
 
 ## Page input during work
 
@@ -132,7 +133,8 @@ during that load. The fixture has two routes:
 - On a PSP it runs as an installed offline app, with no network. An
   installed app cannot navigate to itself, so its `?device` start URL opens
   the alert from the timer after load instead. Package it with the
-  offline-library fixture tool (`PSPLINK_DEV_LOOP.md`). Copy the fixture to
+  offline-library fixture tool
+  ([USB-only installed-game tests](PSPLINK_DEV_LOOP.md#usb-only-installed-game-tests)). Copy the fixture to
   a scratch directory as `index.html`, beside a `manifest.webmanifest` whose
   `start_url` is `./index.html?device`, then run
   `tilefinch-offline-library-fixture --web-app BUILD/offline
@@ -222,6 +224,24 @@ optional-font publication. Check the font adoption/rollback and owner-thread
 input-acknowledgement records together with the captures. The fallback
 layout must survive preemption, and font adoption must remain retryable.
 Both scenarios use the normal receiver; neither injects a search-result URL.
+
+### section-disclosure-live, wikipedia-article-section-live, youtube-results-focus-live, youtube-detail-poster-live
+
+| Scenario | Start URL | Inspect |
+|---|---|---|
+| `section-disclosure-live` | `http://127.0.0.1:8779/cooperative-disclosure.html` (serve `tests/fixtures` on loopback) | `before`, `expanded`, `collapsed` captures and `tilefinch-control-activation` while 200 paragraphs open and close with timers pending |
+| `wikipedia-article-section-live` | an article with a `#History` fragment | native pointer target `id=History`; the last `section-*` capture shows History prose, not just a focus box; at normal emulator speed, activation at most 1.25 s, flow layout at most 750 ms, and no resource-rebuilding relayout |
+| `youtube-results-focus-live` | a provider results page | `result-next`, `result-below-fold`, `results-filled`: the selected card and scroll move before thumbnails arrive and stay put afterward |
+| `youtube-detail-poster-live` | a watch page | `poster-ready`: the play card holds the downloaded poster after idle work; compare `tilefinch-adapter-commit` resource time apart from transport time (no video plays) |
+
+```sh
+scripts/run-ppsspp-input-script.sh --script wikipedia-article-section-live \
+  --url 'https://en.wikipedia.org/wiki/PlayStation_Portable#History' --runs 2
+```
+
+Live layouts change: update a cursor route only after inspecting the page.
+A zero layout-phase counter can mean instrumentation is unavailable, not that
+the work was free.
 
 ### youtube-scroll-interrupt, youtube-scroll-completion, youtube-bbb
 
@@ -384,6 +404,17 @@ change before ending the test. Session transfer and all live evidence
 remain private.
 
 ## Games
+
+### webgl-game-cadence
+
+`webgl-game-cadence.txt` runs on a device against Prism's
+`?qualification=ordinary`, `?qualification=heavy`, and
+`?qualification=profile` URLs. The first mark resets validation-only counters
+after warm-up. The profile mode splits the example's JavaScript cost into
+update, geometry, upload, command setup, and HUD work. The terminal report
+separates author callback time from native WebGL time and records
+canvas-presentation median, p95, maximum, and 60/30 Hz deadline counts. These
+probes are absent from shipping builds and expose no finer clock to pages.
 
 ### treadline-action-budget
 

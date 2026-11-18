@@ -494,6 +494,13 @@ static bool inline_variable_value(const Stylesheet *sheet,
                 && (custom_property
                     ? memcmp(candidate, name, name_length) == 0
                     : strncasecmp(candidate, name, name_length) == 0);
+            if (!matches && custom_property) {
+                char decoded[STYLE_CUSTOM_NAME_CAPACITY];
+                matches = style_decode_custom_name(
+                    candidate, candidate_length, decoded)
+                    && strlen(decoded) == name_length
+                    && memcmp(decoded, name, name_length) == 0;
+            }
             if (!matches && alias != NULL)
                 matches = span_case_equal(candidate, candidate_length, alias);
             if (matches && value_length < limit
@@ -1491,7 +1498,10 @@ uint64_t stylesheet_inline_custom_property_bits(const char *text,
             const char *name = text + at;
             size_t name_length = colon - at;
             trim(&name, &name_length);
-            if (name_length > 2 && name[0] == '-' && name[1] == '-')
+            char decoded[STYLE_CUSTOM_NAME_CAPACITY];
+            if (style_decode_custom_name(name, name_length, decoded))
+                bits |= stylesheet_custom_property_name_bits(decoded, strlen(decoded));
+            else if (name_length > 2 && name[0] == '-' && name[1] == '-')
                 bits |= stylesheet_custom_property_name_bits(name,
                                                              name_length);
         }
@@ -2530,6 +2540,11 @@ static bool style_resolve_value_nested(const Stylesheet *sheet,
         const char *name = inside;
         size_t name_length = comma;
         trim(&name, &name_length);
+        char decoded[STYLE_CUSTOM_NAME_CAPACITY];
+        if (style_decode_custom_name(name, name_length, decoded)) {
+            name = decoded;
+            name_length = strlen(decoded);
+        }
         /* The looked-up value, already resolved where it was declared:
            at most STYLE_CUSTOM_RESOLVED_CAPACITY, never truncated (a longer
            one is not found). */
@@ -3612,6 +3627,12 @@ static bool collect_custom_rules(Stylesheet *sheet, const char *selector,
                 && name[0] == '-' && name[1] == '-';
             const char *stored_name = name;
             size_t stored_name_length = name_length;
+            char decoded[STYLE_CUSTOM_NAME_CAPACITY];
+            if (style_decode_custom_name(name, name_length, decoded)) {
+                retained = true;
+                stored_name = decoded;
+                stored_name_length = strlen(decoded);
+            }
             if (!retained) {
                 const char *canonical = retained_presentation_property(
                     name, name_length);

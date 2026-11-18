@@ -70,7 +70,8 @@ static JSValue js_selector_syntax_valid(JSContext *context,
     size_t length = 0;
     const char *text = JS_ToCStringLen(context, &length, argv[0]);
     if (text == NULL) return JS_EXCEPTION;
-    bool valid = selector_syntax_valid(text, length);
+    bool valid = selector_syntax_valid_mode(text, length,
+                                           argc > 1 && JS_ToBool(context, argv[1]) > 0);
     JS_FreeCString(context, text);
     return JS_NewBool(context, valid);
 }
@@ -764,11 +765,15 @@ static JSValue js_request_scroll(JSContext *context, JSValueConst this_value,
     if (!(requested >= 0)) requested = 0; /* Also makes NaN become zero. */
     if (requested > INT_MAX) requested = INT_MAX;
     int next = (int) requested;
-    /* The clamp reads the page's scroll extent: complete a truncated
-       layout first (js_rt_bridge_layout). When that build is refused
-       (memory), clamp to the published extent the reader scrolls, as
-       navigation's own clamp does, rather than not at all. */
-    if (js_rt_bridge_layout_truncated(bridge))
+    /* Positive requests observe geometry, just like a root size read.
+       Refresh a dirty extent as well as a truncated one: a page can grow
+       or shrink and call scrollTo in the same callback. Zero needs no
+       measurement on a full layout. The resulting geometry can be adopted
+       by the relayout that publishes the mutation. */
+    if (next != 0) js_rt_bridge_note_parser_writes_for_layout(bridge);
+    if (js_rt_bridge_layout_truncated(bridge)
+        || (next > 0 && bridge->relayout_dirty != NULL
+            && *bridge->relayout_dirty))
         (void) js_rt_bridge_flush_synchronous_layout(bridge, NULL);
     const LayoutDocument *layout = js_rt_bridge_layout(bridge);
     if (layout == NULL && js_rt_bridge_layout_truncated(bridge)
@@ -824,7 +829,10 @@ enum {
     GEOMETRY_x, GEOMETRY_y, GEOMETRY_retained, GEOMETRY_authoritative,
     GEOMETRY_width, GEOMETRY_height, GEOMETRY_clientWidth,
     GEOMETRY_clientHeight, GEOMETRY_scrollWidth, GEOMETRY_scrollHeight,
-    GEOMETRY_scrollLeft, GEOMETRY_scrollTop, GEOMETRY_FIELD_COUNT
+    GEOMETRY_scrollLeft, GEOMETRY_scrollTop, GEOMETRY_FIELD_COUNT,
+    GEOMETRY_clipLeft = GEOMETRY_FIELD_COUNT, GEOMETRY_clipTop,
+    GEOMETRY_clipRight, GEOMETRY_clipBottom, GEOMETRY_inRoot,
+    GEOMETRY_OBSERVER_FIELD_COUNT
 };
 static const char *const geometry_field_names[GEOMETRY_FIELD_COUNT] = {
     "x", "y", "retained", "authoritative", "width", "height",
@@ -840,6 +848,16 @@ static JSValue js_element_geometry(JSContext *context,
     DomBridge *bridge = JS_GetContextOpaque(context);
     lxb_dom_node_t *node = bridge == NULL || argc < 1 ? NULL
                            : js_rt_bridge_node_arg(context, bridge, argv[0]);
+    /* Optional private array-refill modes: -4 adds client fragments,
+       -1 is pre-transform layout
+       geometry; -2 is an observer root; non-negative is an observer
+       target with a root handle (0 denotes the viewport). */
+    int32_t mode = -3;
+    if (argc > 2 && JS_IsNumber(argv[2])
+        && JS_ToInt32(context, &mode, argv[2]) < 0) return JS_EXCEPTION;
+    bool observe = mode >= 0;
+    bool untransformed = mode == -1;
+    bool fragments_requested = mode == -4;
     if (bridge != NULL && bridge->result != NULL) {
         bridge->result->geometry_queries++;
     }
@@ -901,6 +919,12 @@ static JSValue js_element_geometry(JSContext *context,
             unknown_y = bridge->layout_region_end;
         }
     }
+    if (box == NULL && document_manual_shadow_excludes(node)) {
+        /* A manual slot excludes the light subtree from the box tree.
+           Don't synthesize its authored width/height in the JS fallback. */
+        unknown = true;
+        unknown_y = 0;
+    }
 #ifndef TILEFINCH_NO_TRACE
     if (getenv("TILEFINCH_TRACE_GEOMETRY") != NULL) {
         size_t name_length = 0, id_length = 0;
@@ -918,9 +942,64 @@ static JSValue js_element_geometry(JSContext *context,
                 box == NULL ? 0 : box->height);
     }
 #endif
+    const LayoutInlineFragment *fragment =
+        node != NULL && layout != NULL && (box == NULL || fragments_requested)
+        ? layout_inline_fragment_first(layout, node) : NULL;
+    LayoutNodeBox inline_box;
+    if (fragment != NULL) {
+        int left = fragment->x, top = fragment->y;
+        int right = left + fragment->width, bottom = top + fragment->height;
+        const LayoutInlineFragment *part = fragment;
+        inline_box = (LayoutNodeBox) {
+            .command_end = part->command, .cssom_geometry_authoritative = true
+        };
+        for (; part != NULL; part = layout_inline_fragment_next(layout, part)) {
+            if (part->x < left) left = part->x;
+            if (part->y < top) top = part->y;
+            if (part->x + part->width > right) right = part->x + part->width;
+            if (part->y + part->height > bottom) bottom = part->y + part->height;
+            inline_box.command_start = part->command;
+        }
+        inline_box.x = left;
+        inline_box.y = top;
+        inline_box.width = right - left;
+        inline_box.height = bottom - top;
+        box = &inline_box;
+    }
     int x = box == NULL ? 0 : box->x;
     int y = box == NULL ? unknown_y : box->y;
-    for (lxb_dom_node_t *parent = node == NULL ? NULL : node->parent;
+    LayoutScrollPlacement placement;
+    bool in_root = false;
+    if (observe && node != NULL && layout != NULL) {
+        LayoutObserverMargin margins = {0};
+        if (argc >= 8) {
+            for (unsigned side = 0; side < 4; side++) {
+                int32_t value = 0;
+                if (JS_ToInt32(context, &value, argv[3 + side]) < 0)
+                    return JS_EXCEPTION;
+                margins.values[side] = value;
+            }
+            uint32_t mask;
+            if (JS_ToUint32(context, &mask, argv[7]) < 0) return JS_EXCEPTION;
+            margins.percent_mask = mask;
+        }
+        lxb_dom_node_t *root = mode == 0 ? NULL
+            : js_rt_bridge_node_arg(context, bridge, argv[2]);
+        bool found = layout_node_observer_placement(layout, node, root,
+                                                    argc >= 8 ? &margins : NULL,
+                                                    &placement);
+        in_root = mode == 0 || (root != NULL && found);
+        x += placement.dx;
+        y += placement.dy;
+    } else if (!untransformed && layout != NULL && node != NULL && box != NULL
+               && box->cssom_geometry_authoritative
+               && box->positioned_ancestor_distance != 0) {
+        if (layout_node_scroll_placement(layout, NULL, node, &placement)) {
+            x += placement.dx;
+            y += placement.dy;
+        }
+    } else for (lxb_dom_node_t *parent =
+             node == NULL || untransformed ? NULL : node->parent;
          parent != NULL; parent = parent->parent) {
         if (bridge != NULL && bridge->result != NULL) {
             bridge->result->geometry_ancestor_visits++;
@@ -934,25 +1013,40 @@ static JSValue js_element_geometry(JSContext *context,
     }
     int fixed_dy = 0;
     bool fixed_geometry = false;
+    int viewport_dy = 0;
     if (bridge != NULL
         && fixed_box_offset(layout, box, bridge->viewport_height,
-                            bridge->page_scroll_y, &fixed_geometry,
+                            untransformed ? 0 : bridge->page_scroll_y,
+                            &fixed_geometry,
                             &fixed_dy)) {
-        y += fixed_dy;
-    } else {
-        y -= bridge == NULL ? 0 : bridge->page_scroll_y;
+        viewport_dy = fixed_dy;
+    } else if (!untransformed && bridge != NULL) {
+        viewport_dy = -bridge->page_scroll_y;
+        if (!fixed_geometry && layout != NULL && layout->sticky_count != 0)
+            viewport_dy += layout_node_sticky_offset(
+                layout, node, bridge->page_scroll_y, bridge->viewport_height);
+    }
+    y += viewport_dy;
+    LayoutNodeBox layout_box;
+    if (untransformed && box != NULL && box != &inline_box) {
+        layout_box_untransformed(layout, box, &layout_box);
+        box = &layout_box;
+        x = box->x;
+        y = box->y + viewport_dy;
     }
     /* Every value is computed before anything is stored: defining entries
        on a caller-supplied array (a Proxy passes JS_IsArray) can run
        script. */
-    int values[GEOMETRY_FIELD_COUNT];
+    int values[GEOMETRY_OBSERVER_FIELD_COUNT];
 #define SET_GEOMETRY(name, value) (values[GEOMETRY_##name] = (value))
     SET_GEOMETRY(x, x);
     SET_GEOMETRY(y, y);
     SET_GEOMETRY(retained, box != NULL);
     SET_GEOMETRY(
         authoritative,
-        unknown || (box != NULL
+        unknown || (fragments_requested && box == NULL
+                    && layout_inline_fragments_complete(layout))
+        || (box != NULL
             && (box->cssom_geometry_authoritative || fixed_geometry)));
     if (box != NULL
         && (box->cssom_geometry_authoritative || fixed_geometry)
@@ -969,8 +1063,16 @@ static JSValue js_element_geometry(JSContext *context,
                              ? bridge->viewport_height : 65) : 0;
     ElementScrollIntent *intent = box == NULL
         ? bridge_scroll_intent_find(bridge, node) : NULL;
-    SET_GEOMETRY(width, box == NULL ? fallback_width : box->width);
-    SET_GEOMETRY(height, box == NULL ? fallback_height : box->height);
+    bool clipped_root = mode == -2 && box != NULL
+        && (box->clips_x || box->clips_y);
+    if (clipped_root) {
+        SET_GEOMETRY(x, x + box->clip_inset_left);
+        SET_GEOMETRY(y, y + box->clip_inset_top);
+    }
+    SET_GEOMETRY(width, box == NULL ? fallback_width
+                         : (clipped_root ? box->client_width : box->width));
+    SET_GEOMETRY(height, box == NULL ? fallback_height
+                          : (clipped_root ? box->client_height : box->height));
     /* CSSOM View defines the root element's client box as the layout
        viewport.  A retained layout box for <html> is an implementation
        detail and may legitimately have no content box of its own. */
@@ -1006,24 +1108,59 @@ static JSValue js_element_geometry(JSContext *context,
     SET_GEOMETRY(scrollTop, box == NULL
                               ? (intent == NULL ? 0 : intent->scroll_y)
                               : box->scroll_y);
+    if (observe) {
+        SET_GEOMETRY(clipLeft, in_root ? placement.clip_left : 0);
+        SET_GEOMETRY(clipTop, in_root ? placement.clip_top + viewport_dy : 0);
+        SET_GEOMETRY(clipRight, in_root ? placement.clip_right : 0);
+        SET_GEOMETRY(clipBottom, in_root ? placement.clip_bottom + viewport_dy : 0);
+        /* A browser page owes its first observation after layout, not a
+           synthetic invisible entry before any geometry has published.
+           The runtime can also run without a layout owner (unit/worker
+           contexts); those still get their initial notification. */
+        SET_GEOMETRY(inRoot, layout == NULL && !unknown && bridge != NULL
+                     && bridge->expect_navigation_layout ? -1 : in_root);
+    }
 #undef SET_GEOMETRY
     /* getBoundingClientRect passes its own array to refill, indexed in
        geometry_field_names order, sparing an object and twelve named properties per
        call; every other caller takes the object. */
-    bool refill = argc > 1 && JS_IsArray(context, argv[1]) > 0;
-    JSValue result = refill ? JS_DupValue(context, argv[1])
-                            : JS_NewObject(context);
+    bool refill = !fragments_requested && argc > 1
+        && JS_IsArray(context, argv[1]) > 0;
+    /* Fragment publication walks retained layout storage. Use a fresh
+       native array, not a script-supplied proxy that can replace layout. */
+    JSValue result = fragments_requested ? JS_NewArray(context)
+        : refill ? JS_DupValue(context, argv[1]) : JS_NewObject(context);
     if (JS_IsException(result)) return result;
     if (!refill && bridge != NULL && bridge->result != NULL)
         bridge->result->geometry_result_objects++;
-    for (int i = 0; i < GEOMETRY_FIELD_COUNT; i++) {
+    int count = observe && refill ? GEOMETRY_OBSERVER_FIELD_COUNT
+                                  : GEOMETRY_FIELD_COUNT;
+    for (int i = 0; i < count; i++) {
         JSValue value = JS_NewInt32(context, values[i]);
-        if ((refill
+        if ((refill || fragments_requested
              ? js_rt_define_index(context, result, (uint32_t) i, value)
              : js_rt_define_field(context, result, geometry_field_names[i],
                                   value)) < 0) {
             JS_FreeValue(context, result);
             return JS_EXCEPTION;
+        }
+    }
+    if (fragments_requested && fragment != NULL) {
+        int dx = x - inline_box.x, dy = y - inline_box.y;
+        uint32_t at = GEOMETRY_FIELD_COUNT;
+        for (const LayoutInlineFragment *part = fragment; part != NULL;
+             part = layout_inline_fragment_next(layout, part)) {
+            if (js_rt_define_index(context, result, at++,
+                                   JS_NewInt32(context, part->x + dx)) < 0
+                || js_rt_define_index(context, result, at++,
+                                      JS_NewInt32(context, part->y + dy)) < 0
+                || js_rt_define_index(context, result, at++,
+                                      JS_NewInt32(context, part->width)) < 0
+                || js_rt_define_index(context, result, at++,
+                                      JS_NewInt32(context, part->height)) < 0) {
+                JS_FreeValue(context, result);
+                return JS_EXCEPTION;
+            }
         }
     }
     return result;
@@ -1084,6 +1221,7 @@ static bool frame_realm_prepare(JSContext *caller, ScriptRuntime *host,
         return false;
     }
     host->frame_realms[slot].intrinsic_state = 2;
+    if (host->interface_snapshot) JS_SnapshotInterfaces(realm);
     return true;
 }
 
@@ -1390,12 +1528,15 @@ static JSValue js_storage_get(JSContext *context, JSValueConst this_value,
         return JS_NULL;
     }
     bool local = JS_ToBool(context, argv[0]) > 0;
-    const char *key = JS_ToCString(context, argv[1]);
+    size_t key_length = 0;
+    const char *key = JS_ToCStringLen(context, &key_length, argv[1]);
     if (key == NULL) return JS_EXCEPTION;
     const char *value = NULL;
     size_t length = 0;
-    bool found = browser_session_storage_get(
-        bridge->session, bridge->document_url, local, key, &value, &length);
+    bool found = browser_session_storage_get_scoped(
+        bridge->session, bridge->document_url, local, bridge->session_storage_scope,
+        key, key_length,
+        &value, &length);
     JS_FreeCString(context, key);
     return found ? JS_NewStringLen(context, value, length) : JS_NULL;
 }
@@ -1496,7 +1637,8 @@ static JSValue js_storage_set(JSContext *context, JSValueConst this_value,
     if (bridge->session == NULL) return JS_TRUE;
     if (bridge->opaque_origin) return JS_FALSE;
     bool local = JS_ToBool(context, argv[0]) > 0;
-    const char *key = JS_ToCString(context, argv[1]);
+    size_t key_length = 0;
+    const char *key = JS_ToCStringLen(context, &key_length, argv[1]);
     size_t value_length = 0;
     const char *value = JS_ToCStringLen(context, &value_length, argv[2]);
     if (key == NULL || value == NULL) {
@@ -1504,9 +1646,9 @@ static JSValue js_storage_set(JSContext *context, JSValueConst this_value,
         if (value != NULL) JS_FreeCString(context, value);
         return JS_EXCEPTION;
     }
-    bool stored = browser_session_storage_set(
-        bridge->session, bridge->document_url, local, key, value,
-        value_length);
+    bool stored = browser_session_storage_set_scoped(
+        bridge->session, bridge->document_url, local, bridge->session_storage_scope,
+        key, key_length, value, value_length);
     JS_FreeCString(context, value);
     JS_FreeCString(context, key);
     return JS_NewBool(context, stored);
@@ -1521,9 +1663,9 @@ static JSValue js_storage_length(JSContext *context,
     if (bridge->session == NULL || bridge->opaque_origin || argc < 1) {
         return JS_NewInt32(context, 0);
     }
-    size_t length = browser_session_storage_length(
+    size_t length = browser_session_storage_length_scoped(
         bridge->session, bridge->document_url,
-        JS_ToBool(context, argv[0]) > 0);
+        JS_ToBool(context, argv[0]) > 0, bridge->session_storage_scope);
     return JS_NewInt64(context, (int64_t) length);
 }
 
@@ -1538,10 +1680,13 @@ static JSValue js_storage_key(JSContext *context, JSValueConst this_value,
     int64_t index = -1;
     if (JS_ToInt64(context, &index, argv[1]) < 0) return JS_EXCEPTION;
     const char *key = NULL;
-    bool found = index >= 0 && browser_session_storage_key(
+    size_t key_length = 0;
+    bool found = index >= 0 && (uint64_t) index <= SIZE_MAX
+        && browser_session_storage_key_scoped(
         bridge->session, bridge->document_url,
-        JS_ToBool(context, argv[0]) > 0, (size_t) index, &key);
-    return found ? JS_NewString(context, key) : JS_NULL;
+        JS_ToBool(context, argv[0]) > 0, bridge->session_storage_scope,
+        (size_t) index, &key, &key_length);
+    return found ? JS_NewStringLen(context, key, key_length) : JS_NULL;
 }
 
 static JSValue js_storage_remove(JSContext *context,
@@ -1554,11 +1699,13 @@ static JSValue js_storage_remove(JSContext *context,
         return JS_TRUE;
     }
     bool local = JS_ToBool(context, argv[0]) > 0;
-    const char *key = JS_ToCString(context, argv[1]);
+    size_t key_length = 0;
+    const char *key = JS_ToCStringLen(context, &key_length, argv[1]);
     if (key == NULL) return JS_EXCEPTION;
     /* False when the Memory Stick refused to record it: the item stays. */
-    bool removed = browser_session_storage_remove(
-        bridge->session, bridge->document_url, local, key);
+    bool removed = browser_session_storage_remove_scoped(
+        bridge->session, bridge->document_url, local, bridge->session_storage_scope,
+        key, key_length);
     JS_FreeCString(context, key);
     return JS_NewBool(context, removed);
 }
@@ -1571,9 +1718,9 @@ static JSValue js_storage_clear(JSContext *context, JSValueConst this_value,
     if (bridge->session == NULL || bridge->opaque_origin || argc < 1)
         return JS_TRUE;
     /* False when some item could not be removed; those stay. */
-    return JS_NewBool(context, browser_session_storage_clear(
+    return JS_NewBool(context, browser_session_storage_clear_scoped(
         bridge->session, bridge->document_url,
-        JS_ToBool(context, argv[0]) > 0));
+        JS_ToBool(context, argv[0]) > 0, bridge->session_storage_scope));
 }
 
 static JSValue js_cookie_get(JSContext *context, JSValueConst this_value,
@@ -1638,6 +1785,26 @@ static JSValue js_console_log(JSContext *context, JSValueConst this_value,
 {
     (void) this_value;
     DomBridge *bridge = JS_GetContextOpaque(context);
+#ifdef JS_RT_TEST_INSTRUMENTS
+    /* Host and validation realms only: a test page reads what the console
+       received, the browser's own warnings included, by defining
+       __tilefinchTestConsoleSink(level, ...values). Replacing console.warn
+       shows a page only its own calls, as in browsers. */
+    if (bridge != NULL && bridge->host != NULL && bridge->host->test_probes) {
+        JSValue global = JS_GetGlobalObject(context);
+        JSValue sink = JS_GetPropertyStr(context, global,
+                                         "__tilefinchTestConsoleSink");
+        JS_FreeValue(context, global);
+        if (JS_IsFunction(context, sink)) {
+            JSValue sunk = JS_Call(context, sink, JS_UNDEFINED, argc, argv);
+            JS_FreeValue(context, sink);
+            if (JS_IsException(sunk)) return sunk;
+            JS_FreeValue(context, sunk);
+        } else {
+            JS_FreeValue(context, sink);
+        }
+    }
+#endif
     if (bridge == NULL || !tilefinch_trace_console()
         || bridge->console_messages >= 64) return JS_UNDEFINED;
     bridge->console_messages++;
@@ -2372,7 +2539,9 @@ enum {
     JS_OPFS_READ,
     JS_OPFS_WRITE,
     JS_OPFS_REMOVE,
-    JS_OPFS_LIST
+    JS_OPFS_LIST,
+    JS_OPFS_LOCK,
+    JS_OPFS_UNLOCK
 };
 
 static JSValue js_opfs_result(JSContext *context, BrowserOpfsResult status)
@@ -2401,6 +2570,14 @@ static JSValue js_opfs_command(JSContext *context, JSValueConst this_value,
     if (argc < 2)
         return JS_ThrowTypeError(context, "OPFS command and path required");
     if (JS_ToInt32(context, &command, argv[0]) < 0) return JS_EXCEPTION;
+    if (command == JS_OPFS_UNLOCK) {
+        int64_t lease = 0;
+        if (argc > 2 && JS_ToInt64(context, &lease, argv[2]) < 0)
+            return JS_EXCEPTION;
+        if (lease > 0 && bridge != NULL)
+            browser_session_opfs_unlock(bridge->session, bridge, (uint64_t) lease);
+        return JS_UNDEFINED;
+    }
     const char *path = JS_ToCString(context, argv[1]);
     if (path == NULL) return JS_EXCEPTION;
     bool authorized = bridge != NULL && bridge->session != NULL
@@ -2483,14 +2660,15 @@ static JSValue js_opfs_command(JSContext *context, JSValueConst this_value,
         const uint8_t *bytes = NULL;
         size_t length = 0;
         JSValue owner = JS_UNDEFINED;
-        int64_t expected_generation = 0;
+        int64_t expected_generation = 0, shared_lease = 0;
         if (argc < 4) {
             JS_FreeCString(context, path);
             return JS_ThrowTypeError(context, "OPFS write requires bytes");
         }
         /* Coerce before borrowing the bytes: a valueOf() could otherwise
            detach the buffer under the pointer that is written to storage. */
-        if (JS_ToInt64(context, &expected_generation, argv[3]) < 0) {
+        if (JS_ToInt64(context, &expected_generation, argv[3]) < 0
+            || (argc > 4 && JS_ToInt64(context, &shared_lease, argv[4]) < 0)) {
             JS_FreeCString(context, path);
             return JS_EXCEPTION;
         }
@@ -2499,26 +2677,46 @@ static JSValue js_opfs_command(JSContext *context, JSValueConst this_value,
             JS_FreeCString(context, path);
             return JS_ThrowTypeError(context, "OPFS write requires bytes");
         }
-        BrowserOpfsResult found = browser_session_opfs_stat(
-            bridge->session, bridge->document_url, path, &view);
-        if (found != BROWSER_OPFS_OK) status = found;
-        else if (expected_generation <= 0
-                 || view.generation != (uint64_t) expected_generation)
-            status = BROWSER_OPFS_STALE;
-        else {
-            status = browser_session_opfs_write(
-                bridge->session, bridge->document_url, path, bytes, length);
-            if (status == BROWSER_OPFS_OK)
-                status = browser_session_opfs_stat(
-                    bridge->session, bridge->document_url, path, &view);
+        if (shared_lease > 0) {
+            status = browser_session_opfs_commit_shared(bridge->session,
+                bridge->document_url, path, bridge, (uint64_t) shared_lease,
+                bytes, length);
+        } else {
+            status = browser_session_opfs_stat(
+                bridge->session, bridge->document_url, path, &view);
+            if (status == BROWSER_OPFS_OK) {
+                if (expected_generation <= 0 || view.generation != (uint64_t) expected_generation)
+                    status = BROWSER_OPFS_STALE;
+                else {
+                    status = browser_session_opfs_write(
+                        bridge->session, bridge->document_url, path, bytes, length);
+                    if (status == BROWSER_OPFS_OK)
+                        status = browser_session_opfs_stat(
+                            bridge->session, bridge->document_url, path, &view);
+                }
+            }
         }
         JS_FreeValue(context, owner);
         result = js_opfs_result(context, status);
-        if (status == BROWSER_OPFS_OK && !JS_IsException(result)
+        if (shared_lease == 0 && status == BROWSER_OPFS_OK && !JS_IsException(result)
             && JS_DefinePropertyValueUint32(
                    context, result, 1,
                    JS_NewInt64(context, (int64_t) view.generation),
                    JS_PROP_C_W_E) < 0) {
+            JS_FreeValue(context, result);
+            result = JS_EXCEPTION;
+        }
+    } else if (command == JS_OPFS_LOCK) {
+        uint64_t lease = 0;
+        status = browser_session_opfs_lock(
+            bridge->session, bridge->document_url, path, bridge,
+            argc > 2 && JS_ToBool(context, argv[2]) > 0, &lease);
+        result = js_opfs_result(context, status);
+        if (status == BROWSER_OPFS_OK
+            && (JS_IsException(result) || JS_DefinePropertyValueUint32(
+                    context, result, 1, JS_NewInt64(context, (int64_t) lease),
+                    JS_PROP_C_W_E) < 0)) {
+            browser_session_opfs_unlock(bridge->session, bridge, lease);
             JS_FreeValue(context, result);
             result = JS_EXCEPTION;
         }
@@ -3316,6 +3514,10 @@ bool js_rt_install_native(JSContext *context, JSValue target,
         : script_profile_native_value(
               context, function, native->name, native->arguments);
     if (JS_IsException(value)) return false;
+    /* The host's natives do the browser's work whoever calls them: a
+       global they set or an interface they read is the browser's, not what
+       the calling page made of it (the interface snapshot). */
+    JS_MarkBrowserNative(context, value);
     int flags = 0;
     if (native->flags & JS_RT_NATIVE_TEST_OVERRIDABLE) {
         DomBridge *bridge = JS_GetContextOpaque(context);
@@ -3327,8 +3529,14 @@ bool js_rt_install_native(JSContext *context, JSValue target,
     /* Only TRUE counts: lazy modules install their bridges after author
        code ran, and a page-owned non-configurable name answers FALSE. The
        module would then capture the page's value as its bridge. */
-    return JS_DefinePropertyValueStr(
-               context, target, native->name, value, flags) > 0;
+    if (JS_DefinePropertyValueStr(
+            context, target, native->name, value, flags) <= 0)
+        return false;
+    /* A test's replacement of an overridable native must reach the
+       bootstrap, which the interface snapshot would otherwise keep from
+       it. (A no-op when the target is not the global object.) */
+    if (flags & JS_PROP_WRITABLE) JS_LeaveGlobalToPage(context, native->name);
+    return true;
 }
 
 bool js_rt_install_natives(JSContext *context, JSValue target,

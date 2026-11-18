@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Keep private investigations and development journals out of public sources."""
+"""Keep private investigations and development journals out of public sources,
+keep docs/ARCHITECTURE.md a page of rules rather than mechanism, and keep it
+and the engineering pages that hold its mechanism in the present tense."""
 
 from pathlib import Path
 import re
@@ -47,6 +49,100 @@ PRIVATE_REFERENCE = re.compile(
     r"(?:/Users/[^/\s]+/|/home/[^/\s]+/|/private/tmp/|i/work/|merge-tools/|"
     r"\b(?:claude|codex)/[\w-]+|(?i:\bmain checkout\b))"
 )
+
+# docs/ARCHITECTURE.md gives each rule, its reason and a link; mechanism
+# (thresholds, helper functions, diagnostics, site examples, history) lives
+# in docs/engineering/ or in code comments. These ceilings hold it there:
+# the page and its largest section measured about 8,000 and 480 words when
+# they were set, so they leave room for a new rule but not for a mechanism.
+ARCHITECTURE_PAGE = "docs/ARCHITECTURE.md"
+ARCHITECTURE_PAGE_WORD_CEILING = 8500
+ARCHITECTURE_SECTION_WORD_CEILING = 550
+ARCHITECTURE_HEADING = re.compile(r"^#{1,6}\s")
+# The engineering pages that hold the mechanism ARCHITECTURE.md summarizes.
+# They get the domain and history checks below, not the word ceilings.
+ENGINEERING_RULE_PAGES = (
+    "docs/engineering/JS_RUNTIME.md",
+    "docs/engineering/SCRIPT_MEMORY.md",
+    "docs/engineering/STYLE_INVALIDATION.md",
+    "docs/engineering/PAGE_NAVIGATIONS.md",
+    "docs/engineering/UI_DURING_PAGE_WORK.md",
+)
+# A site's domain name. Standards bodies and the upstream source hosts of
+# vendored code may be linked as references, and a library whose name looks
+# like a domain (Socket.io, ASP.NET) may be named.
+ARCHITECTURE_DOMAIN = re.compile(
+    r"\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+"
+    r"(?:com|org|net|io|gov|edu|co|uk|de|jp|tv|me|app|dev|ai|info|news)\b",
+    re.IGNORECASE)
+ARCHITECTURE_DOMAIN_ALLOWED = re.compile(
+    r"(?:^|\.)(?:whatwg\.org|w3\.org|ietf\.org|rfc-editor\.org|"
+    r"tc39\.es|unicode\.org|"
+    r"github\.com|githubusercontent\.com|gitlab\.com|codeberg\.org|"
+    r"sourceforge\.net|bellard\.org)$|"
+    r"^(?:socket\.io|asp\.net)$", re.IGNORECASE)
+# Words that narrate change instead of describing the present system.
+# "Previously", "no longer", "any more" and "used to" are left out: each has
+# an ordinary present-tense use ("the previously healthy slot", "a permission
+# that is no longer granted", "the table is used to pick a slot").
+ARCHITECTURE_HISTORY = re.compile(
+    r"\b(?:now|nowadays|formerly|originally|as before|until recently)\b",
+    re.IGNORECASE)
+ARCHITECTURE_HINT = (
+    "docs/ARCHITECTURE.md states each rule, the reason for it and a link; "
+    "put mechanism detail (thresholds, helper functions, diagnostics, "
+    "examples, measurements) in an engineering page under docs/engineering/ "
+    "or in a code comment, and link to it from the rule.")
+ENGINEERING_RULE_HINT = (
+    "engineering pages describe the present system: name no site unless it "
+    "is needed, and put history (what changed, and when) in the commit "
+    "message rather than in the page.")
+
+
+def architecture_page_violations(text: str) -> list[str]:
+    """Word ceilings, site domains and history words in ARCHITECTURE.md."""
+    return page_rule_violations(text, word_ceilings=True)
+
+
+def engineering_page_violations(text: str) -> list[str]:
+    """Site domains and history words in an engineering rule page."""
+    return page_rule_violations(text, word_ceilings=False)
+
+
+def page_rule_violations(text: str, word_ceilings: bool) -> list[str]:
+    found = []
+    total = 0
+    sections = [["(opening)", 1, 0]]
+    fence = False
+    for number, line in enumerate(text.splitlines(), 1):
+        words = len(line.split())
+        total += words
+        if line.lstrip().startswith(("```", "~~~")):
+            fence = not fence
+        elif not fence and ARCHITECTURE_HEADING.match(line):
+            sections.append([line.lstrip("#").strip(), number, 0])
+            continue
+        sections[-1][2] += words
+        if fence:
+            continue
+        prose = re.sub(r"`[^`]*`", "", line)
+        for match in ARCHITECTURE_DOMAIN.finditer(prose):
+            if not ARCHITECTURE_DOMAIN_ALLOWED.search(match[0]):
+                found.append(f"line {number}: site domain name "
+                             f"'{match[0]}'")
+        for match in ARCHITECTURE_HISTORY.finditer(prose):
+            found.append(f"line {number}: history word '{match[0]}'")
+    if not word_ceilings:
+        return found
+    if total > ARCHITECTURE_PAGE_WORD_CEILING:
+        found.append(f"page has {total} words, ceiling "
+                     f"{ARCHITECTURE_PAGE_WORD_CEILING}")
+    for title, number, words in sections:
+        if words > ARCHITECTURE_SECTION_WORD_CEILING:
+            found.append(f"line {number}: section '{title}' has {words} "
+                         f"words, ceiling {ARCHITECTURE_SECTION_WORD_CEILING}")
+    return found
+
 
 
 def tracked_paths(root: Path) -> list[str]:
@@ -185,7 +281,34 @@ def main() -> int:
         for reference in ledger_references:
             print(f"  {reference}", file=sys.stderr)
         return 1
-    print("PASS: public tree contains no private investigation files or logs")
+    architecture = root / ARCHITECTURE_PAGE
+    if architecture.is_file():
+        violations = architecture_page_violations(
+            architecture.read_text(encoding="utf-8"))
+        if violations:
+            print(f"public-tree hygiene: {ARCHITECTURE_PAGE}:", file=sys.stderr)
+            for violation in violations:
+                print(f"  {violation}", file=sys.stderr)
+            print(ARCHITECTURE_HINT, file=sys.stderr)
+            return 1
+    engineering_failed = False
+    for name in ENGINEERING_RULE_PAGES:
+        page = root / name
+        if not page.is_file():
+            continue
+        violations = engineering_page_violations(
+            page.read_text(encoding="utf-8"))
+        if violations:
+            print(f"public-tree hygiene: {name}:", file=sys.stderr)
+            for violation in violations:
+                print(f"  {violation}", file=sys.stderr)
+            engineering_failed = True
+    if engineering_failed:
+        print(ENGINEERING_RULE_HINT, file=sys.stderr)
+        return 1
+    print("PASS: public tree contains no private investigation files or logs, "
+          "and ARCHITECTURE.md and its engineering pages stay within their "
+          "rules")
     return 0
 
 

@@ -23,10 +23,14 @@ bool layout_block_flexrow_section(LayoutContext *context,
     int declared_content_height = frame->declared_content_height;
     bool replaced_content = frame->replaced_content;
     bool flex_row = frame->flex_row;
-    bool reverse_row = frame->reverse_row;
     bool table_row = frame->table_row;
     bool css_table_row = frame->css_table_row;
     bool anonymous_cell_row = frame->anonymous_cell_row;
+    bool reverse_row = frame->reverse_row != computed_style_direction_rtl(style);
+    JustifyContent justify = style_align_content_in_axis(style->justify_content,
+                                                        frame->reverse_row);
+    if (justify == JUSTIFY_LEFT) justify = reverse_row ? JUSTIFY_END : JUSTIFY_START;
+    if (justify == JUSTIFY_RIGHT) justify = reverse_row ? JUSTIFY_START : JUSTIFY_END;
     size_t flex_children = 0;
     size_t css_table_auto_children = 0;
     size_t total_main_auto_margins = 0;
@@ -39,6 +43,8 @@ bool layout_block_flexrow_section(LayoutContext *context,
     int total_grow = 0;
     int anonymous_percentage_width = 0;
     long long total_shrink_weight = 0;
+    int total_shrink_factor = 0;
+    bool planned = false;
     FlexOrderPlan *row_order = &scratch->row_order;
     *row_order = (FlexOrderPlan) {0};
     /* A wrapping row sizes each line from that line's own items
@@ -53,6 +59,13 @@ bool layout_block_flexrow_section(LayoutContext *context,
         if (!flex_order_plan_build(row_order, context, node, style)) {
             return false;
         }
+        size_t count = row_order->item_count;
+        if (!style->flex_wrap && !table_row && !css_table_row
+            && !anonymous_cell_row && count && count <= FLEX_MAIN_LIMIT) {
+            row_order->main_items = budget_malloc_category(row_order->budget,
+                BUDGET_CATEGORY_LAYOUT, count * sizeof(*row_order->main_items));
+            planned = row_order->main_items != NULL;
+        }
         FlexItemIterator *iterator = &scratch->traversal.flex.iterator;
         FlatItem *item = &scratch->traversal.flex.item;
         flex_iterator_init(iterator, context, node, style, row_order);
@@ -66,9 +79,19 @@ bool layout_block_flexrow_section(LayoutContext *context,
             bool previous_intrinsic_pair_mode =
                 context->intrinsic_pair_mode;
             if (!table_row) context->intrinsic_pair_mode = true;
+            if (planned && flex_children <= count) {
+                flex_measure_row_main(context, item, &row_order->main_items[flex_children - 1u],
+                    content_width, child_containing_height,
+                    frame->definite_height
+                    && flex_item_alignment(style, &item->style) == ALIGN_STRETCH);
+                total_main_auto_margins += item->style.margin_left_auto
+                    + item->style.margin_right_auto;
+                context->intrinsic_pair_mode = previous_intrinsic_pair_mode;
+                continue;
+            }
             int child_basis = table_row ? 0
                               : flex_child_basis(context, item,
-                                                 content_width);
+                                                 content_width, child_containing_height);
             int child_minimum = table_row ? 0 : flex_child_row_minimum(
                 context, item, content_width, css_table_row);
             context->intrinsic_pair_mode = previous_intrinsic_pair_mode;
@@ -122,6 +145,8 @@ bool layout_block_flexrow_section(LayoutContext *context,
                        unequally when their text minima differed. */
                     total_shrink_weight += (long long) child_basis
                                            * item->style.flex_shrink;
+                    total_shrink_factor = layout_add_coordinate(
+                        total_shrink_factor, item->style.flex_shrink);
                 }
             }
         }
@@ -133,20 +158,30 @@ bool layout_block_flexrow_section(LayoutContext *context,
             : NULL;
         int gaps = table_row ? 0 : layout_clamp_coordinate(
             (int64_t) style->gap * (int64_t) (flex_children - 1u));
-        if (!table_row
+        planned = planned && flex_children <= row_order->item_count;
+        if (planned) {
+            total_basis = flex_resolve_main(row_order->main_items, flex_children,
+                layout_subtract_coordinate(content_width, gaps));
+            total_grow = 0;
+            total_shrink_weight = 0;
+        }
+        if (!planned && !table_row
             && layout_add_coordinate(total_hypothetical_basis, gaps)
                    > content_width) {
             /* A zero flex base can already be frozen at its content minimum.
                Reserve that space before distributing shrink to its siblings,
                even when the unclamped bases would fit the row. */
             total_basis = total_hypothetical_basis;
-        } else if (!table_row) {
+        } else if (!planned && !table_row) {
             /* A zero flex base with a content minimum (flex: 0 1 0%) does
                not grow, so its siblings share only what it leaves. */
             total_basis = total_grow_frozen_basis;
         }
         int remaining = layout_subtract_coordinate(
             layout_subtract_coordinate(content_width, total_basis), gaps);
+        const int shrink_remaining = total_shrink_factor < 512
+            ? tilefinch_mul_div_int(remaining, total_shrink_factor, 512)
+            : remaining;
         if (anonymous_cell_row && remaining > 0) {
             /* The anonymous table wrapper around an otherwise complete run
                of table-cell children shrink-wraps its row. The containing
@@ -155,6 +190,10 @@ bool layout_block_flexrow_section(LayoutContext *context,
             remaining = required_extra > 0 ? required_extra : 0;
         }
         int cursor_x = content_x;
+        /* Only baseline-aligned children with actual inline formatting need
+           this temporary side table. Keep retained box sizes unchanged. */
+        size_t baseline_limit = flex_children < 128u ? flex_children : 128u;
+        bool baseline_allocation_tried = false;
         if (table_tracks != NULL && table_tracks->border_collapse) {
             cursor_x = layout_add_coordinate(
                 cursor_x, table_tracks->collapsed_left_gutter);
@@ -167,27 +206,9 @@ bool layout_block_flexrow_section(LayoutContext *context,
         trace_flex_sizing(context, "container", node, NULL, NULL,
                           content_width, total_basis, remaining, cursor_x,
                           0, 0);
-        if (remaining > 0 && total_grow == 0
-            && total_main_auto_margins == 0) {
-            if (style->justify_content == JUSTIFY_CENTER) {
-                cursor_x = layout_add_coordinate(cursor_x, remaining / 2);
-            } else if (style->justify_content == JUSTIFY_END) {
-                cursor_x = layout_add_coordinate(cursor_x, remaining);
-            } else if (style->justify_content == JUSTIFY_SPACE_BETWEEN
-                       && flex_children > 1) {
-                flex_gap = layout_add_coordinate(
-                    flex_gap, remaining / (int) (flex_children - 1));
-            } else if (style->justify_content == JUSTIFY_SPACE_AROUND) {
-                int distributed = remaining / (int) flex_children;
-                cursor_x = layout_add_coordinate(
-                    cursor_x, distributed / 2);
-                flex_gap = layout_add_coordinate(flex_gap, distributed);
-            } else if (style->justify_content == JUSTIFY_SPACE_EVENLY) {
-                int distributed = remaining / ((int) flex_children + 1);
-                cursor_x = layout_add_coordinate(cursor_x, distributed);
-                flex_gap = layout_add_coordinate(flex_gap, distributed);
-            }
-        }
+        if (total_grow == 0 && total_main_auto_margins == 0)
+            cursor_x = layout_add_coordinate(cursor_x, layout_content_offset(
+                justify, remaining, (int) flex_children, &flex_gap));
         int cursor_y = line->y;
         if (table_row && table_tracks != NULL
             && !table_tracks->border_collapse) {
@@ -207,6 +228,7 @@ bool layout_block_flexrow_section(LayoutContext *context,
                                 ? remaining : 0;
         long long shrink_weight_seen = 0;
         bool first_flex_line = true;
+        size_t main_index = 0;
         FlexItemIterator *iterator = &scratch->traversal.flex.iterator;
         FlexItemIterator *item_start =
             &scratch->traversal.flex.saved_iterator;
@@ -231,7 +253,7 @@ bool layout_block_flexrow_section(LayoutContext *context,
                 FlexLineMetrics metrics = flex_line_metrics(
                     context, item_start,
                     &scratch->traversal.flex.lookahead_item,
-                    content_width, style->gap);
+                    content_width, child_containing_height, style->gap);
                 line_items_remaining = metrics.count;
                 int line_gaps = layout_clamp_coordinate(
                     (int64_t) style->gap
@@ -253,38 +275,9 @@ bool layout_block_flexrow_section(LayoutContext *context,
                 first_flex_line = false;
                 cursor_x = content_x;
                 flex_gap = style->gap;
-                if (line_remaining > 0 && line_total_grow == 0
-                    && line_auto_margins == 0) {
-                    if (style->justify_content == JUSTIFY_CENTER) {
-                        cursor_x = layout_add_coordinate(
-                            cursor_x, line_remaining / 2);
-                    } else if (style->justify_content == JUSTIFY_END) {
-                        cursor_x = layout_add_coordinate(
-                            cursor_x, line_remaining);
-                    } else if (style->justify_content
-                               == JUSTIFY_SPACE_BETWEEN
-                               && metrics.count > 1) {
-                        flex_gap = layout_add_coordinate(
-                            flex_gap,
-                            line_remaining / (int) (metrics.count - 1));
-                    } else if (style->justify_content
-                               == JUSTIFY_SPACE_AROUND) {
-                        int distributed = line_remaining
-                                          / (int) metrics.count;
-                        cursor_x = layout_add_coordinate(
-                            cursor_x, distributed / 2);
-                        flex_gap = layout_add_coordinate(
-                            flex_gap, distributed);
-                    } else if (style->justify_content
-                               == JUSTIFY_SPACE_EVENLY) {
-                        int distributed = line_remaining
-                                          / ((int) metrics.count + 1);
-                        cursor_x = layout_add_coordinate(
-                            cursor_x, distributed);
-                        flex_gap = layout_add_coordinate(
-                            flex_gap, distributed);
-                    }
-                }
+                if (line_total_grow == 0 && line_auto_margins == 0)
+                    cursor_x = layout_add_coordinate(cursor_x, layout_content_offset(
+                        justify, line_remaining, (int) metrics.count, &flex_gap));
             }
             bool auto_before = reverse_row
                                ? child_style->margin_right_auto
@@ -365,9 +358,11 @@ bool layout_block_flexrow_section(LayoutContext *context,
                 }
             } else if (table_row) {
                 child_width = content_width / (int) flex_children;
+            } else if (planned && main_index < flex_children) {
+                child_width = row_order->main_items[main_index++].result;
             } else {
                 child_width = flex_child_basis(context, item,
-                                                content_width);
+                                                content_width, child_containing_height);
             }
             if (css_table_row) {
                 int table_minimum = flex_child_row_minimum(
@@ -401,7 +396,7 @@ bool layout_block_flexrow_section(LayoutContext *context,
                     child_width,
                     tilefinch_mul_div_int(
                         available, child_style->flex_grow,
-                        available_grow));
+                        available_grow < 1000 ? 1000 : available_grow));
             } else if (remaining < 0 && !style->flex_wrap
                        && child_style->flex_shrink > 0
                        && total_shrink_weight > 0) {
@@ -416,17 +411,17 @@ bool layout_block_flexrow_section(LayoutContext *context,
                 long long child_weight = shrink_capacity == 0 ? 0
                     : (long long) child_basis * child_style->flex_shrink;
                 long long next_weight = shrink_weight_seen + child_weight;
-                int before = (int) ((long long) remaining
+                int before = (int) ((long long) shrink_remaining
                                     * shrink_weight_seen
                                     / total_shrink_weight);
-                int after = (int) ((long long) remaining * next_weight
+                int after = (int) ((long long) shrink_remaining * next_weight
                                    / total_shrink_weight);
                 child_width = layout_add_coordinate(
                     child_width, after - before);
                 if (child_width < child_minimum) child_width = child_minimum;
                 shrink_weight_seen = next_weight;
             }
-            int used_minimum = table_row ? 0 : flex_child_row_minimum(
+            int used_minimum = table_row || planned ? 0 : flex_child_row_minimum(
                 context, item, content_width, css_table_row);
             if (css_table_row && child_style->has_width
                 && !child_style->width_percent) {
@@ -505,6 +500,24 @@ bool layout_block_flexrow_section(LayoutContext *context,
                     context, item->node, &item->parent_style, cursor_x,
                     cursor_y, child_width, child_containing_height, true,
                     descendant_positioned_box, &child_bottom);
+                if (laid_out && context->completed_baseline_node == item->node
+                    && flex_item_alignment(style, child_style) == ALIGN_BASELINE
+                    && row_order->baseline_count < baseline_limit) {
+                    if (!baseline_allocation_tried) {
+                        baseline_allocation_tried = true;
+                        row_order->baselines = budget_malloc_category(row_order->budget,
+                            BUDGET_CATEGORY_LAYOUT, baseline_limit * sizeof(FlexBaseline));
+                    }
+                    if (row_order->baselines != NULL) {
+                        const LayoutNodeBox *box = layout_box_for_node(context->layout,
+                                                                      item->node);
+                        if (box != NULL) {
+                            row_order->baselines[row_order->baseline_count++] =
+                                (FlexBaseline){ item->node,
+                                    context->completed_first_baseline - box->y };
+                        }
+                    }
+                }
                 context->percentage_basis_node = saved_basis_node;
                 context->percentage_basis_width = saved_basis_width;
                 context->assigned_flex_node = saved_flex_node;
@@ -559,8 +572,8 @@ bool layout_block_flexrow_section(LayoutContext *context,
                 line_items_remaining--;
             }
         }
-        reverse_flex_row_items(context, node, style, row_order,
-                               content_x, content_width);
+        if (!table_row && !css_table_row && !anonymous_cell_row && reverse_row)
+            reverse_flex_row_items(context, node, style, row_order, content_x, content_width);
         int flex_flow_top = line->y;
         int stretch_free = 0;
         size_t stretch_lines = 0;

@@ -63,6 +63,22 @@ Lab tools with their own pages:
 - [SWDEC_DIAGNOSTICS.md](SWDEC_DIAGNOSTICS.md): software-decoder diagnostic
   switches and masks.
 
+## Page engine
+
+- [JS_RUNTIME.md](JS_RUNTIME.md): realms, workers and frames, the task
+  scheduler and page clock, page input events, platform object identity,
+  DOM handles, computed-style retention, and the engine's representations.
+- [SCRIPT_MEMORY.md](SCRIPT_MEMORY.md): script admission and the circuit
+  breaker, compiled-script reuse, lazy webpack bundles, and the
+  function-source store.
+- [STYLE_INVALIDATION.md](STYLE_INVALIDATION.md): the mutation journal,
+  invalidation scope, the retained style table, hidden-only changes,
+  container-query probes, retained focus paint, and stylesheet input.
+- [PAGE_NAVIGATIONS.md](PAGE_NAVIGATIONS.md): declarative refresh and the
+  history handling of script navigations.
+- [UI_DURING_PAGE_WORK.md](UI_DURING_PAGE_WORK.md): the owner-thread
+  cooperative scope and the loading-UI supervisor's presentation fence.
+
 ## Contracts
 
 - [STREAMING_NAVIGATION.md](STREAMING_NAVIGATION.md): bounded transport,

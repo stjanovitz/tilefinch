@@ -160,10 +160,10 @@ stored when the module compiles, because linking it rewrites the compiled
 record before any idle turn could serialize it.
 
 A lazily split webpack bundle (`js_lazy_webpack.c`; see
-[ARCHITECTURE.md](ARCHITECTURE.md#lazy-webpack-bundles)) has no bytecode in
-these tables; its factories compile when they first run. Every load of one
-plans the whole bundle (a lexer pass that finds the factories). A bundle
-record (`src/session_lazy_bundle.c`) keeps the plan of one exact byte
+[Lazy webpack bundles](engineering/SCRIPT_MEMORY.md#lazy-webpack-bundles)) has
+no bytecode in these tables; its factories compile when they first run. Every
+load of one plans the whole bundle (a lexer pass that finds the factories). A
+bundle record (`src/session_lazy_bundle.c`) keeps the plan of one exact byte
 sequence: the factory table (32 bytes plus 12 per factory). It says nothing
 about the factories' syntax, which is checked when each factory first
 compiles, on every load. A later load of the same bytes on the same site
@@ -221,8 +221,8 @@ for development and then takes precedence over the menu.
   with the same length, flags and source digest check, and kept nowhere. A
   pack that fails the check, or whose bytecode does not restore, is removed
   and the script compiles.
-- A page with more module bytecode than the module table holds (a news
-  article's dozens of modules) would otherwise keep only its first modules.
+- A page with more module bytecode than the module table holds (dozens of
+  modules) would otherwise keep only its first modules.
   While the tier may write, a module the table cannot take is serialized
   into a write queue instead, and an unwritten module record that another
   load evicts from the table moves to the queue rather than being lost. The
@@ -245,8 +245,9 @@ for development and then takes precedence over the menu.
   only.
 - The first idle turns of a session that writes sweep the directory in
   bounded slices (8 entries, 2 ms) and remove other builds' packs, stray
-  `.tmp` files, the retired per-module tier's `.tfmb` records and packs the
-  index does not name (a pack published just before a crash or power cut).
+  `.tmp` files, `.tfmb` per-module record files (a layout this tier never
+  reads) and packs the index does not name (a pack published just before a
+  crash or power cut).
 - Nothing is written during a captive sign-in or while **Cookies & storage**
   blocks site data, and no-store responses, `data:`/`blob:` scripts and
   opaque-origin documents never reach the tables it writes from.
@@ -275,6 +276,10 @@ script-heavy page revisited after a restart.
 kept per origin and allocated on the first write. By default everything is
 in RAM:
 
+- Same-origin documents in one tab share its `sessionStorage`, including
+  across navigation and tab hibernation. Other tabs have separate session
+  entries. Closing a tab retires them; `localStorage` and OPFS remain
+  shared by the origin.
 - Each origin starts with a 32 KiB allowance (keys and values both count).
   When a write would pass it, the allowance doubles in the background, up to
   512 KiB per site and 1 MiB across all sites, but only while at least 3 MiB
@@ -315,8 +320,12 @@ or deletes it when nothing is left, so cleared values do not stay readable on
 the card; **Clear local storage** reports failure when it cannot. A single
 `removeItem` only logs the removal: its old value stays in the log until the
 next compaction. sessionStorage records found in an always-kept log at load
-(written in an earlier session) are compacted away at once. A
-captive-portal session gets an empty RAM-only store of its own, and the
+(written in an earlier session) are compacted away at once. A log is
+version 1, which 0.1.52 reads, until it holds an empty key or a key with a
+NUL character; it is then marked version 2, which 0.1.52 leaves untouched
+instead of misreading. Every compaction writes the lowest version its live
+records need, so a `sessionStorage` key, dead after the next load, never
+keeps a site at version 2. A captive-portal session gets an empty RAM-only store of its own, and the
 **Save RAM storage at exit** snapshot never includes a site on the Memory
 Stick. That snapshot is off by default, so without a per-site choice nothing
 a page stores reaches the Memory Stick.
@@ -516,7 +525,7 @@ falls back to English. Painting never reads or writes these files.
 **Don't ask again** answers and the **Offer language packs** switch are one
 append-only `GLYPHASK` record (a pack bit mask, then 1 for Off) in
 `profile.cfg`, written only while something is declined or the switch is
-Off; older builds ignore it. The size question reads signed metadata into
+Off; a build that does not know the record skips it. The size question reads signed metadata into
 RAM only. Which sites were already offered is session memory
 and never persisted.
 
@@ -525,13 +534,15 @@ and never persisted.
 | Path | Writer | Size bound | Evicted by | Discipline |
 |---|---|---|---|---|
 | `library.bin` (+`.bak`) | `offline_library.c` | ≤ 32 KB | never (12-item index) | backup rotation; loader tries primary, `.tmp`, then `.bak` |
+| `library.bin.recovered` | `offline_library.c` | 9 bytes (`%08x\n`) | deleted by the load whose complete sweep finds no unlisted file at or below its ID | written before the index that relies on it, only after a damaged newer generation forced recovery from an older one (not when `.tmp` is loaded because the primary is missing); unlisted files of IDs up to the recorded one are kept and those IDs are not reused; orphans above it are swept; an unparsable marker triggers a rescan for the highest ID |
 | `<id>.article.html` (+`.bak`) | `offline_library.c` | ≤ 1 MB each | user delete; replaced when the same URL is saved again | backup rotation; length + FNV checksum verified on read |
 | `<id>.app.html`, `<id>.app.pack`, `<id>.app.icon` | `offline_library.c` | ≤ 1 MB markup + 1.5 MiB/32 same-origin responses + 1 MiB optional source-bound classic-script bytecode + 160 KiB pack metadata + 1 KiB icon | user delete or reinstall | each generation has a fresh id; lengths and FNV checksums gate restore, compiler-ABI mismatch falls back to retained source, and the index publishes before the prior generation is removed; while an app runs, a precompiled script's source is read back from `.app.pack` on demand and verified against a 64-bit FNV hash taken at launch; Library → Saved → Recompile (after an update changed the compiler) writes a complete new generation the same way and removes the old one only after the index names the new one |
 | `<id>.video.mp4`, `<id>.audio.mp4` | `offline_download.c` | ≤ 512 MB per stream | user delete | `.part` renamed into place after exact-length ranged download |
 | `<id>.video.part`, `<id>.audio.part` | `offline_download.c` | ≤ stream size | resumed, or reclaimed by the orphan sweep | append-only; size re-validated against the index on load |
+| `<id>.video.identity` | `offline_download.c` | 32 bytes | removed once the item is Ready; user delete; orphan sweep | SHA-256 of the encoded representation (provider object ID and revision, else the exact media URL); a resume appends only when it matches. A download without one (begun on 0.1.52) resumes when the index's lengths, itags and split flag match, and then gets one |
 | `<id>-<stored name>` | `file_download.c` | ≤ 512 MiB each | explicit Delete | published only after a completed, flushed HTTPS stream; the stored name is printable ASCII (below) |
 | `<id>.file.gone` | `offline_library.c` | one filename | removed when Delete finishes, or by the next load's sweep | written and flushed before the index drops the item |
-| `<id>.file.part`, `<id>.file.meta` (+`.tmp`) | `file_download.c` | ≤ 512 MiB body + bounded URL/validator | explicit Delete; orphan metadata/partials swept | matching If-Range and Content-Range required for append; no cookies/passwords |
+| `<id>.file.part`, `<id>.file.meta` (+`.tmp`) | `file_download.c` | ≤ 512 MiB body + bounded URL/validator | explicit Delete; orphan metadata/partials swept | matching If-Range and Content-Range and the same final URL (query ignored under a strong ETag) required for append; no cookies/passwords |
 | `PSP/GAME/.tilefinch-unpack-<id>/` | `zip_install.c` | ≤ 256 MiB, 512 entries | cancelled/failed attempt cleanup; manual USB cleanup after power loss | created exclusively after native Install confirmation; complete CRC-checked tree renamed once |
 | `PSP/GAME/<app>/` | `zip_install.c` | ≤ 256 MiB installed data, 64 managed installations | confirmed Installed homebrew removal or manual USB cleanup | no overwrite, automatic execution, firmware changes or plugin activation; source ZIP retained |
 | `PSP/GAME/<app>/.tilefinch-homebrew` | `zip_install.c` | 80 bytes, or 208 with a title | successful app removal | checked folder name/local ID, no URL or credentials; independent of the ZIP's library record; kept through interrupted removal |
@@ -564,17 +575,19 @@ name unique. The firmware reads a file name's other bytes as Shift-JIS: a
 PSP creates, opens and removes a file named in UTF-8 or Latin-1 by the same
 bytes, but lists it under a different, cut-short name (a UTF-8 Arabic
 `عربي.txt` lists as its first seven bytes, a Latin-1 `café.txt` as `caf`),
-so a folder listing, or a computer over USB, would not find it by its name. A printable-ASCII title, which is every title written before
-titles kept other characters, is its own stored name, so earlier downloads
-are found where they were saved. An index with a non-ASCII file title is
-written as version 7, which releases that read at most version 6 leave
-alone instead of looking for the file under its title.
+so a folder listing, or a computer over USB, would not find it by its name.
+Every title an earlier release wrote is printable ASCII, which is its own
+stored name, so those files are found where they were saved. An index with a
+non-ASCII file title is written as version 7; a release that reads at most
+version 6 leaves such an index alone instead of looking for the file under its
+title.
 
 A downloaded file is published under its stored name (`<id>-<stored name>`),
 which the sweep cannot tell from a file it does not own, so Delete first
 writes the name to `<id>.file.gone` and removes that note once the file is
 gone; the sweep finishes a note left by a power cut (a note without its
-closing newline is torn and only removed). Older versions ignore the note.
+closing newline is torn and only removed). A release that does not know the
+note ignores it.
 
 ### `data/screenshots/` — captures
 

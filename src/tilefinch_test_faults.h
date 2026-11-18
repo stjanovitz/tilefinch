@@ -12,6 +12,7 @@
  */
 #ifndef __PSP__
 #include <stdbool.h>
+#include <stddef.h>
 
 typedef struct {
     /* Host-only native audio allocation/publication refusal gates. */
@@ -29,6 +30,9 @@ typedef struct {
     unsigned wasm_task_checkpoints;
     /* Refuse the next WebAssembly memory alias buffer allocation once. */
     bool refuse_next_wasm_alias;
+    /* The most Budget bytes the WebAssembly interpreter has held at once.
+       Reset by the test. */
+    size_t wasm_runtime_bytes_peak;
     /* Refuse the next dedicated-worker realm creation once. */
     bool refuse_next_worker_realm;
     /* Backdate both halves of the Window performance origin by this many

@@ -1321,6 +1321,16 @@ static bool supports_positive_integer(const char *value, size_t length)
 /* @supports value checks for the sparse properties, one per validator
    named in STYLE_SPARSE_PROPERTIES. Each accepts exactly what the
    retained consumer of that property understands. */
+static bool sparse_supports_clip_path(
+    Stylesheet *sheet, const char *value, size_t length)
+{
+    (void) sheet;
+    return span_case_equal(value, length, "none")
+        || (length > 7 && value[length - 1] == ')'
+            && (strncasecmp(value, "inset(", 6) == 0
+                || strncasecmp(value, "circle(", 7) == 0));
+}
+
 static bool sparse_supports_user_select(
     Stylesheet *sheet, const char *value, size_t value_length)
 {
@@ -2104,8 +2114,10 @@ static bool supports_matches_depth(Stylesheet *sheet, const char *text,
     }
     int sparse = style_sparse_property_index(name, name_length);
     if (sparse >= 0) {
-        return supports_retained_layout_value(
-            sheet, (size_t) sparse, value, value_length);
+        /* A var() value is valid at parse time for any property. */
+        return supports_variable_syntax(value, value_length)
+            || supports_retained_layout_value(
+                sheet, (size_t) sparse, value, value_length);
     }
     if (supports_variable_syntax(value, value_length)) {
         return supports_implemented_property(sheet, name, name_length);

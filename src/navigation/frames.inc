@@ -1989,6 +1989,8 @@ static bool navigation_complete_frame_response(NavigationSession *session,
                 session->page.fetch_domain,
                 NULL, NULL, session->fonts,
                 &frame->script_result);
+            script_runtime_inherit_storage_scope(frame->runtime,
+                                                 frame->parent_runtime);
         }
 #if defined(TILEFINCH_FRAME_LITE)
         if (frame->runtime != NULL) {

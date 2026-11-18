@@ -8,11 +8,9 @@ installs or restarts without confirmation. Its optional background check only
 looks for signed release metadata while Wi-Fi is already connected; it never
 downloads the update package by itself.
 
-Stable also offers **Square → Previous versions** on this page. The bounded
-list is queried from GitHub only when this screen is opened, retained in RAM,
-and never written to the Memory Stick. Choosing a version only selects its
-fixed tagged metadata URL; the user must still check, download, install, and
-restart explicitly.
+Stable also offers **Square → Previous versions** on this page (see
+[Previous signed versions](#previous-signed-versions)); choosing one still
+needs an explicit check, download, install and restart.
 
 An update is installed into the inactive of two browser slots. The small
 launcher verifies the candidate before its first start, keeps the previous
@@ -21,29 +19,6 @@ reach its health checkpoint. Holding L during startup selects the previous
 version. The user's profile, bookmarks, downloads, and other shared data live
 outside both browser slots.
 
-### Startup compatibility
-
-Browser slots are ordinary `EBOOT.PBP` packages with the 64 MB memory-mode
-metadata and the protocol-1 file list, so older installed launchers receive
-the same signed updates without a separate legacy feed. The in-app updater
-never overwrites the root launcher: getting a newer launcher's startup
-improvements means copying the root `EBOOT.PBP` from a verified install
-archive once, preserving both slots and `data/`.
-
-A matching launcher can start the browser without a second firmware restart,
-from a build-paired `startup-<sha256>.prx` in a fresh install's slot A or from
-the derived `data/startup-module.prx` cache that it or the updater prepares
-from the selected slot. Neither file is a signature authority or an
-alternative update slot: they are trusted executable copies whose identity
-markers and reuse receipt prevent accidental mixing, not per-boot integrity
-checks. Missing, mismatched or refused copies, pre-held L, and recovery all
-use ordinary package startup; pre-held L and recovery also delete the copies,
-so a copy that loads but never starts the browser stops being used after one
-safe start. Signed installation, trial health, anti-rollback and per-file verification are unchanged. Deleting the copies is
-safe. Their size bounds, receipts and reclaim rules are in
-[Memory Stick storage](STORAGE.md#data--settings-and-session) and its
-[slots section](STORAGE.md#dataupdate-and-the-slots--signed-updates).
-
 Stable is the default channel. Stable and Beta accept only releases authorized
 by Tilefinch's embedded public key; the private signing key is never shipped to
 the PSP or stored in this repository. The Developer channel is a separate,
@@ -51,7 +26,7 @@ explicitly selected mode for testing a contributor's unsigned build from a URL
 entered on the device. It retains A/B installation and rollback, but it does
 not provide authenticity or a code sandbox.
 
-For contributors and release engineers, the implementation combines a fixed
+The implementation combines a fixed
 binary manifest, signed package size and SHA-256, per-file digests, a
 sequence-number anti-rollback floor, redundant state records, and a stable A/B
 launcher. The release preset embeds `trust/root-v1.tfur`; Stable and Beta chain
@@ -117,8 +92,9 @@ On Stable and Beta, an attacker who controls a network path, CDN response,
 GitHub account, or release asset must not be able to make the PSP execute an
 unsigned browser or choose a downgrade. A historical signed release is a
 separate explicit local choice. Developer is an explicit local exception,
-described below, that the same attacker cannot reach: it requires physical
-access to the Memory Stick and a deliberate selection in Settings. On every
+described below, that the same attacker cannot reach: it requires a URL
+entered on the PSP or written to its Memory Stick, and a deliberate selection
+in Settings. On every
 channel, interruption, cancellation, a full Memory Stick, or a bad new build
 must leave the previous browser launchable.
 
@@ -146,7 +122,7 @@ download it, and explicitly restart into it.
 The page begins with:
 
 ```text
-CURRENT       0.1.44 (46)
+CURRENT       1.2.2 (46)
 CHECK FOR UPDATE
 ```
 
@@ -156,7 +132,7 @@ that release tooling assigns separately from the version (see
 `CHECK FOR UPDATE` is activated. A valid newer release changes the page to:
 
 ```text
-AVAILABLE     0.1.45 (47)
+AVAILABLE     1.2.3 (47)
 DOWNLOAD      15.8 MB
 SIGNED NOTES  Safer, faster updates.
 DOWNLOAD UPDATE
@@ -176,9 +152,9 @@ failure must not be collapsed into “up to date.”
 ### Previous signed versions
 
 On Stable, Square queries GitHub's public Releases API and shows up to eight
-earlier stable releases which advertise Tilefinch's signed metadata asset.
-The bounded response and list live only in RAM for this explicit operation;
-no release catalog is persisted. X returns to the ordinary update page with
+earlier stable releases which advertise Tilefinch's signed metadata asset. The
+bounded response and list live only in RAM for this explicit operation; no
+release catalog is persisted. Cross returns to the ordinary update page with
 the chosen version named; checking it fetches
 `releases/download/v<version>/tilefinch-update-v1.tfum`. Old metadata must
 still be within its signed expiry window. An expired historical release is
@@ -194,12 +170,10 @@ the newer signed sequence again.
 Stable is the default and retains the fixed GitHub `latest` metadata URL.
 The **Update channel** row under **Settings → Advanced & experimental → Experimental** can opt into Beta, whose signed
 metadata lives at the distinct fixed `releases/download/beta/` endpoint.
-There is no automatic fallback between Stable and Beta: a failure remains a
-failure on the selected channel, and changing channels clears any in-memory
-offer before creating a new client.
+Changing channels clears any in-memory offer before creating a new client.
 
-Developer is a deliberately conspicuous third choice, and reaching it takes
-two separate local acts, both performed by whoever is holding the PSP:
+Developer is a deliberately conspicuous third choice, reached only through
+the two local acts in [Security guarantees](#security-guarantees):
 
 1. **A locally entered endpoint.** The **Developer URL** row under **Settings
    → Advanced & experimental → Experimental** accepts a bounded public
@@ -208,30 +182,25 @@ two separate local acts, both performed by whoever is holding the PSP:
    `data/boot-overrides.cfg`. It may alternatively be hand-edited off-device,
    over USB or by moving the card. Page content and remote responses cannot
    invoke the editor or supply the value.
-   `developer_package_url=` may separately name the TFUP package; when empty,
-   the package named by its manifest is resolved beside the metadata. The
-   optional separate package override remains a configuration-file setting.
-2. **An explicit UI selection.** With a usable URL present, the channel row
-   appears in the **Update channel** row and must be chosen.
-   Without a configured URL, Developer is skipped by the channel selector.
-
-Neither step has a remote trigger, and there is no state a server, page, or
-update payload can put the device into that produces one.
+   `developer_package_url=` may separately name the TFUP package; it is set
+   only in the configuration file. When it is empty, the package named by the
+   manifest is resolved beside the metadata.
+2. **An explicit UI selection.** With a usable URL present, Developer appears
+   in the **Update channel** row and must be chosen. Without one, the channel
+   selector skips it.
 
 `https://` is required, not merely preferred. This is the only channel whose
 payload carries no signature, so a cleartext endpoint would let anything on
 the network path substitute the package with nothing downstream able to
-notice; plain `http://` also bypassed the per-hop redirect validator, which is
-installed only for HTTPS requests. Both places that admit a developer URL --
-boot-configuration validation and update-client construction -- refuse a
-non-HTTPS one, and the resolved URL is re-checked after share-link rewriting.
+notice, and the per-hop redirect validator runs only for HTTPS requests.
+Both places that admit a developer URL -- boot-configuration validation and
+update-client construction -- refuse a non-HTTPS one, and the resolved URL is
+re-checked after share-link rewriting.
 
-An unusable value in either key is an ordinary mistake, not a fatal one.
-These are optional and worth only whether the channel is offered, so the
-in-app path validates before writing and boot clears any bad hand-edited
-value, logs one line, and continues. A bad metadata URL hides the channel; a
-bad package URL alone leaves the channel and falls back to same-directory
-package lookup. No other boot-configuration key changed posture.
+The in-app editor validates before writing, and boot clears a bad
+hand-edited value, logs one line, and continues. A bad metadata URL hides the
+channel; a bad package URL alone keeps the channel and falls back to
+same-directory package lookup.
 
 Developer is intentionally an **unsigned-code mode** for a user who chooses to
 test a contributor's build without asking a release-key holder to sign it.
@@ -257,13 +226,10 @@ This is crash safety, not authenticity or sandboxing. Whoever controls the
 configured Developer endpoint can supply arbitrary PSP code, read or alter
 shared browser data, and report itself healthy. A/B rollback protects against
 a build that crashes or never reaches the health checkpoint; it cannot make
-malicious native code safe. The two deliberate opt-ins are editing the local
-configuration file and selecting Developer in Settings.
+malicious native code safe.
 
-This provides a signed TestFlight-like path for public beta builds and a
-low-friction unsigned contributor path without weakening Stable/Beta trust.
-The one-time launcher/A/B install shape is required for every channel. Stable
-and Beta additionally require an embedded public root and offline signature;
+Every channel needs the one-time launcher and A/B installation. Stable and
+Beta additionally need an embedded public root and an offline signature;
 Developer works in a root-empty contributor build and never needs or reads a
 private key.
 
@@ -346,11 +312,35 @@ through the calls above, and device validation covers the supported CFW set.
 On a firmware that refuses that handoff, the safe fallback is a manual-copy
 update, not a weaker in-place installer.
 
+### Startup compatibility
+
+Browser slots are ordinary `EBOOT.PBP` packages with the 64 MB memory-mode
+metadata and the protocol-1 file list, so older installed launchers receive
+the same signed updates without a separate legacy feed. The in-app updater
+never overwrites the root launcher: getting a newer launcher's startup
+improvements means copying the root `EBOOT.PBP` from a verified install
+archive once, preserving both slots and `data/`.
+
+A matching launcher can start the browser without a second firmware restart,
+from a build-paired `startup-<sha256>.prx` in a fresh install's slot A or from
+the derived `data/startup-module.prx` cache that it or the updater prepares
+from the selected slot. Neither file is a signature authority or an update
+slot: identity markers and a reuse receipt keep the copies from being mixed
+up, but nothing verifies them on each boot. Missing, mismatched or refused
+copies use ordinary package startup. Pre-held L and the recovery screen always
+use it and also delete the copies, so a copy that loads but never starts the
+browser is not used again after one safe start. The copies bypass none of
+signed installation, trial health, anti-rollback or per-file verification, and
+deleting them is safe. Their size bounds, receipts and reclaim rules are in
+[Memory Stick storage](STORAGE.md#data--settings-and-session) and its [slots
+section](STORAGE.md#dataupdate-and-the-slots--signed-updates).
+
 ## Cryptographic trust
 
 P-256 ECDSA over SHA-256 is the smallest practical choice for this build. The
-PSP image already links the required mbed TLS 3.6.7 P-256, ECDSA verification,
-and streaming SHA-256 routines for HTTPS, so the updater does not need a
+PSP image already links the required Mbed TLS P-256, ECDSA verification, and
+streaming SHA-256 routines for HTTPS (the pinned version is in
+[PSP transport](engineering/PSP_TRANSPORT.md)), so the updater does not need a
 second cryptographic library.
 
 Trust follows a TUF-inspired split:
@@ -361,9 +351,8 @@ Trust follows a TUF-inspired split:
 
 The shipped root v1 uses a 1-of-1 root and a 1-of-1 release role (see
 [Root v1 provenance](#root-v1-provenance)). A compromise of the single release
-key can authorize a malicious release until a newer root revokes it. A 2-of-3
-root and release role is a future option that needs no change to the device
-verifier or the formats. No private key belongs in the repository, an EBOOT, a GitHub account, or a
+key can authorize a malicious release until a newer root revokes it. No
+private key belongs in the repository, an EBOOT, a GitHub account, or a
 GitHub Actions secret. CI may produce unsigned artifacts; offline release
 signing occurs only after their hashes are independently checked.
 
@@ -595,34 +584,27 @@ third, non-interchangeable authority: `TFGMv1` envelopes sign the
 `tilefinch:glyph-component-manifest:v1` domain and authorize only raw bounded
 `TFGFv1` packages (format 3). Fixed asset names identify Japanese, Simplified
 Chinese, Traditional Chinese, Korean, Cyrillic, Extended Latin, and color
-emoji, plus Arabic, Hebrew, Devanagari and Bengali-Assamese page-text packs. Each pack has its own monotonic
-sequence and component ID; the installer
+emoji, plus Arabic, Hebrew, Devanagari and Bengali-Assamese page-text packs.
+Each pack has its own monotonic sequence and component ID; the installer
 verifies the signed size and digest, parses the complete bounded index, writes
 `READY` last, and then promotes `candidate.tmp → active` while retaining one
 `previous` generation. An `UNINSTALLED` marker suppresses both generations
-after interrupted removal.
+after interrupted removal. Packs are built from redistributable Noto inputs
+and never read PSP firmware fonts.
 
-Embedded monochrome CJK/emoji fallback remains part of every browser slot and
-does not depend on these assets. With the default Embedded setting, boot does
-not probe or open optional component storage. When selected, only the chosen
-language pack and/or color-emoji pack is signature-verified and indexed at
-boot. Visible-text script hints can later attach up to two additional installed
-language packs, one signature/index probe per frame and never more than four
-packs total. This does not enumerate packs or read glyph payloads during page
-parsing. Payloads stay on the Memory Stick and enter RAM through bounded 16 KiB
-pump reads after a cache miss; measurement and rasterization themselves perform
-no file I/O, and the runtime path never writes. Optional packs are built from
-redistributable Noto inputs and do not read PSP firmware fonts.
+Every browser slot keeps its embedded monochrome CJK/emoji fallback, which
+does not depend on these packs. What boot and rendering read from installed
+packs (nothing at boot with the default Embedded setting; afterwards only
+bounded, verified reads of a pack a page needs; never a write) is in
+[Memory Stick storage](STORAGE.md#components--optional-signed-data).
 
-The in-page language-pack offer is not a second installer. Page content can
-only make a script count in the parser census; the pack, its label, its
-display size and its asset names all come from the compiled-in catalog, and
-nothing is fetched until the user presses X. That first press runs only
-the client's metadata check (same URL, `TFGMv1` signature and monotonic
-sequence) to show the verified package size; the package is requested only
-by a second X on that confirmation, which raises the same primary request
-as **Settings → Appearance → Language & emoji** and so the same free-space
-preflight and promotion described above.
+The [in-page language-pack offer](TEXT_BIDI.md#in-page-install-offer) is not a
+second installer. Page content can only make a script count in the parser
+census; the pack, its label, its size and its asset names come from the
+compiled-in catalog. The first Cross runs only the signed metadata check to
+show the verified size, and only a second Cross requests the package, through
+the same path, signature check, free-space preflight and promotion as
+**Settings → Appearance → Language & emoji**.
 
 `slot.tfum` is not a TFUP payload: putting the envelope inside the package
 whose hash its own manifest signs would be circular. After package and
@@ -685,10 +667,10 @@ https://github.com/stjanovitz/tilefinch/releases/download/{tag}/{asset}
 
 This closes a race in which “latest” changes between metadata and package
 requests. The package streams through 16 KiB callbacks into the inactive
-staging slot while SHA-256 advances. The browser may consume up to four ready
-callbacks per frame, but keeps the existing 2 ms pump budget. A response length
-is useful defense-in-depth, but only the signed exact size and digest authorize
-the package.
+staging slot while SHA-256 advances (per-frame pacing is under
+[Power-loss-safe A/B transaction](#power-loss-safe-ab-transaction)). A
+response length is useful defense-in-depth, but only the signed exact size and
+digest authorize the package.
 
 An interrupted download starts again from the beginning; saved hash state is
 never trusted.
@@ -742,8 +724,8 @@ with a nonzero byte count.
 Download delivery, fallback package verification, and extraction advance in
 16 KiB irreducible units. Download delivery and the dedicated install page may
 run up to four ready units in one frame, but each stops after a 2 ms advisory
-batch budget. This removes the one-callback-per-frame network ceiling without
-forcing four slow Memory Stick operations into one input gap. Validation
+batch budget, so the network is not held to one unit per frame and one input
+gap never has to absorb four slow Memory Stick operations. Validation
 records the number of install units and the longest unit on completion; the UI
 also reports progress during the fallback verification phase.
 
@@ -759,8 +741,8 @@ run.
 
 Some real firmware and Memory Stick driver combinations reject every device
 sync even though the checked writes and renames before it succeeded. Each
-updater sync follows completed work and is a durability hint
-(`tilefinch_memory_stick_sync`): a rejected sync never reports a committed
+updater sync follows completed work and is only a durability hint: a
+rejected sync never reports a committed
 journal state or a promoted slot as failed, and never sends the launcher to
 recovery over a journal that already says the trial started. Safety does not
 rest on the sync, because the dual-copy journal and the launcher's full slot
@@ -778,42 +760,44 @@ This keeps the vulnerable power-loss window modest without declaring health
 at process entry.
 
 If the next launcher run finds an unconfirmed trial, it returns to the previous
-slot but retains the already staged and verified candidate. Its recovery
-screen offers `TRY UPDATE AGAIN` (X) as well as `DISCARD UPDATE` (Square); an
-ordinary power-off during a healthy trial therefore does not force another
-large download. O, or the screen's ten-second timeout, starts the current
-version and asks once: the launcher writes `data/update-declined`, a copy of
-that `STARTED` journal record, and later boots whose journal is byte-identical
-to it start the active slot the ordinary way (with the faster-startup copy)
-instead of showing the screen again. The candidate stays staged. Settings →
-Updates → Version and update then says `UPDATE DID NOT FINISH STARTING` and
-offers the same two choices: X (`TRY AGAIN`) journals the trial as pending
-again, exactly as the screen's X does, and offers `RESTART TO UPDATE`; Square
-discards it. The page re-reads the journal first and acts only while it still
-holds that trial; it does not offer a check or download until one is chosen.
-The page shows the choice whenever the journal holds a started trial of a slot
-the browser is not running from, so it also resolves the screen of a launcher
-that predates the file and still shows it at every boot.
-
-The file never changes the journal, whose format and reserved bits stay as
-older launchers read them. Any later journal record (a retried trial's new
-`STARTED` record included) differs from the copy, so a leftover file never
-hides another trial's screen; the page removes it after its own journal write,
-and a cut before that removal leaves it unmatched. A cut while it is written
-(temporary file and rename inside `data/`, no device sync) leaves no file, the
-earlier one, or a torn one that does not match, and the next boot asks again.
-Nothing is written when the display could not show the screen.
-
-Holding L at startup chooses the previous known-good slot when there is one.
-A slot that an update has been staged into is no longer one: the installer
-drops that label before it replaces the slot, discarding or rejecting a trial
-drops it too, and the launcher ignores a previous slot that is also the
-pending slot (as journals from older builds can say). Without a known-good
-previous slot, L never starts a pending candidate: it starts the active slot,
-or shows the recovery screen after a trial that did not finish.
+slot but retains the already staged and verified candidate, so an ordinary
+power-off during a healthy trial does not force another large download. Its
+recovery screen offers X `TRY UPDATE AGAIN` and Square `DISCARD UPDATE`.
 Retry returns through the same verify-and-journal-started path as a first
 trial; it never directly executes a pending slot, so the browser can always
 record health against a `STARTED` trial.
+
+O, or the screen's ten-second timeout, starts the current version and asks
+only once:
+
+- The launcher writes `data/update-declined`, a copy of the `STARTED` journal
+  record. While the journal is byte-identical to that copy, boots start the
+  active slot the ordinary way (faster-startup copy included) and the
+  candidate stays staged. Nothing is written when the display could not show
+  the screen.
+- **Settings → Updates → Version and update** then shows
+  `UPDATE DID NOT FINISH STARTING` with the same two choices: X `TRY AGAIN`
+  journals the trial as pending again, exactly as the screen's X does, and
+  offers `RESTART TO UPDATE`; Square discards it. The page offers no check or
+  download until one is chosen, and it re-reads the journal first and acts
+  only while the journal still holds that trial. It shows the choice whenever
+  the journal holds a started trial of a slot the browser is not running
+  from, so it also resolves the screen of a launcher that predates the file.
+- The file never changes the journal, whose format and reserved bits stay as
+  older launchers read them. Every later journal record, a retried trial's
+  new `STARTED` record included, differs from the copy, so a leftover file
+  never hides another trial's screen. A cut while it is written leaves no
+  file, the earlier one, or a torn one that does not match, and the next boot
+  asks again. The file's write discipline is in
+  [Memory Stick storage](STORAGE.md#dataupdate-and-the-slots--signed-updates).
+
+Holding L at startup chooses the previous known-good slot when there is one.
+A slot that an update has been staged into is not one: the installer drops
+that label before it replaces the slot, discarding or rejecting a trial drops
+it too, and the launcher ignores a previous slot that is also the pending
+slot (as journals written by older builds can say). Without a known-good
+previous slot, L never starts a pending candidate: it starts the active slot,
+or shows the recovery screen after a trial that did not finish.
 
 Full manifest, root-chain, package, and per-file verification occurs when
 entering or retrying a pending trial. An ordinary boot of the active
@@ -824,9 +808,10 @@ the no-added-startup-work requirement.
 
 The previous slot is retained until a later update is staged into it. From
 then until that update's trial is confirmed healthy there is no previous
-version; the confirmation makes the formerly active slot the previous one. The root launcher
-does not update itself in-app. A launcher flaw, exhausted root threshold, both
-slots being lost, or an incompatible initial layout requires a manual reinstall.
+version; the confirmation makes the formerly active slot the previous one. The
+root launcher does not update itself in-app. A launcher flaw, exhausted root
+threshold, both slots being lost, or an incompatible initial layout requires a
+manual reinstall.
 
 The launcher remains deliberately independent of browser UI and layout code.
 It uses the same checked, next-frame, cache-coherent PSP display module as the
@@ -866,7 +851,7 @@ python3 tools/tilefinch_update_tool.py pack \
   --directory release-slot --output tilefinch-psp.tfup
 python3 tools/tilefinch_update_tool.py manifest \
   --package tilefinch-psp.tfup --root-version 1 --sequence 47 \
-  --expires 2000000000 --version 0.1.45 --tag v0.1.45 \
+  --expires 2000000000 --version 1.2.3 --tag v1.2.3 \
   --asset tilefinch-psp.tfup --decoder-abi 3 \
   --notes release-notes.txt \
   --output manifest.tfum-body
@@ -874,6 +859,11 @@ python3 tools/tilefinch_update_tool.py envelope \
   --manifest manifest.tfum-body --release-key /offline/release-key.pem \
   --output tilefinch-update-v1.tfum
 ```
+
+`--notes` names a file whose bytes become the signed notes, not literal
+text. The notes are at most 512 inert UTF-8 bytes: the tool rejects any byte
+below 0x20 and 0x7F, so a newline fails, and for a browser manifest the limit
+includes the `Decoder ABI N; rebuild if different. ` prefix the tool adds.
 
 For an unsigned contributor build, use the same bounded `pack` and `manifest`
 steps, then deliberately omit all key operations:
@@ -886,7 +876,7 @@ python3 tools/tilefinch_update_tool.py developer-envelope \
 Host that TFUM and its named TFUP in the same directory, enter the TFUM URL
 as the **Developer URL** under **Settings → Advanced & experimental →
 Experimental**, and select Developer. The
-same value can still be set as `developer_update_url=` by editing the file.
+same value can also be set as `developer_update_url=` by editing the file.
 Alternatively, share each file separately from OneDrive and set both links in
 the configuration file:
 
@@ -914,9 +904,6 @@ For a rotated root, supply each ordered `--root-update` artifact. Upload the
 TFUP and fixed-name TFUM assets to the same immutable public GitHub release
 whose signed tag and asset names appear in the manifest.
 
-Note `--notes` takes a file path (its bytes become the manifest notes), not
-literal text.
-
 ### Root v1 provenance
 
 Only the public `trust/root-v1.tfur` record is checked in; the private root and
@@ -933,18 +920,17 @@ root / 1-of-1 release configuration expiring 2030-01-01 UTC:
 This 1-of-1 configuration makes the one offline root key a single recovery
 dependency. Compromise requires a signed rotation while the release threshold
 can still be met; loss without an available threshold requires manual
-reinstallation. A future 2-of-3 root can improve operational resilience
-without changing the device verifier or package format.
+reinstallation. A future 2-of-3 root and release role can improve
+operational resilience without changing the device verifier or the formats.
 
 The ceremony is rehearsed end-to-end by
 `tilefinch-update-root-proof-tests` (tests/test_update_root_proof.c): an
 updater-enabled build verifies a real signed envelope against the embedded
-root, binds it to the exact packed TFUP bytes, and demonstrates wrong-key,
-tampered-byte, downgrade, equivocation, and expiry rejection plus the A/B
-trial walk. The test skips unless the build embeds a root and
+root, runs the rejections listed under [Validation gates](#validation-gates),
+and walks the A/B trial. The test skips unless the build embeds a root and
 `TILEFINCH_PROOF_ENVELOPE`, `TILEFINCH_PROOF_WRONG_ENVELOPE`, and
 `TILEFINCH_PROOF_PACKAGE` point at rehearsal artifacts; see
-docs/RELEASE_PROCESS.md for producing them.
+[Release process](RELEASE_PROCESS.md) for producing them.
 
 ## Validation gates
 

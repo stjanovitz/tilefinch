@@ -569,7 +569,9 @@ retry:
        compose through the carrier, which itself became one. */
     lxb_dom_node_t *carrier = bridge->nodes[slot];
     uint64_t before = document_style_generation();
-    if (!document_mark_shadow_carrier(carrier)) return JS_FALSE;
+    bool manual = argc > 2 && JS_ToBool(context, argv[2]) > 0;
+    if (!(manual ? document_mark_manual_shadow_carrier(bridge->document, carrier)
+                 : document_mark_shadow_carrier(carrier))) return JS_FALSE;
     lxb_dom_node_t *host = carrier->parent;
     if (host != NULL && host->type == LXB_DOM_NODE_TYPE_ELEMENT
         && js_rt_bridge_computed_style_drop_within(bridge, &host, 1))

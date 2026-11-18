@@ -46,14 +46,13 @@ typedef struct {
     char value[DOCUMENT_CONTROL_VALUE_LIMIT + 1u];
 } DocumentControlValueSnapshot;
 
-/* A compact rollback record for the authored checkedness latch. Native
+/* A compact rollback record for the live checkedness override. Native
    checkbox/radio defaults can touch up to the bounded group size, so this
    deliberately stays allocation-free and small enough for a fixed array. */
 typedef struct {
     bool valid;
     bool state_present;
-    bool default_known;
-    bool default_checked;
+    int8_t checked_state;
     lxb_dom_node_t *node;
 } DocumentControlCheckedSnapshot;
 
@@ -210,6 +209,10 @@ typedef struct {
        page): <noscript> holds ordinary elements and renders. Documents built
        any other way keep the scripting-aware rule that hides it. */
     bool noscript_rendered;
+    /* A script realm has been given this document, so its element geometry
+       can be read (getClientRects). Layouts of it record inline fragments
+       only then; script-free pages never pay for the table. */
+    bool script_realm_bound;
     /* Lazily populated, page-lifetime declaration cache. Keeping this on the
        retained document gives layout, image discovery, Reader and activation
        one immutable selection without rescanning large data scripts. */
@@ -866,22 +869,9 @@ lxb_dom_node_t *document_head_node(const PocDocument *document);
 const char *document_element_name(lxb_dom_node_t *node, size_t *length);
 /* Whether `node` is an element named exactly `wanted` (lower-case for HTML
    elements), or named `wanted` up to ASCII case. */
-static inline bool document_element_name_is(lxb_dom_node_t *node,
-                                            const char *wanted)
-{
-    size_t length = 0;
-    const char *name = document_element_name(node, &length);
-    return name != NULL && strlen(wanted) == length
-        && memcmp(name, wanted, length) == 0;
-}
-static inline bool document_element_name_is_ignoring_case(
-    lxb_dom_node_t *node, const char *wanted)
-{
-    size_t length = 0;
-    const char *name = document_element_name(node, &length);
-    return name != NULL && strlen(wanted) == length
-        && strncasecmp(name, wanted, length) == 0;
-}
+bool document_element_name_is(lxb_dom_node_t *node, const char *wanted);
+bool document_element_name_is_ignoring_case(lxb_dom_node_t *node,
+                                            const char *wanted);
 /* An attribute's value, or NULL when the element has no such attribute.
    A valueless attribute (<script crossorigin>) has the empty value "", as
    the DOM defines it: lexbor stores no value for one, and treating that as
@@ -911,6 +901,15 @@ void document_style_attribute_set_cssom_authorized(lxb_dom_node_t *node,
    slot does not render because it or a shadow ancestor is `hidden`) is
    also resolved display:none, so no path gives it a box. */
 bool document_mark_shadow_carrier(lxb_dom_node_t *node);
+/* Manual slot assignment (slot.assign()): nodes per call, slots with an
+   assignment per document, and assigned nodes per document. */
+#define DOCUMENT_MANUAL_SLOT_LIST_LIMIT 256u
+#define DOCUMENT_MANUAL_SLOT_LIMIT 128u
+#define DOCUMENT_MANUAL_SLOT_NODE_LIMIT 1024u
+bool document_mark_manual_shadow_carrier(PocDocument *document,
+                                         lxb_dom_node_t *node);
+bool document_shadow_assign_manually(PocDocument *document, lxb_dom_node_t *slot,
+                                     lxb_dom_node_t *const *nodes, size_t count);
 #if !defined(__PSP__)
 /* Children visited looking for carriers since the process started. */
 size_t document_test_shadow_scan_visits(void);
@@ -931,6 +930,7 @@ lxb_dom_node_t *document_shadow_carrier_containing(
     const lxb_dom_node_t *node);
 bool document_shadow_light_child_rendered(const lxb_dom_node_t *carrier,
                                           lxb_dom_node_t *child);
+bool document_manual_shadow_excludes(const lxb_dom_node_t *node);
 /* False for a host's light text child the flat tree leaves out. */
 bool document_shadow_text_rendered(lxb_dom_node_t *text);
 /* Flat-tree traversal (DOM 4.2.2.3 / CSS Scoping 2): a shadow host's
@@ -976,12 +976,12 @@ bool document_control_checked_restore(
 bool document_control_default_value(
     PocDocument *document, lxb_dom_node_t *node,
     const char **value, size_t *length);
-/* Retain the authored checked state before a script-free controller default
-   first mutates a checkbox/radio. The existing bounded control-state table
-   owns this bit; no engine-private data-* attribute leaks into page markup. */
-bool document_control_checked_default(
-    PocDocument *document, lxb_dom_node_t *node, bool authored_checked,
-    bool *default_checked);
+/* Checked state is -1 when it follows the authored attribute, otherwise
+   bit 0 is live checkedness and bit 1 is the dirty checkedness flag. */
+int document_control_checked_state(lxb_dom_node_t *node);
+bool document_control_checked(lxb_dom_node_t *node);
+bool document_control_checked_set(
+    PocDocument *document, lxb_dom_node_t *node, int checked_state);
 bool document_control_resize_set(PocDocument *document, lxb_dom_node_t *node,
                                  int width, int height);
 bool document_control_resize(lxb_dom_node_t *node,

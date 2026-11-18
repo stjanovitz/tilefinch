@@ -66,33 +66,38 @@ as 100). Every navigation resolves its stream and committed viewport at that
 zoom (`navigation_resolve_page_viewport()`), so the next page needs no second
 layout. `browser_engine_set_page_zoom()` changes only the stored value.
 
-`browser_engine_apply_presentation()` changes the open page in place. It runs
-the same presentation transaction as a text-size change: the user sheet, the
-stylesheet (media queries see the new width), the layout and the render shell
-are rebuilt together, and the scroll anchor is carried across through device
-pixels. The script runtime's viewport is updated, so `innerWidth` reads the
-new width, and VisualViewport geometry follows it synchronously. A successful
-viewport change queues coalesced Window and VisualViewport `resize` stages.
-Each finishes its native listener microtask checkpoints before the next
-stage, including `onresize` handlers; a rollback queues none. The diagnostic
-Mobile Safari identity keeps reporting a VisualViewport scale of 1.
-If any step is refused,
-typically for memory, the transaction rolls back the viewport, the zoom, the
-sheet and the layout together, and the page stays as it was. A zoom change
-that resolves to the page's current viewport with an unchanged sheet (a
-desktop page at most zoom-out steps) only stores the zoom; asking again for
-the zoom the page already has always relays out.
+`browser_engine_apply_presentation()` changes the open page in place with
+the same presentation transaction as a text-size change:
+
+- the user sheet, the stylesheet (media queries see the new width), the
+  layout and the render shell are rebuilt together, and the scroll anchor is
+  carried across through device pixels;
+- the script runtime's viewport is updated, so `innerWidth` and
+  VisualViewport geometry read the new width synchronously;
+- a successful viewport change queues coalesced Window and VisualViewport
+  `resize` stages, and each finishes its native listener microtask
+  checkpoints (including `onresize` handlers) before the next stage; a
+  rollback queues none;
+- if any step is refused, typically for memory, the transaction rolls back
+  the viewport, the zoom, the sheet and the layout together, and the page
+  stays as it was;
+- zoom-only changes keep every previously applied author sheet or refuse
+  the replacement;
+- a change that resolves to the page's current viewport with an unchanged
+  sheet (a desktop page at most zoom-out steps) only stores the zoom, while
+  asking again for the zoom the page already has always relays out.
+
+The diagnostic Mobile Safari identity keeps reporting a VisualViewport scale
+of 1.
 
 On the PSP, a Left/Right press on the row updates the shown value at once,
-and the page is relaid out when the choice has rested for 400 ms
-(`psp_app_page_zoom_settle()`), so stepping through several values costs one
-relayout. The apply uses the existing native-input cooperation scope, and a
-choice that returns to the current viewport does no rebuild. Zoom-only changes
-must retain all previously applied author sheets or refuse the replacement.
-The setting is saved only once a relayout
-succeeds; a refusal restores the previous value and shows **PAGE ZOOM
-UNAVAILABLE**. The profile stores it in its own `PAGEZOOM` record; a profile
-without one reads 100%.
+and the page is relaid out when the choice has rested for 400 ms, so stepping
+through several values costs one relayout. The apply runs inside the
+native-input cooperation scope, and a choice that returns to the current
+viewport does no rebuild. The setting is saved only once a relayout succeeds;
+a refusal restores the previous value and shows **PAGE ZOOM UNAVAILABLE**.
+The profile stores it in its own `PAGEZOOM` record; a profile without one
+reads 100%.
 
 Images chosen from `srcset` for a narrower layout keep that choice after
 zooming in until the page is loaded again.
@@ -107,14 +112,13 @@ the view is left.
 ## Tests
 
 `tests/test_page_zoom.c` covers the steps, the zoom rule for device-width,
-legacy, fixed-width and narrow pages, its composition with meta viewport
-declarations, and a zoomed page through the engine: hit testing, the focus
-rectangle, scrolling, page-down, the fixed layer, rollback when the render
-shell is refused, and the next navigation inheriting the zoom.
-It also covers synchronous script viewport reads, post-commit resize ordering
-and coalescing, rollback without events, retained external-sheet admission,
-cancellation and no-op zoom requests.
-Native delivery tests include long promise chains, handler attributes,
-captured event marking, one-shot listeners and script-dispatched scrolling.
-`tests/test_browser_profile.c` covers the `PAGEZOOM` record and
-`tests/test_psp_ui.c` the row's cycling and position.
+legacy, fixed-width and narrow pages, and its composition with meta viewport
+declarations. Through the engine it covers a zoomed page's hit testing,
+focus rectangle, scrolling, page-down and fixed layer; rollback when the
+render shell is refused; synchronous script viewport reads; post-commit
+resize ordering and coalescing, and no events after a rollback; retained
+external-sheet admission; cancellation; no-op zoom requests; and the next
+navigation inheriting the zoom. Native delivery tests cover long promise
+chains, handler attributes, captured event marking, one-shot listeners and
+script-dispatched scrolling. `tests/test_browser_profile.c` covers the
+`PAGEZOOM` record and `tests/test_psp_ui.c` the row's cycling and position.

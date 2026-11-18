@@ -192,12 +192,31 @@ static bool script_admit_known_working_set_with_reserve(
     return false;
 }
 
+/* Free Budget the working set and its reserve still lack: the larger of
+   the Budget's own shortfall and the heap's (each freed Budget byte raises
+   the reachable heap by at most one). */
+static size_t script_admission_shortfall(ScriptRuntime *runtime,
+                                         Budget *budget, size_t working_bytes,
+                                         size_t budget_reserve_bytes)
+{
+    size_t wanted = working_bytes > SIZE_MAX - budget_reserve_bytes
+        ? SIZE_MAX : working_bytes + budget_reserve_bytes;
+    size_t free_bytes = budget_remaining(budget);
+    size_t shortfall = wanted > free_bytes ? wanted - free_bytes : 0;
+    size_t reachable = script_runtime_heap_reachable(runtime, 0);
+    if (working_bytes > reachable && working_bytes - reachable > shortfall)
+        shortfall = working_bytes - reachable;
+    return shortfall;
+}
+
 /* Admits one compile unit (a whole script, or the largest factory or
    statement of a bundle the browser splits) of `unit_bytes` source when its
    planned compile working set (script_admission.h: the measured median,
    twice the source plus parser state) fits the heap the realm can reach,
    and the page Budget keeps the presentation reserve beside it. After one
-   collection, a refusal counts as memory pressure. A unit that needs more
+   collection, and then the releases heap growth would make
+   (script_runtime_reclaim_for_admission), a refusal counts as memory
+   pressure. A unit that needs more
    than planned is stopped by the heap limit and refused at compile time
    with the realm intact. A page realm's heap grows on demand
    (script_runtime_heap_reachable counts the growth it can still get). */
@@ -215,12 +234,40 @@ static bool script_admit_known_working_set(
     size_t reclaimed = script_collect_pressure_once(
         runtime, budget, peak, SCRIPT_PRESENTATION_RESERVE_BYTES, 0,
         metrics);
-    if (!budget_pressure_required(
-            budget, peak, SCRIPT_PRESENTATION_RESERVE_BYTES)
-        && !script_heap_pressure_required(runtime, peak, 0)) {
-        budget_record_pressure(
-            budget, BUDGET_PRESSURE_JAVASCRIPT, 0, reclaimed);
-        return true;
+    for (int pass = 0; pass < 2; pass++) {
+        bool budget_short = budget_pressure_required(
+            budget, peak, SCRIPT_PRESENTATION_RESERVE_BYTES);
+        if (!budget_short && !script_heap_pressure_required(runtime, peak, 0)) {
+            budget_record_pressure(
+                budget, BUDGET_PRESSURE_JAVASCRIPT, 0, reclaimed);
+            return true;
+        }
+        if (pass != 0) break;
+        /* Only a Budget shortfall may cost stored function text: dropping
+           classic text to pass the heap check would trade the page's
+           toString() for a charge on paper. Nothing is released when even
+           all of it could not admit the unit. */
+        size_t reclaimable =
+            script_runtime_admission_reclaimable(runtime, budget_short);
+        size_t free_after = budget_remaining(budget);
+        free_after = free_after > SIZE_MAX - reclaimable
+            ? SIZE_MAX : free_after + reclaimable;
+        size_t wanted = peak > SIZE_MAX - SCRIPT_PRESENTATION_RESERVE_BYTES
+            ? SIZE_MAX : peak + SCRIPT_PRESENTATION_RESERVE_BYTES;
+        if (free_after < wanted
+            || script_runtime_heap_reachable_after_release(
+                   runtime, reclaimable) < peak) break;
+        size_t released = script_runtime_reclaim_for_admission(
+            runtime,
+            script_admission_shortfall(
+                runtime, budget, peak, SCRIPT_PRESENTATION_RESERVE_BYTES),
+            budget_short);
+        if (released == 0) break;
+        reclaimed = reclaimed > SIZE_MAX - released
+            ? SIZE_MAX : reclaimed + released;
+        metrics->pressure_reclaimed_bytes =
+            metrics->pressure_reclaimed_bytes > SIZE_MAX - released
+                ? SIZE_MAX : metrics->pressure_reclaimed_bytes + released;
     }
     script_note_memory_skip(runtime, metrics);
     budget_record_pressure(

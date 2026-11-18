@@ -1184,9 +1184,10 @@ static char *make_module(const char *tag, size_t minimum, const char *imports,
     return module;
 }
 
-/* A module table this small holds about one of these modules, so most of a
-   load's records can only reach the card through the write queue. */
-#define SMALL_MODULE_TABLE (20u * KIB)
+/* A module table this small holds about one of these modules' records
+   (their text is in the function-source store, not the record), so most of
+   a load's records can only reach the card through the write queue. */
+#define SMALL_MODULE_TABLE (6u * KIB)
 
 static bool small_table_session(PageFixture *fixture, BrowserSession *session,
                                 const char *directory)

@@ -98,6 +98,52 @@ void layout_flow_scope_leave(LayoutFlowScope *scope)
 }
 #endif
 
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PROFILE_LAYOUT_FLOW)
+ComputedStyle layout_style_for_pseudo(
+    LayoutContext *context, lxb_dom_node_t *node, PseudoElement pseudo,
+    const ComputedStyle *parent)
+{
+    context->pseudo_resolutions++;
+    if (!style_pseudo_may_generate(context->sheet, pseudo)) {
+        context->pseudo_absence_hits++;
+        return (ComputedStyle) {0};
+    }
+    LAYOUT_FLOW_SCOPE(context, LAYOUT_FLOW_PSEUDO);
+    if (layout_reuse_pseudo_absent(context->reuse, context->sheet, node,
+                                   pseudo, parent)) {
+        context->pseudo_absence_hits++;
+        return (ComputedStyle) {0};
+    }
+    StyleRetainedMatches *previous_matches = style_retained_matches_attach(
+        context->sheet,
+        context->reuse != NULL && context->reuse->sheet == context->sheet
+            ? context->reuse->matches : NULL);
+    ((Stylesheet *) context->sheet)->variable_read_names = 0;
+    ComputedStyle result = style_for_layout_pseudo(context->sheet, node, pseudo, parent);
+    (void) style_retained_matches_attach(context->sheet, previous_matches);
+    layout_reuse_note_pseudo(context->reuse, context->sheet, node, pseudo,
+                             parent, &result);
+    context->pseudo_generated += result.generated_content;
+    return result;
+}
+#else
+ComputedStyle layout_style_for_pseudo(
+    LayoutContext *context, lxb_dom_node_t *node, PseudoElement pseudo,
+    const ComputedStyle *parent)
+{
+    if (!style_pseudo_may_generate(context->sheet, pseudo)
+        || layout_reuse_pseudo_absent(context->reuse, context->sheet, node,
+                                      pseudo, parent))
+        return (ComputedStyle) {0};
+    ((Stylesheet *) context->sheet)->variable_read_names = 0;
+    ComputedStyle result =
+        style_for_layout_pseudo(context->sheet, node, pseudo, parent);
+    layout_reuse_note_pseudo(context->reuse, context->sheet, node, pseudo,
+                             parent, &result);
+    return result;
+}
+#endif
+
 static void layout_read_trace_environment(LayoutDocument *layout)
 {
 #ifndef TILEFINCH_NO_TRACE
@@ -928,6 +974,263 @@ bool layout_run_bounds_grow(Budget *budget, LayoutRunBounds *bounds,
     return fresh;
 }
 
+/* Only transformed boxes need the extra geometry. Keep position deltas
+   so subsequent flow/baseline translations move both geometries. */
+struct LayoutUntransformedBox {
+    uint32_t key; /* node box index plus one */
+    int dx, dy;
+    int width, height, client_width, client_height;
+};
+
+static size_t inline_fragment_bucket(const lxb_dom_node_t *node)
+{
+    uintptr_t key = (uintptr_t) node;
+    return ((key >> 4) ^ (key >> 12)) & (INLINE_FRAGMENT_BUCKETS - 1u);
+}
+
+static const LayoutInlineFragment *inline_fragment_find(
+    const LayoutInlineFragments *table, const lxb_dom_node_t *node, uint16_t at)
+{
+    for (unsigned visited = 0; at != 0 && visited < INLINE_FRAGMENT_LIMIT;
+         visited++) {
+        const LayoutInlineFragment *fragment = &table->entries[at - 1u];
+        if (fragment->node == node) return fragment;
+        at = fragment->next;
+    }
+    return NULL;
+}
+
+const LayoutInlineFragment *layout_inline_fragment_first(
+    const LayoutDocument *layout, const lxb_dom_node_t *node)
+{
+    const LayoutInlineFragments *table = layout->inline_fragments;
+    return table == NULL ? NULL : inline_fragment_find(
+        table, node, table->heads[inline_fragment_bucket(node)]);
+}
+
+const LayoutInlineFragment *layout_inline_fragment_next(
+    const LayoutDocument *layout, const LayoutInlineFragment *fragment)
+{
+    return inline_fragment_find(layout->inline_fragments, fragment->node,
+                                fragment->next);
+}
+
+/* Unlinks every fragment of `node`: an element the full table cut short
+   then reports none, so geometry falls back instead of answering with the
+   union of its first lines. */
+static void inline_fragment_unlink(LayoutInlineFragments *table,
+                                   const lxb_dom_node_t *node)
+{
+    uint16_t *link = &table->heads[inline_fragment_bucket(node)];
+    for (unsigned visited = 0; *link != 0 && visited < INLINE_FRAGMENT_LIMIT;
+         visited++) {
+        LayoutInlineFragment *fragment = &table->entries[*link - 1u];
+        if (fragment->node == node) *link = fragment->next;
+        else link = &fragment->next;
+    }
+}
+
+bool layout_inline_fragments_complete(const LayoutDocument *layout)
+{
+    return layout != NULL && !layout->inline_fragments_disabled
+        && (layout->inline_fragments == NULL
+            || !layout->inline_fragments->truncated);
+}
+
+/* Fragments are recorded only for a document a script realm can read
+   (PocDocument.script_realm_bound); the table grows by doubling and is
+   trimmed when the layout finishes. */
+void layout_add_inline_fragment(LineState *line, lxb_dom_node_t *node,
+                                int x, int y, int width, int height)
+{
+    LayoutDocument *layout = line->layout;
+    LayoutInlineFragments *table = layout->inline_fragments;
+    if (layout->inline_fragments_disabled) return;
+    if (table != NULL && table->count == INLINE_FRAGMENT_LIMIT) {
+        /* Every element still open loses the fragments it already has. */
+        table->truncated = true;
+        inline_fragment_unlink(table, node);
+        return;
+    }
+    if (table == NULL || table->count == table->capacity) {
+        unsigned capacity = table == NULL ? 32u : table->capacity * 2u;
+        LayoutInlineFragments *grown = budget_realloc(layout->budget, table,
+            sizeof(*table) + capacity * sizeof(*table->entries));
+        if (grown == NULL) {
+            /* Partial chains would answer with too-small rects. */
+            budget_free(layout->budget, table);
+            layout->inline_fragments = NULL;
+            layout->inline_fragments_disabled = true;
+            return;
+        }
+        if (table == NULL) memset(grown, 0, sizeof(*grown));
+        grown->capacity = (uint16_t) capacity;
+        layout->inline_fragments = table = grown;
+    }
+    if (line->cssom_line == 0) {
+        line->cssom_line = ++table->line;
+    }
+    size_t bucket = inline_fragment_bucket(node);
+    layout_clamp_inline_fragment_commands(layout);
+    table->entries[table->count] = (LayoutInlineFragment) {
+        .node = node, .x = x, .y = y, .width = width, .height = height,
+        .command = (uint32_t) layout->count,
+        .next = table->heads[bucket], .line = line->cssom_line
+    };
+    table->heads[bucket] = ++table->count;
+}
+
+/* A fragment's command is where its element's commands ended when it was
+   sealed. Commands dropped after that (an RTL run coalesced into one) must
+   not leave it past the display list: entries stay in command order, which
+   the walks below stop on. */
+void layout_clamp_inline_fragment_commands(LayoutDocument *layout)
+{
+    LayoutInlineFragments *table = layout->inline_fragments;
+    for (size_t i = table == NULL ? 0 : table->count; i-- != 0;) {
+        LayoutInlineFragment *f = &table->entries[i];
+        if (f->command <= layout->count) break;
+        f->command = (uint32_t) layout->count;
+    }
+}
+
+void layout_trim_inline_fragments(LayoutDocument *layout)
+{
+    LayoutInlineFragments *table = layout->inline_fragments;
+    if (table == NULL || table->count == table->capacity) return;
+    LayoutInlineFragments *trimmed = budget_realloc(layout->budget, table,
+        sizeof(*table) + table->count * sizeof(*table->entries));
+    if (trimmed == NULL) return;
+    trimmed->capacity = trimmed->count;
+    layout->inline_fragments = trimmed;
+}
+
+void layout_align_inline_fragments(LineState *line, int offset,
+                                   bool mirror, int right)
+{
+    LayoutInlineFragments *table = line->layout->inline_fragments;
+    if (table == NULL || (offset == 0 && !mirror)) return;
+    for (size_t i = table->count; i-- != 0;) {
+        LayoutInlineFragment *f = &table->entries[i];
+        if (f->command < line->command_start) break;
+        if (f->line != line->cssom_line && f->command <= line->command_start)
+            continue;
+        if (mirror) f->x = line->start_x + right - f->x - f->width;
+        f->x += offset;
+    }
+}
+
+void layout_move_inline_fragments(LayoutDocument *layout,
+    const lxb_dom_node_t *source, size_t start, int dx, int dy)
+{
+    LayoutInlineFragments *table = layout->inline_fragments;
+    for (size_t i = table == NULL ? 0 : table->count; i-- != 0;) {
+        LayoutInlineFragment *f = &table->entries[i];
+        if (f->command < start) break;
+        if (source != NULL
+            && !layout_node_within(f->node, source)) continue;
+        f->x += dx;
+        f->y += dy;
+    }
+}
+
+void layout_move_node_inline_fragments(LayoutDocument *layout,
+    const lxb_dom_node_t *node, int dx, int dy)
+{
+    for (const LayoutInlineFragment *f = layout_inline_fragment_first(layout, node);
+         f != NULL; f = layout_inline_fragment_next(layout, f)) {
+        LayoutInlineFragment *moved = (LayoutInlineFragment *) f;
+        moved->x += dx;
+        moved->y += dy;
+    }
+}
+
+void layout_adjust_inline_fragment_commands(LayoutDocument *layout,
+                                             size_t at, size_t count)
+{
+    LayoutInlineFragments *table = layout->inline_fragments;
+    for (size_t i = table == NULL ? 0 : table->count; i-- != 0;) {
+        LayoutInlineFragment *f = &table->entries[i];
+        if (f->command > at) f->command += (uint32_t) count;
+        else break;
+    }
+}
+
+#define LAYOUT_UNTRANSFORMED_MAX_CAPACITY 4096u
+
+static LayoutUntransformedBox *untransformed_slot(
+    LayoutUntransformedBox *boxes, size_t capacity, uint32_t key)
+{
+    size_t at = (size_t) (key * UINT32_C(2654435761)) & (capacity - 1u);
+    /* At most half full, so there is always an empty probe slot. */
+    for (size_t probe = 0; probe < capacity; probe++) {
+        if (boxes[at].key == key || boxes[at].key == 0) return &boxes[at];
+        at = (at + 1u) & (capacity - 1u);
+    }
+    return NULL;
+}
+
+void layout_box_untransformed(const LayoutDocument *layout,
+                              const LayoutNodeBox *box, LayoutNodeBox *result)
+{
+    *result = *box;
+    if (layout->untransformed_capacity == 0) return;
+    uint32_t key = (uint32_t) (box - layout->node_boxes) + 1u;
+    const LayoutUntransformedBox *saved = untransformed_slot(
+        layout->untransformed_boxes, layout->untransformed_capacity, key);
+    if (saved == NULL || saved->key != key || saved->width < 0) return;
+    result->x += saved->dx;
+    result->y += saved->dy;
+    result->width = saved->width;
+    result->height = saved->height;
+    result->client_width = saved->client_width;
+    result->client_height = saved->client_height;
+}
+
+void layout_record_box_transform(LayoutDocument *layout, LayoutNodeBox *box,
+                                 int x, int y)
+{
+    uint32_t key = (uint32_t) (box - layout->node_boxes) + 1u;
+    size_t capacity = layout->untransformed_capacity;
+    LayoutUntransformedBox *slot = capacity == 0 ? NULL
+        : untransformed_slot(layout->untransformed_boxes, capacity, key);
+    if (slot == NULL || slot->key == 0) {
+        if (layout->untransformed_count >= capacity / 2u) {
+            if (layout->untransformed_disabled
+                || capacity >= LAYOUT_UNTRANSFORMED_MAX_CAPACITY) return;
+            size_t next = capacity == 0 ? 16u : capacity * 2u;
+            LayoutUntransformedBox *grown = budget_calloc(
+                layout->budget, next, sizeof(*grown));
+            if (grown == NULL) {
+                layout->untransformed_disabled = true;
+                return; /* Painting does not depend on CSSOM. */
+            }
+            for (size_t i = 0; i < capacity; i++) {
+                const LayoutUntransformedBox *old =
+                    &layout->untransformed_boxes[i];
+                if (old->key != 0)
+                    *untransformed_slot(grown, next, old->key) = *old;
+            }
+            budget_free(layout->budget, layout->untransformed_boxes);
+            layout->untransformed_boxes = grown;
+            layout->untransformed_capacity = next;
+            slot = untransformed_slot(grown, next, key);
+        }
+        if (slot == NULL) return;
+        layout->untransformed_count++;
+        slot->key = key;
+        slot->width = -1;
+    }
+    if (slot->width < 0) {
+        *slot = (LayoutUntransformedBox) {
+            .key = key, .width = box->width, .height = box->height,
+            .client_width = box->client_width, .client_height = box->client_height
+        };
+    }
+    slot->dx += box->x - x;
+    slot->dy += box->y - y;
+}
+
 bool add_node_box(LayoutDocument *layout, lxb_dom_node_t *node,
                          int x, int y, int width, int height,
                          int client_width, int client_height,
@@ -979,6 +1282,12 @@ bool add_node_box(LayoutDocument *layout, lxb_dom_node_t *node,
     size_t existing = layout_node_box_index(layout, node);
     if (existing != SIZE_MAX) {
         size_t i = existing;
+        if (layout->untransformed_capacity != 0) {
+            LayoutUntransformedBox *saved = untransformed_slot(
+                layout->untransformed_boxes, layout->untransformed_capacity,
+                (uint32_t) i + 1u);
+            if (saved != NULL && saved->key != 0) saved->width = -1;
+        }
         if (layout->retain_container_padding
             && layout->node_container_padding_sums != NULL
             && i < layout->node_container_padding_capacity) {
@@ -1537,6 +1846,7 @@ static bool layout_job_init(LayoutBuildJob *job)
     context->container_live = job->container_log;
     memset(layout, 0, sizeof(*layout));
     layout->retain_container_padding = job->retain_container_padding;
+    layout->inline_fragments_disabled = !job->document->script_realm_bound;
     layout->image_content_generation = job->document->content_generation;
     layout->image_style_generation = document_style_generation();
     layout->image_sheet_generation = job->stylesheet->build_generation;
@@ -1696,6 +2006,7 @@ static bool layout_job_flow(LayoutBuildJob *job)
     LayoutContext *context = job->context;
     PositionedBox initial_positioned_box = {
         .node = NULL, .x = 0, .y = 0,
+        .direction_rtl = computed_style_direction_rtl(&job->html_style),
         .width = job->viewport_width,
         .height = job->html_height > 0 ? job->html_height : job->viewport_height,
         .fixed_node = NULL, .fixed_x = 0, .fixed_y = 0,
@@ -2106,6 +2417,7 @@ LayoutBuildStatus layout_build_job_pump(LayoutBuildJob *job)
         job->preview_truncated = job->context->preview_truncated;
         job->layout.preview_through = NULL;
         layout_size_background_visuals(&job->layout);
+        layout_trim_inline_fragments(&job->layout);
         tilefinch_platform_trace_step("finish-trace");
         layout_job_trace_finished(job);
         job->layout.performance.finalize_us =
@@ -2820,14 +3132,20 @@ bool layout_clone_visual(LayoutDocument *visual,
         StickyRange *range = &visual->sticky_ranges[i];
         range->origin_y = viewport_scale_floor(
             range->origin_y, numerator, denominator);
-        range->top = viewport_scale_floor(
-            range->top, numerator, denominator);
+        if (range->top != INT_MAX)
+            range->top = viewport_scale_floor(range->top, numerator, denominator);
+        if (range->bottom_inset != INT_MAX)
+            range->bottom_inset = viewport_scale_floor(
+                range->bottom_inset, numerator, denominator);
         range->bottom_y = viewport_scale_floor(
             range->bottom_y, numerator, denominator);
         if (range->maximum_offset != INT_MAX) {
             range->maximum_offset = viewport_scale_floor(
                 range->maximum_offset, numerator, denominator);
         }
+        if (range->minimum_offset != INT_MIN)
+            range->minimum_offset = viewport_scale_floor(
+                range->minimum_offset, numerator, denominator);
     }
     for (size_t i = 0; i < visual->fixed_count; i++) {
         FixedRange *range = &visual->fixed_ranges[i];
@@ -2958,6 +3276,8 @@ void layout_destroy(LayoutDocument *layout)
         budget_free(layout->budget, layout->sticky_ranges);
         budget_free(layout->budget, layout->fixed_ranges);
         budget_free(layout->budget, layout->node_boxes);
+        budget_free(layout->budget, layout->untransformed_boxes);
+        budget_free(layout->budget, layout->inline_fragments);
         budget_free(layout->budget, layout->node_box_command_bounds.bounds);
         budget_free(layout->budget, layout->link_command_bounds.bounds);
         budget_free(layout->budget, layout->grid_columns);
@@ -3904,7 +4224,9 @@ bool layout_scroll_node(LayoutDocument *layout, lxb_dom_node_t *node,
         int maximum_y = box->content_height - box->client_height;
         if (!box->clips_x || box->clip_only_x || maximum_x < 0) maximum_x = 0;
         if (!box->clips_y || box->clip_only_y || maximum_y < 0) maximum_y = 0;
-        if (scroll_x < 0) scroll_x = 0;
+        int minimum_x = box->scroll_rtl ? -maximum_x : 0;
+        if (box->scroll_rtl) maximum_x = 0;
+        if (scroll_x < minimum_x) scroll_x = minimum_x;
         if (scroll_y < 0) scroll_y = 0;
         if (scroll_x > maximum_x) scroll_x = maximum_x;
         if (scroll_y > maximum_y) scroll_y = maximum_y;

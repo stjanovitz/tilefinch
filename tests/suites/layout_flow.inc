@@ -529,6 +529,46 @@ static int test_scroll_scene_coordinate_containment(Budget *budget)
     CHECK(budget->current == 0);
     return 0;
 }
+static int test_nested_sticky_scrollport_pixels(Budget *budget)
+{
+    static const char page[] =
+        "<!doctype html><style>body{margin:0}.before{height:20px}"
+        "#port{width:200px;height:100px;overflow:auto;background:white}"
+        "section{height:500px}.top,.bottom{display:block;position:sticky;height:20px}"
+        ".top{top:0;background:#ff0000}.bottom{bottom:0;background:#0000ff}</style>"
+        "<div class=before></div><div id=port><section><div style='height:50px'></div>"
+        "<div class=top></div><div style='height:360px'></div>"
+        "<div class=bottom></div></section></div>";
+    PocDocument doc = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    TileCache cache = {0};
+    CHECK(document_parse(&doc, budget, page, sizeof(page) - 1u, 32)
+          && stylesheet_build(&sheet, budget, &doc, 480)
+          && layout_build(&layout, budget, &doc, &sheet, NULL, NULL, 480));
+    uint16_t *pixels = budget_malloc(budget, 480u * 272u * sizeof(*pixels));
+    lxb_dom_node_t *port = find_id(lxb_dom_interface_node(doc.html), "port");
+    CHECK(pixels != NULL && port != NULL && layout.sticky_count == 2
+          && tile_cache_init(&cache, budget, &layout, 4)
+          && tile_cache_set_frame(&cache, pixels, 480u * 272u)
+          && tile_cache_render_frame(&cache, 0, 480, 272, NULL)
+          && pixels[75u * 480u + 10u] == test_rgb565(0xff0000)
+          && pixels[105u * 480u + 10u] == test_rgb565(0x0000ff)
+          && layout_scroll_node(&layout, port, 0, 100)
+          && tile_cache_render_frame(&cache, 0, 480, 272, NULL)
+          && pixels[25u * 480u + 10u] == test_rgb565(0xff0000)
+          && pixels[105u * 480u + 10u] == test_rgb565(0x0000ff)
+          && pixels[15u * 480u + 10u] != test_rgb565(0xff0000)
+          && pixels[125u * 480u + 10u] != test_rgb565(0x0000ff));
+    tile_cache_destroy(&cache);
+    budget_free(budget, pixels);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&doc);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
 /* A stuck sticky bar with no background of its own must not show its own
    static-position copy scrolling beneath it. xe.com's sticky header (whose
    gradient does not paint) showed a second "Currency converter" link once

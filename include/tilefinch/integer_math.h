@@ -23,20 +23,21 @@ static inline uint32_t tilefinch_isqrt_u32(uint32_t value)
     return root;
 }
 
+/* The 64-bit quotient, saturated to int; out of line because it expands to
+   a soft 64-bit division on the PSP. Requires denominator > 0. */
+int tilefinch_mul_div_int_wide(int value, int multiplier, int denominator);
+
 static inline int tilefinch_mul_div_int(int value, int multiplier,
                                         int denominator)
 {
     if (denominator <= 0) return 0;
-    int product = 0;
 #if defined(__GNUC__) || defined(__clang__)
+    int product = 0;
     if (!__builtin_mul_overflow(value, multiplier, &product)) {
         return product / denominator;
     }
 #endif
-    int64_t wide = (int64_t) value * multiplier / denominator;
-    if (wide > INT_MAX) return INT_MAX;
-    if (wide < INT_MIN) return INT_MIN;
-    return (int) wide;
+    return tilefinch_mul_div_int_wide(value, multiplier, denominator);
 }
 
 static inline int tilefinch_mul_div_floor_int(int value, int multiplier,

@@ -29,6 +29,13 @@
  * position in the frame. Every call site both asks for admission and records
  * the slice it then consumed; out-of-order admissions and slices recorded
  * without an admission are counted, and the counts are published at exit.
+ * Site-data restoration also runs at two sites outside the table, where it
+ * cannot wait for an admitted frame: the navigation gate
+ * (psp_site_data_restore_gate_navigation holds a navigation until the
+ * localStorage phase is done, and cancels an unfinished cache phase), and
+ * exit cleanup, which finishes it within a bounded number of pumps and
+ * otherwise keeps the saved snapshot, so an immediate exit cannot replace an
+ * unread snapshot with an empty live cache.
  */
 typedef enum {
     FRAME_PUMP_PRECONNECT = 0,

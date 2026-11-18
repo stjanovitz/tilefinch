@@ -41,7 +41,8 @@
  * the index (keys and offsets) is resident for a stick site.
  */
 
-#define STICK_VERSION 1u
+#define STICK_VERSION_LEGACY 1u
+#define STICK_VERSION 2u
 #define STICK_HEADER_FIXED 8u
 #define STICK_RECORD_HEADER 24u
 #define STICK_OPEN_FILES 4u
@@ -75,9 +76,21 @@ typedef struct {
     uint32_t value_checksum;
     int64_t modified_ms;
     uint64_t generation;
+    uint32_t scope;
     uint8_t site;
     uint8_t kind;
 } SiteItem;
+
+#define OPFS_LEASE_LIMIT 16u
+struct BrowserOpfsLease {
+    struct BrowserOpfsLease *next;
+    const void *owner;
+    uint64_t token;
+    uint64_t generation;
+    size_t path_at;
+    bool shared;
+    char names[]; /* canonical origin NUL, then path NUL */
+};
 
 typedef struct {
     char origin[BROWSER_ORIGIN_LIMIT];
@@ -90,6 +103,7 @@ typedef struct {
     size_t dead_bytes;
     uint64_t file_stamp;
     FILE *file;
+    uint8_t disk_version;
     bool used;
     bool loaded;            /* stick tier: the index is resident */
     bool offer_pending;     /* requested and not yet answered */
@@ -332,17 +346,24 @@ static bool items_reserve(BrowserSession *session,
     return true;
 }
 
-static int item_find(const struct BrowserSiteStore *store, size_t site,
-                     uint8_t kind, const char *key)
+static int item_find_bytes(const struct BrowserSiteStore *store, size_t site,
+                           uint8_t kind, uint32_t scope, const char *key,
+                           size_t length)
 {
-    size_t length = strlen(key);
     for (size_t i = 0; i < store->item_count; i++) {
         const SiteItem *item = &store->items[i];
         if (item->site == site && same_class(item->kind, kind)
+            && item->scope == scope
             && item->key_length == length
             && memcmp(item->key, key, length) == 0) return (int) i;
     }
     return -1;
+}
+
+static int item_find(const struct BrowserSiteStore *store, size_t site,
+                     uint8_t kind, const char *key)
+{
+    return item_find_bytes(store, site, kind, 0, key, strlen(key));
 }
 
 /* Drops the item from the index; the caller has logged any removal. */
@@ -439,12 +460,12 @@ static bool stick_mark_session_files(struct BrowserSiteStore *store)
     return true;
 }
 
-static bool stick_write_header(FILE *file, const char *origin,
+static bool stick_write_header(FILE *file, const char *origin, uint8_t version,
                                size_t *written)
 {
     size_t length = strlen(origin);
     unsigned char header[STICK_HEADER_FIXED] = {'T', 'F', 'S', 'S'};
-    header[4] = STICK_VERSION;
+    header[4] = version;
     put_u16(header + 6, (uint16_t) length);
     if (fwrite(header, 1, sizeof(header), file) != sizeof(header)
         || fwrite(origin, 1, length, file) != length) return false;
@@ -481,7 +502,7 @@ static bool stick_create(struct BrowserSiteStore *store, size_t index)
     FILE *file = fopen(path, "w+b");
     if (file == NULL) return false;
     size_t written = 0;
-    if (!stick_write_header(file, site->origin, &written)
+    if (!stick_write_header(file, site->origin, STICK_VERSION_LEGACY, &written)
         || fflush(file) != 0) {
         fclose(file);
         remove(path);
@@ -489,6 +510,7 @@ static bool stick_create(struct BrowserSiteStore *store, size_t index)
     }
     site->file = file;
     site->file_bytes = written;
+    site->disk_version = STICK_VERSION_LEGACY;
     site->dead_bytes = 0;
     site->file_stamp = ++store->file_clock;
     return true;
@@ -527,6 +549,18 @@ static bool stick_append(struct BrowserSiteStore *store, size_t index,
     FILE *file = stick_handle(store, index);
     if (file == NULL || key_length > UINT16_MAX
         || value_length > UINT32_MAX) return false;
+    /* Old readers would truncate an empty key or alias an embedded NUL
+       during replay. Mark the log first, so they leave it untouched. The
+       record layout is unchanged and legacy records still read verbatim. */
+    if (site->disk_version < STICK_VERSION
+        && (key_length == 0 || memchr(key, '\0', key_length) != NULL)) {
+        if (fseek(file, 4, SEEK_SET) != 0
+            || fputc(STICK_VERSION, file) == EOF || fflush(file) != 0) {
+            clearerr(file);
+            return false;
+        }
+        site->disk_version = STICK_VERSION;
+    }
     unsigned char header[STICK_RECORD_HEADER];
     uint32_t checksum = fnv32(UINT32_C(2166136261), value, value_length);
     header[0] = kind;
@@ -622,10 +656,22 @@ static bool stick_compact(BrowserSession *session,
                                 site->item_count * sizeof(*offsets));
         if (offsets == NULL) return false;
     }
+    /* Version 2 only marks keys 0.1.52 cannot read. sessionStorage
+       records are dead after a reload, so a rewrite that leaves only
+       readable keys goes back to version 1 rather than locking 0.1.52
+       out of the site for good. */
+    uint8_t version = STICK_VERSION_LEGACY;
+    for (size_t i = 0; i < store->item_count; i++) {
+        const SiteItem *item = &store->items[i];
+        if (item->site == index
+            && (item->key_length == 0
+                || memchr(item->key, '\0', item->key_length) != NULL))
+            version = STICK_VERSION;
+    }
     FILE *output = fopen(temporary, "w+b");
     size_t written = 0;
     bool ok = output != NULL
-        && stick_write_header(output, site->origin, &written);
+        && stick_write_header(output, site->origin, version, &written);
     unsigned char chunk[1024];
     size_t ordinal = 0;
     for (size_t i = 0; ok && i < store->item_count; i++) {
@@ -671,6 +717,7 @@ static bool stick_compact(BrowserSession *session,
     budget_free(session->budget, offsets);
     site->file_bytes = written;
     site->dead_bytes = 0;
+    site->disk_version = version;
     return true;
 }
 
@@ -686,7 +733,7 @@ static void stick_drop_site_items(BrowserSession *session,
    position after the header. */
 static StickLogState stick_open_log(const char *name, const char *site_origin,
                                     FILE **opened, long *end,
-                                    size_t *origin_length)
+                                    size_t *origin_length, uint8_t *version)
 {
     *opened = NULL;
     FILE *file = fopen(name, "r+b");
@@ -703,7 +750,7 @@ static StickLogState stick_open_log(const char *name, const char *site_origin,
         fclose(file);
         return STICK_LOG_NEWER;
     }
-    bool valid = tagged && header[4] == STICK_VERSION
+    bool valid = tagged && header[4] >= STICK_VERSION_LEGACY
         && (*origin_length = get_u16(header + 6)) < sizeof(origin)
         && fread(origin, 1, *origin_length, file) == *origin_length;
     if (valid) {
@@ -718,6 +765,7 @@ static StickLogState stick_open_log(const char *name, const char *site_origin,
         return STICK_LOG_INVALID;
     }
     *opened = file;
+    if (version != NULL) *version = header[4];
     return STICK_LOG_VALID;
 }
 
@@ -736,7 +784,7 @@ static StickLogState stick_name_state(const SiteRecord *site,
     long end = -1;
     size_t origin_length = 0;
     StickLogState state = stick_open_log(name, site->origin, &file, &end,
-                                         &origin_length);
+                                         &origin_length, NULL);
     if (file != NULL) fclose(file);
     return state;
 }
@@ -757,7 +805,8 @@ static bool stick_log_intact(const char *name, const char *site_origin)
     FILE *file = NULL;
     long end = -1;
     size_t origin_length = 0;
-    if (stick_open_log(name, site_origin, &file, &end, &origin_length)
+    uint8_t version = 0;
+    if (stick_open_log(name, site_origin, &file, &end, &origin_length, &version)
         != STICK_LOG_VALID) return false;
     size_t offset = STICK_HEADER_FIXED + origin_length;
     char key[BROWSER_OPFS_PATH_LIMIT];
@@ -769,14 +818,15 @@ static bool stick_log_intact(const char *name, const char *site_origin)
         intact = fread(record, 1, sizeof(record), file) == sizeof(record)
             && record[0] >= ITEM_LOCAL && record[0] <= ITEM_OPFS_DIRECTORY
             && (record[1] == RECORD_SET || record[1] == RECORD_REMOVE)
-            && (key_length = get_u16(record + 2)) != 0
-            && key_length < sizeof(key)
+            && (key_length = get_u16(record + 2)) < sizeof(key)
             && (value_length = get_u32(record + 4))
                    <= BROWSER_SITE_STORAGE_STICK_VALUE_BYTES
             && (long) (offset + record_bytes(key_length, value_length)) <= end
             && fread(key, 1, key_length, file) == key_length
             && fnv32(fnv32(UINT32_C(2166136261), record, 20), key,
-                     key_length) == get_u32(record + 20);
+                     key_length) == get_u32(record + 20)
+            && ((version >= STICK_VERSION && record[0] <= ITEM_SESSION)
+                || (key_length != 0 && memchr(key, '\0', key_length) == NULL));
         uint32_t checksum = UINT32_C(2166136261);
         for (size_t read = 0; intact && read < value_length;) {
             size_t part = value_length - read < sizeof(chunk)
@@ -822,7 +872,7 @@ static bool stick_load(BrowserSession *session,
         long probe_end = -1;
         size_t probe_origin = 0;
         states[i] = stick_open_log(candidates[i], site->origin, &probe,
-                                   &probe_end, &probe_origin);
+                                  &probe_end, &probe_origin, NULL);
         if (probe != NULL) fclose(probe);
         if (states[i] == STICK_LOG_FOREIGN || states[i] == STICK_LOG_NEWER) {
             if (site->tier == BROWSER_SITE_STORAGE_STICK_ALWAYS)
@@ -851,7 +901,7 @@ static bool stick_load(BrowserSession *session,
         remove(path);
     if (chosen != 3 && (chosen == 0 || rename(candidates[chosen], path) == 0))
         (void) stick_open_log(path, site->origin, &file, &end,
-                              &origin_length);
+                              &origin_length, &site->disk_version);
     if (file != NULL) {
         /* With the log in place, a leftover copy is redundant (or a torn
            or damaged rewrite): do not keep it on the stick. */
@@ -890,16 +940,19 @@ static bool stick_load(BrowserSession *session,
         size_t value_length = get_u32(record + 4);
         if (kind < ITEM_LOCAL || kind > ITEM_OPFS_DIRECTORY
             || (op != RECORD_SET && op != RECORD_REMOVE)
-            || key_length == 0 || key_length >= sizeof(key)
+            || key_length >= sizeof(key)
             || value_length > BROWSER_SITE_STORAGE_STICK_VALUE_BYTES
             || fread(key, 1, key_length, file) != key_length
             || fnv32(fnv32(UINT32_C(2166136261), record, 20), key,
-                     key_length) != get_u32(record + 20)) break;
+                     key_length) != get_u32(record + 20)
+            || ((site->disk_version < STICK_VERSION || kind > ITEM_SESSION)
+                && (key_length == 0 || memchr(key, '\0', key_length) != NULL)))
+            break;
         key[key_length] = '\0';
         size_t length = record_bytes(key_length, value_length);
         if ((long) (offset + length) > end
             || fseek(file, (long) (offset + length), SEEK_SET) != 0) break;
-        int existing = item_find(store, index, kind, key);
+        int existing = item_find_bytes(store, index, kind, 0, key, key_length);
         if (kind == ITEM_SESSION) {
             site->dead_bytes += length;
             session_records = true;
@@ -1217,17 +1270,16 @@ static int site_for(BrowserSession *session, const char *url, bool create)
 
 /* Sets (or creates) an item. The value is copied into RAM or appended to
    the site's log. */
-static bool item_set(BrowserSession *session, size_t index, uint8_t kind,
-                     const char *key, const unsigned char *value,
+static bool item_set(BrowserSession *session, size_t index, uint8_t kind, uint32_t scope,
+                     const char *key, size_t key_length, const unsigned char *value,
                      size_t value_length, bool admit)
 {
     struct BrowserSiteStore *store = session->site_store;
     SiteRecord *site = &store->sites[index];
-    size_t key_length = strlen(key);
     /* No tier holds a larger value; this also keeps the byte sums below
        from overflowing. */
     if (value_length > BROWSER_SITE_STORAGE_STICK_VALUE_BYTES) return false;
-    int existing = item_find(store, index, kind, key);
+    int existing = item_find_bytes(store, index, kind, scope, key, key_length);
     size_t old_bytes = existing >= 0
         ? item_bytes(&store->items[existing]) : 0;
     if (admit && !site_admit(session, store, index, old_bytes,
@@ -1268,7 +1320,7 @@ static bool item_set(BrowserSession *session, size_t index, uint8_t kind,
     } else {
         item = &store->items[store->item_count++];
         *item = (SiteItem) {
-            .key = block, .key_length = key_length,
+            .key = block, .key_length = key_length, .scope = scope,
             .site = (uint8_t) index
         };
         site->item_count++;
@@ -1323,10 +1375,9 @@ static uint8_t storage_kind(bool local)
     return local ? ITEM_LOCAL : ITEM_SESSION;
 }
 
-bool browser_session_storage_get(const BrowserSession *session,
-                                 const char *url, bool local,
-                                 const char *key, const char **value,
-                                 size_t *value_length)
+bool browser_session_storage_get_scoped(
+    const BrowserSession *session, const char *url, bool local, uint32_t scope,
+    const char *key, size_t key_length, const char **value, size_t *value_length)
 {
     if (session == NULL || !session->site_data_allowed || key == NULL)
         return false;
@@ -1334,7 +1385,8 @@ bool browser_session_storage_get(const BrowserSession *session,
     int index = site_for(mutable_session, url, false);
     if (index < 0) return false;
     struct BrowserSiteStore *store = session->site_store;
-    int at = item_find(store, (size_t) index, storage_kind(local), key);
+    int at = item_find_bytes(store, (size_t) index, storage_kind(local),
+                             local ? 0 : scope, key, key_length);
     if (at < 0 || store->items[at].kind != storage_kind(local)) return false;
     const unsigned char *data = item_value(mutable_session, store,
                                            &store->items[at]);
@@ -1344,8 +1396,25 @@ bool browser_session_storage_get(const BrowserSession *session,
     return true;
 }
 
-size_t browser_session_storage_length(
-    const BrowserSession *session, const char *url, bool local)
+bool browser_session_storage_get_bytes(
+    const BrowserSession *session, const char *url, bool local,
+    const char *key, size_t key_length, const char **value, size_t *value_length)
+{
+    return browser_session_storage_get_scoped(
+        session, url, local, 0, key, key_length, value, value_length);
+}
+
+bool browser_session_storage_get(const BrowserSession *session,
+                                 const char *url, bool local,
+                                 const char *key, const char **value,
+                                 size_t *value_length)
+{
+    return key != NULL && browser_session_storage_get_bytes(
+        session, url, local, key, strlen(key), value, value_length);
+}
+
+size_t browser_session_storage_length_scoped(
+    const BrowserSession *session, const char *url, bool local, uint32_t scope)
 {
     if (session == NULL || !session->site_data_allowed) return 0;
     int index = site_for((BrowserSession *) session, url, false);
@@ -1354,13 +1423,20 @@ size_t browser_session_storage_length(
     size_t count = 0;
     for (size_t i = 0; i < store->item_count; i++)
         if (store->items[i].site == (size_t) index
-            && store->items[i].kind == storage_kind(local)) count++;
+            && store->items[i].kind == storage_kind(local)
+            && store->items[i].scope == (local ? 0 : scope)) count++;
     return count;
 }
 
-bool browser_session_storage_key(
-    const BrowserSession *session, const char *url, bool local,
-    size_t index, const char **key)
+size_t browser_session_storage_length(
+    const BrowserSession *session, const char *url, bool local)
+{
+    return browser_session_storage_length_scoped(session, url, local, 0);
+}
+
+bool browser_session_storage_key_scoped(
+    const BrowserSession *session, const char *url, bool local, uint32_t scope,
+    size_t index, const char **key, size_t *key_length)
 {
     if (session == NULL || !session->site_data_allowed) return false;
     int site = site_for((BrowserSession *) session, url, false);
@@ -1370,21 +1446,38 @@ bool browser_session_storage_key(
     for (size_t i = 0; i < store->item_count; i++) {
         const SiteItem *item = &store->items[i];
         if (item->site != (size_t) site
-            || item->kind != storage_kind(local)) continue;
+            || item->kind != storage_kind(local)
+            || item->scope != (local ? 0 : scope)) continue;
         if (seen++ != index) continue;
         if (key != NULL) *key = item->key;
+        if (key_length != NULL) *key_length = item->key_length;
         return true;
     }
     return false;
 }
 
-bool browser_session_storage_set(BrowserSession *session, const char *url,
-                                 bool local, const char *key,
-                                 const char *value, size_t value_length)
+bool browser_session_storage_key_bytes(
+    const BrowserSession *session, const char *url, bool local,
+    size_t index, const char **key, size_t *key_length)
+{
+    return browser_session_storage_key_scoped(
+        session, url, local, 0, index, key, key_length);
+}
+
+bool browser_session_storage_key(
+    const BrowserSession *session, const char *url, bool local,
+    size_t index, const char **key)
+{
+    return browser_session_storage_key_bytes(session, url, local, index, key, NULL);
+}
+
+bool browser_session_storage_set_scoped(
+    BrowserSession *session, const char *url, bool local, uint32_t scope,
+    const char *key, size_t key_length, const char *value, size_t value_length)
 {
     if (session == NULL || !session->site_data_allowed
-        || key == NULL || value == NULL || key[0] == '\0'
-        || strlen(key) >= BROWSER_KEY_LIMIT) return false;
+        || key == NULL || value == NULL || key_length >= BROWSER_KEY_LIMIT)
+        return false;
     int index = site_for(session, url, true);
     if (index < 0) {
         store_trim(session);
@@ -1393,30 +1486,63 @@ bool browser_session_storage_set(BrowserSession *session, const char *url,
     SiteRecord *site = &session->site_store->sites[index];
     if (stick_tier(site)
         && value_length > BROWSER_SITE_STORAGE_STICK_VALUE_BYTES) return false;
-    bool stored = item_set(session, (size_t) index, storage_kind(local), key,
-                           (const unsigned char *) value, value_length,
+    bool stored = item_set(session, (size_t) index, storage_kind(local),
+                           local ? 0 : scope, key,
+                           key_length, (const unsigned char *) value, value_length,
                            true);
     if (!stored) site_idle(session, (size_t) index);
     return stored;
 }
 
-bool browser_session_storage_remove(BrowserSession *session, const char *url,
-                                    bool local, const char *key)
+bool browser_session_storage_set_bytes(
+    BrowserSession *session, const char *url, bool local,
+    const char *key, size_t key_length, const char *value, size_t value_length)
+{
+    return browser_session_storage_set_scoped(
+        session, url, local, 0, key, key_length, value, value_length);
+}
+
+bool browser_session_storage_set(BrowserSession *session, const char *url,
+                                 bool local, const char *key,
+                                 const char *value, size_t value_length)
+{
+    return key != NULL && browser_session_storage_set_bytes(
+        session, url, local, key, strlen(key), value, value_length);
+}
+
+bool browser_session_storage_remove_scoped(
+    BrowserSession *session, const char *url, bool local, uint32_t scope,
+    const char *key, size_t key_length)
 {
     if (session == NULL || !session->site_data_allowed || key == NULL)
         return false;
     int index = site_for(session, url, false);
     if (index < 0) return true;
-    int at = item_find(session->site_store, (size_t) index,
-                       storage_kind(local), key);
+    int at = item_find_bytes(session->site_store, (size_t) index,
+                             storage_kind(local), local ? 0 : scope, key, key_length);
     if (at < 0) return true;
     bool removed = item_remove(session, (size_t) at);
     site_idle(session, (size_t) index);
     return removed;
 }
 
-bool browser_session_storage_clear(BrowserSession *session, const char *url,
-                                   bool local)
+bool browser_session_storage_remove_bytes(
+    BrowserSession *session, const char *url, bool local,
+    const char *key, size_t key_length)
+{
+    return browser_session_storage_remove_scoped(
+        session, url, local, 0, key, key_length);
+}
+
+bool browser_session_storage_remove(BrowserSession *session, const char *url,
+                                    bool local, const char *key)
+{
+    return key != NULL && browser_session_storage_remove_bytes(
+        session, url, local, key, strlen(key));
+}
+
+bool browser_session_storage_clear_scoped(
+    BrowserSession *session, const char *url, bool local, uint32_t scope)
 {
     if (session == NULL || !session->site_data_allowed) return false;
     int index = site_for(session, url, false);
@@ -1426,6 +1552,7 @@ bool browser_session_storage_clear(BrowserSession *session, const char *url,
     for (size_t i = store->item_count; i-- > 0;)
         if (store->items[i].site == (size_t) index
             && store->items[i].kind == storage_kind(local)
+            && store->items[i].scope == (local ? 0 : scope)
             && !item_remove(session, i)) cleared = false;
     /* The page's clear() is done once the removals are logged; scrubbing
        the values off the card is best effort here. */
@@ -1434,6 +1561,23 @@ bool browser_session_storage_clear(BrowserSession *session, const char *url,
     return cleared;
 }
 
+bool browser_session_storage_clear(BrowserSession *session, const char *url,
+                                   bool local)
+{
+    return browser_session_storage_clear_scoped(session, url, local, 0);
+}
+
+void browser_session_storage_retire_scope(BrowserSession *session, uint32_t scope)
+{
+    if (session == NULL || session->site_store == NULL) return;
+    struct BrowserSiteStore *store = session->site_store;
+    for (size_t i = store->item_count; i-- > 0;)
+        if (store->items[i].kind == ITEM_SESSION && store->items[i].scope == scope)
+            (void) item_remove(session, i); /* never writes a tombstone */
+    for (size_t i = 0; i < BROWSER_SITE_STORAGE_SITES; i++)
+        site_release_if_idle(store, i);
+    store_trim(session);
+}
 bool browser_session_storage_clear_all(BrowserSession *session, bool local)
 {
     if (session == NULL || session->budget == NULL
@@ -1612,7 +1756,7 @@ BrowserOpfsResult browser_session_opfs_create(
     if (!item_set(session, (size_t) site,
                   kind == BROWSER_OPFS_DIRECTORY ? ITEM_OPFS_DIRECTORY
                                                  : ITEM_OPFS_FILE,
-                  path, NULL, 0, true)) {
+                  0, path, strlen(path), NULL, 0, true)) {
         site_idle(session, (size_t) site);
         return BROWSER_OPFS_QUOTA_EXCEEDED;
     }
@@ -1646,7 +1790,7 @@ BrowserOpfsResult browser_session_opfs_write(
                            + data_length);
         return BROWSER_OPFS_QUOTA_EXCEEDED;
     }
-    return item_set(session, (size_t) site, ITEM_OPFS_FILE, path, data,
+    return item_set(session, (size_t) site, ITEM_OPFS_FILE, 0, path, strlen(path), data,
                     data_length, true)
         ? BROWSER_OPFS_OK : BROWSER_OPFS_QUOTA_EXCEEDED;
 }
@@ -1686,6 +1830,100 @@ bool browser_session_opfs_clear_all(BrowserSession *session)
     return cleared;
 }
 
+BrowserOpfsResult browser_session_opfs_lock(
+    BrowserSession *session, const char *url, const char *path,
+    const void *owner, bool shared, uint64_t *token)
+{
+    BrowserOpfsView view;
+    BrowserOpfsResult found = browser_session_opfs_stat(session, url, path, &view);
+    if (found != BROWSER_OPFS_OK) return found;
+    if (view.kind != BROWSER_OPFS_FILE) return BROWSER_OPFS_TYPE_MISMATCH;
+    char origin[BROWSER_ORIGIN_LIMIT];
+    if (owner == NULL || token == NULL || !origin_of(url, origin))
+        return BROWSER_OPFS_UNAVAILABLE;
+    size_t count = 0;
+    for (const struct BrowserOpfsLease *lease = session->opfs_leases;
+         lease != NULL && count < OPFS_LEASE_LIMIT; lease = lease->next, count++) {
+        if (strcmp(lease->names, origin) == 0
+            && strcmp(lease->names + lease->path_at, path) == 0
+            && (!shared || !lease->shared))
+            return BROWSER_OPFS_LOCKED;
+    }
+    if (count == OPFS_LEASE_LIMIT) return BROWSER_OPFS_QUOTA_EXCEEDED;
+    size_t path_at = strlen(origin) + 1u, path_bytes = strlen(path) + 1u;
+    struct BrowserOpfsLease *lease = budget_malloc_category(
+        session->budget, BUDGET_CATEGORY_SESSION,
+        sizeof(*lease) + path_at + path_bytes);
+    if (lease == NULL) return BROWSER_OPFS_QUOTA_EXCEEDED;
+    *lease = (struct BrowserOpfsLease) {
+        .owner = owner, .next = session->opfs_leases,
+        .token = next_generation(session), .generation = view.generation,
+        .path_at = path_at, .shared = shared,
+    };
+    memcpy(lease->names, origin, path_at);
+    memcpy(lease->names + path_at, path, path_bytes);
+    session->opfs_leases = lease;
+    *token = lease->token;
+    return BROWSER_OPFS_OK;
+}
+
+BrowserOpfsResult browser_session_opfs_commit_shared(
+    BrowserSession *session, const char *url, const char *path,
+    const void *owner, uint64_t token, const unsigned char *bytes, size_t length)
+{
+    char origin[BROWSER_ORIGIN_LIMIT];
+    if (owner == NULL || token == 0 || !origin_of(url, origin))
+        return BROWSER_OPFS_STALE;
+    BrowserOpfsView view;
+    BrowserOpfsResult status = browser_session_opfs_stat(session, url, path, &view);
+    if (status != BROWSER_OPFS_OK) return status;
+    const uint64_t before = view.generation;
+    bool admitted = false;
+    size_t i = 0;
+    for (const struct BrowserOpfsLease *lease = session->opfs_leases;
+         lease != NULL && i < OPFS_LEASE_LIMIT; lease = lease->next, i++) {
+        if (lease->token == token && lease->owner == owner && lease->shared
+            && lease->generation == before && strcmp(lease->names, origin) == 0
+            && strcmp(lease->names + lease->path_at, path) == 0) {
+            admitted = true;
+            break;
+        }
+    }
+    if (!admitted) return BROWSER_OPFS_STALE;
+    status = browser_session_opfs_write(session, url, path, bytes, length);
+    if (status != BROWSER_OPFS_OK) return status;
+    status = browser_session_opfs_stat(session, url, path, &view);
+    if (status != BROWSER_OPFS_OK) return status;
+    /* Other shared writers still own a snapshot of this entry, not of
+       whichever file may replace it after clearing site data. */
+    i = 0;
+    for (struct BrowserOpfsLease *lease = session->opfs_leases;
+         lease != NULL && i < OPFS_LEASE_LIMIT; lease = lease->next, i++)
+        if (lease->shared && lease->generation == before
+            && strcmp(lease->names, origin) == 0
+            && strcmp(lease->names + lease->path_at, path) == 0)
+            lease->generation = view.generation;
+    return BROWSER_OPFS_OK;
+}
+
+void browser_session_opfs_unlock(BrowserSession *session, const void *owner,
+                                 uint64_t token)
+{
+    if (session == NULL) return;
+    struct BrowserOpfsLease **at = &session->opfs_leases;
+    for (size_t i = 0; *at != NULL && i < OPFS_LEASE_LIMIT; i++) {
+        struct BrowserOpfsLease *lease = *at;
+        if ((owner == NULL || owner == lease->owner)
+            && (token == 0 || token == lease->token)) {
+            *at = lease->next;
+            budget_free(session->budget, lease);
+            if (token != 0) return;
+        } else {
+            at = &lease->next;
+        }
+    }
+}
+
 BrowserOpfsResult browser_session_opfs_remove(
     BrowserSession *session, const char *url, const char *path,
     bool recursive)
@@ -1698,6 +1936,15 @@ BrowserOpfsResult browser_session_opfs_remove(
     int at = opfs_find(session, url, path, &site);
     if (at < 0) return BROWSER_OPFS_NOT_FOUND;
     struct BrowserSiteStore *store = session->site_store;
+    const char *origin = store->sites[site].origin;
+    for (const struct BrowserOpfsLease *lease = session->opfs_leases;
+         lease != NULL; lease = lease->next) {
+        const char *locked = lease->names + lease->path_at;
+        if (strcmp(lease->names, origin) == 0
+            && (strcmp(path, locked) == 0
+                || (recursive && opfs_descendant(path, locked, NULL))))
+            return BROWSER_OPFS_LOCKED;
+    }
     if (store->items[at].kind == ITEM_OPFS_DIRECTORY) {
         for (size_t i = store->item_count; i-- > 0;) {
             const SiteItem *child = &store->items[i];
@@ -2021,6 +2268,7 @@ void browser_site_storage_remove_session_files(const char *directory)
 
 void site_storage_destroy(BrowserSession *session)
 {
+    browser_session_opfs_unlock(session, NULL, 0);
     struct BrowserSiteStore *store = session->site_store;
     if (store == NULL) return;
     for (size_t i = 0; i < BROWSER_SITE_STORAGE_SITES; i++) {
@@ -2115,19 +2363,12 @@ bool site_storage_next_local(const BrowserSession *session, size_t *cursor,
             .origin = site->origin,
             .key = item->key,
             .value = item->key + item->key_length + 1u,
+            .key_length = item->key_length,
             .value_length = item->value_length
         };
         return true;
     }
     return false;
-}
-
-size_t site_storage_local_count(const BrowserSession *session)
-{
-    size_t cursor = 0, count = 0;
-    SiteStorageLocalView view;
-    while (site_storage_next_local(session, &cursor, &view)) count++;
-    return count;
 }
 
 /* Target sites the staging snapshot would land in: RAM sites only. */

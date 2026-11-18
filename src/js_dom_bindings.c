@@ -23,6 +23,7 @@
 #include <lexbor/html/node.h>
 #include <lexbor/html/serialize.h>
 #include <lexbor/ns/ns.h>
+#include <SheenBidi/SBCodepoint.h>
 
 #include <stdio.h>
 #include <math.h>
@@ -1185,6 +1186,38 @@ static lxb_dom_node_t *selector_query(
 
 #include "js_dom_mutations.inc"
 
+JSValue js_dom_assign_slot(JSContext *context, JSValueConst this_value,
+                           int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL || argc < 1
+        || (unsigned) (argc - 1) > DOCUMENT_MANUAL_SLOT_LIST_LIMIT) return JS_FALSE;
+    lxb_dom_node_t *slot = js_rt_bridge_node_arg(context, bridge, argv[0]);
+    if (slot == NULL) return JS_FALSE;
+    lxb_dom_node_t *nodes[DOCUMENT_MANUAL_SLOT_LIST_LIMIT];
+    size_t count = 0;
+    for (int i = 1; i < argc; i++) {
+        lxb_dom_node_t *node = js_rt_bridge_node_arg(context, bridge, argv[i]);
+        if (node == NULL || (node->type != LXB_DOM_NODE_TYPE_ELEMENT
+                             && node->type != LXB_DOM_NODE_TYPE_TEXT)) return JS_FALSE;
+        /* Another document's node can never be slotted here; assign()
+           ignores it rather than failing. */
+        if (node->owner_document == slot->owner_document) nodes[count++] = node;
+    }
+    if (!document_shadow_assign_manually(bridge->document, slot, nodes, count))
+        return JS_FALSE;
+    /* Assignment may remove a node from another slot, including one in a
+       different shadow tree. No single host bounds the invalidation. The
+       host's own record lets a newly slotted light image be discovered. */
+    document_style_changed();
+    bridge_mutated(bridge, SCRIPT_MUTATION_CHILD_LIST, NULL, NULL, 0);
+    lxb_dom_node_t *carrier = document_shadow_carrier_containing(slot);
+    if (carrier != NULL && carrier->parent != NULL)
+        bridge_mutated(bridge, SCRIPT_MUTATION_CHILD_LIST, carrier->parent, NULL, 0);
+    return JS_TRUE;
+}
+
 JSValue js_dom_body(JSContext *context, JSValueConst this_value,
                     int argc, JSValueConst *argv)
 {
@@ -1403,7 +1436,7 @@ static JSValue dom_query_all(JSContext *context, int argc,
         : (requested > DOM_QUERY_RESULT_LIMIT
                ? DOM_QUERY_RESULT_LIMIT : (uint32_t) requested);
     uint32_t count = 0;
-    bool complete = length > 512 || result_limit == 0
+    bool complete = length > 512 || result_limit == 0 || root == NULL
         || query_all_nodes(bridge, root, boundary, selector, length,
                            by_name, context, array, &count, result_limit);
     JS_FreeCString(context, selector);
@@ -4451,12 +4484,28 @@ JS_RT_GUARDED_NATIVE(, js_dom_get_attribute)(JSContext *context,
     const char *name = JS_ToCStringLen(context, &name_length, argv[1]);
     if (name == NULL) return JS_EXCEPTION;
     size_t value_length = 0;
-    const lxb_char_t *value = lxb_dom_element_get_attribute(
-        lxb_dom_interface_element(node), (const lxb_char_t *) name,
-        name_length, &value_length);
-    bool present = value != NULL || lxb_dom_element_has_attribute(
-        lxb_dom_interface_element(node), (const lxb_char_t *) name,
-        name_length);
+    lxb_dom_element_t *element = lxb_dom_interface_element(node);
+    const lxb_char_t *value = NULL;
+    bool present = false;
+    if (node->ns == LXB_NS_HTML) {
+        value = lxb_dom_element_get_attribute(
+            element, (const lxb_char_t *) name, name_length, &value_length);
+        present = value != NULL || lxb_dom_element_has_attribute(
+            element, (const lxb_char_t *) name, name_length);
+    } else {
+        /* Lexbor's local-name lookup folds case even for foreign elements.
+           Preserve their qualified spelling without allocating Attr wrappers. */
+        lxb_dom_attr_t *attr = element->first_attr;
+        for (size_t i = 0; attr != NULL && i < 4096u; i++, attr = attr->next) {
+            size_t length = 0;
+            const lxb_char_t *qualified = lxb_dom_attr_qualified_name(attr, &length);
+            if (qualified == NULL || length != name_length ||
+                memcmp(qualified, name, length) != 0) continue;
+            present = true;
+            value = lxb_dom_attr_value(attr, &value_length);
+            break;
+        }
+    }
     JS_FreeCString(context, name);
     return !present ? JS_NULL
                     : JS_NewStringLen(context,
@@ -4515,32 +4564,6 @@ JS_RT_GUARDED_NATIVE(, js_dom_image_property)(JSContext *context,
     return JS_NewInt32(context, 0);
 }
 
-static bool js_dom_latch_checked_default(DomBridge *bridge,
-                                         lxb_dom_node_t *node,
-                                         const char *name,
-                                         size_t name_length)
-{
-    if (bridge == NULL || bridge->document == NULL || node == NULL
-        || name == NULL || name_length != sizeof("checked") - 1u
-        || strncasecmp(name, "checked", name_length) != 0
-        || !bridge_mutation_node_name_is(node, "input")) return true;
-    size_t type_length = 0;
-    const char *type = document_attribute(node, "type", &type_length);
-    bool checkable = type != NULL
-        && ((type_length == sizeof("checkbox") - 1u
-             && strncasecmp(type, "checkbox", type_length) == 0)
-            || (type_length == sizeof("radio") - 1u
-                && strncasecmp(type, "radio", type_length) == 0));
-    if (!checkable) return true;
-    bool ignored_default = false;
-    return document_control_checked_default(
-        bridge->document, node,
-        lxb_dom_element_has_attribute(
-            lxb_dom_interface_element(node),
-            (const lxb_char_t *) "checked", sizeof("checked") - 1u),
-        &ignored_default);
-}
-
 /* The answer js_rt_script_element_parser_started infers for a host-parser
    script reads its type, which the author can change without starting or
    un-starting the element (consent managers retype text/plain scripts and
@@ -4581,12 +4604,6 @@ JS_RT_GUARDED_NATIVE(, js_dom_set_attribute)(JSContext *context,
         if (name != NULL) JS_FreeCString(context, name);
         if (value != NULL) JS_FreeCString(context, value);
         return JS_EXCEPTION;
-    }
-    if (!js_dom_latch_checked_default(
-            bridge, node, name, name_length)) {
-        JS_FreeCString(context, value);
-        JS_FreeCString(context, name);
-        return JS_FALSE;
     }
     size_t old_value_length = 0;
     const lxb_char_t *old_value = lxb_dom_element_get_attribute(
@@ -4745,6 +4762,90 @@ JSValue js_dom_set_control_value(JSContext *context,
     return JS_NewBool(context, set);
 }
 
+JSValue js_dom_control_checked(JSContext *context, JSValueConst this_value,
+                              int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    lxb_dom_node_t *node = argc != 0
+        ? js_rt_bridge_node_arg(context, bridge, argv[0]) : NULL;
+    if (argc < 2) return JS_NewInt32(context, document_control_checked_state(node));
+    int32_t state;
+    if (node == NULL || node->ns != LXB_NS_HTML
+        || node->local_name != LXB_TAG_INPUT || bridge == NULL)
+        return JS_FALSE;
+    if (JS_ToInt32(context, &state, argv[1]) < 0) return JS_EXCEPTION;
+    bool before = document_control_checked(node);
+    bool set = document_control_checked_set(bridge->document, node, state);
+    if (set && before != document_control_checked(node))
+        bridge_mutated(bridge, SCRIPT_MUTATION_ATTRIBUTE, node, "checked", 7);
+    return JS_NewBool(context, set);
+}
+
+/* Form directionality is independent of the CSS direction property.
+   A Unicode first-strong scan uses no layout or paragraph allocation. */
+static int form_text_direction(const char *text, size_t length, size_t *remaining)
+{
+    for (size_t at = 0; text != NULL && at < length && *remaining != 0;) {
+        unsigned codepoint;
+        size_t used = font_utf8_next(text + at, length - at, &codepoint);
+        if (used == 0 || used > *remaining) break;
+        *remaining -= used;
+        at += used;
+        SBBidiType type = SBCodepointGetBidiType(codepoint);
+        if (type == SBBidiTypeL) return -1;
+        if (type == SBBidiTypeR || type == SBBidiTypeAL) return 1;
+    }
+    return 0;
+}
+
+JSValue js_dom_form_direction(JSContext *context, JSValueConst this_value,
+                             int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    size_t remaining = 8192u;
+    if (argc >= 2) {
+        size_t length = 0;
+        const char *text = JS_ToCStringLen(context, &length, argv[1]);
+        if (text == NULL) return JS_EXCEPTION;
+        int direction = form_text_direction(text, length, &remaining);
+        JS_FreeCString(context, text);
+        return JS_NewBool(context, direction > 0);
+    }
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    lxb_dom_node_t *root = argc != 0
+        ? js_rt_bridge_node_arg(context, bridge, argv[0]) : NULL;
+    lxb_dom_node_t *node = root == NULL ? NULL : root->first_child;
+    for (size_t visited = 0; node != NULL && visited < 512u && remaining; visited++) {
+        bool descend = true;
+        if (node->type == LXB_DOM_NODE_TYPE_TEXT) {
+            size_t length = 0;
+            const char *text = document_text_data(node, &length);
+            int direction = form_text_direction(text, length, &remaining);
+            if (direction != 0) return JS_NewBool(context, direction > 0);
+        } else if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+            if (node->ns == LXB_NS_HTML && (node->local_name == LXB_TAG_BDI
+                || node->local_name == LXB_TAG_SCRIPT || node->local_name == LXB_TAG_STYLE
+                || node->local_name == LXB_TAG_TEXTAREA))
+                descend = false;
+            size_t length = 0;
+            const char *dir = document_attribute(node, "dir", &length);
+            if (dir != NULL && ((length == 3 &&
+                    (strncasecmp(dir, "ltr", 3) == 0 || strncasecmp(dir, "rtl", 3) == 0))
+                || (length == 4 && strncasecmp(dir, "auto", 4) == 0)))
+                descend = false;
+        }
+        if (descend && node->first_child != NULL) {
+            node = node->first_child;
+            continue;
+        }
+        for (; node != root && node->next == NULL && visited < 512u; visited++)
+            node = node->parent;
+        node = node == root || visited >= 512u ? NULL : node->next;
+    }
+    return JS_FALSE;
+}
+
 JSValue js_dom_parser_form_owner(JSContext *context,
                                  JSValueConst this_value,
                                  int argc, JSValueConst *argv)
@@ -4807,11 +4908,6 @@ JS_RT_GUARDED_NATIVE(, js_dom_remove_attribute)(JSContext *context,
     /* All attribute-removal forms meet here, including borrowed native
        methods on the carrier. Its identity is not an author attribute. */
     if (document_shadow_attribute_protected(node, name, name_length)) {
-        JS_FreeCString(context, name);
-        return JS_FALSE;
-    }
-    if (!js_dom_latch_checked_default(
-            bridge, node, name, name_length)) {
         JS_FreeCString(context, name);
         return JS_FALSE;
     }
@@ -4931,10 +5027,16 @@ static bool inline_declaration_named(const char *style,
                                      const InlineDeclaration *declaration,
                                      const char *wanted, size_t wanted_length)
 {
-    return declaration->has_colon
-        && js_rt_property_name_equal(style + declaration->name_start,
-                          declaration->name_end - declaration->name_start,
-                          wanted, wanted_length);
+    if (!declaration->has_colon) return false;
+    const char *name = style + declaration->name_start;
+    size_t length = declaration->name_end - declaration->name_start;
+    if (js_rt_property_name_equal(name, length, wanted, wanted_length))
+        return true;
+    char decoded[STYLE_CUSTOM_NAME_CAPACITY];
+    return wanted_length > 2 && wanted[0] == '-' && wanted[1] == '-'
+        && style_decode_custom_name(name, length, decoded)
+        && strlen(decoded) == wanted_length
+        && memcmp(decoded, wanted, wanted_length) == 0;
 }
 
 JS_RT_GUARDED_NATIVE(, js_style_get)(JSContext *context, JSValueConst this_value,

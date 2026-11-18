@@ -687,11 +687,8 @@ static inline bool draw_command_text_underline_offset(
 static inline int draw_command_text_x_fixed(const DrawCommand *command)
 {
     if (command == NULL) return 0;
-    int64_t fixed = (int64_t) command->x * 64
-        + (command->type == DRAW_TEXT
-           ? command->radius & LAYOUT_TEXT_X_FRACTION_MASK : 0);
-    return fixed > INT32_MAX ? INT32_MAX
-           : (fixed < INT32_MIN ? INT32_MIN : (int) fixed);
+    return style_fixed_26_6(command->x, command->type == DRAW_TEXT
+        ? (unsigned) command->radius & LAYOUT_TEXT_X_FRACTION_MASK : 0u);
 }
 
 static inline TextTransformMode draw_command_text_transform(
@@ -798,22 +795,19 @@ static inline int draw_command_text_font_size_fixed(
     const DrawCommand *command)
 {
     if (command == NULL) return 0;
-    int64_t fixed = (int64_t) command->font_size * 64
-        + (command->type == DRAW_TEXT
-           ? (command->radius & LAYOUT_TEXT_FONT_SIZE_FRACTION_MASK)
-             >> LAYOUT_TEXT_FONT_SIZE_FRACTION_SHIFT : 0);
-    return fixed > INT32_MAX ? INT32_MAX
-           : (fixed < INT32_MIN ? INT32_MIN : (int) fixed);
+    return style_fixed_26_6(command->font_size, command->type == DRAW_TEXT
+        ? ((unsigned) command->radius & LAYOUT_TEXT_FONT_SIZE_FRACTION_MASK)
+          >> LAYOUT_TEXT_FONT_SIZE_FRACTION_SHIFT : 0u);
 }
 
 static inline void draw_command_set_text_x_fixed(DrawCommand *command,
                                                   int fixed)
 {
     if (command == NULL) return;
-    int64_t wide = fixed;
-    command->x = wide >= 0 ? (int) (wide / 64)
-                 : (int) (-((-wide + 63) / 64));
-    unsigned fraction = (unsigned) (wide - (int64_t) command->x * 64) & 63u;
+    /* Floor division: the arithmetic shift rounds toward negative infinity,
+       leaving the low six bits as the non-negative fraction. */
+    command->x = fixed >> 6;
+    unsigned fraction = (unsigned) fixed & 63u;
     command->radius = (command->radius & ~LAYOUT_TEXT_X_FRACTION_MASK)
                       | (int) fraction;
 }
@@ -846,6 +840,10 @@ typedef struct {
     int top;
     int bottom_y;
     int maximum_offset;
+    int minimum_offset;
+    int bottom_inset;             /* INT_MAX is auto, as for top */
+    const lxb_dom_node_t *node;
+    size_t scrollport_box_plus_one;
 } StickyRange;
 
 typedef struct {
@@ -946,7 +944,20 @@ typedef struct {
        so LayoutNodeBox remains 68 bytes on PSP. */
     uint8_t clip_inset_left;
     uint8_t clip_inset_top;
+    /* This layout pass left a descendant height unresolved until flex
+       cross sizing. Fits the existing alignment padding. */
+    uint8_t unresolved_descendant_height : 1;
+    uint8_t scroll_rtl : 1;
 } LayoutNodeBox;
+
+typedef struct LayoutUntransformedBox LayoutUntransformedBox;
+typedef struct LayoutInlineFragments LayoutInlineFragments;
+typedef struct {
+    lxb_dom_node_t *node;
+    int x, y, width, height;
+    uint32_t command;
+    uint16_t next, line;
+} LayoutInlineFragment;
 
 #define LAYOUT_SCROLL_CONTAINER_LIMIT 128u
 #define LAYOUT_SCROLL_SNAP_CANDIDATE_LIMIT 256u
@@ -1344,6 +1355,11 @@ typedef struct LayoutDocument {
     size_t fixed_count;
     size_t fixed_capacity;
     LayoutNodeBox *node_boxes;
+    LayoutUntransformedBox *untransformed_boxes;
+    size_t untransformed_capacity;
+    size_t untransformed_count;
+    LayoutInlineFragments *inline_fragments;
+    bool inline_fragments_disabled, untransformed_disabled;
     size_t node_box_count;
     size_t node_box_capacity;
     /* Build-only bounds of the command indices held by node boxes (the
@@ -1817,6 +1833,19 @@ const ControlRegion *layout_control_at(const LayoutDocument *layout,
                                        int x, int y);
 const LayoutNodeBox *layout_box_for_node(const LayoutDocument *layout,
                                          const lxb_dom_node_t *node);
+/* Use the pre-transform layout coordinates and dimensions of a retained
+   visual box. An ordinary (untransformed) box needs no side storage. */
+void layout_box_untransformed(const LayoutDocument *layout,
+                              const LayoutNodeBox *box, LayoutNodeBox *result);
+const LayoutInlineFragment *layout_inline_fragment_first(
+    const LayoutDocument *layout, const lxb_dom_node_t *node);
+const LayoutInlineFragment *layout_inline_fragment_next(
+    const LayoutDocument *layout, const LayoutInlineFragment *fragment);
+/* Every inline element of the layout has its fragments: none were dropped
+   at the table's limit or for memory, and recording was on (a script realm
+   holds the document). Only then does an element without fragments have no
+   boxes. */
+bool layout_inline_fragments_complete(const LayoutDocument *layout);
 /* A layout's element boxes lent to image loading (images_set_layout_boxes):
    a view of a live layout, or the box array taken from one about to be
    released (a full rebuild releases its layout before it loads images). */
@@ -1943,6 +1972,11 @@ bool layout_scroll_node(LayoutDocument *layout, lxb_dom_node_t *node,
                         int scroll_x, int scroll_y);
 bool layout_build_scroll_metadata(LayoutDocument *layout,
                                   const Stylesheet *stylesheet);
+int layout_sticky_offset(const LayoutDocument *layout, const StickyRange *range,
+                         int viewport_scroll, int viewport_height);
+int layout_node_sticky_offset(const LayoutDocument *layout,
+                              const lxb_dom_node_t *node,
+                              int viewport_scroll, int viewport_height);
 /* Applies a delta to the deepest scroll container containing/focusing node,
    then chains through ancestors according to overscroll-behavior. */
 bool layout_scroll_node_chain(LayoutDocument *layout, lxb_dom_node_t *node,
@@ -2002,6 +2036,17 @@ bool layout_node_scroll_placement(const LayoutDocument *layout,
    it does not escape, scrolling or not (what paint clips it to). */
 bool layout_node_overflow_placement(const LayoutDocument *layout,
                                     const lxb_dom_node_t *node,
+                                    LayoutScrollPlacement *placement);
+typedef struct {
+    /* Fixed 1/64 px or 1/64 percentage points (top/right/bottom/left). */
+    int values[4];
+    unsigned percent_mask;
+} LayoutObserverMargin;
+
+bool layout_node_observer_placement(const LayoutDocument *layout,
+                                    const lxb_dom_node_t *node,
+                                    const lxb_dom_node_t *root,
+                                    const LayoutObserverMargin *margin,
                                     LayoutScrollPlacement *placement);
 LayoutCursor layout_cursor_for_node(const Stylesheet *stylesheet,
                                     lxb_dom_node_t *node);

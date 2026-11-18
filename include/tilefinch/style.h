@@ -126,6 +126,8 @@ typedef int32_t StyleLength;
 #define STYLE_INSET_LEFT_PERCENT UINT8_C(8)
 
 #define GRID_TRACK_AUTO UINT8_C(0)
+/* Accessor returns a tagged hundredth-percent floor, or a fixed pixel floor. */
+#define GRID_TRACK_PERCENT_MINIMUM UINT32_C(0x10000)
 #define GRID_TRACK_FIXED UINT8_C(1)
 #define GRID_TRACK_FLEX UINT8_C(2)
 #define GRID_TRACK_PERCENT UINT8_C(3)
@@ -248,12 +250,26 @@ enum {
     JUSTIFY_SPACE_AROUND,
     JUSTIFY_SPACE_EVENLY,
     JUSTIFY_STRETCH,
-    /* justify-content written as start/flex-start/left. JUSTIFY_START (0)
+    /* JUSTIFY_START (0)
        is the initial "normal": flexbox packs both at the start, but a grid
        stretches its auto tracks for normal and must not for an explicit
        start. */
-    JUSTIFY_START_EXPLICIT
+    JUSTIFY_START_EXPLICIT,
+    JUSTIFY_END_LOGICAL,
+    JUSTIFY_FLEX_START,
+    JUSTIFY_LEFT,
+    JUSTIFY_RIGHT,
+    JUSTIFY_UNSAFE_CENTER
 };
+static inline JustifyContent style_align_content_in_axis(
+    JustifyContent value, bool reversed)
+{
+    if (value == JUSTIFY_START_EXPLICIT)
+        return reversed ? JUSTIFY_END : JUSTIFY_START;
+    if (value == JUSTIFY_END_LOGICAL)
+        return reversed ? JUSTIFY_START : JUSTIFY_END;
+    return value;
+}
 
 typedef uint8_t TextAlign;
 enum {
@@ -1039,7 +1055,8 @@ static inline bool computed_style_width_fit_content(
         && style->width == STYLE_LENGTH_FIT_CONTENT;
 }
 
-#define COMPUTED_GRID_COLUMN_COUNT_MASK UINT32_C(0x000000ff)
+#define COMPUTED_GRID_COLUMN_COUNT_MASK UINT32_C(0x0000007f)
+#define COMPUTED_GRID_AUTO_FILL UINT32_C(0x00000080)
 #define COMPUTED_GRID_TEMPLATE_AREA_SHIFT 8u
 #define COMPUTED_GRID_TEMPLATE_AREA_MASK UINT32_C(0x00003f00)
 #define COMPUTED_GRID_SUBGRID_COLUMNS UINT32_C(0x00004000)
@@ -1084,6 +1101,18 @@ static inline unsigned computed_style_grid_column_count(
 {
     return style == NULL ? 0
         : (unsigned) style->grid_columns & COMPUTED_GRID_COLUMN_COUNT_MASK;
+}
+
+static inline bool computed_style_grid_auto_fill(const ComputedStyle *style)
+{
+    return ((uint32_t) style->grid_columns & COMPUTED_GRID_AUTO_FILL) != 0;
+}
+
+static inline void computed_style_set_grid_auto_fill(ComputedStyle *style, bool enabled)
+{
+    uint32_t packed = (uint32_t) style->grid_columns;
+    style->grid_columns = (int) (enabled ? packed | COMPUTED_GRID_AUTO_FILL
+                                         : packed & ~COMPUTED_GRID_AUTO_FILL);
 }
 
 static inline void computed_style_set_grid_column_count(
@@ -1688,33 +1717,11 @@ static inline uint32_t computed_style_grid_placement_named_flag(
     }
 }
 
-static inline uint8_t computed_style_grid_placement_value(
-    const ComputedStyle *style, unsigned field)
-{
-    if (style == NULL || field >= COMPUTED_GRID_PLACEMENT_FIELDS) return 0;
-    if (computed_style_grid_area_is_named(style)) return 0;
-    if (((uint32_t) style->grid_columns
-         & computed_style_grid_placement_named_flag(field)) != 0) return 0;
-    return style->grid_placement[field];
-}
+uint8_t computed_style_grid_placement_value(const ComputedStyle *style,
+                                            unsigned field);
 
-static inline void computed_style_set_grid_placement_value(
-    ComputedStyle *style, unsigned field, unsigned value)
-{
-    if (style == NULL || field >= COMPUTED_GRID_PLACEMENT_FIELDS) return;
-    if (computed_style_grid_area_is_named(style)) {
-        memset(style->grid_placement, 0, sizeof(style->grid_placement));
-    }
-    if ((field == COMPUTED_GRID_COLUMN_SPAN_FIELD
-         || field == COMPUTED_GRID_ROW_SPAN_FIELD)
-        && value > COMPUTED_GRID_SPAN_LIMIT) {
-        value = COMPUTED_GRID_SPAN_LIMIT;
-    }
-    style->grid_placement[field] = (uint8_t) value;
-    style->grid_columns = (int) (
-        (uint32_t) style->grid_columns
-        & ~computed_style_grid_placement_named_flag(field));
-}
+void computed_style_set_grid_placement_value(ComputedStyle *style,
+                                            unsigned field, unsigned value);
 
 #define COMPUTED_GRID_PLACEMENT_ACCESSORS(axis, field, slot)                  \
     static inline uint8_t computed_style_grid_##axis##_##field(               \
@@ -1770,13 +1777,19 @@ static inline unsigned computed_style_font_weight(const ComputedStyle *style)
         ? style->font_weight : (style->font_bold ? 700u : 400u));
 }
 
+/* whole * 64 + fraction (0..63) as 26.6 fixed point, saturated to int32.
+   Kept in 32-bit arithmetic: |whole| below 2^25 cannot overflow. */
+static inline int style_fixed_26_6(int whole, unsigned fraction)
+{
+    if (whole >= (1 << 25)) return INT32_MAX;
+    if (whole < -(1 << 25)) return INT32_MIN;
+    return whole * 64 + (int) fraction;
+}
+
 static inline int computed_style_font_size_fixed(const ComputedStyle *style)
 {
     if (style == NULL) return 16 * 64;
-    int64_t fixed = (int64_t) style->font_size * 64
-                    + (style->font_size_fraction & 63u);
-    return fixed > INT32_MAX ? INT32_MAX
-           : (fixed < INT32_MIN ? INT32_MIN : (int) fixed);
+    return style_fixed_26_6(style->font_size, style->font_size_fraction & 63u);
 }
 
 static inline int computed_style_root_font_size_fixed(
@@ -1894,6 +1907,9 @@ typedef struct {
    take in anyway). */
 #define STYLE_CUSTOM_SELECTOR_CAPACITY STYLE_SELECTOR_TEXT_CAPACITY
 #define STYLE_CUSTOM_NAME_CAPACITY 128u
+/* Decode an escaped custom-property identifier into caller-owned storage. */
+bool style_decode_custom_name(const char *text, size_t length,
+                              char output[STYLE_CUSTOM_NAME_CAPACITY]);
 #define STYLE_CUSTOM_VALUE_CAPACITY 1024u
 /* Custom-property values at least this long are "long": together with
    long transition values (STYLE_TRANSITION_SHORT_VALUE_CAPACITY) they may
@@ -3081,6 +3097,7 @@ bool stylesheet_grid_track_automatic_minimum(
 uint8_t stylesheet_grid_track_line_name(
     const Stylesheet *sheet, const ComputedStyle *container,
     bool rows, unsigned line, unsigned slot);
+int stylesheet_grid_line_reference(const Stylesheet *sheet, uint8_t *name);
 bool stylesheet_resolve_named_grid_lines(
     const Stylesheet *sheet, const ComputedStyle *container,
     ComputedStyle *item);

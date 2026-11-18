@@ -244,6 +244,14 @@ static const char intersection_capacity[] =
     "===1&&entries[0].target===target;observer.disconnect();if(resized&&intersected)pocSummary='OK'});"
     "observer.observe(target);for(const id of ids)clearTimeout(id);";
 
+static const char intersection_percent_margin[] =
+    "pocSummary='MARGIN-PENDING';const target=document.getElementById('target');"
+    "const observer=new IntersectionObserver(entries=>{const r=entries[0]?.rootBounds;"
+    "pocSummary=r&&innerWidth!==innerHeight"
+    "&&Math.abs(r.top+innerWidth*.1)<.01"
+    "&&Math.abs(r.left+innerWidth*.1)<.01?'OK':'MARGIN-BAD';"
+    "observer.disconnect()},{rootMargin:'10%'});observer.observe(target);";
+
 static const char intersection_continuation[] =
     "pocSummary='INTERSECTION-CONTINUATION-PENDING';const targets=[],seen=new Set();"
     "for(let i=0;i<80;i++){const target=document.createElement('div');"
@@ -707,6 +715,7 @@ int main(int argc, char **argv)
         {"ports", port_capacity}, {"performance", performance_capacity},
         {"resize", resize_capacity}, {"worker-performance", worker_performance_capacity},
         {"intersection", intersection_capacity},
+        {"intersection-percent-margin", intersection_percent_margin},
         {"intersection-continuation", intersection_continuation},
         {"disconnect", observer_disconnect}, {"termination", worker_observer_termination},
         {"worker-intrinsics", worker_observer_intrinsics},

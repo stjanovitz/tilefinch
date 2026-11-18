@@ -16,6 +16,9 @@
    retained batch could replay rectangles that were already blended. */
 #define CANVAS_SURFACE_PIXEL_LIMIT ((512u * 1024u) / 4u)
 #define CANVAS_RECT_BATCH_LIMIT 32u
+#define CANVAS_OP_MASK 15
+#define CANVAS_OP_OPAQUE 16
+#define CANVAS_OP_FULL_CLIP 32
 _Static_assert(CANVAS_RECT_BATCH_LIMIT * CANVAS_SURFACE_PIXEL_LIMIT
                    <= CANVAS_RASTER_WORK_LIMIT,
                "canvas rectangle batch must fit the raster work allowance");
@@ -34,11 +37,26 @@ static uint8_t canvas_byte(double value)
     return (uint8_t) (value + 0.5);
 }
 
+static bool canvas_operation_valid(int op, int minimum)
+{
+    return op >= 0 && op < 64
+        && (op & CANVAS_OP_MASK) >= minimum
+        && (op & CANVAS_OP_MASK) <= 11;
+}
+
+static void canvas_zero_pixel(uint8_t *pixel, int op)
+{
+    memset(pixel, 0, 4u);
+    if (op & CANVAS_OP_OPAQUE) pixel[3] = 255;
+}
+
 static void canvas_blend_pixel(uint8_t *pixels, size_t at,
                                int red, int green, int blue, int alpha,
                                double global_alpha, int operation,
                                double coverage)
 {
+    bool opaque_surface = (operation & CANVAS_OP_OPAQUE) != 0;
+    operation &= CANVAS_OP_MASK;
     /* Opaque source-over and copy produce exactly the source color at full
        alpha; skip the (soft-float on the PSP) blend. */
     if ((operation == 1 || operation == 2) && alpha == 255
@@ -78,22 +96,23 @@ static void canvas_blend_pixel(uint8_t *pixels, size_t at,
         + destination_alpha * destination_factor;
     if (output_alpha > 1.0) output_alpha = 1.0;
     if (output_alpha <= 0.0) {
-        memset(pixels + at, 0, 4u);
+        canvas_zero_pixel(pixels + at, opaque_surface ? CANVAS_OP_OPAQUE : 0);
         return;
     }
+    double denominator = opaque_surface ? 1.0 : output_alpha;
     pixels[at] = canvas_byte(
         ((double) red * source_alpha * source_factor
          + (double) pixels[at] * destination_alpha * destination_factor)
-        / output_alpha);
+        / denominator);
     pixels[at + 1u] = canvas_byte(
         ((double) green * source_alpha * source_factor
          + (double) pixels[at + 1u] * destination_alpha * destination_factor)
-        / output_alpha);
+        / denominator);
     pixels[at + 2u] = canvas_byte(
         ((double) blue * source_alpha * source_factor
          + (double) pixels[at + 2u] * destination_alpha * destination_factor)
-        / output_alpha);
-    pixels[at + 3u] = canvas_byte(output_alpha * 255.0);
+        / denominator);
+    pixels[at + 3u] = opaque_surface ? 255u : canvas_byte(output_alpha * 255.0);
 }
 
 static bool canvas_typed_bytes(JSContext *context, JSValueConst value,
@@ -599,6 +618,7 @@ JSValue js_canvas_native_surface(JSContext *context, JSValueConst this_value,
         || JS_ToInt32(context, &width, argv[1]) < 0
         || JS_ToInt32(context, &height, argv[2]) < 0) return JS_FALSE;
     bool sized = width > 0 && height > 0;
+    bool initialize_opaque = sized && argc > 4 && JS_ToBool(context, argv[4]) > 0;
     size_t required = 0;
     if (sized && !canvas_dimensions(width, height, &required))
         return JS_FALSE;
@@ -627,6 +647,8 @@ JSValue js_canvas_native_surface(JSContext *context, JSValueConst this_value,
             store->pixels = pixels;
             store->width = sized ? width : 0;
             store->height = sized ? height : 0;
+            if (initialize_opaque && copy == NULL)
+                for (size_t at = 3; at < required; at += 4) pixels[at] = 255;
         } else if (pixels != NULL) {
             js_free_rt(canvas_store_runtime(bridge), pixels);
         }
@@ -640,6 +662,8 @@ JSValue js_canvas_native_surface(JSContext *context, JSValueConst this_value,
         if (ok) {
             store->width = width;
             store->height = height;
+            if (initialize_opaque && copy == NULL)
+                for (size_t at = 3; at < required; at += 4) store->pixels[at] = 255;
         }
     }
     JS_FreeValue(context, buffer);
@@ -824,7 +848,7 @@ JSValue js_canvas_raster_rect(JSContext *context,
         || red < 0 || red > 255 || green < 0 || green > 255
         || blue < 0 || blue > 255 || alpha < 0 || alpha > 255
         || global_alpha < 0.0 || global_alpha > 1.0
-        || operation < 0 || operation > 11
+        || !canvas_operation_valid(operation, 0)
         || (size_t) width > SIZE_MAX / (size_t) height
         || (size_t) width * (size_t) height > SIZE_MAX / 4u) {
         return JS_FALSE;
@@ -840,7 +864,7 @@ JSValue js_canvas_raster_rect(JSContext *context,
         && (!canvas_typed_bytes(context, argv[13], sizeof(double),
                                 &clip_paths, &clip_path_count,
                                 &clip_path_buffer)
-            || clip_path_count > 8201u || operation == 0)) {
+            || clip_path_count > 8201u || (operation & CANVAS_OP_MASK) == 0)) {
         JS_FreeValue(context, clip_path_buffer);
         return JS_FALSE;
     }
@@ -856,19 +880,22 @@ JSValue js_canvas_raster_rect(JSContext *context,
 
     /* Operation 0 is the private clear command. Public Porter-Duff operation
        codes begin at 1 and are kept compact by the JavaScript facade. */
-    if (operation == 0) {
+    if ((operation & CANVAS_OP_MASK) == 0) {
         size_t row_bytes = (size_t) (right - left) * 4u;
         for (int32_t y = top; y < bottom; y++) {
-            memset(pixels + ((size_t) y * (size_t) width
-                             + (size_t) left) * 4u,
-                   0, row_bytes);
+            uint8_t *row = pixels + ((size_t) y * (size_t) width
+                                     + (size_t) left) * 4u;
+            memset(row, 0, row_bytes);
+            if (operation & CANVAS_OP_OPAQUE)
+                for (size_t at = 3; at < row_bytes; at += 4) row[at] = 255;
         }
         JS_FreeValue(context, buffer);
         return JS_TRUE;
     }
 
     double source_alpha = ((double) alpha / 255.0) * global_alpha;
-    if (operation == 1 && source_alpha <= 0.0) {
+    const int base_op = operation & CANVAS_OP_MASK;
+    if (base_op == 1 && source_alpha <= 0.0) {
         JS_FreeValue(context, clip_path_buffer);
         JS_FreeValue(context, buffer);
         return JS_TRUE;
@@ -895,7 +922,7 @@ JSValue js_canvas_raster_rect(JSContext *context,
         JS_FreeValue(context, buffer);
         return JS_NewInt32(context, work_exhausted ? 2 : 1);
     }
-    if (operation == 1 && source_alpha >= 1.0) {
+    if (base_op == 1 && source_alpha >= 1.0) {
         for (int32_t y = top; y < bottom; y++) {
             uint8_t *row = pixels + ((size_t) y * (size_t) width
                                      + (size_t) left) * 4u;
@@ -1051,7 +1078,7 @@ JSValue js_canvas_raster_rect_batch(JSContext *context,
         if (right <= left || bottom <= top || red < 0 || red > 255
             || green < 0 || green > 255 || blue < 0 || blue > 255
             || alpha < 0 || alpha > 255 || global_alpha < 0.0
-            || global_alpha > 1.0 || operation < 1 || operation > 11) {
+            || global_alpha > 1.0 || !canvas_operation_valid(operation, 1)) {
             continue;
         }
         size_t rect_width = (size_t) (right - left);
@@ -1064,7 +1091,8 @@ JSValue js_canvas_raster_rect_batch(JSContext *context,
             work_exhausted = true;
             break;
         }
-        bool opaque = (operation == 1 || operation == 2) && alpha == 255
+        int base_op = operation & CANVAS_OP_MASK;
+        bool opaque = (base_op == 1 || base_op == 2) && alpha == 255
             && global_alpha == 1.0;
         for (int y = top; y < bottom; y++) {
             size_t row = ((size_t) y * (size_t) width + (size_t) left) * 4u;
@@ -1322,7 +1350,7 @@ static JSValue canvas_raster_text_with_work(
         || red < 0 || red > 255 || green < 0 || green > 255
         || blue < 0 || blue > 255 || alpha < 0 || alpha > 255
         || global_alpha < 0.0 || global_alpha > 1.0
-        || operation < 1 || operation > 11) return JS_FALSE;
+        || !canvas_operation_valid(operation, 1)) return JS_FALSE;
     bool bold = JS_ToBool(context, argv[8]) > 0;
     bool italic = JS_ToBool(context, argv[9]) > 0;
     bool stroke = JS_ToBool(context, argv[16]) > 0;
@@ -1397,6 +1425,20 @@ static JSValue canvas_raster_text_with_work(
     if (stroke && !canvas_integer(
             fmax(1.0, fmin(16.0, line_width)) / 2.0,
             CANVAS_INTEGER_CEIL, &stroke_radius)) {
+        JS_FreeCString(context, text);
+        JS_FreeValue(context, clip_path_buffer);
+        JS_FreeValue(context, clip_buffer);
+        JS_FreeValue(context, transform_buffer);
+        JS_FreeValue(context, pixel_buffer);
+        return JS_FALSE;
+    }
+    /* The tiny bitset is needed only for compositing modes that replace
+       untouched pixels too. It is charged to the script heap. A refusal
+       fails this command alone (no pending exception), so a batch keeps
+       the commands it already blended and falls back for this one. */
+    uint8_t *touched = (operation & CANVAS_OP_FULL_CLIP)
+        ? js_mallocz_rt(JS_GetRuntime(context), (required / 4u + 7u) / 8u) : NULL;
+    if ((operation & CANVAS_OP_FULL_CLIP) && touched == NULL) {
         JS_FreeCString(context, text);
         JS_FreeValue(context, clip_path_buffer);
         JS_FreeValue(context, clip_buffer);
@@ -1498,6 +1540,8 @@ static JSValue canvas_raster_text_with_work(
                         clip_paths, clip_path_count, tx, ty)) continue;
                 size_t at = ((size_t) py * (size_t) width
                              + (size_t) px) * 4u;
+                if (touched != NULL)
+                    touched[at / 32u] |= (uint8_t) (1u << ((at / 4u) & 7u));
                 canvas_blend_pixel(pixels, at, red, green, blue, alpha,
                                    global_alpha, operation,
                                    (double) coverage / 255.0);
@@ -1508,6 +1552,23 @@ static JSValue canvas_raster_text_with_work(
         font_glyph_destroy(face, &glyph);
     }
 canvas_text_finished:
+    if (touched != NULL && rendered && !work_exhausted) {
+        size_t cost = clip_path_count / 2u + 1u;
+        for (int py = clip[1]; py < clip[3] && !work_exhausted; py++) {
+            for (int px = clip[0]; px < clip[2]; px++) {
+                if (!canvas_work_take(work_remaining, cost)) {
+                    work_exhausted = true;
+                    break;
+                }
+                size_t position = (size_t) py * (size_t) width + (size_t) px;
+                if ((touched[position / 8u] & (1u << (position & 7u))) == 0
+                    && canvas_clip_stack_contains(
+                        clip_paths, clip_path_count, px + 0.5, py + 0.5))
+                    canvas_zero_pixel(pixels + position * 4u, operation);
+            }
+        }
+    }
+    js_free(context, touched);
     JS_FreeCString(context, text);
     JS_FreeValue(context, clip_path_buffer);
     JS_FreeValue(context, clip_buffer);
@@ -1619,6 +1680,16 @@ static bool canvas_gradient_color(const uint8_t *gradient,
     if (kind < 1 || kind > 3 || stop_count < 1
         || stop_count > 16
         || 8u + (size_t) stop_count * 5u > gradient_count) return false;
+    size_t matrix = 8u + (size_t) stop_count * 5u;
+    if (gradient_count == matrix + 6u) {
+        double source_x = canvas_double_at(gradient, matrix) * x
+            + canvas_double_at(gradient, matrix + 2u) * y
+            + canvas_double_at(gradient, matrix + 4u);
+        y = canvas_double_at(gradient, matrix + 1u) * x
+            + canvas_double_at(gradient, matrix + 3u) * y
+            + canvas_double_at(gradient, matrix + 5u);
+        x = source_x;
+    }
     double offset = 0.0;
     if (kind == 1) {
         double x0 = canvas_double_at(gradient, 1);
@@ -1778,7 +1849,14 @@ static bool canvas_raster_path_fill(
         }
         for (int x = left; x < right && valid && !work_exhausted; x++) {
             unsigned covered = coverage[(size_t) (x - left)];
-            if (covered == 0u) continue;
+            size_t at = ((size_t) y * (size_t) width + (size_t) x) * 4u;
+            if (covered == 0u) {
+                if ((operation & CANVAS_OP_FULL_CLIP)
+                    && canvas_clip_stack_contains(
+                        clip_paths, clip_path_count, x + 0.5, y + 0.5))
+                    canvas_zero_pixel(pixels + at, operation);
+                continue;
+            }
             int color[4];
             if (!canvas_gradient_color(
                     gradient, gradient_count, x + 0.5, y + 0.5,
@@ -1786,7 +1864,6 @@ static bool canvas_raster_path_fill(
                 valid = false;
                 break;
             }
-            size_t at = ((size_t) y * (size_t) width + (size_t) x) * 4u;
             canvas_blend_pixel(pixels, at, color[0], color[1], color[2],
                                color[3], global_alpha, operation,
                                (double) covered / 4.0);
@@ -2002,8 +2079,17 @@ static bool canvas_raster_path_stroke(
         for (int x = left; x < right; x++) {
             unsigned covered = bit_count[coverage[
                 (size_t) (y - top) * span + (size_t) (x - left)] & 15u];
-            if (covered == 0u) continue;
             size_t at = ((size_t) y * (size_t) width + (size_t) x) * 4u;
+            if (covered == 0u) {
+                if ((operation & CANVAS_OP_FULL_CLIP) && !work_exhausted) {
+                    if (!canvas_work_take(work_remaining, clip_path_count / 2u + 1u))
+                        work_exhausted = true;
+                    else if (canvas_clip_stack_contains(
+                            clip_paths, clip_path_count, x + 0.5, y + 0.5))
+                        canvas_zero_pixel(pixels + at, operation);
+                }
+                continue;
+            }
             canvas_blend_pixel(pixels, at, color[0], color[1], color[2],
                                color[3], global_alpha, operation,
                                (double) covered / 4.0);
@@ -2042,7 +2128,7 @@ static JSValue canvas_raster_path_with_work(
     }
     size_t required = 0;
     if (!canvas_dimensions(width, height, &required)
-        || operation < 1 || operation > 11
+        || !canvas_operation_valid(operation, 1)
         || line_cap < 0 || line_cap > 2
         || line_join < 0 || line_join > 2
         || miter_limit <= 0.0 || miter_limit > 64.0
@@ -2132,6 +2218,9 @@ static JSValue canvas_raster_path_with_work(
     if (top < clip[1]) top = clip[1];
     if (right > clip[2]) right = clip[2];
     if (bottom > clip[3]) bottom = clip[3];
+    if (operation & CANVAS_OP_FULL_CLIP) {
+        left = clip[0]; top = clip[1]; right = clip[2]; bottom = clip[3];
+    }
     size_t area = right > left && bottom > top
         ? (size_t) (right - left) * (size_t) (bottom - top) : 0u;
     if (!bounds_ok || finite_points < 2u || area == 0u
@@ -2347,6 +2436,10 @@ static bool canvas_raster_image_pixels(
     if (top < clip[1]) top = clip[1];
     if (right > clip[2]) right = clip[2];
     if (bottom > clip[3]) bottom = clip[3];
+    const bool full_clip = (operation & CANVAS_OP_FULL_CLIP) != 0;
+    if (full_clip) {
+        left = clip[0]; top = clip[1]; right = clip[2]; bottom = clip[3];
+    }
     size_t sample_cost = clip_path_count / 2u + (smooth ? 4u : 1u);
     bool work_exhausted = false;
     for (int y = top; y < bottom && !work_exhausted; y++) {
@@ -2357,6 +2450,7 @@ static bool canvas_raster_image_pixels(
             }
             if (!canvas_clip_stack_contains(
                     clip_paths, clip_path_count, x + 0.5, y + 0.5)) continue;
+            size_t at = ((size_t) y * (size_t) width + (size_t) x) * 4u;
             double tx = x + 0.5 - transform[4];
             double ty = y + 0.5 - transform[5];
             double local_x = (transform[3] * tx - transform[2] * ty)
@@ -2364,11 +2458,15 @@ static bool canvas_raster_image_pixels(
             double local_y = (-transform[1] * tx + transform[0] * ty)
                 / determinant;
             if (local_x < dx || local_y < dy
-                || local_x >= dx + dw || local_y >= dy + dh) continue;
+                || local_x >= dx + dw || local_y >= dy + dh) {
+                if (full_clip) canvas_zero_pixel(target + at, operation);
+                continue;
+            }
             double source_x = sx + (local_x - dx) * sw / dw;
             double source_y = sy + (local_y - dy) * sh / dh;
             if (source_x < 0.0 || source_y < 0.0
                 || source_x >= source_width || source_y >= source_height) {
+                if (full_clip) canvas_zero_pixel(target + at, operation);
                 continue;
             }
             int color[4];
@@ -2376,11 +2474,16 @@ static bool canvas_raster_image_pixels(
                                      source_x, source_y, smooth, color)) {
                 return false;
             }
-            size_t at = ((size_t) y * (size_t) width + (size_t) x) * 4u;
-            if (operation == 0) {
+            if ((operation & CANVAS_OP_MASK) == 0) {
                 /* putImageData into a native store: the bytes as given. */
                 for (size_t c = 0; c < 4u; c++)
                     target[at + c] = (uint8_t) color[c];
+                if (operation & CANVAS_OP_OPAQUE) {
+                    for (size_t c = 0; c < 3u; c++)
+                        target[at + c] =
+                            (uint8_t) ((color[c] * color[3] + 127) / 255);
+                    target[at + 3u] = 255;
+                }
                 continue;
             }
             canvas_blend_pixel(target, at, color[0], color[1], color[2],
@@ -2423,7 +2526,7 @@ JSValue js_canvas_raster_image(JSContext *context,
         || !isfinite(dx) || !isfinite(dy) || !isfinite(dw) || !isfinite(dh)
         || sw == 0.0 || sh == 0.0 || dw == 0.0 || dh == 0.0
         || global_alpha < 0.0 || global_alpha > 1.0
-        || operation < 0 || operation > 11) return JS_FALSE;
+        || !canvas_operation_valid(operation, 0)) return JS_FALSE;
     if (sw < 0.0) { sx += sw; sw = -sw; }
     if (sh < 0.0) { sy += sh; sh = -sh; }
     if (dw < 0.0) { dx += dw; dw = -dw; }
@@ -2615,7 +2718,7 @@ JSValue js_canvas_raster_image_batch(JSContext *context,
             && isfinite(sw) && isfinite(sh) && isfinite(dx) && isfinite(dy)
             && isfinite(dw) && isfinite(dh) && sw != 0.0 && sh != 0.0
             && dw != 0.0 && dh != 0.0 && global_alpha >= 0.0
-            && global_alpha <= 1.0 && operation >= 1 && operation <= 11;
+            && global_alpha <= 1.0 && canvas_operation_valid(operation, 1);
         for (size_t i = 0; i < 6u; i++)
             values_ok = values_ok && isfinite(transform[i]);
         if (sw < 0.0) { sx += sw; sw = -sw; }
@@ -2666,7 +2769,7 @@ JSValue js_canvas_raster_pattern(JSContext *context, JSValueConst this_value,
     size_t required = 0;
     if (!canvas_dimensions(width, height, &required)
         || global_alpha < 0.0 || global_alpha > 1.0
-        || operation < 1 || operation > 11) return JS_FALSE;
+        || !canvas_operation_valid(operation, 1)) return JS_FALSE;
     bool even_odd = JS_ToBool(context, argv[4]) > 0;
     /* Nothing below runs script. */
     const uint8_t *points = NULL, *clip_bytes = NULL, *clip_paths = NULL;
@@ -2712,6 +2815,13 @@ JSValue js_canvas_raster_pattern(JSContext *context, JSValueConst this_value,
         top = fmax(fmax(top, clip_rect[1]), 0.0);
         right = fmin(fmin(right, clip_rect[2]), (double) width);
         bottom = fmin(fmin(bottom, clip_rect[3]), (double) height);
+        const bool full_clip = (operation & CANVAS_OP_FULL_CLIP) != 0;
+        if (full_clip) {
+            left = fmax(clip_rect[0], 0.0);
+            top = fmax(clip_rect[1], 0.0);
+            right = fmin(clip_rect[2], (double) width);
+            bottom = fmin(clip_rect[3], (double) height);
+        }
         int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
         rendered = !(left < right && top < bottom)
             || (canvas_integer(left, CANVAS_INTEGER_CEIL, &x0)
@@ -2726,11 +2836,15 @@ JSValue js_canvas_raster_pattern(JSContext *context, JSValueConst this_value,
                     work_exhausted = true;
                     break;
                 }
-                if (!canvas_path_inside(points, point_count, x + 0.5,
-                                        y + 0.5, even_odd)
-                    || !canvas_clip_stack_contains(
+                if (!canvas_clip_stack_contains(
                         clip_paths, clip_path_count, x + 0.5, y + 0.5))
                     continue;
+                size_t at = ((size_t) y * (size_t) width + (size_t) x) * 4u;
+                if (!canvas_path_inside(points, point_count, x + 0.5,
+                                        y + 0.5, even_odd)) {
+                    if (full_clip) canvas_zero_pixel(pixels + at, operation);
+                    continue;
+                }
                 int color[4];
                 canvas_pattern_color(&pattern, x + 0.5, y + 0.5, color);
                 /* canvas.js leaves the pixel alone for an invisible
@@ -2739,7 +2853,7 @@ JSValue js_canvas_raster_pattern(JSContext *context, JSValueConst this_value,
                     && ((double) color[3] / 255.0) * global_alpha <= 0.0)
                     continue;
                 canvas_blend_pixel(
-                    pixels, ((size_t) y * (size_t) width + (size_t) x) * 4u,
+                    pixels, at,
                     color[0], color[1], color[2], color[3], global_alpha,
                     operation, 1.0);
             }

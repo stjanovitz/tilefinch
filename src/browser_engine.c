@@ -309,11 +309,14 @@ struct BrowserEngine {
     bool candidate_shell_prepared;
     bool replacement_frame_frozen;
     bool forced_dark;
-    /* Whether the committed page declares its own dark rendering, cached
-       per navigation generation (see browser_engine_page_declares_dark). */
+    /* Whether the committed page declares its own dark rendering. Root
+       selectors, late sheets and head metadata can all change in place. */
     bool page_dark_valid;
     bool page_dark;
     uint64_t page_dark_generation;
+    uint64_t page_dark_document_generation;
+    uint64_t page_dark_content_generation;
+    uint64_t page_dark_stylesheet_generation;
     BrowserEngineYoutube youtube;
     bool autofocus_pending;
     /* A page update retired the page because memory refused it; taken once
@@ -2218,14 +2221,20 @@ static bool color_scheme_lists_dark(const char *value, size_t length)
    "color-scheme"> or a root color-scheme listing dark) already honours
    night mode through prefers-color-scheme; the forced-dark pixel transform
    would only fight it (chatgpt.com's logo and menu icon, inline SVG, stayed
-   black on its dark surface). Cached per committed navigation. */
+   black on its dark surface). */
 static bool browser_engine_page_declares_dark(BrowserEngine *engine)
 {
     NavigationSession *navigation = &engine->navigation;
     if (!navigation->page.loaded || navigation->page.document.html == NULL)
         return false;
+    uint64_t document_generation = document_style_generation();
+    uint64_t content_generation = navigation->page.document.content_generation;
+    uint64_t stylesheet_generation = navigation->page.stylesheet.build_generation;
     if (engine->page_dark_valid
-        && engine->page_dark_generation == navigation->generation)
+        && engine->page_dark_generation == navigation->generation
+        && engine->page_dark_document_generation == document_generation
+        && engine->page_dark_content_generation == content_generation
+        && engine->page_dark_stylesheet_generation == stylesheet_generation)
         return engine->page_dark;
     bool declares = false;
     lxb_dom_node_t *root = NULL;
@@ -2264,6 +2273,9 @@ static bool browser_engine_page_declares_dark(BrowserEngine *engine)
     }
     engine->page_dark = declares;
     engine->page_dark_generation = navigation->generation;
+    engine->page_dark_document_generation = document_generation;
+    engine->page_dark_content_generation = content_generation;
+    engine->page_dark_stylesheet_generation = stylesheet_generation;
     engine->page_dark_valid = true;
     return declares;
 }
@@ -2284,6 +2296,7 @@ bool browser_engine_set_forced_dark(BrowserEngine *engine, bool enabled)
     stylesheet_set_prefers_dark_color_scheme(enabled);
     if (engine->forced_dark == enabled) return true;
     engine->forced_dark = enabled;
+    engine->page_dark_valid = false;
     /*
      * The load preview's frame and tiles are raster products. Keeping them
      * across an appearance change would briefly reintroduce the old palette
@@ -4171,19 +4184,52 @@ bool browser_engine_replace_history(
     return true;
 }
 
+/* The new tab is already committed; the live history is the other tab's.
+   The replacement is staged before anything is freed, so it either
+   replaces that history whole or leaves it. Only when it is refused is
+   the other tab's history freed to make room for one more try; if that
+   is refused too, the history is empty and BrowserTabs captures the
+   committed document itself. */
+void browser_engine_recover_tab_history(BrowserEngine *engine)
+{
+    if (engine == NULL || !engine->navigation_ready) return;
+    NavigationSession *nav = &engine->navigation;
+    NavigationHistoryRecord entry = {
+        .url = nav->page.document_url,
+        .title = nav->page.document.title == NULL ? "" : nav->page.document.title,
+    };
+    if (navigation_replace_history(nav, &entry, 1, 0)) return;
+    navigation_clear_history(nav);
+    (void) navigation_replace_history(nav, &entry, 1, 0);
+}
+
 bool browser_engine_restore_view(
     BrowserEngine *engine, int scroll_y, int focus_kind,
     size_t focus_index)
 {
+    return browser_engine_restore_view_with_identity(
+        engine, scroll_y, focus_kind, focus_index, 0);
+}
+
+bool browser_engine_restore_view_with_identity(
+    BrowserEngine *engine, int scroll_y, int focus_kind,
+    size_t focus_index, uint64_t focus_identity)
+{
     if (!browser_engine_input_ready(engine)) return false;
     browser_engine_cancel_idle_work(engine);
     if (!browser_engine_settle_bounded_layout(engine)) return false;
-    lxb_dom_node_t *focus = browser_engine_semantic_focus(
-        engine, focus_kind, focus_index, NULL);
+    lxb_dom_node_t *focus = browser_engine_history_focus(
+        engine, focus_kind, focus_index, focus_identity);
     if (focus != NULL)
         (void) controller_focus_node(&engine->controller, focus);
-    if (!navigation_set_scroll(&engine->navigation, scroll_y)) return false;
-    return browser_engine_apply_focus_paint(engine);
+    if (!browser_engine_input_ready(engine)) return false;
+    int maximum = viewport_max_scroll_css(&engine->navigation.viewport,
+        engine->navigation.page.layout.height);
+    if (!navigation_set_scroll(&engine->navigation,
+            scroll_y < maximum ? scroll_y : maximum)
+        || !browser_engine_apply_focus_paint(engine)) return false;
+    browser_engine_store_current_focus(engine);
+    return true;
 }
 
 static bool browser_engine_input_ready(const BrowserEngine *engine)
@@ -5060,6 +5106,12 @@ bool browser_engine_canvas_materialize(BrowserEngine *engine)
     return engine == NULL || tile_cache_canvas_materialize(&engine->render);
 }
 
+static void browser_engine_prepare_frame_palette(BrowserEngine *engine)
+{
+    tile_cache_set_forced_dark(&engine->render,
+        engine->forced_dark && !browser_engine_page_declares_dark(engine));
+}
+
 bool browser_engine_render_frame(BrowserEngine *engine,
                                  const char *optional_ppm_path)
 {
@@ -5075,9 +5127,7 @@ bool browser_engine_render_frame(BrowserEngine *engine,
             != engine->navigation.incremental_relayouts
         && !browser_engine_apply_layout_damage(engine)) return false;
     if (!browser_engine_apply_focus_paint(engine)) return false;
-    tile_cache_set_forced_dark(
-        &engine->render,
-        engine->forced_dark && !browser_engine_page_declares_dark(engine));
+    browser_engine_prepare_frame_palette(engine);
     const NavigationEntry *entry = navigation_current(&engine->navigation);
     int scroll_y = entry == NULL ? 0 : entry->scroll_y;
     bool previous_scroll_valid = engine->render.last_frame_scroll_valid;
@@ -5245,6 +5295,8 @@ BrowserRenderJobStatus browser_engine_render_frame_bounded_cancelable(
         && !browser_engine_apply_layout_damage(engine)) {
         return BROWSER_RENDER_JOB_FAILED;
     }
+    /* Switch before preparing tiles; a palette change invalidates them. */
+    browser_engine_prepare_frame_palette(engine);
     const NavigationEntry *entry = navigation_current(&engine->navigation);
     int scroll_y = entry == NULL ? 0 : entry->scroll_y;
     if (tile_cache_canvas_frame_fast_eligible(

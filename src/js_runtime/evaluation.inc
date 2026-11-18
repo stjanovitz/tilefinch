@@ -443,6 +443,20 @@ static void script_profile_enter(ScriptRuntime *runtime)
     runtime->profile->last_ns = js_rt_monotonic_time_ns();
 }
 
+/* The profiling trampoline stands in for a host native, which is browser
+   code whoever calls it (js_rt_install_native marks the plain function;
+   the trampoline, a data function with no frame of its own, brackets the
+   call instead). */
+static JSValue script_profile_browser_native(
+    const ScriptProfileNative *native, JSContext *context,
+    JSValueConst this_value, int argc, JSValueConst *argv)
+{
+    void *previous = JS_EnterBrowserCode(context);
+    JSValue value = native->function(context, this_value, argc, argv);
+    JS_LeaveBrowserCode(context, previous);
+    return value;
+}
+
 static JSValue script_profile_native_call(JSContext *context,
                                           JSValueConst this_value, int argc,
                                           JSValueConst *argv, int magic,
@@ -458,7 +472,7 @@ static JSValue script_profile_native_call(JSContext *context,
         profile->work_native_calls[magic]++;
     }
     if (profile == NULL || profile->native_depth != 0)
-        return native->function(context, this_value, argc, argv);
+        return script_profile_browser_native(native, context, this_value, argc, argv);
     uint64_t begin_ns = js_rt_monotonic_time_ns();
     /* Close the caller's script interval at the call, so neither this
        native's time nor script it calls back into inherits it. */
@@ -477,7 +491,7 @@ static JSValue script_profile_native_call(JSContext *context,
     profile->native_stack_top = JS_GetStackTop(owner->runtime);
     profile->native_depth++;
     unsigned ledger = work_ledger_enter(WORK_LEDGER_NATIVE);
-    JSValue value = native->function(context, this_value, argc, argv);
+    JSValue value = script_profile_browser_native(native, context, this_value, argc, argv);
     work_ledger_leave(ledger);
     /* The runtime may have released the profile (a report) meanwhile. */
     profile = owner->profile;
@@ -1744,6 +1758,12 @@ bool js_rt_record_script_exception(JSContext *context, const char *name,
         return false;
     }
     JSValue exception = JS_GetException(context);
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    const Watchdog *watchdog = bridge == NULL || bridge->host == NULL
+        ? NULL : &bridge->host->watchdog;
+    bool heap_refused = watchdog != NULL && watchdog->pool != NULL
+        && budget_quickjs_pool_rejection_count(watchdog->pool)
+               > watchdog->pool_rejections_started;
     JS_Throw(context, JS_DupValue(context, exception));
     js_rt_record_exception(context, result);
     /* A refused allocation is the host's failure, not the script's. QuickJS
@@ -1756,17 +1776,14 @@ bool js_rt_record_script_exception(JSContext *context, const char *name,
        JavaScript. */
     static const char out_of_memory[] = "InternalError: out of memory",
                       unformatted[] = "JavaScript exception";
-    DomBridge *bridge = JS_GetContextOpaque(context);
-    const Watchdog *watchdog = bridge == NULL || bridge->host == NULL
-        ? NULL : &bridge->host->watchdog;
-    bool heap_refused = watchdog != NULL && watchdog->pool != NULL
-        && budget_quickjs_pool_rejection_count(watchdog->pool)
-               > watchdog->pool_rejections_started;
+    bool unformatted_oom = heap_refused && (JS_IsNull(exception)
+        || strncmp(result->error, unformatted, sizeof(unformatted) - 1) == 0);
+    /* Preserve the classification for the navigation's low-memory recovery
+       too, even when this realm could not allocate the diagnostic string. */
+    if (unformatted_oom)
+        memcpy(result->error, out_of_memory, sizeof(out_of_memory));
     bool host_failure = strncmp(result->error, out_of_memory,
-                                sizeof(out_of_memory) - 1) == 0
-        || (heap_refused && (JS_IsNull(exception)
-                             || strncmp(result->error, unformatted,
-                                        sizeof(unformatted) - 1) == 0));
+                                sizeof(out_of_memory) - 1) == 0;
     bool reported = !host_failure
         && js_rt_report_script_error(context, exception, name, source_kind);
     JS_FreeValue(context, exception);
@@ -1784,10 +1801,23 @@ static void promise_rejection_tracker(JSContext *context,
        the owner Window.  The immutable realm hook only queues a bounded task;
        it never invokes author handlers from inside QuickJS's rejection
        tracker.  A failure in this browser-owned notification path must not
-       replace the promise's own rejection. */
-    JSValue worker_global = JS_GetGlobalObject(context);
-    JSValue worker_notify = JS_GetPropertyStr(
-        context, worker_global, "__tilefinchQueuePromiseRejection");
+       replace the promise's own rejection.  Only a worker realm's
+       platform initializer defines the hook (non-writable and
+       non-configurable): elsewhere the name is the page's to define, and
+       the tracker never calls page code. */
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    bool worker_realm = false;
+    if (bridge != NULL && bridge->host != NULL) {
+        for (size_t i = 0; i < SCRIPT_WORKER_REALM_LIMIT; i++)
+            if (bridge->host->worker_realms[i].context == context)
+                worker_realm = true;
+    }
+    JSValue worker_global = worker_realm
+        ? JS_GetGlobalObject(context) : JS_UNDEFINED;
+    JSValue worker_notify = worker_realm
+        ? JS_GetPropertyStr(context, worker_global,
+                            "__tilefinchQueuePromiseRejection")
+        : JS_UNDEFINED;
     if (JS_IsFunction(context, worker_notify)) {
         JSValue args[3] = {
             JS_DupValue(context, promise),
@@ -2315,15 +2345,15 @@ bool js_rt_evaluate_compiled_source(
  * Function source outside the heap.
  *
  * QuickJS keeps each function's source text for
- * Function.prototype.toString(). For a classic script that is close to one
- * copy of the whole script in the realm heap (a mean of 3.7 MB, a fifth of
- * the heap, on the video sites that run out of JavaScript memory), plus a
- * copy of every nested function's text while it compiles. A classic script
- * of at least SCRIPT_SOURCE_STORE_MINIMUM_BYTES (inline or external; not
- * modules, which drop the text outright, see js_module_loader.c, nor
- * lazy-webpack factories, whose text that tier already keeps) therefore
- * compiles with JS_STRIP_SOURCE, and its text goes to the realm's
- * function-source store (js_source_store.h) in the page Budget instead.
+ * Function.prototype.toString(). For a script that is close to one copy of
+ * the whole script in the realm heap (a mean of 3.7 MB, a fifth of the
+ * heap, on the video sites that run out of JavaScript memory), plus a copy
+ * of every nested function's text while it compiles. A page script of at
+ * least SCRIPT_SOURCE_STORE_MINIMUM_BYTES (inline, external or a module,
+ * js_module_loader.c "Source retention for page modules"; not lazy-webpack
+ * factories, whose text that tier already keeps) therefore compiles with
+ * JS_STRIP_SOURCE, and its text goes to the realm's function-source store
+ * (js_source_store.h) in the page Budget instead.
  * Its functions record where their text is (JS_SetExternalSourceHooks()),
  * so toString() returns exactly what the unstripped engine returned, and
  * file:line:col in stacks is unchanged (the line tables stay).
@@ -2397,6 +2427,25 @@ static const ScriptSourceStoreConfig *script_source_store_config(void)
     }
 #endif
     return &config;
+}
+
+/* Module text goes to the store too (js_module_loader.c, "Source retention
+   for page modules"). TILEFINCH_JS_MODULE_SOURCE_STORE=0 (lab and
+   validation builds) strips module text with no store copy instead, for an
+   A/B on one binary. */
+bool js_rt_module_source_store_enabled(void)
+{
+#if TILEFINCH_LAB_ENVIRONMENT
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value =
+            tilefinch_lab_getenv("TILEFINCH_JS_MODULE_SOURCE_STORE");
+        enabled = value != NULL && strcmp(value, "0") == 0 ? 0 : 1;
+    }
+    return enabled != 0;
+#else
+    return true;
+#endif
 }
 
 /* The engine's external-source hooks. Ids at or above
@@ -2582,7 +2631,9 @@ static int js_rt_source_store_compile_begin(
     const ScriptSourceStoreConfig *config = script_source_store_config();
     if (config->policy == SCRIPT_SOURCE_POLICY_KEEP
         || (source_kind != SCRIPT_COMPILE_SOURCE_INLINE
-            && source_kind != SCRIPT_COMPILE_SOURCE_EXTERNAL)
+            && source_kind != SCRIPT_COMPILE_SOURCE_EXTERNAL
+            && !(source_kind == SCRIPT_COMPILE_SOURCE_MODULE
+                 && js_rt_module_source_store_enabled()))
         || length < config->minimum_bytes) return -1;
     uint32_t source_id = 0;
     if (config->policy == SCRIPT_SOURCE_POLICY_STORE) {
@@ -3089,6 +3140,15 @@ bool js_rt_evaluate_source(JSContext *context, const char *source,
 {
     return evaluate_source_type(context, source, length, name,
                                 JS_EVAL_TYPE_GLOBAL,
+                                SCRIPT_COMPILE_SOURCE_INTERNAL, result);
+}
+
+bool js_rt_evaluate_browser_source(JSContext *context, const char *source,
+                                   size_t length, const char *name,
+                                   ScriptResult *result)
+{
+    return evaluate_source_type(context, source, length, name,
+                                JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_TRUSTED,
                                 SCRIPT_COMPILE_SOURCE_INTERNAL, result);
 }
 

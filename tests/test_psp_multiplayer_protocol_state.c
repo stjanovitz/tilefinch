@@ -28,12 +28,13 @@ typedef struct {
     unsigned char data[TILEFINCH_MULTIPLAYER_MESSAGE_LIMIT];
 } PspMultiplayerCommand;
 typedef struct {
-    struct sockaddr_in candidate, remote;
+    struct sockaddr_in candidate, remote, punch_endpoint;
+    TilefinchMultiplayerRequest request;
     uint32_t candidate_nonce, remote_nonce, local_nonce, cookie, cookie_secret;
     char candidate_name[TILEFINCH_MULTIPLAYER_PEER_NAME_LIMIT + 1u];
-    bool remote_valid, opened;
+    bool remote_valid, opened, punch_valid;
     PspMultiplayerCandidate candidate_state;
-    uint64_t last_handshake_us;
+    uint64_t last_handshake_us, last_punch_us;
     atomic_uint command_read, command_write;
     PspMultiplayerCommand commands[PSP_MULTIPLAYER_COMMAND_STORAGE];
 } PspMultiplayerSession;
@@ -156,6 +157,17 @@ static bool run_case(const char *name)
         CHECK(multiplayer_candidate_confirms(&session, &a, 1, 99, cookie));
         multiplayer_apply_peer_approval(&session, 1, true);
         CHECK(session.cookie == cookie && session.opened);
+    } else if (!strcmp(name, "late-remote-code")) {
+        session.request.mode = TILEFINCH_MULTIPLAYER_MODE_JOIN;
+        CHECK(multiplayer_apply_remote_endpoint(&session, &a));
+        /* Worker consumes a previously admitted setup command after OPEN. */
+        session.remote_nonce = 12u;
+        session.cookie = 41u;
+        session.opened = true;
+        CHECK(!multiplayer_apply_remote_endpoint(&session, &b));
+        CHECK(session.opened && session.remote_valid
+            && multiplayer_same_endpoint(&session.remote, &a)
+            && session.remote_nonce == 12u && session.cookie == 41u);
     } else if (!strcmp(name, "confirmation-controls")) {
         candidate(&session, 1);
         candidate(&session, 1);
@@ -218,7 +230,7 @@ int main(int argc, char **argv)
 {
     const char *cases[] = {"pending-stable", "approved-stable", "notification-refusal",
         "reject-reset", "late-decision", "confirmation-controls", "essential-admission",
-        "drain-progress", "fifo-wrap"};
+        "drain-progress", "fifo-wrap", "late-remote-code"};
     bool ok = true;
     for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         if (argc > 1 && strcmp(argv[1], cases[i])) continue;

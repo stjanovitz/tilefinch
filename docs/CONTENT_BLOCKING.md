@@ -10,9 +10,8 @@ Tilefinch also hides common cookie-consent overlays by default. This is a
 separate comfort policy: it stays active when request blocking is Off, never
 clicks an acceptance button, and never creates a consent cookie. **Menu →
 Page tools → Site information → Permissions & controls → Cookie notices**
-switches
-between **Hide** and **Show** for the current registrable site, and at most 16
-Show exceptions are kept.
+switches between **Hide** and **Show** for the current site (its registrable
+domain), and at most 16 Show exceptions are kept.
 
 ## Modes
 
@@ -73,9 +72,8 @@ teads.tv                   triplelift.com             yieldmo.com
 zedo.com
 ```
 
-`imasdk.googleapis.com` serves only Google's IMA video-ad SDK (`ima3.js`,
-about 0.5 MB of script, which cnn.com loads once its page is up); the rest of
-`googleapis.com` (libraries, fonts, APIs) is not matched.
+`imasdk.googleapis.com` serves only Google's IMA video-ad SDK (`ima3.js`);
+the rest of `googleapis.com` (libraries, fonts, APIs) is not matched.
 
 Basic also refuses third-party requests to these 15 tag-manager and A/B
 testing host suffixes, and, when **Paywall scripts** is set to **Block**, to
@@ -95,10 +93,11 @@ Paywall SDKs   piano.io  tinypass.com (Piano)  poool.fr  pelcro.com
 ```
 
 These scripts are large, run while the page loads and hold script memory for
-the life of the page, and the page is sent without needing them. Each entry is a vendor's own delivery or
-collection host, not a shared CDN. Feature-flag services, recommendation and
-personalisation engines, and analytics-only hosts are not listed, because
-pages read their answers to work or to fill in content.
+the life of the page, and the page is sent without needing them. Each entry is
+a vendor's own delivery or collection host, not a shared CDN. Feature-flag
+services, recommendation and personalisation engines, and analytics-only hosts
+are not listed, because pages read their answers to work or to fill in
+content.
 
 A page that waits on one of these scripts keeps working when it is refused:
 
@@ -122,10 +121,9 @@ refused SDK appears as the site sent it: open on a site that sends the article
 and gates it in the browser, closed on a site that only sends the article to a
 signed-in reader. The change applies to the requests that follow; reload a
 page to apply it there. A Custom list can refuse them too; the refused script
-then gets only its `error` event, with no answer. A site that needs one of the
-refused scripts can be
-restored with **Permissions & controls → Content blocking**; **Off** loads them
-everywhere.
+then gets only its `error` event, with no answer. A site that needs one of
+the refused scripts can be restored with **Permissions & controls → Content
+blocking**; **Off** loads them everywhere.
 
 Top-level navigation is never blocked, and a matching site exception bypasses
 both Basic/Custom request rules and cosmetic hiding.

@@ -39,22 +39,24 @@ blocking native Home. A Custom theme selection that names no file in
 `data/themes/` reads the single file `data/theme.tfth` instead.
 
 The format is line-oriented UTF-8/ASCII. The header and numeric `format`
-version are mandatory; version 1 is the current schema. A newer Tilefinch can
-therefore reject a future incompatible theme cleanly instead of guessing.
-Every color is `#RRGGBB`. Omitted fields inherit Midnight, which makes a small
-accent-only theme valid. The designer snaps every color to the exact RGB565
-value the PSP will display; hand-authored 24-bit colors are accepted and
-reduced once when loaded.
+version are mandatory; version 2 is the current schema, and Tilefinch still
+reads version 1 files unchanged. A newer Tilefinch can therefore reject a
+future incompatible theme cleanly instead of guessing. Every color is
+`#RRGGBB`. Omitted fields inherit Midnight, which makes a small accent-only
+theme valid. The designer snaps every color to the exact RGB565 value the PSP
+will display; hand-authored 24-bit colors are accepted and reduced once when
+loaded.
 
 ```text
 tilefinch-theme
-format=1
+format=2
 name=Harbor Blue
 ground=#10151D
 panel=#151D28
 text=#F5F8FC
 accent=#5F9DDB
 accent_high=#91BDEA
+danger=#F0707A
 ```
 
 `name` is an optional printable 31-character display label. Without it, the
@@ -66,7 +68,38 @@ chooser derives a label from the filename. The available color fields are:
 | Surfaces | `surface`, `surface_focus`, `line` |
 | Text ramp | `text`, `text_body`, `text_muted`, `text_faint` |
 | Accent | `accent`, `accent_high`, `on_accent` |
-| Semantic | `ok`, `warn` |
+| Semantic | `ok`, `warn`, `danger` |
+
+`on_accent` is the ink on an accent fill: the highlighted menu row,
+buttons, and the selected keyboard key. Give it at least 4.5:1 contrast
+against both `accent` and `accent_high`; the built-in themes and the example
+files meet that. The designer's suggested palettes use near-black or white,
+whichever reads better on both, and move the accent slightly lighter or
+darker when neither reaches 4.5:1. An accent-only file keeps Midnight's dark
+`on_accent`, so give it an accent light enough for dark text.
+
+`warn` marks warnings, such as a low battery or a certificate problem.
+`danger` marks actions that delete or reset something: the Clear rows in
+**Menu → Settings → Device & storage → Site data & storage**, a site's
+**Delete its data**, **Clear data for this site** and **Reset permissions** in
+**Menu → Page tools → Site information**, **Clear playback positions** in
+**Menu → Settings → Video**, a Library item waiting for its second delete
+press, and the warning lines when removing homebrew. It is drawn on the
+`panel` and, for a focused row, on `surface_focus`; give it at least 4.5:1
+contrast against both. The built-in values meet that: the dark themes use
+`#EF6B75` and Daylight `#B3261E`.
+
+Version 2 added `danger`. A version 1 file, or a version 2 file that leaves
+it out, gets a derived red instead of Midnight's: the first of a short ramp
+of reds that reaches 4.5:1 against the file's own `panel` and
+`surface_focus`, starting from the dark themes' red on a dark panel and from
+Daylight's on a light one. A file whose surfaces copy a built-in theme
+therefore gets that theme's danger. When no red reaches 4.5:1 (mid-tone or
+mismatched surfaces), the most legible of those reds and the theme's own
+`text` is used. A version 1 file that names `danger` is rejected as an
+unknown field, as earlier Tilefinch releases reject it; change its `format`
+to 2. Earlier releases reject every version 2 file, so keep a version 1 copy
+for them.
 
 A theme file may be at most 2 KiB, 24 lines, and 95 bytes per line. Tilefinch
 applies it only after the whole file checks out: unknown versions or fields,

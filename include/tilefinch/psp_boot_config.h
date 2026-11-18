@@ -40,6 +40,10 @@ typedef struct {
        first usable input +8 s in two of three runs) for ~0.5 s after the
        send. */
     long page_task_yield;
+    /* 0 builds every page realm without the interface snapshot, so the
+       browser's own script reads the built-ins as the page left them; 1
+       or -1 (unset) keeps it. For comparing the two on one binary. */
+    long interface_snapshot;
     long script_timeout_ms;
     long css_width;
     long css_height;

@@ -899,6 +899,56 @@ static long fill_realm(ScriptRuntime *runtime, ScriptResult *result)
     return atol(result->summary);
 }
 
+/* Before a script is refused for memory, admission makes the releases
+   growth would: the response cache's sole-owned script body goes; one a
+   load still reads stays. */
+static int test_admission_reclaims_cached_script_bodies(void)
+{
+    for (int leased = 0; leased < 2; leased++) {
+        ClassicFixture fixture;
+        CHECK(fixture_open(&fixture));
+        CHECK(browser_session_cache_set_maximum_bytes(
+            &fixture.session, 4u * MIB));
+        static const char url[] = "https://site.test/big.js";
+        ScriptResult result;
+        memset(&result, 0, sizeof(result));
+        ScriptRuntime *runtime = script_runtime_create_configured(
+            &fixture.document, &fixture.budget, 4u * MIB, 8000, page_url,
+            &fixture.options, &result);
+        CHECK(runtime != NULL);
+        BrowserSharedBody *script = put_shared_body(
+            &fixture.session, url, 1536u * KIB,
+            TILEFINCH_DESTINATION_SCRIPT);
+        CHECK(script != NULL);
+        if (!leased) {
+            browser_shared_body_release(script);
+            script = NULL;
+        }
+        /* What admission may count on: the sole body, not a leased one. */
+        size_t reclaimable =
+            script_runtime_admission_reclaimable(runtime, false);
+        CHECK(leased ? reclaimable < 1536u * KIB
+                     : reclaimable >= 1536u * KIB);
+        size_t reachable = script_runtime_heap_reachable(runtime, 0);
+        size_t after = script_runtime_heap_reachable_after_release(
+            runtime, reclaimable);
+        CHECK(after >= reachable && after - reachable <= reclaimable);
+        CHECK(script_runtime_reclaim_for_admission(runtime, 0, false) == 0);
+        size_t freed = script_runtime_reclaim_for_admission(runtime, MIB,
+                                                            false);
+        if (leased) {
+            CHECK(freed < MIB && cached_script(&fixture.session, url));
+            browser_shared_body_release(script);
+        } else {
+            CHECK(freed >= 1536u * KIB
+                  && !cached_script(&fixture.session, url));
+        }
+        script_runtime_destroy(runtime);
+        CHECK(fixture_close(&fixture));
+    }
+    return 0;
+}
+
 /* The realm short of room to grow takes back the response cache's own
    script bodies first, exactly as much as it can then use; with room to
    spare it leaves them alone. */
@@ -1158,6 +1208,8 @@ int main(void)
     puts("cached script bodies released, sole ones only: PASS");
     CHECK(test_growth_takes_back_cached_script_bodies() == 0);
     puts("realm growth takes back cached script bodies: PASS");
+    CHECK(test_admission_reclaims_cached_script_bodies() == 0);
+    puts("admission takes back cached script bodies before refusing: PASS");
     CHECK(test_running_script_body_and_revisits() == 0);
     puts("running script body released; revisits recompile or hit: PASS");
     return 0;

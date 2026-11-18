@@ -60,8 +60,9 @@ engineering detail is in [docs/SECURE_UPDATES.md](docs/SECURE_UPDATES.md) and
 - **Desktop-browser guarantees the engine does not yet make.** Tilefinch has
   no process isolation and no complete CSP, as the README's
   [Known limits](README.md#known-limits) say. It also has no complete CORS
-  fetch policy, no certificate viewer, no permissions system, and no cache
-  partitioning beyond scripts, stylesheets and images.
+  fetch policy, no certificate viewer, no general permission model (the
+  microphone is the only page permission), and no cache partitioning beyond
+  scripts, stylesheets and images.
 
 ## How updates verify
 

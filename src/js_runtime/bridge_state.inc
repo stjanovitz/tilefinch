@@ -195,7 +195,7 @@ static ElementScrollIntent *bridge_scroll_intent_set(
     *intent = (ElementScrollIntent) {
         .node = node,
         .sequence = sequence,
-        .scroll_x = scroll_x < 0 ? 0 : scroll_x,
+        .scroll_x = scroll_x,
         .scroll_y = scroll_y < 0 ? 0 : scroll_y
     };
     return intent;

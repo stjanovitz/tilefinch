@@ -178,9 +178,7 @@ bool layout_paint_special_input(
     unsigned accent = 0x1a73e8;
     if (type == CONTROL_TOGGLE) {
         bool radio = attribute_is(node, "type", "radio");
-        bool checked = lxb_dom_element_has_attribute(
-            lxb_dom_interface_element(node),
-            (const lxb_char_t *) "checked", 7);
+        bool checked = document_control_checked(node);
         bool indeterminate = lxb_dom_element_has_attribute(
             lxb_dom_interface_element(node),
             (const lxb_char_t *) "data-tilefinch-indeterminate", 28);

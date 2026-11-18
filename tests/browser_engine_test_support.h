@@ -39,6 +39,7 @@ int test_grid_fr_rows_share_after_content(void);
 int test_grid_auto_row_stretch_and_focus_clip(void);
 int test_inset_pseudo_disc(void);
 int test_night_mode_prefers_dark(void);
+int test_scroll_after_document_growth(void);
 int test_declared_var_and_script_form_submission(void);
 int test_native_form_submission_sends_script_entries(void);
 int test_native_form_submission_large_bodies(void);

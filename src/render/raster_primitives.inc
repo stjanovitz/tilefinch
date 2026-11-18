@@ -348,11 +348,26 @@ static int overflow_clip_radius(const LayoutDocument *layout,
     return layout_node_box_effective_clip_radius_code(layout, box);
 }
 
-static bool overflow_command_geometry(const LayoutDocument *layout,
+static int sticky_clip_offset(const LayoutNodeBox *box,
+                              const StickyRange *range, int offset)
+{
+    if (range == NULL || offset == 0) return 0;
+    if (box->command_start < range->command_start
+        || box->command_end > range->command_end) return 0;
+    const lxb_dom_node_t *at = box->node, *end = range->node;
+    for (unsigned depth = 0; at != NULL && depth < 256u;
+         depth++, at = at->parent) {
+        if (at == end) return offset;
+    }
+    return 0;
+}
+
+static bool overflow_command_geometry_moved(const LayoutDocument *layout,
                                       size_t index, int *dx, int *dy,
                                       int *clip_left, int *clip_top,
                                       int *clip_right, int *clip_bottom,
-                                      OverflowFallback *fallback)
+                                      OverflowFallback *fallback,
+                                      const StickyRange *sticky, int sticky_dy)
 {
     overflow_fallback_prepare(layout, fallback);
     bool found = false;
@@ -376,6 +391,7 @@ static bool overflow_command_geometry(const LayoutDocument *layout,
         *dy -= box->scroll_y;
         int x = 0, y = 0;
         box_visual_origin(layout, box, &x, &y, fallback);
+        y = render_saturating_add_int(y, sticky_clip_offset(box, sticky, sticky_dy));
         int left, top, right, bottom;
         layout_node_box_clip_rect(box, x, y, &left, &top, &right, &bottom);
         if (box->clips_x) {
@@ -390,6 +406,15 @@ static bool overflow_command_geometry(const LayoutDocument *layout,
     return found && *clip_right > *clip_left && *clip_bottom > *clip_top;
 }
 
+static bool overflow_command_geometry(const LayoutDocument *layout,
+                                      size_t index, int *dx, int *dy,
+                                      int *clip_left, int *clip_top,
+                                      int *clip_right, int *clip_bottom,
+                                      OverflowFallback *fallback)
+{
+    return overflow_command_geometry_moved(layout, index, dx, dy,
+        clip_left, clip_top, clip_right, clip_bottom, fallback, NULL, 0);
+}
 typedef struct {
     int x;
     int y;
@@ -682,9 +707,10 @@ static bool rounded_rect_clip_row_span(int rect_x, int rect_y,
     return true;
 }
 
-static size_t overflow_rounded_clips(const LayoutDocument *layout,
+static size_t overflow_rounded_clips_moved(const LayoutDocument *layout,
                                      size_t index, RoundedClip *clips,
-                                     size_t capacity, OverflowFallback *fallback)
+                                     size_t capacity, OverflowFallback *fallback,
+                                     const StickyRange *sticky, int sticky_dy)
 {
     overflow_fallback_prepare(layout, fallback);
     size_t count = 0;
@@ -701,6 +727,7 @@ static size_t overflow_rounded_clips(const LayoutDocument *layout,
         if (count >= capacity) continue;
         int x = 0, y = 0;
         box_visual_origin(layout, box, &x, &y, fallback);
+        y = render_saturating_add_int(y, sticky_clip_offset(box, sticky, sticky_dy));
         int left, top, right, bottom;
         layout_node_box_clip_rect(box, x, y, &left, &top, &right, &bottom);
         int radius = overflow_clip_radius(layout, box);
@@ -712,6 +739,13 @@ static size_t overflow_rounded_clips(const LayoutDocument *layout,
     return count;
 }
 
+static size_t overflow_rounded_clips(const LayoutDocument *layout,
+                                     size_t index, RoundedClip *clips,
+                                     size_t capacity, OverflowFallback *fallback)
+{
+    return overflow_rounded_clips_moved(layout, index, clips, capacity,
+                                       fallback, NULL, 0);
+}
 static bool point_in_rounded_clips(const RoundedClip *clips, size_t count,
                                    int x, int y)
 {
@@ -805,6 +839,9 @@ struct RenderOverflowCache {
     size_t geometry_count;
     uint32_t rounded_clip_indices[64];
     size_t rounded_count;
+    /* Positioned boxes of this layout, for clip-escape checks made while a
+       frame is painted (stuck sticky commands). */
+    LayoutPositionedClipIndex positioned;
     bool prepared;
     /* The scroll state scroll_values were last checked against, when it has
        a name: tiles call prepare once each, and an unchanged generation
@@ -1086,6 +1123,7 @@ static bool overflow_cache_build(TileCache *cache)
         };
     }
     overflow->rounded_count = rounded;
+    layout_positioned_clip_index_prepare(layout, &overflow->positioned);
     cache->overflow_cache = overflow;
     cache->overflow_cache_bytes = persistent_bytes;
     cache->overflow_cache_builds++;

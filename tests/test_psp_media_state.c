@@ -797,9 +797,33 @@ static bool test_randomized_lifecycle_sequences_preserve_invariants(void)
     return true;
 }
 
+static bool test_playlist_end_is_rearmed_after_replay(void)
+{
+    bool handled = false;
+    CHECK(psp_media_playlist_end_edge(true, &handled));
+    CHECK(!psp_media_playlist_end_edge(true, &handled));
+    /* Restart without changing playlist index; enable Auto next in this pass. */
+    CHECK(!psp_media_playlist_end_edge(false, &handled));
+    CHECK(psp_media_playlist_end_edge(true, &handled));
+    CHECK(!psp_media_playlist_end_edge(true, &handled));
+    return true;
+}
+
+static bool test_failed_initial_subtitles_can_be_reselected(void)
+{
+    CHECK(!psp_media_subtitle_can_retry(false, false, false, false));
+    CHECK(!psp_media_subtitle_can_retry(false, true, false, false));
+    CHECK(!psp_media_subtitle_can_retry(false, false, true, true));
+    CHECK(psp_media_subtitle_can_retry(false, false, false, true));
+    CHECK(!psp_media_subtitle_can_retry(true, false, false, true));
+    return true;
+}
+
 int main(void)
 {
-    if (!test_open_priming_and_play()
+    if (!test_playlist_end_is_rearmed_after_replay()
+        || !test_failed_initial_subtitles_can_be_reselected()
+        || !test_open_priming_and_play()
         || !test_one_shot_presentation_boundaries()
         || !test_video_only_skips_audio_open_phases()
         || !test_audio_only_skips_video_open_phases()

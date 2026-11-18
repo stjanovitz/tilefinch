@@ -463,14 +463,21 @@
   defineProperty(globalThis, "__tilefinchMediaCaptureHostEvent", { __proto__: null,
     configurable: true,
     writable: false,
-    value: (generation, trusted) => {
+    value: (generation, trusted, dispatch) => {
+      const ended = [];
       for (const track of [...liveTracks]) {
         const state = tracks.get(track);
         if (state.generation !== generation) continue;
         liveTracks.delete(track);
         state.readyState = "ended";
-        track.dispatchEvent(trusted(createEvent("ended")));
+        ended.push(track);
       }
+      let next = 0;
+      const deliver = () => {
+        if (next < ended.length)
+          dispatch(ended[next++], trusted(createEvent("ended")), deliver);
+      };
+      deliver();
     },
   });
 })();

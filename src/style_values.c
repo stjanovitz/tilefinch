@@ -4796,13 +4796,19 @@ bool style_parse_grid_track(const Stylesheet *sheet, const char *text,
             int floor = style_parse_length(sheet, floor_text, floor_length,
                                            INT_MIN, &percent);
             if (floor_text[0] == '-') return false;
-            /* The minimum is stored in pixels, so a percentage floor and
-               one mixing a percentage with a length both leave it 0, as
-               they did before floors were validated. */
             if (floor == INT_MIN) {
                 if (!grid_track_math_floor(sheet, floor_text, floor_length))
                     return false;
-            } else if (!percent && floor > 0) {
+            } else if (percent) {
+                char *end;
+                double number = strtod(floor_text, &end);
+                if (end == floor_text || *end != '%'
+                    || (size_t) (end - floor_text) + 1u != floor_length)
+                    number = floor;
+                if (!(number > 0)) number = 0;
+                if (number > 655.35) number = 655.35;
+                *minimum = GRID_TRACK_PERCENT_MINIMUM | (unsigned) (number * 100.0 + 0.5);
+            } else if (floor > 0) {
                 *minimum = (unsigned) floor;
             }
         }
@@ -4818,7 +4824,8 @@ bool style_parse_grid_track(const Stylesheet *sheet, const char *text,
                                     &ignored_minimum)) return false;
         *type = maximum_type;
         *value = maximum_value;
-        if (*type == GRID_TRACK_FIXED && *minimum > *value) {
+        if (*type == GRID_TRACK_FIXED && *minimum > *value
+            && !(*minimum & GRID_TRACK_PERCENT_MINIMUM)) {
             *minimum = *value;
         }
         return true;
@@ -4902,6 +4909,7 @@ bool style_parse_grid_columns(Stylesheet *sheet, const char *text,
     }
     ComputedStyle candidate = *style;
     computed_style_set_grid_column_count(&candidate, 0);
+    computed_style_set_grid_auto_fill(&candidate, false);
     computed_style_set_grid_subgrid_columns(&candidate, false);
     computed_style_set_grid_column_template_id(&candidate, 0);
     candidate.grid_min_column_width = 0;
@@ -4935,6 +4943,8 @@ bool style_parse_grid_columns(Stylesheet *sheet, const char *text,
                 }
             }
             computed_style_set_grid_column_count(&candidate, 0);
+            computed_style_set_grid_auto_fill(&candidate,
+                                               strncmp(argument, "auto-fill", 9) == 0);
             *style = candidate;
             return true;
         }
@@ -5101,7 +5111,34 @@ bool style_parse_grid_line_or_name(
     const char *name = resolved;
     size_t name_length = strlen(resolved);
     trim(&name, &name_length);
-    if (!grid_line_name_valid(name, name_length)) return false;
+    char canonical[STYLE_GRID_AREA_NAME_CAPACITY];
+    if (!grid_line_name_valid(name, name_length)) {
+        size_t first = 0, second;
+        while (first < name_length && !isspace((unsigned char) name[first])) first++;
+        second = first;
+        while (second < name_length && isspace((unsigned char) name[second])) second++;
+        if (!first || second == name_length) return false;
+        const char *ordinal = name + second;
+        size_t ordinal_length = name_length - second;
+        if (grid_line_name_valid(name, first)) {
+            name_length = first;
+        } else if (grid_line_name_valid(name + second, name_length - second)) {
+            ordinal = name;
+            ordinal_length = first;
+            name += second;
+            name_length -= second;
+        } else {
+            return false;
+        }
+        int count = 0, ignored = 0;
+        if (!style_parse_grid_line(sheet, ordinal, ordinal_length, &count, &ignored)
+            || count == 0) return false;
+        int used = snprintf(canonical, sizeof(canonical), "%.*s %d",
+                            (int) name_length, name, count);
+        if (used < 0 || (size_t) used >= sizeof(canonical)) return false;
+        name = canonical;
+        name_length = (size_t) used;
+    }
     uint8_t id = style_intern_grid_line_name(sheet, name, name_length);
     if (id == 0) return false;
     *line = 0;
@@ -5122,6 +5159,20 @@ static bool grid_track_automatic_minimum(const char *text, size_t length)
         && grid_track_keyword_floor(floor, floor_length);
 }
 
+#define GRID_TRACK_TYPE_PERCENT_FLOOR UINT8_C(0x80)
+
+static void grid_store_track(StyleGridTrackTemplate *parsed,
+    uint8_t type, unsigned value, unsigned minimum, bool automatic_minimum)
+{
+    unsigned index = parsed->track_count++;
+    parsed->track_types[index] = type | ((minimum & GRID_TRACK_PERCENT_MINIMUM)
+        ? GRID_TRACK_TYPE_PERCENT_FLOOR : 0);
+    parsed->track_values[index] = value > UINT16_MAX ? UINT16_MAX : (uint16_t) value;
+    parsed->track_minimums[index] = (uint16_t) minimum;
+    if (automatic_minimum)
+        parsed->automatic_minimums[index / 8u] |= (uint8_t) (1u << (index % 8u));
+}
+
 static bool grid_append_track(
     const Stylesheet *sheet, StyleGridTrackTemplate *parsed,
     const char *text, size_t length, unsigned limit)
@@ -5131,14 +5182,8 @@ static bool grid_append_track(
     unsigned value = 0, minimum = 0;
     if (!style_parse_grid_track(
             sheet, text, length, &type, &value, &minimum)) return false;
-    unsigned index = parsed->track_count++;
-    parsed->track_types[index] = type;
-    parsed->track_values[index] =
-        value > UINT16_MAX ? UINT16_MAX : (uint16_t) value;
-    parsed->track_minimums[index] =
-        minimum > UINT16_MAX ? UINT16_MAX : (uint16_t) minimum;
-    if (grid_track_automatic_minimum(text, length))
-        parsed->automatic_minimums[index / 8u] |= (uint8_t) (1u << (index % 8u));
+    grid_store_track(parsed, type, value, minimum,
+                     grid_track_automatic_minimum(text, length));
     return true;
 }
 
@@ -5164,16 +5209,8 @@ static bool grid_expand_uniform_repeat(
     if (!style_parse_grid_track(
             sheet, track, track_length, &type, &value, &minimum)) return false;
     bool automatic_minimum = grid_track_automatic_minimum(track, track_length);
-    for (long i = 0; i < count; i++) {
-        unsigned index = parsed->track_count++;
-        parsed->track_types[index] = type;
-        parsed->track_values[index] =
-            value > UINT16_MAX ? UINT16_MAX : (uint16_t) value;
-        parsed->track_minimums[index] =
-            minimum > UINT16_MAX ? UINT16_MAX : (uint16_t) minimum;
-        if (automatic_minimum)
-            parsed->automatic_minimums[index / 8u] |= (uint8_t) (1u << (index % 8u));
-    }
+    for (long i = 0; i < count; i++)
+        grid_store_track(parsed, type, value, minimum, automatic_minimum);
     return true;
 }
 
@@ -5733,7 +5770,8 @@ uint8_t stylesheet_grid_track_type(
     const StyleGridTrackTemplate *template =
         style_grid_track_template(sheet, container, rows);
     if (template != NULL && !template->subgrid
-        && index < template->track_count) return template->track_types[index];
+        && index < template->track_count)
+        return template->track_types[index] & ~GRID_TRACK_TYPE_PERCENT_FLOOR;
     return GRID_TRACK_AUTO;
 }
 
@@ -5756,7 +5794,9 @@ unsigned stylesheet_grid_track_minimum(
         style_grid_track_template(sheet, container, rows);
     if (template != NULL && !template->subgrid
         && index < template->track_count) {
-        return template->track_minimums[index];
+        return template->track_minimums[index]
+            | ((template->track_types[index] & GRID_TRACK_TYPE_PERCENT_FLOOR)
+                ? GRID_TRACK_PERCENT_MINIMUM : 0);
     }
     return 0;
 }
@@ -5784,49 +5824,75 @@ uint8_t stylesheet_grid_track_line_name(
     return template->line_names[line][slot];
 }
 
+int stylesheet_grid_line_reference(
+    const Stylesheet *sheet, uint8_t *name)
+{
+    if (sheet == NULL || sheet->grid_areas == NULL || *name == 0
+        || *name > sheet->grid_areas->line_name_count) return 0;
+    const char *text = sheet->grid_areas->line_names[*name - 1u];
+    const char *space = strchr(text, ' ');
+    if (!space) return 0;
+    *name = style_find_grid_line_name(sheet->grid_areas, text, (size_t) (space - text));
+    return (int) strtol(space + 1, NULL, 10);
+}
+
+/* The `occurrence`th line (from the end when negative) named `name_id`.
+   An area's implicit `<area>-start`/`<area>-end` line counts as one of the
+   named lines (CSS Grid 7.3.2). For a numbered placement, any remainder
+   counts implicit lines past the explicit grid (CSS Grid 8.3.1). */
 static int style_grid_named_line(
     const Stylesheet *sheet, const ComputedStyle *container,
-    bool rows, uint8_t name_id)
+    bool rows, uint8_t name_id, int occurrence, bool use_implicit)
 {
-    if (sheet == NULL || sheet->grid_areas == NULL || name_id == 0
+    if (sheet == NULL || sheet->grid_areas == NULL
         || name_id > sheet->grid_areas->line_name_count) return 0;
-    const StyleGridTrackTemplate *template =
-        style_grid_track_template(sheet, container, rows);
-    if (template != NULL) {
-        for (unsigned line = 0; line <= GRID_TRACK_REPEAT_LIMIT; line++) {
-            for (unsigned slot = 0; slot < STYLE_GRID_LINE_NAMES_PER_LINE;
-                 slot++) {
-                if (template->line_names[line][slot] == name_id) {
-                    return (int) line + 1;
-                }
-            }
-        }
-    }
-
-    const char *wanted = sheet->grid_areas->line_names[name_id - 1u];
+    int implicit = 0;
+    const char *wanted = name_id ? sheet->grid_areas->line_names[name_id - 1u] : "";
     size_t wanted_length = strlen(wanted);
     const StyleGridAreaTemplate *areas =
         style_grid_area_template(sheet, container);
-    if (areas == NULL) return 0;
-    for (uint8_t i = 0; i < areas->area_count; i++) {
+    for (uint8_t i = 0; areas != NULL && i < areas->area_count; i++) {
         const StyleGridAreaRect *area = &areas->areas[i];
         if (area->name_id == 0
             || area->name_id > sheet->grid_areas->name_count) continue;
         const char *area_name =
             sheet->grid_areas->names[area->name_id - 1u];
         size_t area_length = strlen(area_name);
-        if (wanted_length == area_length + 6u
-            && memcmp(wanted, area_name, area_length) == 0
-            && memcmp(wanted + area_length, "-start", 6) == 0) {
-            return (rows ? area->row_start : area->column_start) + 1;
+        if (wanted_length <= area_length
+            || memcmp(wanted, area_name, area_length) != 0) continue;
+        const char *suffix = wanted + area_length;
+        if (wanted_length == area_length + 6u && memcmp(suffix, "-start", 6) == 0) {
+            implicit = (rows ? area->row_start : area->column_start) + 1;
+            break;
         }
-        if (wanted_length == area_length + 4u
-            && memcmp(wanted, area_name, area_length) == 0
-            && memcmp(wanted + area_length, "-end", 4) == 0) {
-            return (rows ? area->row_end : area->column_end) + 1;
+        if (wanted_length == area_length + 4u && memcmp(suffix, "-end", 4) == 0) {
+            implicit = (rows ? area->row_end : area->column_end) + 1;
+            break;
         }
     }
-    return 0;
+    const StyleGridTrackTemplate *template =
+        style_grid_track_template(sheet, container, rows);
+    int step = occurrence < 0 ? -1 : 1;
+    if (template && name_id) {
+        int line = step < 0 ? GRID_TRACK_REPEAT_LIMIT : 0;
+        for (; (unsigned) line <= GRID_TRACK_REPEAT_LIMIT; line += step) {
+            bool named = line + 1 == implicit;
+            for (unsigned slot = 0; !named && slot < STYLE_GRID_LINE_NAMES_PER_LINE;
+                 slot++)
+                named = template->line_names[line][slot] == name_id;
+            if (named && (occurrence -= step) == 0) return line + 1;
+        }
+    } else if (implicit && (occurrence -= step) == 0) {
+        return implicit;
+    }
+    if (!use_implicit || (rows ? computed_style_grid_subgrid_rows(container)
+                              : computed_style_grid_subgrid_columns(container)))
+        return 0;
+    unsigned tracks = stylesheet_grid_track_count(sheet, container, rows);
+    unsigned area_tracks = rows ? stylesheet_grid_template_area_rows(sheet, container)
+                                : stylesheet_grid_template_area_columns(sheet, container);
+    if (area_tracks > tracks) tracks = area_tracks;
+    return occurrence + step * ((int) tracks + 1);
 }
 
 /* CSS Grid 8.3.1: a <custom-ident> placement first looks for the implicit
@@ -5839,6 +5905,9 @@ static int style_grid_named_edge_line(
 {
     if (sheet == NULL || sheet->grid_areas == NULL || name_id == 0
         || name_id > sheet->grid_areas->line_name_count) return 0;
+    int occurrence = stylesheet_grid_line_reference(sheet, &name_id);
+    if (occurrence)
+        return style_grid_named_line(sheet, container, rows, name_id, occurrence, true);
     const char *name = sheet->grid_areas->line_names[name_id - 1u];
     size_t length = strlen(name);
     const char *suffix = start ? "-start" : "-end";
@@ -5850,10 +5919,10 @@ static int style_grid_named_edge_line(
         uint8_t edge_id = style_find_grid_line_name(
             sheet->grid_areas, edge, length + suffix_length);
         int line = edge_id == 0 ? 0 : style_grid_named_line(
-            sheet, container, rows, edge_id);
+            sheet, container, rows, edge_id, 1, false);
         if (line != 0) return line;
     }
-    return style_grid_named_line(sheet, container, rows, name_id);
+    return style_grid_named_line(sheet, container, rows, name_id, 1, false);
 }
 
 bool stylesheet_resolve_named_grid_lines(
@@ -5919,11 +5988,17 @@ static bool append_grid_track_token(
     } else {
         snprintf(token, sizeof(token), "auto");
     }
-    if ((minimum != 0 || (type == GRID_TRACK_FLEX && !automatic_minimum))
-        && type != GRID_TRACK_FIXED) {
+    if ((minimum & GRID_TRACK_PERCENT_MINIMUM)
+        || ((minimum != 0 || (type == GRID_TRACK_FLEX && !automatic_minimum))
+            && type != GRID_TRACK_FIXED)) {
         char wrapped[96];
-        snprintf(wrapped, sizeof(wrapped), "minmax(%upx,%s)",
-                 minimum, token);
+        if (minimum & GRID_TRACK_PERCENT_MINIMUM) {
+            minimum &= ~GRID_TRACK_PERCENT_MINIMUM;
+            snprintf(wrapped, sizeof(wrapped), "minmax(%u.%02u%%,%s)",
+                     minimum / 100u, minimum % 100u, token);
+        } else {
+            snprintf(wrapped, sizeof(wrapped), "minmax(%upx,%s)", minimum, token);
+        }
         return append_grid_area_serialization(
             output, capacity, used, wrapped, strlen(wrapped));
     }
@@ -6193,4 +6268,37 @@ const StyleCounterOperations *style_counter_operations(
     if (sheet == NULL || id == 0
         || (size_t) id > sheet->counter_operation_set_count) return NULL;
     return &sheet->counter_operation_sets[id - 1];
+}
+
+uint8_t computed_style_grid_placement_value(
+    const ComputedStyle *style, unsigned field)
+{
+    if (style == NULL || field >= COMPUTED_GRID_PLACEMENT_FIELDS) return 0;
+    if (computed_style_grid_area_is_named(style)) return 0;
+    if (((uint32_t) style->grid_columns
+         & computed_style_grid_placement_named_flag(field)) != 0) return 0;
+    return style->grid_placement[field];
+}
+
+void computed_style_set_grid_placement_value(
+    ComputedStyle *style, unsigned field, unsigned value)
+{
+    if (style == NULL || field >= COMPUTED_GRID_PLACEMENT_FIELDS) return;
+    if (computed_style_grid_area_is_named(style)) {
+        memset(style->grid_placement, 0, sizeof(style->grid_placement));
+    }
+    if ((field == COMPUTED_GRID_COLUMN_SPAN_FIELD
+         || field == COMPUTED_GRID_ROW_SPAN_FIELD)
+        && value > COMPUTED_GRID_SPAN_LIMIT) {
+        value = COMPUTED_GRID_SPAN_LIMIT;
+    }
+    style->grid_placement[field] = (uint8_t) value;
+    style->grid_columns = (int) (
+        (uint32_t) style->grid_columns
+        & ~computed_style_grid_placement_named_flag(field));
+}
+
+bool span_equal(const char *text, size_t length, const char *wanted)
+{
+    return strlen(wanted) == length && memcmp(text, wanted, length) == 0;
 }

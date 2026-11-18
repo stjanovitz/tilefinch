@@ -587,11 +587,6 @@ consume_script_navigation:
                                    session->fonts, session->images,
                                    !replace);
     }
-    int scroll_y = 0;
-    if (script_runtime_consume_scroll(session->page.runtime, &scroll_y)) {
-        int maximum = navigation_max_scroll(session);
-        navigation_set_scroll(session, scroll_y < maximum ? scroll_y : maximum);
-    }
     size_t heap_rejections_after = script_runtime_heap_rejections(
         session->page.runtime);
     bool relayout_requested =
@@ -616,6 +611,7 @@ consume_script_navigation:
                 relayout_finished - relayout_started;
         }
     }
+    if (ok) (void) navigation_publish_script_scroll(session);
     /* Inspect the successfully settled layout, not the pre-mutation command
        count. Only a real allocator rejection plus blank paint/control output
        and bounded useful content may retire a realm. Hard relayout/security

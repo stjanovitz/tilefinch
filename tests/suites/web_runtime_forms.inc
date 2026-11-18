@@ -324,7 +324,8 @@
         "const transformed=new TransformStream({transform(value,c){"
         "c.enqueue(String(value).toUpperCase());}}),writer=transformed.writable."
         "getWriter(),output=transformed.readable.getReader();"
-        "await writer.write('psp');const transformedValue=await output.read();"
+        "const pendingOutput=output.read();await writer.write('psp');"
+        "const transformedValue=await pendingOutput;"
         "await writer.close();const transformedEnd=await output.read();"
         "const response=new Response(new ReadableStream({start(c){"
         "c.enqueue(new TextEncoder().encode('a=1&b=two'));c.close();}}),"
@@ -836,7 +837,8 @@
           && controller_activate(
               &native_controls_controller, &native_controls_action)
           && native_controls_action.type == CONTROLLER_ACTION_CONTROL);
-    CHECK(lxb_dom_element_has_attribute(
+    CHECK(document_control_checked(native_check)
+          && !lxb_dom_element_has_attribute(
               lxb_dom_interface_element(native_check),
               (const lxb_char_t *) "checked", 7));
     CHECK(controller_focus_node(
@@ -893,23 +895,17 @@
         native_slider, &native_value_length);
     if (native_value == NULL || native_value_length != 2
         || memcmp(native_value, "14", 2) != 0
-        || lxb_dom_element_has_attribute(
-            lxb_dom_interface_element(native_check),
-            (const lxb_char_t *) "checked", 7)) {
+        || document_control_checked(native_check)) {
         fprintf(
             stderr, "native reset value=%.*s length=%zu checked=%d\n",
             (int) native_value_length,
             native_value == NULL ? "" : native_value,
             native_value_length,
-            lxb_dom_element_has_attribute(
-                lxb_dom_interface_element(native_check),
-                (const lxb_char_t *) "checked", 7));
+            document_control_checked(native_check));
     }
     CHECK(native_value != NULL && native_value_length == 2
           && memcmp(native_value, "14", 2) == 0
-          && !lxb_dom_element_has_attribute(
-              lxb_dom_interface_element(native_check),
-              (const lxb_char_t *) "checked", 7));
+          && !document_control_checked(native_check));
     navigation_destroy(&native_controls_navigation);
     CHECK(budget.current == 0);
 
@@ -3104,7 +3100,7 @@
         "const recordParams=new URLSearchParams({conversationState:'{\\\"messages\\\":[]}',count:0});const sequenceParams=new URLSearchParams([['first','one'],['first','two']]);"
         "const malformedParams=new URLSearchParams('bad=%E0%A4%A&literal=%&plus=a+b'),lone=String.fromCharCode(0xd800),loneParams=new URLSearchParams([[lone,lone]]),valueParams=new URLSearchParams('a=1&a=2&a=1'),liveParams=new URLSearchParams('first=1&second=2'),liveKeys=liveParams.keys(),liveFirst=liveKeys.next().value;liveParams.append('third','3');const liveRest=[...liveKeys].join(','),stableURL=new URL('https://example.test/old?a=1'),stableParams=stableURL.searchParams,directURL=new URL('https://example.test/path?old=1'),directParams=directURL.searchParams,componentURL=new URL('https://old.test:444/a?x=1#old'),componentParams=componentURL.searchParams;valueParams.delete('a','1');stableURL.href='https://example.test/new?b=2';directURL.search='?new=two words#part';componentURL.pathname='next path?literal';componentURL.hash='new hash';componentURL.hostname='Example.TEST';componentURL.port='443';componentURL.host='other.test:8443';componentURL.protocol='http';const componentHref=componentURL.href;componentURL.host='bad host';componentURL.port='99999';const urlOk=url.pathname==='/next'&&url.searchParams.get('q')==='one two'&&url.search.includes('extra=yes')&&String(new URL('.',url))==='https://example.test/'&&recordParams.toString()==='conversationState=%7B%22messages%22%3A%5B%5D%7D&count=0'&&sequenceParams.getAll('first').join(',')==='one,two'&&malformedParams.get('bad')==='�%A'&&malformedParams.get('literal')==='%'&&malformedParams.get('plus')==='a b'&&loneParams.toString()==='%EF%BF%BD=%EF%BF%BD'&&valueParams.getAll('a').join(',')==='2'&&!valueParams.has('a','1')&&valueParams.has('a','2')&&liveFirst==='first'&&liveRest==='second,third'&&stableURL.searchParams===stableParams&&stableParams.get('a')===null&&stableParams.get('b')==='2'&&directURL.searchParams===directParams&&directURL.search==='?new=two%20words%23part'&&directParams.get('old')===null&&directParams.get('new')==='two words#part'&&directURL.href==='https://example.test/path?new=two%20words%23part'&&componentURL.searchParams===componentParams&&componentParams.get('x')==='1'&&componentHref==='http://other.test:8443/next%20path%3Fliteral?x=1#new%20hash'&&componentURL.href===componentHref;"
         "const submitForm=document.createElement('form'),submitInput=document.createElement('input'),uncheckedInput=document.createElement('input'),submitButton=document.createElement('button');submitForm.action='/submit';submitInput.name='message';submitInput.value='hello';uncheckedInput.name='ignored';uncheckedInput.type='checkbox';submitButton.type='submit';submitForm.appendChild(submitInput);submitForm.appendChild(uncheckedInput);submitForm.appendChild(submitButton);document.body.appendChild(submitForm);const formData=new FormData(submitForm);formData.set('message','updated');formData.append('extra','yes');const formDataOk=submitForm.action.endsWith('/submit')&&submitForm.elements.namedItem('message')===submitInput&&formData.get('message')==='updated'&&!formData.has('ignored')&&[...formData].length===2;let submitterOk=false;submitForm.addEventListener('submit',event=>{submitterOk=event.submitter===submitButton;event.preventDefault();});submitButton.click();"
-        "const documentObserver=new MutationObserver(records=>{if(records.some(record=>record.addedNodes.some(node=>node.id==='document-observer-probe')))document.body.setAttribute('data-document-observer','yes');});documentObserver.observe(document,{childList:true,subtree:true});const documentObserverProbe=document.createElement('i');documentObserverProbe.id='document-observer-probe';document.body.appendChild(documentObserverProbe);"
+        "const documentObserver=new MutationObserver(records=>{if(records.some(record=>Array.from(record.addedNodes).some(node=>node.id==='document-observer-probe')))document.body.setAttribute('data-document-observer','yes');});documentObserver.observe(document,{childList:true,subtree:true});const documentObserverProbe=document.createElement('i');documentObserverProbe.id='document-observer-probe';document.body.appendChild(documentObserverProbe);"
         "const root=document.getElementById('root');"
         "root.addEventListener('ping',()=>root.setAttribute('data-hit','yes'));"
         "root.dispatchEvent(new Event('ping'));"
@@ -3237,6 +3233,9 @@
     CHECK(budget.current == 0);
 
     puts("test: Worker bootstrap keeps compiler private and binds one policy URL");
+    /* The page's poisons go in through the test seam so the browser's own
+       script sees them, as it would without the interface snapshot: the
+       Worker start-up must coerce the URL once and call none of them. */
     static const char worker_boundary_page[] =
         "<!doctype html><body></body>";
     PocDocument worker_boundary_document;
@@ -3263,8 +3262,9 @@
               "String.fromCodePoint;"
               "let poisonCalls=0,sensitiveCalls=0,mapCalls=0,weakCalls=0,"
               "decoderCalls=0,fromCodePointCalls=0,leaked,coercions=0;"
-              "globalThis.WeakMap=function(){poisonCalls++;leaked="
-              "globalThis.__tilefinchRunWorker;return new NativeWeakMap()};"
+              "const patch=__tilefinchTestBrowserPatch;"
+              "patch(globalThis,'WeakMap',function(){poisonCalls++;leaked="
+              "globalThis.__tilefinchRunWorker;return new NativeWeakMap()});"
               "const blob=new Blob([new Uint8Array([255])]);"
               "const blobURL=URL.createObjectURL(blob),copy="
               "__tilefinchBlobBytes(blob),first=copy[0];copy[0]=0;"
@@ -3273,24 +3273,27 @@
               "const poisonObject={toString(){return "
               "'https://worker-boundary.test/allowed.js'},"
               "startsWith(){return true},slice(){return ''}};"
-              "globalThis.String=value=>{"
+              "patch(globalThis,'String',value=>{"
               "if(value===changingURL){sensitiveCalls++;return poisonObject}"
               "if(value===poisonObject){sensitiveCalls++;return blobURL}"
-              "return NativeString(value)};"
-              "Map.prototype.get=function(){mapCalls++;return null};"
-              "WeakMap.prototype.get=function(){weakCalls++;return null};"
-              "TextDecoder.prototype.decode=function(){decoderCalls++;"
-              "return \"postMessage('POLICY-BYPASS')\"};"
-              "globalThis.TextDecoder=class{decode(){decoderCalls++;return "
-              "\"postMessage('POLICY-BYPASS')\"}};"
-              "String.fromCodePoint=function(){fromCodePointCalls++;return "
-              "\"postMessage('POLICY-BYPASS')\"};"
-              "const worker=new Worker(changingURL);globalThis.WeakMap="
-              "NativeWeakMap;globalThis.String=NativeString;"
-              "Map.prototype.get=nativeMapGet;WeakMap.prototype.get="
-              "nativeWeakMapGet;globalThis.TextDecoder=NativeDecoder;"
-              "TextDecoder.prototype.decode=nativeDecode;"
-              "String.fromCodePoint=nativeFromCodePoint;"
+              "return NativeString(value)});"
+              "patch(Map.prototype,'get',function(){mapCalls++;return null});"
+              "patch(NativeWeakMap.prototype,'get',function(){weakCalls++;"
+              "return null});"
+              "patch(NativeDecoder.prototype,'decode',function(){decoderCalls++;"
+              "return \"postMessage('POLICY-BYPASS')\"});"
+              "patch(globalThis,'TextDecoder',class{decode(){decoderCalls++;"
+              "return \"postMessage('POLICY-BYPASS')\"}});"
+              "patch(NativeString,'fromCodePoint',function(){"
+              "fromCodePointCalls++;return \"postMessage('POLICY-BYPASS')\"});"
+              "const worker=new Worker(changingURL);"
+              "patch(globalThis,'WeakMap',NativeWeakMap);"
+              "patch(globalThis,'String',NativeString);"
+              "patch(Map.prototype,'get',nativeMapGet);"
+              "patch(NativeWeakMap.prototype,'get',nativeWeakMapGet);"
+              "patch(globalThis,'TextDecoder',NativeDecoder);"
+              "patch(NativeDecoder.prototype,'decode',nativeDecode);"
+              "patch(NativeString,'fromCodePoint',nativeFromCodePoint);"
               "const done=kind=>{pocSummary=kind+':' +coercions+':'"
               "+poisonCalls+':'+sensitiveCalls+':'+mapCalls+':'"
               "+weakCalls+':'+decoderCalls+':'+fromCodePointCalls+':'"
@@ -6020,6 +6023,11 @@
     CHECK(budget.current == 0);
 
     puts("test: terminating a Worker cancels a pending OPFS acquisition");
+    /* The owner's createSyncAccessHandle is delayed so the worker is
+       terminated while its acquisition is pending. The delay goes in
+       through the test seam: a page's own replacement does not reach the
+       browser's forwarding (the interface snapshot), and "delayed" shows
+       the forwarding called it. */
     CHECK(document_parse(
         &worker_performance_document, &budget, worker_lifecycle_page,
         strlen(worker_lifecycle_page), 8));
@@ -6036,19 +6044,22 @@
               "(async()=>{pocSummary='pending';const root=await navigator.storage."
               "getDirectory(),file=await root.getFileHandle('pending.bin',{create:"
               "true}),prototype=FileSystemFileHandle.prototype,original=prototype."
-              "createSyncAccessHandle;prototype.createSyncAccessHandle=function(){"
+              "createSyncAccessHandle;let delayed=0;__tilefinchTestBrowserPatch("
+              "prototype,'createSyncAccessHandle',function(){delayed++;"
               "const receiver=this;return new Promise((resolve,reject)=>setTimeout("
-              "()=>original.call(receiver).then(resolve,reject),0))};const source="
+              "()=>original.call(receiver).then(resolve,reject),0))});const source="
               "\"(async()=>{const root=await navigator.storage.getDirectory(),file="
               "await root.getFileHandle('pending.bin');postMessage('kill');file."
               "createSyncAccessHandle().then(handle=>handle.close(),()=>{})})()."
               "catch(error=>postMessage(error.name+':'+error.message))\",url=URL."
               "createObjectURL(new Blob([source])),worker=new Worker(url);worker."
               "onmessage=event=>{if(event.data!=='kill'){pocSummary='OPFS-PENDING-"
-              "ERROR:'+event.data;return}worker.terminate();prototype."
-              "createSyncAccessHandle=original;let waits=4;const retry=async()=>{if("
+              "ERROR:'+event.data;return}worker.terminate();"
+              "__tilefinchTestBrowserPatch(prototype,'createSyncAccessHandle',"
+              "original);let waits=4;const retry=async()=>{if("
               "waits-->0){setTimeout(retry,0);return}try{const writer=await file."
-              "createWritable();await writer.close();pocSummary='OPFS-PENDING-OK'}"
+              "createWritable();await writer.close();pocSummary=delayed>0?"
+              "'OPFS-PENDING-OK':'OPFS-PENDING-NOT-DELAYED'}"
               "catch(error){pocSummary='OPFS-PENDING-ERROR:'+error.name+':'"
               "+error.message}URL.revokeObjectURL(url)};setTimeout(retry,0)}})()."
               "catch(error=>{pocSummary='OPFS-PENDING-ERROR:'+error.name+':'"
