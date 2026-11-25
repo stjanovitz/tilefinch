@@ -26,6 +26,13 @@ void layout_block_size_paint_image_command(
     DrawCommand *command, const StylePaintLayer *layer,
     const ImageResource *image, int area_width, int area_height);
 
+/* The size an auto-sized background or mask layer paints `image` at in an
+   area_width x area_height area: its natural size or, for an image with
+   none (image->no_natural_size), its ratio contained in the area, as CSS
+   sizes an image that has only a ratio. */
+void layout_image_auto_size(const ImageResource *image, int area_width,
+                            int area_height, int *width, int *height);
+
 /* The tile size of an explicit background-size (`flags` holds the
    STYLE_BACKGROUND_* size bits): lengths, percentages of the positioning
    area, and `auto` from the image's natural size, never the decoded copy,
@@ -60,6 +67,9 @@ typedef struct LayoutBlockPaintPlan {
     const StylePaintLayer *background_geometry;
     const ImageResource *element_mask;
     const ImageResource *element_background;
+    /* element_background is the box's <noscript> fallback image, painted
+       as a centered cover background (image_noscript_placeholder_source). */
+    bool noscript_cover;
     const ImageResource *background_layer_resources[STYLE_PAINT_LAYER_LIMIT];
     size_t background_layer_indices[STYLE_PAINT_LAYER_LIMIT];
     uint8_t background_layer_stack_indices[STYLE_PAINT_LAYER_LIMIT];

@@ -442,11 +442,10 @@ JS_RT_GUARDED_NATIVE(static, js_element_nonce)(JSContext *context, JSValueConst 
     return JS_NewBool(context, stored);
 }
 
-static JSValue js_post_message(JSContext *context,
-                               JSValueConst this_value,
-                               int argc, JSValueConst *argv)
+static JSValue js_post_message_impl(JSContext *context,
+                                    int argc, JSValueConst *argv,
+                                    bool keyed)
 {
-    (void) this_value;
     DomBridge *bridge = JS_GetContextOpaque(context);
     if (bridge == NULL || argc < 3) {
         return JS_ThrowTypeError(context, "frame messaging is not configured");
@@ -474,7 +473,45 @@ static JSValue js_post_message(JSContext *context,
         return JS_ThrowRangeError(
             context, "message task sequence must be non-negative");
     }
-    bool valid = json_length <= 65536 && origin_length <= 2048;
+    bool valid = json_length <= SCRIPT_FRAME_MESSAGE_BYTE_LIMIT
+        && origin_length <= 2048;
+    /* All coercions (which may run JS) are complete. The navigation callback
+       copies these bytes before it returns, without calling page script. */
+    const uint8_t *key_bytes = NULL;
+    size_t key_length = 0;
+    JSValue key_buffer = JS_UNDEFINED;
+    if (keyed && valid) {
+        if (argc < 6) {
+            JS_ThrowTypeError(context, "missing private message data");
+        } else {
+            size_t offset = 0, element = 0, storage = 0;
+            /* The private caller provides a Uint8Array. Validate the view
+               bounds without invoking any author-defined property hooks. */
+            key_buffer = JS_GetTypedArrayBuffer(
+                context, argv[5], &offset, &key_length, &element);
+            if (!JS_IsException(key_buffer)) {
+                const uint8_t *data = JS_GetArrayBuffer(
+                    context, &storage, key_buffer);
+                if (data != NULL && element == 1 && offset <= storage
+                    && key_length <= storage - offset) {
+                    key_bytes = data + offset;
+                } else if (!JS_HasException(context)) {
+                    JS_ThrowTypeError(context, "invalid private message data");
+                }
+            }
+        }
+        if (key_bytes == NULL) {
+            JS_FreeValue(context, key_buffer);
+            if (task_kind != NULL) JS_FreeCString(context, task_kind);
+            JS_FreeCString(context, origin);
+            JS_FreeCString(context, json);
+            return JS_EXCEPTION;
+        }
+        valid = key_length != 0
+            && key_length <= SCRIPT_FRAME_MESSAGE_BYTE_LIMIT - json_length
+            && memchr(json, '\0', json_length) == NULL
+            && memchr(origin, '\0', origin_length) == NULL;
+    }
     /* A WindowProxy may outlive a detached iframe's browsing context.
        postMessage to that discarded target is a silent no-op in browsers;
        absence of our optional navigation bridge must not leak as an author
@@ -483,13 +520,28 @@ static JSValue js_post_message(JSContext *context,
         || bridge->post_message(
             bridge->post_message_opaque, bridge->host, (long) target,
             json, origin, task_kind == NULL ? "unknown" : task_kind,
-            (uint64_t) task_sequence));
+            (uint64_t) task_sequence, key_bytes, key_length));
+    JS_FreeValue(context, key_buffer);
     if (task_kind != NULL) JS_FreeCString(context, task_kind);
     JS_FreeCString(context, origin);
     JS_FreeCString(context, json);
     if (!queued) return JS_ThrowInternalError(context,
                                                "message queue rejected postMessage");
     return JS_UNDEFINED;
+}
+
+static JSValue js_post_message(JSContext *context, JSValueConst this_value,
+                               int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    return js_post_message_impl(context, argc, argv, false);
+}
+
+static JSValue js_post_key_message(JSContext *context, JSValueConst this_value,
+                                   int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    return js_post_message_impl(context, argc, argv, true);
 }
 
 /* FNV-1a over a URL up to its fragment; 0 means "none". */
@@ -769,7 +821,11 @@ static JSValue js_request_scroll(JSContext *context, JSValueConst this_value,
        Refresh a dirty extent as well as a truncated one: a page can grow
        or shrink and call scrollTo in the same callback. Zero needs no
        measurement on a full layout. The resulting geometry can be adopted
-       by the relayout that publishes the mutation. */
+       by the relayout that publishes the mutation. This forced layout is
+       deliberate (CSSOM View clamps to the current scrolling area, and
+       Chromium updates layout for every scrollTo but (0, 0)): the
+       accepted position is returned and read back as scrollY in this task,
+       so deferring it would publish an unclamped position. */
     if (next != 0) js_rt_bridge_note_parser_writes_for_layout(bridge);
     if (js_rt_bridge_layout_truncated(bridge)
         || (next > 0 && bridge->relayout_dirty != NULL
@@ -1628,6 +1684,28 @@ static JSValue js_heap_memory_snapshot(JSContext *context,
     return values;
 }
 
+/* Whether a Blob of argv[0] bytes fits the heap the realm can obtain,
+   collecting once before saying no. The bootstrap refuses one that does
+   not with a RangeError before allocating, so the page gets an error it
+   can catch instead of an allocation refusal, which the memory stop rule
+   would judge. Blobs have no cap of their own. */
+static JSValue js_blob_fits(JSContext *context, JSValueConst this_value,
+                            int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    double size = 0.0;
+    if (argc < 1 || JS_ToFloat64(context, &size, argv[0]) < 0)
+        return JS_EXCEPTION;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    ScriptRuntime *runtime = bridge == NULL ? NULL : bridge->host;
+    if (runtime == NULL || !(size > 0.0)) return JS_TRUE;
+    if (size <= (double) script_runtime_heap_obtainable(runtime))
+        return JS_TRUE;
+    (void) script_runtime_collect_and_trim(runtime);
+    return JS_NewBool(
+        context, size <= (double) script_runtime_heap_obtainable(runtime));
+}
+
 static JSValue js_storage_set(JSContext *context, JSValueConst this_value,
                               int argc, JSValueConst *argv)
 {
@@ -2222,14 +2300,7 @@ static JSValue js_utf8_encode(JSContext *context,
     (void) this_value;
     if (argc < 1 || !JS_IsString(argv[0]))
         return JS_ThrowTypeError(context, "well-formed string required");
-    /* TextEncoder keeps its public ceiling. Blob may use the remaining
-       portion of its separately bounded URL payload allowance. This hook
-       is captured privately by the bootstrap, never exposed to authors. */
-    uint32_t maximum = 256u * 1024u;
-    if (argc > 1 && JS_ToUint32(context, &maximum, argv[1]) < 0)
-        return JS_EXCEPTION;
-    if (maximum > 512u * 1024u)
-        return JS_ThrowRangeError(context, "invalid encoding allowance");
+    const uint32_t maximum = 256u * 1024u;
     JSValue units_value = JS_GetPropertyStr(context, argv[0], "length");
     uint32_t units = 0u;
     if (JS_IsException(units_value)
@@ -2268,14 +2339,65 @@ static JSValue js_utf8_encode(JSContext *context,
     return result;
 }
 
+/* Prepare a Blob string, measure a well-formed chunk, or write a chunk
+   into the admitted Blob. The two-argument form checks the only full
+   string allocation (linearizing a rope) before QuickJS can attempt it.
+   All other temporary allocations are limited to one 4097-unit chunk. */
+static JSValue js_blob_utf8_chunk(JSContext *context, JSValueConst this_value,
+                                 int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    if (argc < 1 || !JS_IsString(argv[0]))
+        return JS_ThrowTypeError(context, "well-formed string required");
+    JSValue units_value = JS_GetPropertyStr(context, argv[0], "length");
+    uint32_t units = 0u;
+    if (JS_IsException(units_value)
+        || JS_ToUint32(context, &units, units_value) < 0) {
+        JS_FreeValue(context, units_value);
+        return JS_EXCEPTION;
+    }
+    JS_FreeValue(context, units_value);
+    if (argc == 2) {
+        if (JS_VALUE_GET_TAG(argv[0]) == JS_TAG_STRING)
+            return JS_DupValue(context, argv[0]);
+        double needed = 0.0;
+        if (JS_ToFloat64(context, &needed, argv[1]) < 0) return JS_EXCEPTION;
+        JSValue charge = JS_NewFloat64(context, needed + (double) units * 2.0);
+        JSValue fits = js_blob_fits(context, JS_UNDEFINED, 1, &charge);
+        if (JS_IsException(fits)) return fits;
+        if (!JS_ToBool(context, fits))
+            return JS_ThrowRangeError(context, "Blob exceeds the page's memory");
+        return JS_ToString(context, argv[0]);
+    }
+    if (units > 4097u)
+        return JS_ThrowRangeError(context, "Blob text chunk exceeds bounded size");
+    size_t length = 0u;
+    const char *text = JS_ToCStringLen(context, &length, argv[0]);
+    if (text == NULL) return JS_EXCEPTION;
+    JSValue result = JS_NewInt32(context, (int32_t) length);
+    if (argc >= 3 && length != 0u) {
+        size_t capacity = 0u;
+        uint32_t offset = 0u;
+        uint8_t *out = JS_GetArrayBuffer(context, &capacity, argv[1]);
+        if (out == NULL || JS_ToUint32(context, &offset, argv[2]) < 0)
+            result = JS_EXCEPTION;
+        else if (offset > capacity || length > capacity - offset)
+            result = JS_ThrowRangeError(context, "Blob text exceeds allocation");
+        else
+            memcpy(out + offset, text, length);
+    }
+    JS_FreeCString(context, text);
+    return result;
+}
+
 static JSValue js_media_matches(JSContext *context, JSValueConst this_value,
                                 int argc, JSValueConst *argv)
 {
     (void) this_value;
-    if (argc < 4 || !JS_IsString(argv[0])) return JS_FALSE;
+    if (argc < 6 || !JS_IsString(argv[0])) return JS_FALSE;
     JSValue units_value = JS_GetPropertyStr(context, argv[0], "length");
     uint32_t units = 0;
-    int32_t width, height;
+    int32_t width, height, device_width, device_height;
     double resolution;
     bool valid = !JS_IsException(units_value)
         && JS_ToUint32(context, &units, units_value) >= 0;
@@ -2284,12 +2406,15 @@ static JSValue js_media_matches(JSContext *context, JSValueConst this_value,
     if (units > 4096) return JS_FALSE;
     if (JS_ToInt32(context, &width, argv[1]) < 0
         || JS_ToInt32(context, &height, argv[2]) < 0
-        || JS_ToFloat64(context, &resolution, argv[3]) < 0) return JS_EXCEPTION;
+        || JS_ToFloat64(context, &resolution, argv[3]) < 0
+        || JS_ToInt32(context, &device_width, argv[4]) < 0
+        || JS_ToInt32(context, &device_height, argv[5]) < 0) return JS_EXCEPTION;
     size_t length = 0;
     const char *query = JS_ToCStringLen(context, &length, argv[0]);
     if (!query) return JS_EXCEPTION;
     bool matches = stylesheet_media_matches_viewport(
-        width, height, resolution, query, length);
+        width, height, resolution, device_width, device_height, query,
+        length);
     JS_FreeCString(context, query);
     return JS_NewBool(context, matches);
 }
@@ -2396,7 +2521,11 @@ static JSValue js_is_proxy(JSContext *context, JSValueConst this_value,
     return JS_NewBool(context, argc > 0 && JS_IsProxy(argv[0]));
 }
 
-/* digest(source, algorithm): algorithm is a TilefinchWebDigest the
+static JSValue js_crypto_start(JSContext *context,
+                               const TilefinchWebJobParams *params,
+                               bool sliced);
+
+/* digest(source, algorithm, sliced): algorithm is a TilefinchWebDigest the
    bootstrap derived from the normalized WebCrypto name. */
 static JSValue js_crypto_digest(JSContext *context,
                                 JSValueConst this_value,
@@ -2472,19 +2601,385 @@ static JSValue js_crypto_digest(JSContext *context,
         return JS_ThrowRangeError(context,
                                   "digest input exceeds bounded size");
     }
-    uint8_t digest[64];
-    const uint8_t *input = length == 0 ? NULL : bytes;
-    size_t digest_length = tilefinch_web_digest(
-        (TilefinchWebDigest) algorithm, input, length, digest);
-    if (digest_length == 0) {
+    /* compat.js asks for a job (the third argument) when subtle-crypto.js
+       can run one; a digest over a slice's work then returns one. */
+    TilefinchWebJobParams params = {
+        .kind = TILEFINCH_WEB_JOB_DIGEST,
+        .hash = (TilefinchWebDigest) algorithm,
+        .a = length == 0 ? NULL : bytes, .a_length = length
+    };
+    JSValue result = js_crypto_start(context, &params,
+                                     argc > 2 && JS_ToBool(context, argv[2]));
+    if (JS_IsNull(result))
         return JS_ThrowInternalError(context, "digest failed");
-    }
-    if (bridge != NULL && bridge->result != NULL) {
+    if (!JS_IsException(result) && bridge != NULL && bridge->result != NULL) {
         js_rt_saturating_add_size(&bridge->result->crypto_digest_calls, 1u);
         js_rt_saturating_add_size(&bridge->result->crypto_digest_bytes,
                                   length);
     }
-    return JS_NewArrayBufferCopy(context, digest, digest_length);
+    return result;
+}
+
+/* A CryptoKey's secret: an object with no prototype and no properties
+   that only compat.js's private key state holds, so page script never
+   reaches the bytes. The finalizer zeroes them when the key is
+   collected. */
+typedef struct {
+    size_t length;
+    uint8_t bytes[];
+} JsCryptoKeyData;
+
+static JSClassID js_crypto_key_class_id;
+
+static void js_crypto_key_finalizer(JSRuntime *runtime, JSValue value)
+{
+    JsCryptoKeyData *key = JS_GetOpaque(value, js_crypto_key_class_id);
+    if (key == NULL) return;
+    tilefinch_web_crypto_zeroize(key->bytes, key->length);
+    js_free_rt(runtime, key);
+}
+
+static JSClassDef js_crypto_key_class = {
+    .class_name = "CryptoKeyData",
+    .finalizer = js_crypto_key_finalizer,
+};
+
+static bool js_crypto_class(JSRuntime *runtime, JSClassID *id,
+                            const JSClassDef *definition)
+{
+    if (*id == 0) JS_NewClassID(id);
+    return JS_IsRegisteredClass(runtime, *id)
+        || JS_NewClass(runtime, *id, definition) >= 0;
+}
+
+/* The bootstrap passes its own Uint8Array copies of every BufferSource. */
+static bool js_crypto_bytes(JSContext *context, JSValueConst value,
+                            const uint8_t **bytes, size_t *length)
+{
+    size_t offset = 0, view_length = 0, element = 0, buffer_length = 0;
+    JSValue buffer = JS_GetTypedArrayBuffer(context, value, &offset,
+                                            &view_length, &element);
+    if (JS_IsException(buffer)) return false;
+    const uint8_t *data = JS_GetArrayBuffer(context, &buffer_length, buffer);
+    JS_FreeValue(context, buffer);
+    if ((data == NULL && buffer_length != 0) || offset > buffer_length
+        || view_length > buffer_length - offset) {
+        JS_ThrowTypeError(context, "byte view required");
+        return false;
+    }
+    *bytes = data == NULL ? NULL : data + offset;
+    *length = view_length;
+    return true;
+}
+
+/* key(bytes) makes key data from a Uint8Array, or returns null when it
+   holds more than TILEFINCH_WEB_CRYPTO_INPUT_LIMIT bytes; key(data) copies
+   the bytes back out as an ArrayBuffer (exportKey); key(data, true)
+   duplicates the opaque native allocation without exposing any bytes. */
+static JSValue js_crypto_key(JSContext *context, JSValueConst this_value,
+                             int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    if (argc < 1) return JS_ThrowTypeError(context, "key data required");
+    JsCryptoKeyData *key = JS_GetOpaque(argv[0], js_crypto_key_class_id);
+    const uint8_t *bytes = NULL;
+    size_t length = 0;
+    if (key != NULL) {
+        if (argc < 2 || !JS_IsBool(argv[1]) || !JS_ToBool(context, argv[1]))
+            return JS_NewArrayBufferCopy(context, key->bytes, key->length);
+        bytes = key->bytes;
+        length = key->length;
+    } else if (!js_crypto_bytes(context, argv[0], &bytes, &length))
+        return JS_EXCEPTION;
+    if (length > TILEFINCH_WEB_CRYPTO_INPUT_LIMIT) return JS_NULL;
+    if (!js_crypto_class(JS_GetRuntime(context), &js_crypto_key_class_id,
+                         &js_crypto_key_class)) return JS_EXCEPTION;
+    JSValue object = JS_NewObjectProtoClass(context, JS_NULL,
+                                            js_crypto_key_class_id);
+    if (JS_IsException(object)) return object;
+    key = js_malloc(context, sizeof(*key) + length + 1u);
+    if (key == NULL) {
+        JS_FreeValue(context, object);
+        return JS_EXCEPTION;
+    }
+    key->length = length;
+    if (length != 0) memcpy(key->bytes, bytes, length);
+    JS_SetOpaque(object, key);
+    return object;
+}
+
+typedef enum {
+    JS_CRYPTO_HMAC = 0,
+    JS_CRYPTO_GCM_ENCRYPT,
+    JS_CRYPTO_GCM_DECRYPT,
+    JS_CRYPTO_CBC_ENCRYPT,
+    JS_CRYPTO_CBC_DECRYPT,
+    JS_CRYPTO_CTR,
+    JS_CRYPTO_PBKDF2,
+    JS_CRYPTO_HKDF,
+    JS_CRYPTO_DIGEST,
+    JS_CRYPTO_STEP
+} JsCryptoOperation;
+
+/* A slice's start and length: with the task boundaries' 16 ms advance
+   limit, about two slices run per turn before input and presentation get
+   one. */
+typedef struct {
+    uint64_t started, length;
+} JsCryptoSlice;
+
+static bool js_crypto_slice_more(void *context)
+{
+    const JsCryptoSlice *slice = context;
+    uint64_t now = js_rt_monotonic_time_ns();
+    return now >= slice->started && now - slice->started < slice->length;
+}
+
+static JsCryptoSlice js_crypto_slice(JSContext *context)
+{
+    JsCryptoSlice slice = {js_rt_monotonic_time_ns(), SCRIPT_CRYPTO_SLICE_NS};
+#ifdef JS_RT_TEST_INSTRUMENTS
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge != NULL && bridge->host != NULL
+        && bridge->host->crypto_slice_ns != 0)
+        slice.length = bridge->host->crypto_slice_ns;
+#else
+    (void) context;
+#endif
+    return slice;
+}
+
+/* An operation run in slices (src/web_crypto.c), as an object with no
+   prototype or properties that only the bootstrap's job records hold. It
+   owns copies of the bytes it reads, so the caller's may change or be
+   zeroed, and its output from the first slice on; the finalizer zeroes
+   and frees what it still holds. */
+typedef struct {
+    TilefinchWebJob *job;
+    uint8_t *copies, *output;
+    size_t copies_length, capacity;
+} JsCryptoJob;
+
+static JSClassID js_crypto_job_class_id;
+
+static void js_crypto_job_release(JSRuntime *runtime, JsCryptoJob *job)
+{
+    if (job->job != NULL) {
+        tilefinch_web_job_end(job->job);
+        js_free_rt(runtime, job->job);
+    }
+    tilefinch_web_crypto_zeroize(job->copies, job->copies_length);
+    js_free_rt(runtime, job->copies);
+    tilefinch_web_crypto_zeroize(job->output, job->capacity);
+    js_free_rt(runtime, job->output);
+    *job = (JsCryptoJob) {0};
+}
+
+static void js_crypto_job_finalizer(JSRuntime *runtime, JSValue value)
+{
+    JsCryptoJob *job = JS_GetOpaque(value, js_crypto_job_class_id);
+    if (job == NULL) return;
+    js_crypto_job_release(runtime, job);
+    js_free_rt(runtime, job);
+}
+
+static JSClassDef js_crypto_job_class = {
+    .class_name = "CryptoJob",
+    .finalizer = js_crypto_job_finalizer,
+};
+
+static void js_crypto_free_output(JSRuntime *runtime, void *opaque,
+                                  void *bytes)
+{
+    (void) opaque;
+    js_free_rt(runtime, bytes);
+}
+
+/* A job object for params. With copy, the job reads copies of the bytes,
+   so it may outlive the call; without, it must end within it. null for an
+   OperationError. */
+static JSValue js_crypto_new_job(JSContext *context,
+                                 TilefinchWebJobParams params,
+                                 size_t capacity, bool copy)
+{
+    JSValue object = JS_NewObjectProtoClass(context, JS_NULL,
+                                            js_crypto_job_class_id);
+    if (JS_IsException(object)) return object;
+    JsCryptoJob *job = js_mallocz(context, sizeof(*job));
+    if (job == NULL) {
+        JS_FreeValue(context, object);
+        return JS_EXCEPTION;
+    }
+    JS_SetOpaque(object, job);
+    job->capacity = capacity != 0 ? capacity : 1u;
+    const uint8_t **sources[] = {&params.key, &params.a, &params.b,
+                                 &params.c};
+    const size_t lengths[] = {params.key_length, params.a_length,
+                              params.b_length, params.c_length};
+    if (copy) {
+        /* Each is at most a few MiB, so the sum cannot wrap. */
+        for (size_t i = 0; i < 4u; i++) job->copies_length += lengths[i];
+        job->copies = js_malloc(context, job->copies_length + 1u);
+        if (job->copies == NULL) goto fail;
+        uint8_t *at = job->copies;
+        for (size_t i = 0; i < 4u; i++) {
+            if (lengths[i] == 0) continue;
+            memcpy(at, *sources[i], lengths[i]);
+            *sources[i] = at;
+            at += lengths[i];
+        }
+    }
+    /* Zeroed, a job holds nothing to free. */
+    job->job = js_mallocz(context, tilefinch_web_job_size());
+    if (job->job == NULL) goto fail;
+    if (tilefinch_web_job_begin(job->job, &params)) return object;
+    JS_FreeValue(context, object);
+    return JS_NULL;
+fail:
+    JS_FreeValue(context, object);
+    return JS_EXCEPTION;
+}
+
+/* Runs a slice of job (all of it when whole): false while work remains,
+   the output as an ArrayBuffer, or null for an OperationError. A job
+   that settled holds nothing more. */
+static JSValue js_crypto_step(JSContext *context, JsCryptoJob *job,
+                              bool whole)
+{
+    if (job->job == NULL) return JS_NULL;
+    if (job->output == NULL) {
+        job->output = js_malloc(context, job->capacity);
+        if (job->output == NULL) return JS_EXCEPTION;
+    }
+    JsCryptoSlice slice = js_crypto_slice(context);
+    int status = tilefinch_web_job_run(job->job, job->output,
+                                       whole ? NULL : js_crypto_slice_more,
+                                       &slice);
+    if (status == 0) return JS_FALSE;
+    JSValue result = JS_NULL;
+    if (status > 0) {
+        /* The buffer takes the output without a copy. */
+        result = JS_NewArrayBuffer(context, job->output,
+                                   tilefinch_web_job_length(job->job),
+                                   js_crypto_free_output, NULL, false);
+        if (!JS_IsException(result)) job->output = NULL;
+    }
+    js_crypto_job_release(JS_GetRuntime(context), job);
+    return result;
+}
+
+/* The output of params: in the call when its work fits a slice (or
+   sliced is false), otherwise a job object to step. */
+static JSValue js_crypto_start(JSContext *context,
+                               const TilefinchWebJobParams *params,
+                               bool sliced)
+{
+    size_t capacity = 0, work = 0;
+    if (!tilefinch_web_job_plan(params, &capacity, &work)) return JS_NULL;
+    if (!js_crypto_class(JS_GetRuntime(context), &js_crypto_job_class_id,
+                         &js_crypto_job_class)) return JS_EXCEPTION;
+    sliced = sliced && work > TILEFINCH_WEB_CRYPTO_SLICE_WORK;
+    JSValue object = js_crypto_new_job(context, *params, capacity, sliced);
+    if (sliced || JS_IsException(object) || JS_IsNull(object))
+        return object;
+    JSValue result = js_crypto_step(
+        context, JS_GetOpaque(object, js_crypto_job_class_id), true);
+    JS_FreeValue(context, object);
+    return result;
+}
+
+/* run(operation, key data, a, b, c, d) -> ArrayBuffer, a job, or null for
+   an OperationError. The bootstrap checks the WebCrypto parameter rules;
+   the arguments by operation are
+     HMAC: hash, data
+     GCM: iv, additional data, data, tag bytes
+     CBC: iv (16 bytes), data
+     CTR: counter block, counter bits, data
+     PBKDF2: hash, salt, iterations, job
+     HKDF: hash, salt, info, output bytes.
+   An operation whose work is over a slice
+   (TILEFINCH_WEB_CRYPTO_SLICE_WORK) returns a job instead of its output,
+   and run(step, job) runs its next slice: false while work remains, then
+   its output or null. PBKDF2 runs one slice of its derivation and answers
+   whether it is complete: the job (a Uint8Array the bootstrap holds) is
+   the derivation's state (TilefinchWebPbkdf2State), then its output. */
+static JSValue js_crypto_run(JSContext *context, JSValueConst this_value,
+                             int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    int32_t operation = -1;
+    uint32_t numbers[3] = {0, 0, 0};
+    /* The native row declares six arguments, so QuickJS pads argv. */
+    if (argc < 2 || JS_ToInt32(context, &operation, argv[0]) < 0
+        || operation < JS_CRYPTO_HMAC || operation > JS_CRYPTO_STEP
+        || operation == JS_CRYPTO_DIGEST)
+        return JS_ThrowTypeError(context, "invalid crypto operation");
+    if (operation == JS_CRYPTO_STEP) {
+        JsCryptoJob *job = JS_GetOpaque(argv[1], js_crypto_job_class_id);
+        if (job == NULL)
+            return JS_ThrowTypeError(context, "invalid crypto operation");
+        return js_crypto_step(context, job, false);
+    }
+    JsCryptoKeyData *key = JS_GetOpaque(argv[1], js_crypto_key_class_id);
+    if (key == NULL)
+        return JS_ThrowTypeError(context, "invalid crypto operation");
+    const uint8_t *bytes[3] = {NULL, NULL, NULL};
+    size_t lengths[3] = {0, 0, 0};
+    /* Which of a..d are byte views (bit set); the others are numbers,
+       taken in order. */
+    static const uint8_t views[] = {
+        0x2, 0x7, 0x7, 0x3, 0x3, 0x5, 0xa, 0x6
+    };
+    size_t view = 0, number = 0;
+    for (int slot = 0; slot < 4; slot++) {
+        JSValueConst value = argv[2 + slot];
+        if (views[operation] & (1u << slot)) {
+            if (view < 3 && !js_crypto_bytes(context, value, &bytes[view],
+                                             &lengths[view]))
+                return JS_EXCEPTION;
+            size_t overhead = 0u;
+            if (operation == JS_CRYPTO_PBKDF2 && view == 1)
+                overhead = TILEFINCH_WEB_PBKDF2_STATE_BYTES;
+            if ((operation == JS_CRYPTO_GCM_DECRYPT && view == 2)
+                || (operation == JS_CRYPTO_CBC_DECRYPT && view == 1))
+                overhead = 16u;
+            if (view < 3 && lengths[view] >
+                    TILEFINCH_WEB_CRYPTO_INPUT_LIMIT + overhead)
+                return JS_NULL;
+            view++;
+        } else if (number < 3 && !JS_IsUndefined(value)) {
+            if (JS_ToUint32(context, &numbers[number], value) < 0)
+                return JS_EXCEPTION;
+            number++;
+        } else number++;
+    }
+    TilefinchWebDigest hash = (TilefinchWebDigest) numbers[0];
+    if (operation == JS_CRYPTO_PBKDF2) {
+        if (lengths[1] <= TILEFINCH_WEB_PBKDF2_STATE_BYTES) return JS_NULL;
+        /* The bootstrap's own buffer, so it may be written. */
+        uint8_t *job = (uint8_t *) bytes[1];
+        TilefinchWebPbkdf2State state;
+        memcpy(&state, job, sizeof(state));
+        JsCryptoSlice slice = js_crypto_slice(context);
+        int status = tilefinch_web_pbkdf2_slice(
+            hash, key->bytes, key->length, bytes[0], lengths[0], numbers[1],
+            job + sizeof(state), lengths[1] - sizeof(state), &state,
+            js_crypto_slice_more, &slice);
+        memcpy(job, &state, sizeof(state));
+        tilefinch_web_crypto_zeroize(&state, sizeof(state));
+        return status < 0 ? JS_NULL : JS_NewBool(context, status > 0);
+    }
+    /* The byte views are a, b and c in order; HKDF's output length is its
+       second number, the tag or counter bits the others' first. */
+    TilefinchWebJobParams params = {
+        .kind = (TilefinchWebJobKind) operation, .hash = hash,
+        .number = operation == JS_CRYPTO_HKDF ? numbers[1] : numbers[0],
+        .key = key->bytes, .key_length = key->length,
+        .a = bytes[0], .a_length = lengths[0],
+        .b = bytes[1], .b_length = lengths[1],
+        .c = bytes[2], .c_length = lengths[2]
+    };
+    return js_crypto_start(context, &params, true);
 }
 
 #define SCRIPT_COMPRESSION_INPUT_LIMIT (1024u * 1024u)

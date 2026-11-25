@@ -1859,8 +1859,12 @@ typedef struct {
        reparsed after var() substitution keep the consuming sheet's URL and
        Referrer-Policy without growing StyleRule. */
     uint8_t image_source_slot;
-    bool has_fast_key;
-    bool important;
+    bool has_fast_key : 1;
+    bool important : 1;
+    /* STYLE_SELECTOR_FACTS_* bits about the selector text, 0 until first
+       asked for (style_rule_selector_facts). They move with the rule, so a
+       rebuilt rule order or index rescans only rules added since. */
+    uint8_t selector_facts : 6;
 } StyleRule;
 
 /* A custom property declared on :root, kept for var() lookups that have
@@ -1935,7 +1939,10 @@ typedef struct {
     const char *name;
     const char *value;
     uint16_t selector_length;
-    bool important;
+    bool important : 1;
+    /* As StyleRule.selector_facts, plus whether the structural bit is
+       filled (style_custom_rule_structural). */
+    uint8_t selector_facts : 7;
     uint8_t pseudo;
     /* One-based @container definition. */
     uint8_t container_query;
@@ -2253,6 +2260,9 @@ typedef struct {
     /* Copied from PocDocument.noscript_rendered: the HTML UA rule
        "noscript { display: none }" applies only when scripting is enabled. */
     bool noscript_rendered;
+    /* PocDocument.noscript_images, copied with the document's other facts;
+       never kept by a sheet reused for another document. */
+    ImageNoscriptStore *noscript_images;
     StyleRule *rules;
     size_t count;
     size_t capacity;
@@ -2442,6 +2452,10 @@ typedef struct {
     bool selector_cooperate_cancelled;
     int viewport_width;
     int viewport_height;
+    /* The screen's size in CSS pixels (ViewportContext's device size), what
+       the device-width and device-height media features read. */
+    int device_width;
+    int device_height;
     /* The prefers-color-scheme answer (night mode) its media queries were
        evaluated against; rules appended later must be evaluated the same
        way. */
@@ -2465,6 +2479,9 @@ typedef struct {
     uint32_t *rule_index_slots;
     size_t rule_index_payload_count;
     size_t rule_index_payload_capacity;
+    /* Most buckets the index files: one per rule, plus further :is()
+       option keys. */
+    size_t rule_index_key_limit;
     uint32_t *rule_index_entries;
     /* Optional per-rule Bloom requirements for the directly matched
        compound and its ancestor chain. False positives fall through to the
@@ -2514,6 +2531,12 @@ typedef struct {
     StyleCustomRuleIndexEntry *custom_rule_index;
     size_t custom_rule_index_count;
     size_t custom_rule_index_bytes;
+    /* The distinct carriers of the shadow-tree <style> scopes, ascending
+       by address: the tree groups of the custom rule index's keys. Owned
+       with the index; none without a scope or when refused (every rule
+       then shares group 0). */
+    const lxb_dom_node_t **custom_rule_index_carriers;
+    size_t custom_rule_index_carrier_count;
     /* Which retained standard properties (not custom properties) a rule
        could give an element, by a key every element the rule selects must
        carry: slot (key hash) -> one bit per property-name hash. A clear bit
@@ -2623,6 +2646,11 @@ typedef struct {
        token dependency cannot be listed (or the list could not be built). */
     uint32_t *svg_raster_tokens;
     uint32_t svg_raster_token_count;
+    /* The [class]/[id] tests other than an exact token that selectors make
+       off their subject, each named by a token of its own (form and value),
+       built on the first identity scan or class/id change of a build
+       generation (style_sheet.c). */
+    struct StyleIdentityTests *identity_tests;
     size_t svg_raster_token_rules;
     uint64_t svg_raster_token_generation;
     bool svg_raster_tokens_ready;
@@ -2838,7 +2866,10 @@ bool stylesheet_append_style_elements(
    `context_changed` reports a parse-context signature move (variables,
    layers, fonts): declaration values may differ from a clean rebuild, which
    the retained computed styles already discard, but selector answers do not
-   depend on it. */
+   depend on it. `cascade_unchanged`: the sources added no rule and left
+   the parse context and every sheet-wide table a style resolution reads
+   (custom properties, keyframes, transitions, fonts, layers) as they
+   were, so no element's computed style can differ. */
 typedef struct {
     uint16_t *remap;
     size_t old_count;
@@ -2846,6 +2877,7 @@ typedef struct {
     size_t appended_count;
     bool appended_bounded_out;
     bool context_changed;
+    bool cascade_unchanged;
 } StylesheetAppendResult;
 /* `after_source` is the number of already ingested inline sources that
    precede `elements` in document order: the new rules take their cascade
@@ -2960,6 +2992,14 @@ bool stylesheet_style_source_known(const Stylesheet *sheet,
    or supply an image (see stylesheet_tokens_may_affect_discovery). */
 bool stylesheet_rules_affect_discovery(const Stylesheet *sheet,
                                        const uint32_t *indices, size_t count);
+/* Adds the subject key (the class, id, tag or attribute every element the
+   rule's subject compound matches carries) of each rule at these indices
+   to keys[0..*key_count), once each. False when a subject carries no key
+   or more than `capacity` distinct keys would be needed. */
+bool stylesheet_rules_subject_keys(const Stylesheet *sheet,
+                                   const uint32_t *indices, size_t count,
+                                   uint32_t *keys, size_t capacity,
+                                   size_t *key_count);
 /* Whether a class/id change with these token hashes could change which
    elements match a rule able to affect display/visibility or supply an
    image; true whenever the rule filters cannot bound that. */
@@ -3001,6 +3041,11 @@ void stylesheet_destroy(Stylesheet *sheet);
    sheet is moved into the RAM-only navigation cache. Authored rules and
    indices are retained; no source or compiled data is serialized. */
 void stylesheet_prepare_for_document_reuse(Stylesheet *sheet);
+/* How many rules style resolution tests on every element before its tag,
+   id and classes add theirs: the rule index's unscoped universal rules,
+   building the index first if it is missing (as resolution does); every
+   rule when it cannot be built, as resolution then scans them all. */
+size_t stylesheet_rules_tested_per_element(Stylesheet *sheet);
 /* Cuts the sheet back to what it held when its first source outside <head>
    (or the user stylesheet) began (Stylesheet.head_mark): every rule, custom and transition
    rule, revert mask and intern-pool entry added since is released, and the
@@ -3175,12 +3220,16 @@ uint64_t stylesheet_inline_custom_property_bits(const char *text,
    relational rule filters and by journaled attribute changes. */
 uint32_t stylesheet_identity_token_hash(bool id, const char *text,
                                         size_t length);
-/* For a class or id attribute change with exact before/after values, write
-   the hashes of the classes/ids that changed (absent and empty values are
-   equivalent) and return true. Returns false for other attributes and when
-   more than `capacity` tokens changed: those stay conservative. */
+/* For a class or id attribute change with exact before/after values (NULL:
+   absent), write the hashes of the classes/ids that changed (absent and
+   empty values carry the same tokens), plus, when the value or its presence
+   changed, the kind's empty-name hash and the tokens of the
+   sheet's other [class]/[id] tests whose answer differs between the two
+   values, and return true. Returns false for other attributes, when more
+   than `capacity` tokens changed, or without the sheet or when its tests
+   could not be listed: those stay conservative. */
 bool stylesheet_attribute_change_tokens(
-    const char *name, size_t name_length,
+    const Stylesheet *sheet, const char *name, size_t name_length,
     const char *old_value, size_t old_length,
     const char *new_value, size_t new_length, uint32_t *hashes,
     size_t capacity, size_t *count);
@@ -3197,7 +3246,8 @@ bool stylesheet_attribute_change_may_affect_has(
    conservative. */
 /* stylesheet_tree_change_may_affect_has, also summarizing which :has()
    plan entries the change can move: a 64-bit summary (UINT64_MAX when
-   unknown) of the build `serial` names, for layout to note only those. */
+   unknown) of the build `serial` names, for layout to note only those.
+   With no `node`, every child of `parent` changing at once. */
 bool stylesheet_tree_change_has_entries(const Stylesheet *sheet,
                                         lxb_dom_node_t *node,
                                         lxb_dom_node_t *parent,
@@ -3205,6 +3255,16 @@ bool stylesheet_tree_change_has_entries(const Stylesheet *sheet,
 bool stylesheet_tree_change_may_affect_has(const Stylesheet *sheet,
                                            lxb_dom_node_t *node,
                                            lxb_dom_node_t *parent);
+/* stylesheet_tree_change_has_entries for every child of `parent` at once
+   (innerHTML: asked for the old children before they leave and for the new
+   ones after they arrive). With *serial a first probe's (not 0), the
+   answer is merged into that probe's: the union of the entries, or
+   everything (UINT64_MAX, serial 0, true) when the plan was rebuilt
+   between them. */
+bool stylesheet_children_change_has_entries(const Stylesheet *sheet,
+                                            lxb_dom_node_t *parent,
+                                            uint64_t *entries,
+                                            uint32_t *serial);
 typedef enum {
     STYLE_FOCUS_CHANGE_UNSAFE = 0,
     STYLE_FOCUS_CHANGE_OUTLINE_ONLY,
@@ -3499,7 +3559,9 @@ bool stylesheet_prefers_dark_color_scheme(void);
 bool stylesheet_media_matches(const Stylesheet *sheet, const char *query,
                               size_t query_length);
 /* Same bounded evaluator without a cascade or authored font context. */
+/* `device_width` and `device_height`: the screen's size in CSS pixels. */
 bool stylesheet_media_matches_viewport(int width, int height, double resolution,
+                                       int device_width, int device_height,
                                        const char *query, size_t query_length);
 bool stylesheet_supports_matches(Stylesheet *sheet, const char *query,
                                  size_t query_length);
@@ -3524,6 +3586,12 @@ bool stylesheet_direction_change_rules(const Stylesheet *sheet,
                                        bool rtl_markup_absent,
                                        size_t *indices, size_t capacity,
                                        size_t *count);
+/* Whether declaration text (a style attribute or a deferred block) can
+   give an element an RTL direction or a bidi override: it declares
+   `direction` with a value other than ltr or a CSS-wide keyword, or
+   `unicode-bidi` with a value other than normal, embed, isolate,
+   plaintext or a CSS-wide keyword. var() and unparsed values count. */
+bool style_declarations_may_change_direction(const char *text, size_t length);
 bool stylesheet_rule_index_matches(const Stylesheet *sheet, size_t index,
                                    lxb_dom_node_t *node);
 size_t stylesheet_retained_bytes(const Stylesheet *sheet);

@@ -488,12 +488,25 @@ bool script_runtime_finish_loading(ScriptRuntime *runtime,
        Calling it directly avoids compiling a fresh wrapper at every document
        boundary.  That transient compilation could exhaust a tight 2 MiB
        realm even though the dispatcher and author script both fit. */
+    /* The candidate keeps deferred parser scripts' feature probes under
+       the image-only rule. Lifecycle listeners instead get fresh geometry,
+       including after their own mutations, within a work allowance: a
+       first layout only on a page small enough by estimate, then a share
+       of its work (script_runtime_flush_geometry_layout_reuse). The
+       browser's own reads, and a page whose handlers measure nothing, pay
+       for no layout here. */
+    DomBridge *bridge = &runtime->bridge;
+    bridge->loading_layout_allowance = 0;
+    bridge->loading_layout_first = 0;
+    bridge->loading_count_valid = false;
+    bridge->synchronous_layout_loading = bridge->synchronous_layout_images_only;
     bool evaluated = runtime_call_captured(
         runtime,
         runtime->host_callbacks[SCRIPT_HOST_DISPATCH_DOM_CONTENT_LOADED],
         "__tilefinchDispatchDOMContentLoaded", 0, NULL, NULL);
     js_lazy_webpack_recover_failure(runtime);
     if (evaluated) evaluated = js_rt_runtime_run_jobs(runtime);
+    bridge->synchronous_layout_loading = false;
     if (evaluated) evaluated = js_rt_runtime_refresh(runtime);
     if (!evaluated) capture_cached_error_source(runtime);
     runtime->result.dom_content_loaded_dispatched = evaluated;

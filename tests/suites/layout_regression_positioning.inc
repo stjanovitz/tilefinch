@@ -238,7 +238,7 @@
         "Another long value that must share the same column boundary"
         "</td></tr><tr id=row-span><td id=span colspan=2>"
         "A full-width table note</td></tr></tbody></table>"
-        "<div id=bounded-span colspan=1000 hidden></div></body>";
+        "<table hidden><tr><td id=bounded-span colspan=1000></td></tr></table></body>";
     PocDocument table_track_document;
     Stylesheet table_track_sheet;
     LayoutDocument table_track_layout;

@@ -1,0 +1,117 @@
+Omit unused variable tables from bootstrap bytecode (JS_WRITE_OBJ_STRIP_UNUSED_LOCALS).
+
+diff --git a/quickjs.c b/quickjs.c
+index 68c2bae..69a0a8c 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -48147,6 +48147,7 @@ typedef struct BCWriterState {
+     BOOL allow_sab : 8;
+     BOOL allow_reference : 8;
+     BOOL pinned_atoms : 8; /* JS_WRITE_OBJ_PINNED_ATOMS */
++    BOOL strip_unused_locals : 8; /* JS_WRITE_OBJ_STRIP_UNUSED_LOCALS */
+     uint32_t first_atom;
+     uint32_t *atom_to_idx;
+     int atom_to_idx_size;
+@@ -48477,6 +48478,51 @@ static int JS_WriteBigInt(BCWriterState *s, JSValueConst obj)
+ 
+ static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj);
+ 
++/* Tilefinch: whether a function's variable table has no reader, so that
++   JS_WRITE_OBJ_STRIP_UNUSED_LOCALS may omit it. The table is read only for
++   a captured local (get_var_ref() for a closure, mapped arguments or a
++   reference object, and close_lexical_var() for OP_close_loc, each of which
++   needs var_ref_count != 0), for direct eval (add_closure_variables(), on a
++   function whose names js_create_function() kept) and for the name in a
++   lexical-variable error (also only when kept). A missing table already
++   means "no names" to the error path, the memory census and the free
++   path, and the reader allocates none for a zero count. The function's
++   code is checked as well, so that an opcode which reaches one of those
++   readers keeps the table even if the counts above stop implying it. */
++static BOOL js_function_locals_unused(const JSFunctionBytecode *b)
++{
++    const uint8_t *code = b->byte_code_buf;
++    int i, pos, op;
++    if (b->var_ref_count != 0)
++        return FALSE;
++    for(i = 0; i < b->arg_count + b->var_count; i++) {
++        if (b->vardefs[i].var_name != JS_ATOM_NULL || b->vardefs[i].is_captured)
++            return FALSE;
++    }
++    for(pos = 0; pos < b->byte_code_len; pos += short_opcode_info(op).size) {
++        op = code[pos];
++        switch(op) {
++        case OP_close_loc:
++        case OP_make_loc_ref:
++        case OP_make_arg_ref:
++        case OP_eval:
++        case OP_apply_eval:
++            return FALSE;
++        case OP_special_object:
++            if (pos + 1 >= b->byte_code_len ||
++                (code[pos + 1] == OP_SPECIAL_OBJECT_MAPPED_ARGUMENTS &&
++                 b->arg_count != 0))
++                return FALSE;
++            break;
++        default:
++            if (op >= OP_COUNT)
++                return FALSE;
++            break;
++        }
++    }
++    return TRUE;
++}
++
+ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
+ {
+     JSFunctionBytecode *b = JS_VALUE_GET_PTR(obj);
+@@ -48511,7 +48557,8 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
+     bc_put_leb128(s, b->closure_var_count);
+     bc_put_leb128(s, b->cpool_count);
+     bc_put_leb128(s, b->byte_code_len);
+-    if (b->vardefs) {
++    if (b->vardefs &&
++        !(s->strip_unused_locals && js_function_locals_unused(b))) {
+         bc_put_leb128(s, b->arg_count + b->var_count);
+         for(i = 0; i < b->arg_count + b->var_count; i++) {
+             JSBytecodeVarDef *vd = &b->vardefs[i];
+@@ -49053,6 +49100,8 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
+         s->pinned_atoms = TRUE;
+         s->first_atom = JS_ATOM_END + ctx->rt->pinned_atom_count;
+     }
++    s->strip_unused_locals = s->allow_bytecode &&
++        (flags & JS_WRITE_OBJ_STRIP_UNUSED_LOCALS) != 0;
+     js_dbuf_init(ctx, &s->dbuf);
+     js_object_list_init(&s->object_list);
+ 
+@@ -49638,6 +49687,15 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+         JS_ThrowSyntaxError(ctx, "invalid lazy function");
+         goto fail;
+     }
++    /* Tilefinch: a variable table covers every argument and local, and
++       one may be absent (JS_WRITE_OBJ_STRIP_UNUSED_LOCALS) only when no
++       local is captured, since get_var_ref() and close_lexical_var() read
++       it for a captured one. */
++    if (local_count != 0 ? local_count != bc.arg_count + bc.var_count
++                         : bc.var_ref_count != 0) {
++        JS_ThrowSyntaxError(ctx, "invalid function variables");
++        goto fail;
++    }
+ 
+     if (bc.has_debug) {
+         function_size = sizeof(*b);
+diff --git a/quickjs.h b/quickjs.h
+index a317430..03d1e57 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1313,6 +1313,11 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx);
+ /* Tilefinch: name the runtime's JS_PinAtomTable() atoms by index. Only a
+    runtime holding the same table reads the result. */
+ #define JS_WRITE_OBJ_PINNED_ATOMS (1 << 4)
++/* Tilefinch: omit the variable table of a function whose locals nothing
++   captures and whose table names none of them (compiled with JS_STRIP_DEBUG
++   and without direct eval). Its frame slots are unchanged. For bytecode
++   whose functions are never debugged: the bootstrap generator's. */
++#define JS_WRITE_OBJ_STRIP_UNUSED_LOCALS (1 << 5)
+ uint8_t *JS_WriteObject(JSContext *ctx, size_t *psize, JSValueConst obj,
+                         int flags);
+ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,

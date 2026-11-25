@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include "script_test_support.h"
+#include "../src/js_runtime_internal.h"
 
 #define MIB (1024u * 1024u)
 #define PAGE_URL "https://csp.test/"
@@ -34,6 +35,8 @@ typedef struct {
     const char *error;
     /* Scheduler pumps the replayed response takes to complete. */
     unsigned delay_pumps;
+    /* The recorded response's URL when a redirect led elsewhere, or NULL. */
+    const char *effective_url;
 } PageRecord;
 
 static bool write_fixture(char directory[128], const PageRecord *records,
@@ -91,7 +94,9 @@ static bool write_fixture(char directory[128], const PageRecord *records,
             records[i].url, records[i].url,
             records[i].error == NULL ? 1 : 0, records[i].delay_pumps,
             records[i].error == NULL ? "" : records[i].error, length,
-            (unsigned long long) hash, records[i].url,
+            (unsigned long long) hash,
+            records[i].effective_url == NULL ? records[i].url
+                                             : records[i].effective_url,
             records[i].content_type, records[i].header == NULL ? 1 : 2,
             records[i].content_type) > 0;
         if (ok && records[i].header != NULL) {
@@ -647,6 +652,361 @@ static const PageCase deferred_preload_case = {
     .expected = "yes",
     .check = deferred_preload_awaited,
 };
+
+/* A module preload still in flight when parsing ends is the module map's
+   fetch (HTML "fetch a single module script"): the realm takes its request
+   over, and the module script or import with its key waits for that
+   response instead of fetching the URL again. */
+static const PageRecord inflight_module_resources[] = {
+    {.url = "https://csp.test/late.mjs", .content_type = "text/javascript",
+     .body = "globalThis.lateModule='yes';", .delay_pumps = 40},
+};
+
+static bool module_preload_awaited(NavigationSession *navigation)
+{
+    const ScriptResult *result = &navigation->page.script_result;
+    size_t requests = replayed_requests();
+    bool ok = result->preloaded_scripts_adopted == 1u && requests == 2u;
+    if (!ok)
+        fprintf(stderr, "in-flight module preload: adopted=%zu "
+                "requests=%zu\n", result->preloaded_scripts_adopted,
+                requests);
+    return ok;
+}
+
+static const PageCase inflight_module_preload_case = {
+    .name = "inserted module script waits for an in-flight modulepreload",
+    .html =
+        "<!doctype html><head><link rel=modulepreload "
+        "href='https://csp.test/late.mjs'></head>"
+        "<body><p>x</p><script>"
+        "var s=document.createElement('script');s.type='module';"
+        "s.src='https://csp.test/late.mjs';document.head.append(s);"
+        "</script></body>",
+    .resources = inflight_module_resources,
+    .resource_count = 1,
+    .probe = "globalThis.pocSummary=String(globalThis.lateModule)",
+    .expected = "yes",
+    .check = module_preload_awaited,
+};
+
+/* A parser-inserted module script (deferred) waits for the scanner's
+   request of it, which the realm takes over at commit. */
+static const PageCase parser_module_preload_case = {
+    .name = "parser module script waits for its in-flight speculative fetch",
+    .html =
+        "<!doctype html><head><script type=module "
+        "src='https://csp.test/late.mjs'></script></head><body><p>x</p>"
+        "</body>",
+    .resources = inflight_module_resources,
+    .resource_count = 1,
+    .probe = "globalThis.pocSummary=String(globalThis.lateModule)",
+    .expected = "yes",
+    .check = module_preload_awaited,
+};
+
+static const PageRecord inflight_import_resources[] = {
+    {.url = "https://csp.test/dep.mjs", .content_type = "text/javascript",
+     .body = "export const dep='yes';", .delay_pumps = 40},
+};
+
+/* An import waits for a modulepreload of its URL. */
+static const PageCase import_module_preload_case = {
+    .name = "import waits for an in-flight modulepreload",
+    .html =
+        "<!doctype html><head><link rel=modulepreload "
+        "href='https://csp.test/dep.mjs'></head><body><p>x</p>"
+        "<script type=module>import {dep} from 'https://csp.test/dep.mjs';"
+        "globalThis.dep=dep;</script></body>",
+    .resources = inflight_import_resources,
+    .resource_count = 1,
+    .probe = "globalThis.pocSummary=String(globalThis.dep)",
+    .expected = "yes",
+    .check = module_preload_awaited,
+};
+
+/* The same for an import of a parser-inserted module script, which
+   carries its parser metadata, while HTML fetches a modulepreload as
+   not parser-inserted; the module prefetcher leaves the import to the
+   preload. The root's own speculative fetch completes first and is served
+   from the HTTP cache. */
+static const PageRecord inflight_root_import_resources[] = {
+    {.url = "https://csp.test/dep.mjs", .content_type = "text/javascript",
+     .body = "export const dep='yes';", .delay_pumps = 40},
+    {.url = "https://csp.test/root.mjs", .content_type = "text/javascript",
+     .body = "import {dep} from './dep.mjs';globalThis.rootDep=dep;",
+     .header = "cache-control: max-age=600"},
+};
+
+static bool root_import_preload_awaited(NavigationSession *navigation)
+{
+    const ScriptResult *result = &navigation->page.script_result;
+    size_t requests = replayed_requests();
+    bool ok = result->preloaded_scripts_adopted >= 1u && requests == 3u;
+    if (!ok)
+        fprintf(stderr, "root import module preload: adopted=%zu "
+                "requests=%zu\n", result->preloaded_scripts_adopted,
+                requests);
+    return ok;
+}
+
+static const PageCase root_import_module_preload_case = {
+    .name = "parser module script's import waits for a modulepreload",
+    .html =
+        "<!doctype html><head><link rel=modulepreload "
+        "href='https://csp.test/dep.mjs'><script type=module "
+        "src='https://csp.test/root.mjs'></script></head><body><p>x</p>"
+        "</body>",
+    .resources = inflight_root_import_resources,
+    .resource_count = 2,
+    .probe = "globalThis.pocSummary=String(globalThis.rootDep)",
+    .expected = "yes",
+    .check = root_import_preload_awaited,
+};
+
+/* A modulepreload's integrity metadata is checked only on a fetch with the
+   same metadata: a module script without any fetches the URL itself. */
+static bool module_preload_refused(NavigationSession *navigation)
+{
+    (void) navigation;
+    size_t requests = replayed_requests();
+    if (requests != 3u)
+        fprintf(stderr, "refused module preload: requests=%zu\n", requests);
+    return requests == 3u;
+}
+
+static const PageCase integrity_module_preload_case = {
+    .name = "module script without integrity skips a modulepreload with it",
+    .html =
+        "<!doctype html><head><link rel=modulepreload integrity='sha256-"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' "
+        "href='https://csp.test/late.mjs'></head>"
+        "<body><p>x</p><script>"
+        "var s=document.createElement('script');s.type='module';"
+        "s.src='https://csp.test/late.mjs';document.head.append(s);"
+        "</script></body>",
+    .resources = inflight_module_resources,
+    .resource_count = 1,
+    .probe = "globalThis.pocSummary=String(globalThis.lateModule)",
+    .expected = "yes",
+    .check = module_preload_refused,
+};
+
+/* A data: module script may be longer than a URL buffer: its absolute
+   imports resolve as from a short one, and a relative import (which a
+   data: URL cannot be the base of) rejects with a TypeError. The loader
+   refused both without an exception, so import() rejected with the
+   engine's uninitialized marker, which a page's `const x = await
+   import(...)` then read as a TDZ ReferenceError. */
+#define LONG_BASE_X16 "xxxxxxxxxxxxxxxx"
+#define LONG_BASE_X256 LONG_BASE_X16 LONG_BASE_X16 LONG_BASE_X16 \
+    LONG_BASE_X16 LONG_BASE_X16 LONG_BASE_X16 LONG_BASE_X16 LONG_BASE_X16 \
+    LONG_BASE_X16 LONG_BASE_X16 LONG_BASE_X16 LONG_BASE_X16 LONG_BASE_X16 \
+    LONG_BASE_X16 LONG_BASE_X16 LONG_BASE_X16
+static const PageRecord long_base_resources[] = {
+    SCRIPT("https://csp.test/dep.mjs", "export const dep='ok';"),
+};
+
+static const PageCase long_base_import_case = {
+    .name = "imports from an over-long data: module",
+    .html =
+        "<!doctype html><head></head><body><p>x</p><script type=module "
+        "src=\"data:text/javascript,function%20name(e){return%20e%20"
+        "instanceof%20Error?e.name:'other:'+typeof%20e}"
+        "Promise.all([import('https://csp.test/dep.mjs').then(function(m)"
+        "{return%20m.dep},name),import('./dep.mjs').then(function(){return"
+        "'loaded'},name)]).then(function(v){globalThis.longBase=v.join('|')"
+        "})/*"
+        LONG_BASE_X256 LONG_BASE_X256 LONG_BASE_X256 LONG_BASE_X256
+        LONG_BASE_X256 LONG_BASE_X256 LONG_BASE_X256 LONG_BASE_X256
+        LONG_BASE_X256 "*/\"></script></body>",
+    .resources = long_base_resources,
+    .resource_count = 1,
+    .probe = "globalThis.pocSummary=String(globalThis.longBase)",
+    .expected = "ok|TypeError",
+};
+
+/* A redirected module preload stays out of the module HTTP cache: a hit
+   skips the redirect-time CSP checks, which the preload passed with its
+   nonce. A later module script without the nonce, whose own URL the policy
+   allows, fetches the URL itself. */
+static const PageRecord redirected_preload_resources[] = {
+    {.url = "https://csp.test/r.mjs", .content_type = "text/javascript",
+     .body = "globalThis.redirected='yes';",
+     .header = "cache-control: max-age=600",
+     .effective_url = "https://csp.test/elsewhere.mjs"},
+};
+
+static bool redirected_preload_refetched(NavigationSession *navigation)
+{
+    (void) navigation;
+    size_t requests = replayed_requests();
+    if (requests != 3u)
+        fprintf(stderr, "redirected module preload: requests=%zu\n",
+                requests);
+    return requests == 3u;
+}
+
+static const PageCase redirected_module_preload_case = {
+    .name = "redirected modulepreload is not served from the cache",
+    .policy = "script-src 'nonce-x' https://csp.test/r.mjs",
+    .html =
+        "<!doctype html><head><link rel=modulepreload nonce=x "
+        "href='https://csp.test/r.mjs'></head><body><p>x</p>"
+        "<script type=module src='https://csp.test/r.mjs'></script>"
+        "</body>",
+    .resources = redirected_preload_resources,
+    .resource_count = 1,
+    .probe = "globalThis.pocSummary=String(globalThis.redirected)",
+    .expected = "yes",
+    .check = redirected_preload_refetched,
+};
+
+/* A policy a later <meta> adds never checked a preload made before it
+   (here while a parser-blocking script waits): the module script and the
+   classic script fetch their URLs themselves. */
+static const PageRecord meta_after_preload_resources[] = {
+    {.url = "https://csp.test/late.mjs", .content_type = "text/javascript",
+     .body = "globalThis.lateModule='yes';", .delay_pumps = 40},
+    {.url = "https://csp.test/late.js", .content_type = "text/javascript",
+     .body = "globalThis.late='yes';", .delay_pumps = 40},
+    {.url = "https://csp.test/block.js", .content_type = "text/javascript",
+     .body = "globalThis.blocked='yes';", .delay_pumps = 10,
+     .header = "cache-control: max-age=600"},
+};
+
+static bool meta_after_preload_refetched(NavigationSession *navigation)
+{
+    (void) navigation;
+    size_t requests = replayed_requests();
+    if (requests != 6u)
+        fprintf(stderr, "preload before meta: requests=%zu\n", requests);
+    return requests == 6u;
+}
+
+static const PageCase meta_after_preload_case = {
+    .name = "a preload made before a meta policy is not consumed",
+    .html =
+        "<!doctype html><head><link rel=modulepreload "
+        "href='https://csp.test/late.mjs'><link rel=preload as=script "
+        "crossorigin=anonymous href='https://csp.test/late.js'>"
+        "<script src='https://csp.test/block.js'></script>"
+        "<meta http-equiv=Content-Security-Policy content=\"script-src "
+        "'nonce-m' https://csp.test\"></head><body><p>x</p><script nonce=m>"
+        "var s=document.createElement('script');s.type='module';"
+        "s.src='https://csp.test/late.mjs';document.head.append(s);"
+        "var c=document.createElement('script');c.crossOrigin='anonymous';"
+        "c.src='https://csp.test/late.js';document.head.append(c);"
+        "</script></body>",
+    .resources = meta_after_preload_resources,
+    .resource_count = 3,
+    .probe = "globalThis.pocSummary=globalThis.lateModule+'|'+"
+             "globalThis.late",
+    .expected = "yes|yes",
+    .check = meta_after_preload_refetched,
+};
+
+/* A same-document URL change while the page parses keeps the origin the
+   preload's request was made for: the realm still adopts it. */
+static const PageCase replaced_url_preload_case = {
+    .name = "modulepreload is adopted after replaceState",
+    .html =
+        "<!doctype html><head><link rel=modulepreload "
+        "href='https://csp.test/late.mjs'></head>"
+        "<body><p>x</p><script>history.replaceState(null,'','/moved');"
+        "var s=document.createElement('script');s.type='module';"
+        "s.src='https://csp.test/late.mjs';document.head.append(s);"
+        "</script></body>",
+    .resources = inflight_module_resources,
+    .resource_count = 1,
+    .probe = "globalThis.pocSummary=String(globalThis.lateModule)",
+    .expected = "yes",
+    .check = module_preload_awaited,
+};
+
+/* A module preload the module HTTP cache holds fresh leaves the map: the
+   import that reads it from the cache leaves no READY entry holding its
+   body and a slot. */
+static const PageRecord settled_preload_resources[] = {
+    {.url = "https://csp.test/dep.mjs", .content_type = "text/javascript",
+     .body = "export const dep='yes';", .delay_pumps = 10,
+     .header = "cache-control: max-age=600"},
+    {.url = "https://csp.test/root.mjs", .content_type = "text/javascript",
+     .body = "import {dep} from './dep.mjs';globalThis.rootDep=dep;",
+     .header = "cache-control: max-age=600"},
+};
+
+static bool settled_preload_left_map(NavigationSession *navigation)
+{
+    const ScriptRuntime *runtime = navigation->page.runtime;
+    size_t held = 0;
+    for (size_t i = 0; runtime != NULL && i < SCRIPT_PRELOADED_SCRIPT_LIMIT;
+         i++) {
+        if (runtime->bridge.preloaded_scripts[i].state
+            != SCRIPT_PRELOADED_SCRIPT_EMPTY) held++;
+    }
+    size_t requests = replayed_requests();
+    if (held != 0 || requests != 3u)
+        fprintf(stderr, "settled module preload: held=%zu requests=%zu\n",
+                held, requests);
+    return held == 0 && requests == 3u;
+}
+
+static const PageCase settled_module_preload_case = {
+    .name = "cached modulepreload leaves the map",
+    .html =
+        "<!doctype html><head><link rel=modulepreload "
+        "href='https://csp.test/dep.mjs'><script>globalThis.realm=1;"
+        "</script></head><body><p>x</p></body>",
+    .resources = settled_preload_resources,
+    .resource_count = 2,
+    /* Inserts the importing module script once the preload has settled. */
+    .probe = "globalThis.turns=(globalThis.turns||0)+1;"
+             "if(globalThis.turns==24){var s=document.createElement("
+             "'script');s.type='module';s.src='https://csp.test/root.mjs';"
+             "document.head.append(s)}"
+             "globalThis.pocSummary=String(globalThis.rootDep)",
+    .expected = "yes",
+    .check = settled_preload_left_map,
+};
+
+/* Fetch's "strip url for use as a referrer": a local scheme's URL (about:,
+   blob:, data:) as the referrer source gives a request with no referrer,
+   not one refused for want of an origin. */
+static bool local_referrer_sources_stripped(void)
+{
+    static const char *const sources[] = {
+        "about:blank", "about:srcdoc",
+        "blob:https://csp.test/6f4e0c1a-58d2-4b8e-9a7e-2d6c1b0f3e11",
+        "data:text/javascript,export%20default%201"
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
+        TilefinchRequestContext context = {
+            .target_url = "https://csp.test/dep.mjs",
+            .initiator_url = PAGE_URL,
+            .top_level_url = PAGE_URL,
+            .method = "GET",
+            .mode = TILEFINCH_REQUEST_MODE_CORS,
+            .credentials = TILEFINCH_CREDENTIALS_SAME_ORIGIN,
+            .destination = TILEFINCH_DESTINATION_SCRIPT,
+        };
+        FetchPreparedPageRequest prepared;
+        bool ready = fetch_prepare_page_request_context(
+            &context, sources[i], "", NULL, NULL, NULL, NULL, &prepared,
+            NULL);
+        const FetchRequest *request = ready
+            ? fetch_prepared_page_request(&prepared) : NULL;
+        if (request == NULL || request->referer != NULL) {
+            fprintf(stderr, "local referrer source %s: prepared=%d "
+                    "referer=%s\n", sources[i], request != NULL,
+                    request == NULL || request->referer == NULL
+                        ? "none" : request->referer);
+            ok = false;
+        }
+    }
+    return ok;
+}
 
 /* HTML's CORS settings attribute, as the request it makes. A bare
    crossorigin (which lexbor stores without a value), "" and an invalid
@@ -2107,7 +2467,12 @@ int main(void)
         &meta_changed_base_case, &meta_nomodule_activation_case,
         &meta_prepared_header_case, &meta_prepared_data_case,
         &parser_preload_case, &parser_preload_integrity_case,
-        &inflight_preload_case,
+        &inflight_preload_case, &inflight_module_preload_case,
+        &parser_module_preload_case, &import_module_preload_case,
+        &integrity_module_preload_case, &long_base_import_case,
+        &root_import_module_preload_case, &redirected_module_preload_case,
+        &meta_after_preload_case,
+        &replaced_url_preload_case, &settled_module_preload_case,
         &deferred_preload_case, &cors_parser_script_case,
         &cors_dynamic_script_case, &cors_module_script_case,
         &cors_stylesheet_case, &bare_preload_case, &spelled_preload_case,
@@ -2120,6 +2485,7 @@ int main(void)
     }
     if (!module_disk_tier_behind_sri_and_csp()) failures++;
     if (!held_preloads_yield()) failures++;
+    if (!local_referrer_sources_stripped()) failures++;
     if (failures != 0) {
         fprintf(stderr, "tilefinch-csp-page-tests: %zu failure(s)\n",
                 failures);

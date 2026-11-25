@@ -162,7 +162,12 @@ typedef struct {
        speaker the microphone can hear. Page microphone audio is heard only
        while this is true; without it, never. */
     bool (*audio_output_private)(void *context);
+    /* Native user navigation only. No page text, draft or credentials cross
+       this boundary. Missing service or dismissal means stay on the page. */
+    bool (*confirm_draft_loss)(void *context);
 } TilefinchPlatformServices;
+
+bool tilefinch_platform_confirm_draft_loss(void);
 
 void tilefinch_platform_set_services(const TilefinchPlatformServices *services);
 
@@ -229,8 +234,8 @@ bool tilefinch_platform_media_capture_input_free(void);
    BACKUP is removed only if the rename refuses to replace it, while PATH is
    still whole) and moved back if TEMPORARY cannot be installed, so a
    complete generation exists under PATH or BACKUP at every instant.
-   Without BACKUP, an atomic replace is tried first; only when that fails
-   (and TEMPORARY and PATH exist) is PATH moved to PATH.old and the rename
+   Without BACKUP, an atomic replace is tried first; only on a destination
+   collision (and when TEMPORARY and PATH are files) is PATH moved to PATH.old and the rename
    retried. A failed retry moves PATH back; a power loss in that window
    leaves PATH.old (removed by the next replace) and TEMPORARY.
 
@@ -238,6 +243,17 @@ bool tilefinch_platform_media_capture_input_free(void);
    discarded or kept for recovery. */
 bool tilefinch_platform_replace_file(const char *temporary, const char *path,
                                      const char *backup);
+/* Publish without ever creating an aside or backup. If the filesystem
+   cannot replace an existing name, retire it before installing the stage.
+   The old file may be lost on failure; the caller owns stage cleanup. */
+bool tilefinch_platform_replace_file_no_copy(const char *temporary,
+                                             const char *path);
+/* Finish a private, disposable staging file. Takes ownership of the open
+   stream. Only a successful writer and close can publish; all other paths
+   discard the stage. Use replace_file directly for recoverable stages. */
+bool tilefinch_platform_finish_file(FILE *file, bool complete,
+                                   const char *temporary, const char *path,
+                                   const char *backup);
 /* fprintf for short records: formats with vsnprintf into a 1 KiB stack
    buffer and writes the text with one fwrite. The shipping PSP image
    formats only through snprintf, so writing files this way keeps newlib's

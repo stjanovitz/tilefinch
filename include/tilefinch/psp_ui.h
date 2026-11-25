@@ -120,6 +120,7 @@ typedef struct {
     uint8_t offline_state;
     /* An installed app whose bytecode needs recompiling (X offers it). */
     bool needs_recompile;
+    uint32_t offline_id;
     const unsigned char *icon_rgba;
 } PspUiCollectionsRow;
 
@@ -174,6 +175,7 @@ typedef struct {
     PageDialogKind kind;
     bool offer_suppress;
     bool right_to_left;
+    bool browser_draft;
     const char *host;
     const char *message;
     const char *value;
@@ -631,7 +633,8 @@ typedef enum {
     /* The page opened in Basic view by default because its site's scripts
        ran out of memory last time: X loads the full page
        (PSP_UI_ACTION_TRY_FULL_PAGE), O keeps Basic view. */
-    PSP_UI_TOAST_BASIC_DEFAULT
+    PSP_UI_TOAST_BASIC_DEFAULT,
+    PSP_UI_TOAST_VIDEO_DETAILS
 } PspUiToastKind;
 
 typedef struct {
@@ -924,7 +927,12 @@ typedef struct {
     int cursor_y_milli;
     char url[PSP_UI_URL_CAPACITY];
     char title[PSP_UI_TITLE_CAPACITY];
-    char status[PSP_UI_STATUS_CAPACITY];
+    union {
+        char status[PSP_UI_STATUS_CAPACITY];
+        /* Keep untrusted display text separate from the status key seen
+           by actions and diagnostics. The supervisor copies this by value. */
+        struct { char key[8], title[48], channel[24]; } video_details;
+    };
     /* Update and Options are mutually exclusive overlays. Sharing their
        bounded label storage keeps the per-frame UI state at its 1 KiB
        ratchet instead of charging every browsing frame for an SSID. */
@@ -1356,6 +1364,7 @@ void psp_ui_set_loading(PspUiState *ui, bool loading,
    for every load: "CONNECTING  O CANCEL", "RECEIVING PAGE  O CANCEL",
    "RUNNING PAGE SCRIPTS  O CANCEL", "LOADING PAGE  O CANCEL". */
 const char *psp_ui_loading_status_text(unsigned phase);
+void psp_ui_show_video_details(PspUiState *ui, const char *title, const char *channel);
 void psp_ui_show_loading_status(PspUiState *ui, unsigned phase,
                                 unsigned duration_frames);
 /* Follows a pending load's phase: a new phase replaces a showing loading
@@ -1488,6 +1497,10 @@ void psp_ui_set_tabs(PspUiState *ui, const PspUiTabsView *tabs);
 void psp_ui_set_home(PspUiState *ui, const PspUiHomeView *home);
 void psp_ui_set_collections(
     PspUiState *ui, const PspUiCollectionsView *collections);
+/* Capture before rebuilding an in-place view; never borrow its row text. */
+uint32_t psp_ui_collections_armed_offline_id(const PspUiState *ui);
+void psp_ui_refresh_collections(
+    PspUiState *ui, const PspUiCollectionsView *collections, uint32_t armed_id);
 void psp_ui_collection_format_bytes(PspUiCollectionsRow *row, uint64_t bytes);
 void psp_ui_collection_download_progress(
     PspUiCollectionsRow *row, uint64_t received, uint64_t total);

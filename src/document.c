@@ -18,6 +18,7 @@
 #include <lexbor/ns/const.h>
 
 #include "tilefinch/platform.h"
+#include "tilefinch/resources.h"
 #include "tilefinch/script_loader.h"
 #include "tilefinch/font.h"
 #include "tilefinch/text_encoding.h"
@@ -1374,6 +1375,7 @@ static lxb_dom_document_mutation_cb_t document_style_tree_callbacks;
 static lxb_dom_document_attr_mutation_cb_t document_style_attr_callbacks;
 /* <iframe> and <frame> insertions into any tracked document's trees. */
 static uint64_t document_frame_insertions;
+static uint64_t document_noscript_insertions;
 
 uint64_t document_style_generation(void)
 {
@@ -1448,6 +1450,8 @@ static void document_style_note_write(const lxb_dom_node_t *node)
 
 static lxb_status_t document_style_node_inserted(lxb_dom_node_t *node)
 {
+    if (document_node_is_tag(node, LXB_TAG_NOSCRIPT))
+        document_noscript_insertions++;
     if (node != NULL && node->type == LXB_DOM_NODE_TYPE_ELEMENT
         && node->ns == LXB_NS_HTML
         && (node->local_name == LXB_TAG_IFRAME
@@ -1550,6 +1554,8 @@ static void document_style_track(lxb_html_document_t *html)
 
 static lxb_status_t document_parser_node_inserted(lxb_dom_node_t *node)
 {
+    if (document_node_is_tag(node, LXB_TAG_NOSCRIPT))
+        document_noscript_insertions++;
     PocDocument *document = document_insertion_recorder;
     if (document != NULL && document->html != NULL && node != NULL
         && node->parent != NULL
@@ -2007,6 +2013,7 @@ typedef struct {
     bool bidi_markup_present;
     bool pointer_event_attributes_present;
     bool autofocus_attribute_present;
+    bool noscript_present;
 } DocumentStats;
 
 static uint16_t document_codepoint_glyph_script(unsigned codepoint)
@@ -2254,6 +2261,8 @@ static bool gather_stats(lxb_dom_node_t *node, bool in_body, bool hidden,
         if (!document_stats_add(&stats->nodes, 1)) return false;
         if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
             if (!document_stats_add(&stats->elements, 1)) return false;
+            if (node->local_name == LXB_TAG_NOSCRIPT)
+                stats->noscript_present = true;
             lxb_dom_element_t *element = lxb_dom_interface_element(node);
             for (lxb_dom_attr_t *attr = element->first_attr;
                  attr != NULL; attr = attr->next) {
@@ -2636,6 +2645,14 @@ lxb_dom_node_t *document_parser_open_script(const DocumentParser *parser)
         ? NULL : lxb_html_tree_current_node(tree);
     return current != NULL && current->local_name == LXB_TAG_SCRIPT
             && current->ns == LXB_NS_HTML ? current : NULL;
+}
+
+lxb_dom_node_t *document_parser_current_node(const DocumentParser *parser)
+{
+    if (parser == NULL || !parser->active || parser->failed) return NULL;
+    lxb_html_tree_t *tree = parser->original_token_context;
+    return tree == NULL || tree->open_elements == NULL
+        ? NULL : lxb_html_tree_current_node(tree);
 }
 
 /* Return the unused tail of Lexbor's temporary token buffer. Only called
@@ -3322,6 +3339,8 @@ bool document_refresh(PocDocument *document)
         stats.pointer_event_attributes_present;
     document->autofocus_attribute_present =
         stats.autofocus_attribute_present;
+    document->noscript_present = stats.noscript_present;
+    document->noscript_insertions_seen = document_noscript_insertions;
     document_note_connected_mutation(document);
     document_allocation_owner_leave(document, previous);
     return true;
@@ -3344,6 +3363,27 @@ static lxb_dom_node_t *document_bounded_next(lxb_dom_node_t *node,
     if (!skip_children && node->first_child != NULL) return node->first_child;
     while (node != root && node->next == NULL) node = node->parent;
     return node == root ? NULL : node->next;
+}
+
+bool document_may_have_noscript(PocDocument *document)
+{
+    if (document == NULL || document->html == NULL) return false;
+    if (document->noscript_present) return true;
+    /* Unknown mutation callbacks cannot prove a negative. */
+    if (document->html->dom_document.mutation != &document_style_tree_callbacks)
+        return true;
+    if (document->noscript_insertions_seen == document_noscript_insertions)
+        return false;
+    /* A new insertion may belong to another tab or a detached fragment.
+       Recheck once, not once per scroll or runtime tick. */
+    document->noscript_insertions_seen = document_noscript_insertions;
+    lxb_dom_node_t *root = lxb_dom_interface_node(document->html);
+    lxb_dom_node_t *node = root;
+    for (size_t i = 0; node != NULL && i < DOCUMENT_TRAVERSAL_NODE_LIMIT; i++) {
+        if (document_node_is_tag(node, LXB_TAG_NOSCRIPT)) break;
+        node = document_bounded_next(node, root, false);
+    }
+    return document->noscript_present = node != NULL;
 }
 
 static bool document_loading_only_body(lxb_dom_node_t *body)
@@ -4604,6 +4644,7 @@ void document_destroy(PocDocument *document)
         budget_free(document->budget, document->body_text);
         budget_free(document->budget, document->base_href_snapshot);
         budget_free(document->budget, document->frozen_base_url);
+        image_noscript_release(document);
     }
     if (document->html != NULL) {
         document->html = lxb_html_document_destroy(document->html);
@@ -4763,6 +4804,15 @@ const char *document_control_value(lxb_dom_node_t *node, size_t *length)
     if (state == NULL) return NULL;
     if (length != NULL) *length = state->length;
     return state->value;
+}
+
+bool document_control_value_changed(lxb_dom_node_t *node)
+{
+    const DocumentControlState *state = document_control_state_live(node);
+    return state != NULL && state->value != NULL
+        && (!state->default_value_known || state->length != state->default_length
+            || (state->length != 0
+                && memcmp(state->value, state->default_value, state->length) != 0));
 }
 
 lxb_dom_node_t *document_control_parser_form_owner(lxb_dom_node_t *node)

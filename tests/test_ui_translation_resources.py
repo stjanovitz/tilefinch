@@ -173,13 +173,13 @@ class ResourceTests(unittest.TestCase):
         old_languages = generator.CATALOGS[6][1]
         rows = generator.read_rows(7, old_languages)
         for column, (code, label, glyphs) in enumerate(old_languages, 1):
-            self.assertIn(f'"translations/ui/v20/{code}.tful"', manifest)
-        self.assertIn('"translations/ui/v20/pt.tful"', manifest)
+            self.assertIn(f'"translations/ui/v{generator.ACTIVE_VERSION}/{code}.tful"', manifest)
+        self.assertIn(f'"translations/ui/v{generator.ACTIVE_VERSION}/pt.tful"', manifest)
         portuguese = generator.read_rows(8, generator.CATALOGS[7][1])
         self.assertGreaterEqual({row[0] for row in portuguese}, {row[0] for row in rows})
         self.assertEqual(dict(portuguese)["Portuguese"], "Português")
-        self.assertIn('"translations/ui/v20/bn.tful"', manifest)
-        self.assertIn('"translations/ui/v20/as.tful"', manifest)
+        self.assertIn(f'"translations/ui/v{generator.ACTIVE_VERSION}/bn.tful"', manifest)
+        self.assertIn(f'"translations/ui/v{generator.ACTIVE_VERSION}/as.tful"', manifest)
 
     def test_v16_stays_frozen_under_the_narrow_bound(self):
         # v16 is pinned by the release candidate, whose reader has 16-bit
@@ -215,12 +215,13 @@ class ResourceTests(unittest.TestCase):
         # it does not retire.
         # Hebrew reads right to left with Arabic and needs no shaping: no
         # niqqud or cantillation marks, no presentation forms.
-        version, languages = generator.CATALOGS[-3]
+        versions = dict(generator.CATALOGS)
+        version, languages = 18, versions[18]
         self.assertEqual(version, 18)
-        self.assertEqual(languages, generator.CATALOGS[-4][1] + [("he", "Hebrew", "HEBREW")])
+        self.assertEqual(languages, versions[17] + [("he", "Hebrew", "HEBREW")])
         self.assertEqual(generator.RIGHT_TO_LEFT, {"ar", "he"})
         rows = generator.read_rows(18, languages)
-        v17 = generator.read_rows(17, generator.CATALOGS[-4][1])
+        v17 = generator.read_rows(17, versions[17])
         self.assertLessEqual({row[0] for row in v17} - generator.RETIRED_KEYS[18],
                              {row[0] for row in rows})
         hebrew = [(row[0], row[-1]) for row in rows]
@@ -231,16 +232,17 @@ class ResourceTests(unittest.TestCase):
                                  for c in value), key)
         manifest = outputs()[ROOT / "src/generated/ui_languages.inc"].decode()
         self.assertIn('BROWSER_GLYPH_LANGUAGE_HEBREW', manifest)
-        self.assertRegex(manifest, r'\{"he", "Hebrew", BROWSER_GLYPH_LANGUAGE_HEBREW, "[0-9a-f]{64}", 20, 1, '
-                                   r'"translations/ui/v20/he.tful", true\},')
+        active = generator.ACTIVE_VERSION
+        self.assertRegex(manifest, rf'\{{"he", "Hebrew", BROWSER_GLYPH_LANGUAGE_HEBREW, "[0-9a-f]{{64}}", {active}, 1, '
+                                   rf'"translations/ui/v{active}/he.tful", true\}},')
         self.assertRegex(manifest, r'\{"ar", "Arabic", .*, true\},')
         self.assertEqual(manifest.count(", true},"), 2)
 
     def test_v19_adds_labels_without_rewriting_v18(self):
-        self.assertEqual(generator.CATALOGS[-2][0], 19)
-        self.assertEqual(generator.CATALOGS[-2][1], generator.CATALOGS[-3][1])
-        previous = generator.read_rows(18, generator.CATALOGS[-3][1])
-        current = generator.read_rows(19, generator.CATALOGS[-2][1])
+        versions = dict(generator.CATALOGS)
+        self.assertEqual(versions[19], versions[18])
+        previous = generator.read_rows(18, versions[18])
+        current = generator.read_rows(19, versions[19])
         self.assertEqual(len(current), len(previous) + 2)
         old = {row[0]: row for row in previous}
         self.assertEqual({row[0]: row for row in current if row[0] in old}, old)
@@ -250,11 +252,11 @@ class ResourceTests(unittest.TestCase):
 
     def test_v20_adds_labels_without_rewriting_v19(self):
         # v19 is pinned by 0.1.51; the Basic-by-default notice, Try full
-        # page and frame offer rows went into v20.
-        self.assertEqual(generator.ACTIVE_VERSION, 20)
-        self.assertEqual(generator.CATALOGS[-1][1], generator.CATALOGS[-2][1])
-        previous = generator.read_rows(19, generator.CATALOGS[-2][1])
-        current = generator.read_rows(20, generator.CATALOGS[-1][1])
+        # page and frame offer went into v20, pinned by 0.1.53.
+        versions = dict(generator.CATALOGS)
+        self.assertEqual(versions[20], versions[19])
+        previous = generator.read_rows(19, versions[19])
+        current = generator.read_rows(20, versions[20])
         old = {row[0]: row for row in previous}
         self.assertEqual({row[0]: row for row in current if row[0] in old}, old)
         self.assertEqual({row[0] for row in current} - set(old), {
@@ -269,6 +271,24 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256((ROOT / "translations/ui/v19/source.tsv")
                                         .read_bytes()).hexdigest(),
                          "4ea6c18fa757e36b351a3553d91c01ba3c034627ac2bd41a2945d4552e8838e5")
+
+    def test_v21_adds_labels_without_rewriting_v20(self):
+        versions = dict(generator.CATALOGS)
+        self.assertEqual(versions[21], versions[20])
+        previous = generator.read_rows(20, versions[20])
+        current = generator.read_rows(21, versions[21])
+        old = {row[0]: row for row in previous}
+        self.assertEqual({row[0]: row for row in current if row[0] in old}, old)
+        self.assertEqual({row[0] for row in current} - set(old), {
+            "Not all edits can be saved. Leave this page without saving them?",
+            "X Leave without saving   O Stay",
+            "REMOVED FOR NOW - HISTORY NOT SAVED",
+            "RESTORE OFF - SAVED TABS OR PAGE REMAIN",
+            "RESTORE OFF THIS RUN - SAVED DATA MAY REMAIN",
+            "RESTORE OFF THIS RUN - SETTING NOT SAVED"})
+        self.assertEqual(hashlib.sha256((ROOT / "translations/ui/v20/source.tsv")
+                                        .read_bytes()).hexdigest(),
+                         "7f190b5363fb8e99f1846f4461b21eaffb1667be55f36068d82a8ab9d5fa0f53")
 
     def test_active_clusters_are_in_the_required_glyph_revision(self):
         # A pack revision is built from the sequences of the catalog that

@@ -107,6 +107,62 @@ static int test_opfs_sync_access(void)
                  "OPFS-SYNC-OK") == 0);
     script_runtime_destroy(worker_performance_runtime);
     document_destroy(&worker_performance_document);
+
+    /* A terminated worker's open sync access handle and writable give
+       their exclusive leases back: the page can open both files again
+       without the worker ever closing them. A worker writer's truncate is
+       charged as the page's is (not by its size), so an oversized one
+       fails as QuotaExceededError there too. */
+    puts("test: terminating a Worker releases its OPFS leases");
+    CHECK(document_parse(
+        &worker_performance_document, &budget, worker_lifecycle_page,
+        strlen(worker_lifecycle_page), 8));
+    memset(&worker_performance_result, 0,
+           sizeof(worker_performance_result));
+    worker_performance_runtime = script_runtime_create_deferred(
+        &worker_performance_document, &budget, 5 * MIB, 1000,
+        "https://opfs-sync.test/", &storage_manager_session,
+        &worker_performance_result);
+    CHECK(worker_performance_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              worker_performance_runtime,
+              "(()=>{pocSummary='pending';const source=\"(async()=>{const root="
+              "await navigator.storage.getDirectory(),held=await(await root."
+              "getFileHandle('held.bin',{create:true})).createSyncAccessHandle(),"
+              "writer=await(await root.getFileHandle('open.bin',{create:true}))."
+              "createWritable();held.write(new Uint8Array([1]));await writer.write("
+              "'x');const cut=await(await root.getFileHandle('cut.bin',{create:"
+              "true})).createWritable();let cutError='none';try{await cut.truncate("
+              "2**30)}catch(error){cutError=error.name}postMessage('ready:'+cutError)"
+              "})().catch(error=>postMessage(error.name))\","
+              "url=URL.createObjectURL(new Blob([source])),worker=new Worker(url);"
+              "worker.onmessage=async event=>{try{if(event.data!=="
+              "'ready:QuotaExceededError')throw "
+              "Error(event.data);worker.terminate();URL.revokeObjectURL(url);"
+              "const root=await navigator.storage.getDirectory(),tries=async name=>{"
+              "const file=await root.getFileHandle(name);for(let i=0;i<8;i++){try{"
+              "const writer=await file.createWritable();await writer.close();"
+              "return true}catch(error){if(error.name!=="
+              "'NoModificationAllowedError')throw error;await new Promise(resolve=>"
+              "setTimeout(resolve,0))}}return false};pocSummary=await tries("
+              "'held.bin')&&await tries('open.bin')?'OPFS-TERMINATE-OK':"
+              "'OPFS-TERMINATE-LOCKED:'+event.data}catch(error){pocSummary='OPFS-TERMINATE-ERROR:'"
+              "+error.name+':'+error.message}}})()",
+              "<opfs-worker-terminate>", &worker_performance_result));
+    for (size_t worker_turn = 0; worker_turn < 64
+         && strcmp(worker_performance_result.summary, "pending") == 0;
+         worker_turn++)
+        CHECK(script_runtime_advance(
+            worker_performance_runtime, worker_turn, 32,
+            &worker_performance_result));
+    if (strcmp(worker_performance_result.summary, "OPFS-TERMINATE-OK") != 0)
+        fprintf(stderr, "OPFS terminate summary=%s error=%s\n",
+                worker_performance_result.summary,
+                worker_performance_result.error);
+    CHECK(strcmp(worker_performance_result.summary,
+                 "OPFS-TERMINATE-OK") == 0);
+    script_runtime_destroy(worker_performance_runtime);
+    document_destroy(&worker_performance_document);
     browser_session_destroy(&storage_manager_session);
     CHECK(budget.current == 0);
     return 0;

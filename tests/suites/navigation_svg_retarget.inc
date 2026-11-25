@@ -3,6 +3,51 @@
    written here: vertical stripes (32 of 256 units each, so their edges fall
    on whole pixels at 20 and 40 px) and a two-colour sprite sheet. */
 
+static bool test_svg_one_dimension_uses_viewbox_ratio(void)
+{
+    static const struct {
+        const char *dimension;
+        int width, height;
+        bool artwork_at_bottom;
+    } cases[] = {
+        /* An explicit zero is not an omitted dimension; preserve the
+           decoder's previous fallback for that input. */
+        {"width='24' height='0'", 24, 40, false},
+        {"width='24'", 24, 12, true}, {"height='15'", 30, 15, true},
+        {"", 80, 40, true}
+    };
+    Budget budget;
+    budget_init(&budget, MIB);
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char markup[256];
+        int length = snprintf(markup, sizeof(markup),
+            "<svg %s viewBox='10 20 80 40'>"
+            "<clipPath id='left'><rect x='10' y='20' width='40' height='40'/>"
+            "</clipPath><rect x='10' y='20' width='80' height='40' "
+            "fill='red' clip-path='url(#left)'/></svg>", cases[i].dimension);
+        if (length < 0 || (size_t) length >= sizeof(markup)) return false;
+        int width = 0, height = 0;
+        unsigned char *pixels = image_svg_decode(markup, (size_t) length,
+            &budget, MIB, &width, &height);
+        bool okay = pixels != NULL && width == cases[i].width
+            && height == cases[i].height;
+        if (okay && cases[i].artwork_at_bottom) {
+            /* Artwork and clip coordinates must use the same viewport. */
+            size_t bottom = (size_t) (height - 2) * (size_t) width * 4u;
+            okay = pixels[bottom + 7u] == 255
+                && pixels[bottom + ((size_t) width - 2u) * 4u + 3u] == 0;
+        }
+        budget_free(&budget, pixels);
+        if (!okay || budget.current != 0) {
+            fprintf(stderr, "SVG %s: got %dx%d, want %dx%d with clip\n",
+                    cases[i].dimension, width, height,
+                    cases[i].width, cases[i].height);
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool test_nested_svg_viewports_preserve_atlas_geometry(void)
 {
     static const char markup[] =
@@ -760,9 +805,10 @@ static bool test_inline_svg_font_relative_attributes_use_computed_size(void)
    rasterizes a 20 px icon at 40 device pixels. Teardown leaves no bytes
    behind. */
 static bool svg_oversize_test_target(void *opaque, int source_width,
-                                      int source_height, int *width,
-                                      int *height)
+                                      int source_height, bool painted,
+                                      int *width, int *height)
 {
+    (void) painted;
     size_t *calls = opaque;
     (*calls)++;
     if (source_width != 3000 || source_height != 1000) return false;
@@ -1488,7 +1534,7 @@ static bool test_svg_kept_parse_counts_its_owner_after_reclaim(void)
         unsigned char *pixels = image_svg_decode_deferrable(
             markup, length, &budget, 40000, &width, &height, NULL, NULL,
             svg_kept_defer_always, NULL, NULL, NULL, &limited, &deferred,
-            allowance, &parse);
+            allowance, &parse, NULL);
         bool counted = allocated && pixels == NULL && deferred && !limited
             && reclaim.ballast == NULL && budget.reclaim_calls != 0
             && (pass == 0 ? parse == NULL && budget.current == 0
@@ -1527,7 +1573,7 @@ static bool test_svg_kept_parse_rasterizes_like_a_fresh_decode(void)
         unsigned char *none = image_svg_decode_deferrable(
             markup, sizeof(markup) - 1, &budget, MIB, &width, &height,
             NULL, NULL, svg_kept_defer_always, NULL, &sw, &sh, &limited,
-            &deferred, 64u * 1024u, &parse);
+            &deferred, 64u * 1024u, &parse, NULL);
         ok = none == NULL && deferred && !limited && width == 100
             && height == 60 && sw == 100 && sh == 60 && parse != NULL
             && image_svg_parse_bytes(parse) >= sizeof(markup) - 1

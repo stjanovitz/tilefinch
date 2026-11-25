@@ -33,7 +33,11 @@ into the realm heap to patch its atoms: about 260 KiB of the resident
 bootstrap on the device realm (measured 2026-11-14). A runtime without the
 same table refuses this bytecode rather than misreading it. The bytecode omits its source text,
 line tables, and local-variable names, because QuickJS would copy them out of
-ROM into every realm's heap on restore. Bootstrap exceptions still name the
+ROM into every realm's heap on restore. A function whose arguments and locals
+no closure captures carries no variable table at all
+(`JS_WRITE_OBJ_STRIP_UNUSED_LOCALS`, which only the generator passes; the
+engine's reasons are in `third_party/quickjs/README.md`): most bootstrap
+functions, 12 bytes per argument and local each. Bootstrap exceptions still name the
 module and function; for line numbers, run the host with
 `TILEFINCH_DISABLE_BOOTSTRAP_BYTECODE=1`, which compiles the embedded source
 with full debug information. Setting `TILEFINCH_BOOTSTRAP_KEEP_LINES=1` while
@@ -106,8 +110,58 @@ encoder and decoder every `postMessage()` between windows and frames uses)
 is built the first time a realm posts or receives such a message; it has
 no global names of its own, so `platform.js` asks for it through a private
 native, as the form collections and typed form-value conversions, secondary documents and CSSOM rule
-modules do. It is the one lazy module whose atoms the generator pins with
-the eager modules' (`sources.def`), so it runs from ROM when it loads.
+modules do. The layout-less `getBoundingClientRect()` fallback
+(`geometry.js`, for an element native layout holds no authoritative box
+for) is built the same way, through a private native from `dom.js`, on
+the first such measurement, and so are constraint validation's checks and
+messages (`validation.js`, from `platform.js`), on the first validity read
+or check, and script-side detached documents (`detached-documents.js`, from
+`platform.js`: XML documents, `new Document()`, the template contents
+owner), on the first one a realm makes. Those private natives are deleted
+before page script, and each consumer takes its factory off the global right
+after loading it (the rule is in Interface snapshot in
+`docs/engineering/JS_RUNTIME.md`). These modules were moved out of an eager
+module for source headroom, so the generator pins their atoms with the
+eager modules' (`sources.def`): the atoms were resident already, and the
+modules run from ROM when they load.
+
+The separate `dom-attributes.js` module handles namespace-aware writes,
+Attr node insertion, and copying namespace mirrors. Ordinary HTML
+attribute reads, writes, and clones do not load it. The private lazy hook
+publisher delivers its factory, and module-only atoms stay out of the
+eager table.
+
+`subtle-crypto.js` holds the SubtleCrypto operations other than `digest`
+and `CryptoKey`'s attributes. `compat.js` keeps `digest` and a `CryptoKey`
+whose constructor throws, and the first read of `crypto.subtle` loads the
+module through a private native, takes its factory off the global, as the
+frame-clone pattern above does, and lets it add the members before the read
+returns. Its atoms are its own, so they are not pinned.
+
+`event-source.js` (`EventSource`), `file-reader.js` (`FileReader`),
+`gpu.js` (`GPU`, `WGSLLanguageFeatures` and navigator.gpu's object) and
+`multiplayer.js` (the channel behind `navigator.tilefinchMultiplayer`) hold
+APIs few pages use, moved out of `compat.js` and `platform.js`. The three
+globals' first read loads their module, as for Streams. `platform.js` keeps
+navigator.gpu's getter, which loads `gpu.js` through a private native in a
+secure context, and the module hands it the object through its hook
+publisher. `compat.js` keeps the frozen `navigator.tilefinchMultiplayer`
+object; its first `host()`, `join()` or `discover()` loads the module
+through a private native and takes the channel factory off the global, as
+the frame-clone pattern above does. The EventSource and multiplayer
+delivery hooks and the FileReader worker-abort hook are reserved before
+page script and set by their module (`hardening.js`). The host lends
+`event-source.js` dom.js's private share, and `file-reader.js` the share
+and the trusted-event marker, for their evaluation only. Their atoms are
+their own, so they are not pinned. A dedicated Worker's realm builds its
+`FileReader` and `navigator.gpu` from its owner's, so creating a Worker
+loads `file-reader.js` and, in a secure context, `gpu.js` in the owner.
+Each module hands its constructors to `hardening.js`'s captured table as it
+loads, and a Worker reads these shared names there, not from the owner's
+globals. A load a Worker or navigator.gpu starts leaves deleted a global
+the page deleted first. If a module fails to load, navigator.gpu reads
+undefined and a Worker starts without that interface.
+
 A lazy module runs after the interface snapshot, so it declares nothing at
 its top level: it is one function expression or call that publishes through
 `globalThis`, and the engine refuses a top-level declaration (see Interface

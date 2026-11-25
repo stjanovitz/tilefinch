@@ -559,9 +559,20 @@ static bool custom_rule_later(const Stylesheet *sheet, const lxb_dom_node_t *nod
 }
 
 struct StyleCustomRuleIndexEntry {
-    uint32_t hash;
+    /* The rule's name hash with its low STYLE_CUSTOM_KEY_GROUP_BITS
+       replaced by its tree group: 0 for a rule any element may match, or
+       one plus the rank of its shadow tree's carrier in
+       Stylesheet.custom_rule_index_carriers for a rule of a shadow tree's
+       <style>. A component that keeps a <style> in each instance's root
+       repeats each declaration once per instance, and only the trees an
+       element is in, hosts or is slotted into can admit one
+       (style_shadow_scope_admits), so a lookup scans those groups
+       (custom_rule_spans) instead of every instance's copy. Names whose
+       hashes differ only in the group bits share a range; the scans
+       compare names anyway. */
+    uint32_t key;
     /* The custom rule's index; STYLE_CUSTOM_INDEX_SCOPED marks a rule of a
-       sheet only shadow roots adopt. Within one hash those sort after the
+       sheet only shadow roots adopt. Within one key those sort after the
        others, so a lookup for an element outside every adopting carrier
        stops at the first. STYLE_CUSTOM_INDEX_KEYED marks a rule with a
        retained-gate key (stylesheet_custom_rule_gate_key); it does not
@@ -572,6 +583,11 @@ struct StyleCustomRuleIndexEntry {
 #define STYLE_CUSTOM_INDEX_KEYED UINT32_C(0x40000000)
 #define STYLE_CUSTOM_INDEX_FLAGS \
     (STYLE_CUSTOM_INDEX_SCOPED | STYLE_CUSTOM_INDEX_KEYED)
+#define STYLE_CUSTOM_KEY_GROUP_BITS 12u
+#define STYLE_CUSTOM_KEY_GROUP_MASK \
+    ((UINT32_C(1) << STYLE_CUSTOM_KEY_GROUP_BITS) - 1u)
+_Static_assert(STYLE_SHADOW_SCOPE_LIMIT < STYLE_CUSTOM_KEY_GROUP_MASK,
+               "every shadow tree's group and the one after it fit the key");
 
 static uint32_t custom_rule_name_hash(const char *text, size_t length)
 {
@@ -924,7 +940,7 @@ static int compare_custom_rule_index_entries(const void *left,
 {
     const StyleCustomRuleIndexEntry *a = left;
     const StyleCustomRuleIndexEntry *b = right;
-    if (a->hash != b->hash) return a->hash < b->hash ? -1 : 1;
+    if (a->key != b->key) return a->key < b->key ? -1 : 1;
     /* The scoped bit is the top bit: unscoped rules sort first. Rules of
        equal cascade weight resolve by this order (custom_rule_later), so
        the keyed bit is left out of it. */
@@ -934,16 +950,146 @@ static int compare_custom_rule_index_entries(const void *left,
     return left_index < right_index ? -1 : 1;
 }
 
+/* The first entry at or after `key`. */
 static size_t custom_rule_index_lower_bound(
-    const StyleCustomRuleIndexEntry *entries, size_t count, uint32_t hash)
+    const StyleCustomRuleIndexEntry *entries, size_t count, uint32_t key)
 {
     size_t begin = 0;
     while (begin < count) {
         size_t middle = begin + (count - begin) / 2u;
-        if (entries[middle].hash < hash) begin = middle + 1u;
+        if (entries[middle].key < key) begin = middle + 1u;
         else count = middle;
     }
     return begin;
+}
+
+/* The tree group of shadow carrier `carrier` (see
+   StyleCustomRuleIndexEntry.key), or 0 when no <style> of the sheet is in
+   its tree. */
+static uint32_t custom_rule_carrier_group(const Stylesheet *sheet,
+                                          const lxb_dom_node_t *carrier)
+{
+    size_t begin = 0, end = sheet->custom_rule_index_carrier_count;
+    while (carrier != NULL && begin < end) {
+        size_t middle = begin + (end - begin) / 2u;
+        uintptr_t at = (uintptr_t) sheet->custom_rule_index_carriers[middle];
+        if (at == (uintptr_t) carrier) return (uint32_t) middle + 1u;
+        if (at < (uintptr_t) carrier) begin = middle + 1u;
+        else end = middle;
+    }
+    return 0;
+}
+
+/* The tree groups (see StyleCustomRuleIndexEntry.key) whose rules may
+   apply to an element: those of the trees it is inside, hosts, or is a
+   light child of; 0 for none, and each named once. Found on first need
+   (custom_rule_spans): the carrier lookups walk the ancestors and scan
+   children, so a name no shadow tree's <style> declares never pays them.
+   One value serves every name looked up on the same element. */
+typedef struct {
+    const lxb_dom_node_t *node;
+    uint32_t group[3];
+    bool known;
+} StyleCustomRuleGroups;
+
+static void custom_rule_groups_find(const Stylesheet *sheet,
+                                    StyleCustomRuleGroups *groups)
+{
+    const lxb_dom_node_t *node = groups->node;
+    groups->known = true;
+    if (node == NULL) return;
+    const lxb_dom_node_t *carriers[3] = {
+        document_shadow_carrier_containing(node),
+        document_shadow_carrier_of_host(node),
+        document_shadow_carrier_of_host(node->parent)
+    };
+    for (size_t i = 0; i < 3u; i++) {
+        bool repeated = (i > 0 && carriers[0] == carriers[i])
+            || (i > 1 && carriers[1] == carriers[i]);
+        groups->group[i] = repeated ? 0
+            : custom_rule_carrier_group(sheet, carriers[i]);
+    }
+}
+
+/* Where one name's rules able to apply to an element start in the index
+   (or, without the index, the custom rule list): the ungrouped rules, and
+   the element's tree groups'. Each run of the index ends at the first
+   entry of another key (custom_rule_span_ends); the ungrouped run also
+   ends at the first STYLE_CUSTOM_INDEX_SCOPED entry for an element
+   outside every adopting carrier. */
+typedef struct {
+    size_t begin[4];
+    uint32_t key[4];
+    bool stop_scoped;
+    unsigned count;
+} StyleCustomRuleSpans;
+
+static void custom_rule_spans(const Stylesheet *sheet, uint32_t hash,
+                              const StyleMatchSubject *subject,
+                              StyleCustomRuleGroups *groups,
+                              StyleCustomRuleSpans *spans)
+{
+    spans->begin[0] = 0;
+    spans->stop_scoped = false;
+    spans->count = 1;
+    if (!sheet->custom_rule_index_ready) return;
+    const StyleCustomRuleIndexEntry *entries = sheet->custom_rule_index;
+    size_t count = sheet->custom_rule_index_count;
+    uint32_t base = hash & ~STYLE_CUSTOM_KEY_GROUP_MASK;
+    spans->begin[0] = custom_rule_index_lower_bound(entries, count, base);
+    spans->key[0] = base;
+    spans->stop_scoped = style_subject_outside_custom_scopes(sheet, subject);
+    if (sheet->custom_rule_index_carrier_count == 0) return;
+    /* Tree-group entries of this name's key range, if any, follow the
+       ungrouped ones. */
+    size_t grouped = custom_rule_index_lower_bound(entries, count, base + 1u);
+    if (grouped == count
+        || (entries[grouped].key & ~STYLE_CUSTOM_KEY_GROUP_MASK) != base)
+        return;
+    if (!groups->known) custom_rule_groups_find(sheet, groups);
+    for (size_t i = 0; i < 3u; i++) {
+        uint32_t group = groups->group[i];
+        if (group == 0) continue;
+        size_t begin = grouped + custom_rule_index_lower_bound(
+            entries + grouped, count - grouped, base | group);
+        if (begin == count || entries[begin].key != (base | group)) continue;
+        spans->begin[spans->count] = begin;
+        spans->key[spans->count] = base | group;
+        spans->count++;
+    }
+}
+
+/* The bound every span's scan stays below (see custom_rule_span_ends). */
+static size_t custom_rule_span_limit(const Stylesheet *sheet)
+{
+    return sheet->custom_rule_index_ready ? sheet->custom_rule_index_count
+                                          : sheet->custom_rule_count;
+}
+
+static bool custom_rule_span_ends(const Stylesheet *sheet,
+                                  const StyleCustomRuleSpans *spans,
+                                  unsigned span, size_t position)
+{
+    if (!sheet->custom_rule_index_ready) return false;
+    const StyleCustomRuleIndexEntry *entry =
+        &sheet->custom_rule_index[position];
+    return entry->key != spans->key[span]
+        || (span == 0 && spans->stop_scoped
+            && (entry->index & STYLE_CUSTOM_INDEX_SCOPED) != 0);
+}
+
+/* The custom rule an index position (or, without the index, a custom
+   rule position) names, and whether it carries a retained-gate key. */
+static size_t custom_rule_at(const Stylesheet *sheet, size_t position,
+                             bool *keyed)
+{
+    if (!sheet->custom_rule_index_ready) {
+        if (keyed != NULL) *keyed = false;
+        return position;
+    }
+    uint32_t entry = sheet->custom_rule_index[position].index;
+    if (keyed != NULL) *keyed = (entry & STYLE_CUSTOM_INDEX_KEYED) != 0;
+    return entry & ~STYLE_CUSTOM_INDEX_FLAGS;
 }
 
 static size_t variable_cache_home(const StyleVariableCache *cache,
@@ -1209,24 +1355,16 @@ static const StyleCustomRule *custom_rule_winner_filtered(
 {
     if (name_length >= STYLE_CUSTOM_NAME_CAPACITY) return NULL;
     const StyleCustomRule *winner = NULL;
-    size_t first = sheet->custom_rule_index_ready
-        ? custom_rule_index_lower_bound(
-              sheet->custom_rule_index, sheet->custom_rule_index_count, hash)
-        : 0;
-    size_t end = sheet->custom_rule_index_ready
-        ? sheet->custom_rule_index_count : sheet->custom_rule_count;
-    bool outside = style_subject_outside_custom_scopes(sheet, subject);
-    for (size_t i = first; i < end; i++) {
-        size_t rule_index = i;
-        if (sheet->custom_rule_index_ready) {
-            uint32_t entry = sheet->custom_rule_index[i].index;
-            if (sheet->custom_rule_index[i].hash != hash
-                || (outside && (entry & STYLE_CUSTOM_INDEX_SCOPED) != 0))
-                break;
-            if (keyless_only && (entry & STYLE_CUSTOM_INDEX_KEYED) != 0)
-                continue;
-            rule_index = entry & ~STYLE_CUSTOM_INDEX_FLAGS;
-        }
+    StyleCustomRuleGroups groups = {.node = node};
+    StyleCustomRuleSpans spans;
+    custom_rule_spans(sheet, hash, subject, &groups, &spans);
+    size_t limit = custom_rule_span_limit(sheet);
+    for (unsigned span = 0; span < spans.count; span++)
+    for (size_t i = spans.begin[span]; i < limit; i++) {
+        if (custom_rule_span_ends(sheet, &spans, span, i)) break;
+        bool keyed = false;
+        size_t rule_index = custom_rule_at(sheet, i, &keyed);
+        if (keyless_only && keyed) continue;
         if (candidates != NULL) (*candidates)++;
         const StyleCustomRule *rule = &sheet->custom_rules[rule_index];
         if (rule->pseudo != (uint8_t) pseudo
@@ -2238,28 +2376,19 @@ bool style_retained_presentation_values(
         bool matched;
     } PresentationSelectorCache;
     PresentationSelectorCache selector_cache[SELECTOR_CACHE_CAPACITY] = {0};
+    StyleCustomRuleGroups groups = {.node = node};
+    size_t limit = custom_rule_span_limit(sheet);
     for (size_t property = 0;
          property < STYLE_RETAINED_PRESENTATION_COUNT; property++) {
         const char *name = retained_presentation_names[property];
         size_t name_length = strlen(name);
         uint32_t hash = custom_rule_name_hash(name, name_length);
-        size_t first = sheet->custom_rule_index_ready
-            ? custom_rule_index_lower_bound(
-                  sheet->custom_rule_index,
-                  sheet->custom_rule_index_count, hash)
-            : 0;
-        size_t end = sheet->custom_rule_index_ready
-            ? sheet->custom_rule_index_count : sheet->custom_rule_count;
-        bool outside = style_subject_outside_custom_scopes(sheet, &subject);
-        for (size_t i = first; i < end; i++) {
-            size_t rule_index = i;
-            if (sheet->custom_rule_index_ready) {
-                uint32_t entry = sheet->custom_rule_index[i].index;
-                if (sheet->custom_rule_index[i].hash != hash
-                    || (outside
-                        && (entry & STYLE_CUSTOM_INDEX_SCOPED) != 0)) break;
-                rule_index = entry & ~STYLE_CUSTOM_INDEX_FLAGS;
-            }
+        StyleCustomRuleSpans spans;
+        custom_rule_spans(sheet, hash, &subject, &groups, &spans);
+        for (unsigned span = 0; span < spans.count; span++)
+        for (size_t i = spans.begin[span]; i < limit; i++) {
+            if (custom_rule_span_ends(sheet, &spans, span, i)) break;
+            size_t rule_index = custom_rule_at(sheet, i, NULL);
             const StyleCustomRule *rule = &sheet->custom_rules[rule_index];
             if (rule->pseudo != PSEUDO_NONE
                 || !style_container_query_matches(
@@ -3126,14 +3255,12 @@ bool stylesheet_prepare_focus_rule_index(Stylesheet *sheet)
 
 static bool has_rule_index_fill(Budget *budget, uint32_t **indices,
                                 size_t *count, size_t total,
-                                const char *(*selector_at)(
-                                    const Stylesheet *, size_t),
-                                const Stylesheet *sheet)
+                                bool (*has_at)(Stylesheet *, size_t),
+                                Stylesheet *sheet)
 {
     size_t found = 0;
     for (size_t i = 0; i < total; i++) {
-        const char *selector = selector_at(sheet, i);
-        if (selector != NULL && strstr(selector, ":has(") != NULL) found++;
+        if (has_at(sheet, i)) found++;
     }
     if (found == 0) {
         budget_free(budget, *indices);
@@ -3147,22 +3274,25 @@ static bool has_rule_index_fill(Budget *budget, uint32_t **indices,
     *indices = grown;
     *count = 0;
     for (size_t i = 0; i < total; i++) {
-        const char *selector = selector_at(sheet, i);
-        if (selector != NULL && strstr(selector, ":has(") != NULL)
-            grown[(*count)++] = (uint32_t) i;
+        if (has_at(sheet, i)) grown[(*count)++] = (uint32_t) i;
     }
     return true;
 }
 
-static const char *has_rule_selector(const Stylesheet *sheet, size_t index)
+/* A selector holding ":has(" as written (the facts the rule keeps). */
+static bool has_rule_selector(Stylesheet *sheet, size_t index)
 {
-    return sheet->rules[index].selector;
+    StyleRule *rule = &sheet->rules[index];
+    return rule->selector != NULL
+        && (style_rule_selector_facts(rule) & STYLE_SELECTOR_FACTS_HAS) != 0;
 }
 
-static const char *has_custom_rule_selector(const Stylesheet *sheet,
-                                            size_t index)
+static bool has_custom_rule_selector(Stylesheet *sheet, size_t index)
 {
-    return sheet->custom_rules[index].selector;
+    StyleCustomRule *rule = &sheet->custom_rules[index];
+    return rule->selector != NULL
+        && (style_custom_rule_selector_facts(rule)
+            & STYLE_SELECTOR_FACTS_HAS) != 0;
 }
 
 bool stylesheet_prepare_has_rule_index(Stylesheet *sheet)
@@ -3571,6 +3701,36 @@ void style_sparse_note_inline(const Stylesheet *sheet, const char *text,
         }
         at = end + (end < length);
     }
+}
+
+uint64_t style_retained_gate_name_bit(const char *name, size_t length)
+{
+    return UINT64_C(1) << (custom_rule_name_hash(name, length) & 63u);
+}
+
+uint64_t style_retained_gate_absent_bits(const Stylesheet *sheet,
+                                         const lxb_dom_node_t *node)
+{
+    if (sheet == NULL || sheet->resolve_scratch == NULL || node == NULL)
+        return 0;
+    /* The conditions under which style_retained_property_value trusts the
+       gate. */
+    const StyleRetainedGate *gate = &sheet->resolve_scratch->retained_gate;
+    if (gate->node != node || sheet->retained_gate == NULL
+        || !sheet->custom_rule_index_ready
+        || sheet->custom_rule_index_count != sheet->custom_rule_count
+        || gate->generation != sheet->retained_gate_generation) return 0;
+    return ~(gate->mask | sheet->retained_gate_keyless);
+}
+
+bool style_inline_style_readable(const Stylesheet *sheet,
+                                 lxb_dom_node_t *node)
+{
+    /* As inline_variable_value reads it. */
+    size_t length = 0;
+    return !(sheet != NULL && sheet->block_inline_style_attributes
+             && !document_style_attribute_cssom_authorized(node))
+        && document_attribute(node, "style", &length) != NULL;
 }
 
 static int transition_declaration_kind(const char *name, size_t length);

@@ -450,6 +450,245 @@ static bool test_candidate_ready_event_reads_used_geometry(void)
     return ok && clean;
 }
 
+/* Reads during the load lifecycle (script_runtime_flush_geometry_layout_
+   reuse). The page's geometry reads reach the test's layout callback,
+   which supplies a reuse stub that can prove a change left the layout as
+   it was. */
+static bool load_allowance_unchanged;
+static size_t load_allowance_proofs;
+static ScriptRuntime *load_allowance_runtime;
+static const ViewportContext *load_allowance_viewport;
+
+static LayoutReuseCache *load_allowance_prepare(
+    void *opaque, ScriptMutationJournal *mutations, bool *geometry_unchanged)
+{
+    (void) opaque;
+    (void) mutations;
+    if (geometry_unchanged != NULL) {
+        *geometry_unchanged = load_allowance_unchanged;
+        load_allowance_proofs += load_allowance_unchanged;
+    }
+    return NULL;
+}
+
+static bool load_allowance_layout(void *opaque)
+{
+    (void) opaque;
+    return script_runtime_flush_geometry_layout_reuse(
+        load_allowance_runtime, load_allowance_viewport,
+        load_allowance_prepare, NULL, NULL);
+}
+
+typedef struct {
+    Budget budget;
+    bool installed;
+    bool ready;
+    NavigationSession navigation;
+    ScriptRuntime *runtime;
+} LoadAllowancePage;
+
+/* Commits `html` and puts its runtime in the load lifecycle, with the
+   test's layout callback. */
+static bool load_allowance_open(LoadAllowancePage *page, const char *html)
+{
+    memset(page, 0, sizeof(*page));
+    budget_init(&page->budget, 16 * MIB);
+    page->installed = budget_install_lexbor(&page->budget);
+    page->ready = page->installed
+        && navigation_init(&page->navigation, &page->budget, 2);
+    if (page->ready) navigation_enable_scripts(&page->navigation, 3 * MIB, 1000);
+    bool ok = page->ready && navigation_commit_html(&page->navigation,
+        navigation_begin(&page->navigation), "https://geometry.test/allowance",
+        html, strlen(html), 480, NULL, NULL, true)
+        && page->navigation.page.runtime != NULL;
+    if (!ok) return false;
+    page->runtime = page->navigation.page.runtime;
+    load_allowance_runtime = page->runtime;
+    load_allowance_viewport = &page->navigation.viewport;
+    load_allowance_unchanged = false;
+    load_allowance_proofs = 0;
+    page->runtime->bridge.synchronous_layout = load_allowance_layout;
+    page->runtime->bridge.synchronous_layout_opaque = NULL;
+    page->runtime->bridge.synchronous_layout_loading = true;
+    page->runtime->bridge.loading_layout_allowance = 0;
+    page->runtime->bridge.loading_layout_first = 0;
+    return true;
+}
+
+static bool load_allowance_close(LoadAllowancePage *page)
+{
+    if (page->runtime != NULL)
+        page->runtime->bridge.synchronous_layout_loading = false;
+    if (page->ready) navigation_destroy(&page->navigation);
+    bool clean = page->budget.current == 0
+        && budget_categories_reconcile(&page->budget);
+    if (page->installed) clean = budget_uninstall_lexbor(&page->budget) && clean;
+    return clean;
+}
+
+/* Runs `source` as the page's script, or as the browser's own (trusted)
+   code, and returns its numeric result (-1 when it failed). */
+static double load_allowance_eval(LoadAllowancePage *page, const char *source,
+                                  bool browser)
+{
+    if (!browser) {
+        ScriptResult result = {0};
+        char wrapped[256];
+        snprintf(wrapped, sizeof(wrapped), "globalThis.__read=(%s)", source);
+        if (!script_runtime_evaluate_diagnostic(page->runtime, wrapped,
+                                                "<page>", &result))
+            return -1;
+        source = "globalThis.__read";
+    }
+    JSContext *context = page->runtime->context;
+    JSValue value = JS_Eval(context, source, strlen(source), "<browser>",
+                            JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_TRUSTED);
+    double number = -1;
+    if (JS_IsException(value) || JS_ToFloat64(context, &number, value) != 0)
+        number = -1;
+    JS_FreeValue(context, value);
+    (void) JS_GetException(context);
+    return number;
+}
+
+/* A read that only proves the snapshot still holds builds nothing, so it
+   spends none of the lifecycle's layout allowance: after many such reads,
+   a real change still gets a fresh layout. */
+static bool test_load_layout_allowance_skips_unchanged_reads(void)
+{
+    enum { PROOFS = 32 };
+    LoadAllowancePage page;
+    bool ok = load_allowance_open(&page,
+        "<!doctype html><body><div id=box style='width:100px;height:20px'>"
+        "</div><script>window.ready=1</script>");
+    /* The first and last reads follow a real change; the reads between
+       follow changes the stub proves leave the layout as it was. */
+    unsigned step = 0;
+    for (; ok && step < PROOFS + 2u; step++) {
+        load_allowance_unchanged = step != 0 && step != PROOFS + 1u;
+        char script[96];
+        snprintf(script, sizeof(script), "(box.title='t%u',"
+                 "box.getBoundingClientRect().width)", step);
+        ok = load_allowance_eval(&page, script, false) == 100;
+    }
+    ok = ok && load_allowance_proofs == PROOFS
+        && page.runtime->result.geometry_snapshot_builds == 2;
+    if (!ok) fprintf(stderr, "load allowance: step=%u proofs=%zu builds=%zu "
+                     "error=%s\n", step, load_allowance_proofs,
+                     page.runtime == NULL ? (size_t) 0
+                         : page.runtime->result.geometry_snapshot_builds,
+                     page.navigation.last_error);
+    return load_allowance_close(&page) && ok;
+}
+
+/* The browser's own reads during load (an observer pass, a focus fixup,
+   chrome: code with no page frame on the stack) never build: they read
+   the estimate. The page's read on the same small page builds. */
+static bool test_load_layout_browser_reads_do_not_build(void)
+{
+    LoadAllowancePage page;
+    bool ok = load_allowance_open(&page,
+        "<!doctype html><body><div id=box style='padding:0 5px'>x</div>"
+        "<script>window.ready=1</script>");
+    page.runtime->bridge.layout = NULL;
+    static const char read[] = "box.getBoundingClientRect().width";
+    double browser = ok ? load_allowance_eval(&page, read, true) : -1;
+    bool flushed = ok && script_runtime_flush_geometry_layout_reuse(
+        page.runtime, &page.navigation.viewport, NULL, NULL, NULL);
+    size_t browser_builds = ok ? page.runtime->result.geometry_snapshot_builds : 0;
+    double author = ok ? load_allowance_eval(&page, read, false) : -1;
+    ok = ok && browser >= 0 && !flushed && browser_builds == 0
+        && page.runtime->result.geometry_snapshot_builds == 1
+        /* The body's 8px margins leave the block the rest. */
+        && author == page.navigation.viewport.css_width - 16;
+    if (!ok) fprintf(stderr, "load browser reads: browser=%g flushed=%d "
+                     "builds=%zu/%zu author=%g\n", browser, flushed,
+                     browser_builds, page.runtime == NULL ? (size_t) 0
+                         : page.runtime->result.geometry_snapshot_builds,
+                     author);
+    return load_allowance_close(&page) && ok;
+}
+
+/* A page's read whose first build is estimated to cost more than the
+   allowance builds nothing and answers from the style estimate. */
+static bool test_load_layout_first_build_is_estimated(void)
+{
+    enum { ITEMS = 2000 };
+    static const char head[] =
+        "<!doctype html><body><div id=box style='width:123px;height:7px'>"
+        "</div>";
+    static const char item[] = "<p>Item text</p>";
+    static const char tail[] = "<script>window.ready=1</script>";
+    size_t length = sizeof(head) - 1u + ITEMS * (sizeof(item) - 1u)
+        + sizeof(tail);
+    char *html = malloc(length);
+    if (html == NULL) return false;
+    char *at = html;
+    at += snprintf(at, length, "%s", head);
+    for (size_t i = 0; i < ITEMS; i++)
+        at += snprintf(at, length - (size_t) (at - html), "%s", item);
+    snprintf(at, length - (size_t) (at - html), "%s", tail);
+    LoadAllowancePage page;
+    bool ok = load_allowance_open(&page, html);
+    free(html);
+    if (ok) page.runtime->bridge.layout = NULL;
+    double width = ok ? load_allowance_eval(
+        &page, "box.getBoundingClientRect().width", false) : -1;
+    ok = ok && width == 123 && page.runtime->geometry_layout == NULL
+        && page.runtime->result.geometry_snapshot_builds == 0;
+    if (!ok) fprintf(stderr, "load estimate: width=%g builds=%zu\n", width,
+                     page.runtime == NULL ? (size_t) 0
+                         : page.runtime->result.geometry_snapshot_builds);
+    return load_allowance_close(&page) && ok;
+}
+
+/* The estimate counts the rules every element tests as the build would
+   find them: with the rule index dropped, it builds the index first rather
+   than counting every rule. 300 class rules on 100
+   elements test none of them on every element, and the page is laid out;
+   300 rules no key selects are tested by every element, and it is not. */
+static bool test_load_layout_estimate_indexes_the_rules(void)
+{
+    bool ok = true;
+    for (int universal = 0; ok && universal < 2; universal++) {
+        enum { RULES = 300, ITEMS = 100 };
+        size_t length = 64u * RULES + 32u * ITEMS + 256u;
+        char *html = malloc(length);
+        if (html == NULL) return false;
+        size_t at = (size_t) snprintf(html, length, "<!doctype html><style>");
+        for (int i = 0; i < RULES; i++)
+            at += (size_t) snprintf(html + at, length - at,
+                                    universal ? ":not(.z%d){margin-top:1px}"
+                                              : ".c%d{margin-top:1px}", i);
+        at += (size_t) snprintf(html + at, length - at,
+            "</style><body><div id=box style='width:123px;height:7px'>"
+            "</div>");
+        for (int i = 0; i < ITEMS; i++)
+            at += (size_t) snprintf(html + at, length - at,
+                                    "<p class=c1>Item</p>");
+        snprintf(html + at, length - at, "<script>window.ready=1</script>");
+        LoadAllowancePage page;
+        ok = load_allowance_open(&page, html);
+        free(html);
+        /* As a sheet change that rebuilds the cascade does; the next
+           resolution builds the index again. */
+        Stylesheet *sheet = ok ? (Stylesheet *) page.runtime->bridge.stylesheet
+                               : NULL;
+        if (ok) stylesheet_drop_rule_index(sheet);
+        ok = ok && !sheet->rule_index_ready;
+        if (ok) page.runtime->bridge.layout = NULL;
+        double width = ok ? load_allowance_eval(
+            &page, "box.getBoundingClientRect().width", false) : -1;
+        size_t builds = page.runtime == NULL ? 0
+            : page.runtime->result.geometry_snapshot_builds;
+        ok = ok && width == 123 && builds == (universal ? 0u : 1u);
+        if (!ok) fprintf(stderr, "load estimate rules: universal=%d width=%g "
+                         "builds=%zu\n", universal, width, builds);
+        ok = load_allowance_close(&page) && ok;
+    }
+    return ok;
+}
+
 static bool test_image_load_tasks_follow_publication(void)
 {
     return test_candidate_ready_event_reads_used_geometry()

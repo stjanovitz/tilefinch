@@ -77,6 +77,9 @@ typedef struct {
     bool mask_active, mask_capture;
     bool luminance_capture;
     unsigned mask_opacity, mask_luminance;
+    /* Both root dimensions are known, including a dimension derived from
+       the viewBox ratio. A viewBox alone gives a ratio, not a natural size. */
+    bool natural_size, root_width_specified, root_height_specified;
 } SvgViewportParser;
 
 static SvgViewportParser *svg_clips;
@@ -124,6 +127,12 @@ static void svg_viewport_start_native(void *opaque, const char *name,
     };
     if (context->depth == 1) {
         svg_viewport_parse_attributes(p, attributes);
+        for (unsigned i = 0; attributes[i] != NULL; i += 2) {
+            if (strcmp(attributes[i], "width") == 0)
+                context->root_width_specified = true;
+            else if (strcmp(attributes[i], "height") == 0)
+                context->root_height_specified = true;
+        }
         return;
     }
     float parent_width = p->viewWidth > 0 ? p->viewWidth : p->image->width;
@@ -520,6 +529,26 @@ static NSVGimage *svg_parse_viewports(char *source, Budget *budget)
         if (!context->failed && context->depth == 0
             && context->element_depth == 0 && context->clip_parser == NULL) {
             nsvg__createGradients(p);
+            /* NanoSVG otherwise substitutes the missing viewBox extent
+               verbatim. Supply the ratio-derived size before artwork and
+               clips are mapped into the root viewport. */
+            if (p->viewWidth > 0 && p->viewHeight > 0
+                && isfinite(p->viewWidth) && isfinite(p->viewHeight)) {
+                float *width = &p->image->width, *height = &p->image->height;
+                bool width_only = *width > 0 && isfinite(*width)
+                    && !context->root_height_specified;
+                bool height_only = *height > 0 && isfinite(*height)
+                    && !context->root_width_specified;
+                if (width_only || height_only) {
+                    double size = width_only
+                        ? (double) *width * p->viewHeight / p->viewWidth
+                        : (double) *height * p->viewWidth / p->viewHeight;
+                    *(width_only ? height : width) = size <= FLT_MAX
+                        ? fmaxf((float) size, FLT_MIN) : INFINITY;
+                }
+            }
+            context->natural_size = p->image->width > 0
+                && p->image->height > 0;
             svg_clip_root_transform(context, p);
             nsvg__scaleToViewbox(p, "px");
             result = p->image;

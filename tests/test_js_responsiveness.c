@@ -295,7 +295,12 @@ static int test_inline_tracker_policy(void)
     return 0;
 }
 
-static int test_job_heap_rejection_is_fatal(void)
+/* A continuation the heap refuses is an ordinary author exception, as in a
+   timer or a listener: the checkpoint reports it and carries on. Whether
+   the realm stops is the navigation's decision at the task boundary, from
+   what the realm can still obtain (docs/engineering/SCRIPT_MEMORY.md,
+   "Exhaustion"). */
+static int test_job_heap_rejection_is_author_error(void)
 {
     Budget budget;
     budget_init(&budget, 16u * MIB);
@@ -327,13 +332,14 @@ static int test_job_heap_rejection_is_fatal(void)
 
     size_t live = budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
     size_t rejections_before = script_runtime_heap_rejections(runtime);
+    size_t uncaught_before = runtime->result.uncaught_callback_errors;
     JS_SetMemoryLimit(runtime->runtime, live + 1024u);
-    CHECK(!js_rt_runtime_run_jobs(runtime)
+    CHECK(js_rt_runtime_run_jobs(runtime)
           && runtime->checkpoint_continuation_count == 0u
-          && script_runtime_heap_rejections(runtime) > rejections_before);
+          && script_runtime_heap_rejections(runtime) > rejections_before
+          && runtime->result.uncaught_callback_errors > uncaught_before);
 
-    /* A fatal task result retires the owning page in production. The VM still
-       has to be destructible and testable after the exception was consumed. */
+    /* The realm stays usable once the heap has room again. */
     JS_SetMemoryLimit(runtime->runtime, 5u * MIB);
     CHECK(script_runtime_evaluate_diagnostic(
               runtime,
@@ -343,6 +349,67 @@ static int test_job_heap_rejection_is_fatal(void)
           && strcmp(result.summary, "JOB-HEAP-RECOVERED") == 0);
     JS_FreeValue(runtime->context, callback);
     JS_FreeValue(runtime->context, global);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* Lifecycle events (readystatechange, DOMContentLoaded, load) run through
+   the bounded checkpoint queue. A full queue skips the checkpoint between
+   listeners, never the listeners: every stage fires each listener once and
+   the load boundary succeeds. */
+static int test_lifecycle_survives_full_checkpoint_queue(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] = "<!doctype html><body>Ready</body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_deferred(
+        &document, &budget, 5u * MIB, 4000,
+        "https://lifecycle.test/", NULL, &result);
+    CHECK(runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              runtime,
+              "const n=globalThis.__lc={rs:0,dcl:0,load:0};"
+              "for(let i=0;i<256;i++){"
+              "document.addEventListener('readystatechange',()=>n.rs++);"
+              "document.addEventListener('DOMContentLoaded',()=>n.dcl++);"
+              "addEventListener('load',()=>n.load++)}"
+              "globalThis.__noop=()=>{};",
+              "<lifecycle-setup>", &result));
+    /* Make listener-count-dependent recursion observable even on a host
+       with a much larger native stack than the PSP. */
+    JS_SetMaxStackSize(runtime->runtime, 128u * 1024u);
+    JSValue global = JS_GetGlobalObject(runtime->context);
+    JSValue noop = JS_GetPropertyStr(runtime->context, global, "__noop");
+    CHECK(JS_IsFunction(runtime->context, noop));
+    while (runtime->checkpoint_continuation_count
+           < SCRIPT_CHECKPOINT_CONTINUATION_LIMIT) {
+        size_t slot = ((size_t) runtime->checkpoint_continuation_head
+                       + runtime->checkpoint_continuation_count)
+            % SCRIPT_CHECKPOINT_CONTINUATION_LIMIT;
+        runtime->checkpoint_continuations[slot] =
+            JS_DupValue(runtime->context, noop);
+        runtime->checkpoint_continuation_count++;
+    }
+    JS_FreeValue(runtime->context, noop);
+    JS_FreeValue(runtime->context, global);
+    CHECK(script_runtime_finish_loading(runtime, &result));
+    for (unsigned turn = 0; turn < 8; turn++)
+        (void) script_runtime_advance(runtime, 16, 16, &result);
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "globalThis.pocSummary=JSON.stringify(__lc)+document.readyState",
+              "<lifecycle-check>", &result));
+    if (strcmp(result.summary, "{\"rs\":512,\"dcl\":256,\"load\":256}complete") != 0)
+        fprintf(stderr, "lifecycle: %s\n", result.summary);
+    CHECK(strcmp(result.summary,
+                 "{\"rs\":512,\"dcl\":256,\"load\":256}complete") == 0
+          && runtime->checkpoint_continuation_count == 0u);
     script_runtime_destroy(runtime);
     document_destroy(&document);
     CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
@@ -389,6 +456,74 @@ static int test_refusal_loop_stops_as_out_of_memory(void)
                 (unsigned long long) elapsed_ms, result.error);
     CHECK(!ok && strstr(result.error, "out of memory") != NULL
           && !result.interrupted && elapsed_ms <= 5000u);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* The same loop run deep in page code, with the realm's headroom between
+   one and two copies of the stack text, so each error's stack capture is
+   refused after its text buffer is built, and with most of each try spent
+   inside the try block, where the watchdog's polls land. The refusal
+   guard's interrupt must still end the entry. The refused capture used to
+   replace the uncatchable interrupt with a catchable "out of memory": the
+   loop caught it and ran on through every later interrupt, the execution
+   deadline's included (all 20,000 tries, 36,026 refusals, 3,974 lost
+   interrupts here; a census page spun at its heap wall for minutes). */
+static int test_refusal_loop_survives_refused_stack_text(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] = "<!doctype html><body>Ready</body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 5u * MIB, 20000,
+        "https://refusal-stack.test/", NULL, &result);
+    CHECK(runtime != NULL);
+    /* Eighty frames with long names, then the size of their stack text. */
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "function descend_with_a_long_name_so_each_stack_line_is_long(n, f) {"
+        "  if (n === 0) return f();"
+        "  var r = descend_with_a_long_name_so_each_stack_line_is_long("
+        "    n - 1, f);"
+        "  return r; }"
+        "var tries = 0;"
+        "globalThis.pocSummary = String("
+        "  descend_with_a_long_name_so_each_stack_line_is_long(80,"
+        "    function () { try { null.x } catch (e) {"
+        "      return e.stack.length } }))", "<wall>", &result));
+    unsigned long text = strtoul(result.summary, NULL, 10);
+    CHECK(text > 4096u && text < 65536u);
+    size_t live = budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
+    /* Room for the text buffer (up to 1.5 times the text) and the error,
+       not for the buffer and the string together. */
+    JS_SetMemoryLimit(runtime->runtime, live + text * 7u / 4u);
+    size_t rejections = script_runtime_heap_rejections(runtime);
+    uint64_t started = js_rt_monotonic_time_ns();
+    memset(&result, 0, sizeof(result));
+    bool ok = script_runtime_evaluate_diagnostic(runtime,
+        "descend_with_a_long_name_so_each_stack_line_is_long(80,"
+        "  function () { for (;;) { try {"
+        "      for (var i = 0; i < 1000; i++) {} 'ab'.padEnd(4 << 20) }"
+        "    catch (e) { if (++tries >= 20000) {"
+        "      globalThis.pocSummary = 'escaped'; return } } } })",
+        "<wall>", &result);
+    uint64_t elapsed_ms = (js_rt_monotonic_time_ns() - started) / 1000000u;
+    rejections = script_runtime_heap_rejections(runtime) - rejections;
+    bool stopped = !ok && strstr(result.error, "out of memory") != NULL
+        && !result.interrupted && strcmp(result.summary, "escaped") != 0
+        && rejections <= 2u * SCRIPT_ENTRY_REFUSAL_LIMIT
+        && elapsed_ms <= 5000u;
+    if (!stopped)
+        fprintf(stderr, "refused stack text: ok=%d interrupted=%d %llu ms "
+                "rejections=%zu summary=%.20s error=%.80s\n", ok,
+                result.interrupted, (unsigned long long) elapsed_ms,
+                rejections, result.summary, result.error);
+    CHECK(stopped);
     script_runtime_destroy(runtime);
     document_destroy(&document);
     CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
@@ -4736,12 +4871,17 @@ static int test_coalesced_attribute_tokens(void)
     budget_init(&budget, 16u * MIB);
     CHECK(budget_install_lexbor(&budget));
     PocDocument document;
+    Stylesheet sheet = {0};
     static const char html[] = "<!doctype html><body><p id=p>Text</p>";
-    CHECK(document_parse(&document, &budget, html, sizeof(html)-1u, 17));
+    CHECK(document_parse(&document, &budget, html, sizeof(html)-1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
     ScriptResult result = {0};
     ScriptRuntime *runtime = script_runtime_create_with_session(
         &document, &budget, 5u * MIB, 4000, "https://mutation.test/", NULL, &result);
     CHECK(runtime != NULL);
+    /* Class changes name the sheet's partial-test tokens, so they are exact
+       only while a sheet is bound. */
+    script_runtime_set_stylesheet(runtime, &sheet);
     ScriptMutationJournal journal;
     (void) script_runtime_consume_mutations(runtime, &journal);
     CHECK(script_runtime_evaluate_diagnostic(runtime,
@@ -4771,8 +4911,9 @@ static int test_coalesced_attribute_tokens(void)
     record = NULL;
     for (size_t i = 0; i < journal.count; i++)
         if (strcmp(journal.records[i].attribute, "class") == 0) record = &journal.records[i];
+    /* x0..x49 and the empty class every class change carries. */
     CHECK(record != NULL && record->changed_tokens_exact
-          && record->changed_token_count == 50);
+          && record->changed_token_count == 51);
     /* ...but a record never holds more than the per-record limit. */
     CHECK(script_runtime_evaluate_diagnostic(runtime,
         "p.className='small';p.className=Array.from({length:70},(_, i)=>'y'+i).join(' ');",
@@ -4810,14 +4951,15 @@ static int test_coalesced_attribute_tokens(void)
         if (strcmp(journal.records[i].attribute, "class") != 0) continue;
         if (journal.records[i].changed_tokens_exact) {
             exact++;
-            CHECK(journal.records[i].changed_token_count == 60
-                  && journal.records[i].changed_token_offset + 60u
+            /* 60 classes and the empty class. */
+            CHECK(journal.records[i].changed_token_count == 61
+                  && journal.records[i].changed_token_offset + 61u
                          <= SCRIPT_MUTATION_TOKEN_POOL);
         } else {
             inexact++;
         }
     }
-    CHECK(exact == SCRIPT_MUTATION_TOKEN_POOL / 60u && exact + inexact == 20
+    CHECK(exact == SCRIPT_MUTATION_TOKEN_POOL / 61u && exact + inexact == 20
           && journal.token_count <= SCRIPT_MUTATION_TOKEN_POOL);
     /* This is a renderer invalidation journal, not MutationObserver's
        author-visible record queue. Long names share a conservative prefix
@@ -4833,13 +4975,14 @@ static int test_coalesced_attribute_tokens(void)
           == SCRIPT_MUTATION_ATTRIBUTE_LIMIT - 1u);
     CHECK(!journal.records[0].changed_tokens_exact);
     script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
     document_destroy(&document);
     CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
     return 0;
 }
 
-static ScriptRuntime *host_state_runtime(Budget *budget, PocDocument *document,
-                                         ScriptResult *result)
+static ScriptRuntime *host_state_runtime_with_heap(
+    Budget *budget, PocDocument *document, size_t heap_limit, ScriptResult *result)
 {
     static const char html[] = "<!doctype html><body>Ready</body>";
     ViewportContext viewport;
@@ -4852,8 +4995,14 @@ static ScriptRuntime *host_state_runtime(Budget *budget, PocDocument *document,
         .execution_policy = policy, .defer_document_scripts = true,
         .allow_test_network_primitive_overrides = true };
     return script_runtime_create_configured(
-        document, budget, 6u * MIB, 4000, "https://host-state.test/",
+        document, budget, heap_limit, 4000, "https://host-state.test/",
         &options, result);
+}
+
+static ScriptRuntime *host_state_runtime(Budget *budget, PocDocument *document,
+                                         ScriptResult *result)
+{
+    return host_state_runtime_with_heap(budget, document, 6u * MIB, result);
 }
 
 static bool host_state_eval(ScriptRuntime *runtime, const char *source,
@@ -7460,6 +7609,49 @@ static int test_detached_image_preloads(void)
     CHECK(handle_table_eval(runtime,
         "pocSummary=JSON.stringify([imageLoads,imageErrors,preload.naturalWidth,"
         "preload.naturalHeight])", "[2,2,6,7]", &result));
+    /* Let decode bind to A, then return to the same URL before a pump.
+       Its obsolete promise cannot be completed by the new A's pixels. */
+    CHECK(handle_table_eval(runtime,
+        "globalThis.watch=new Image();globalThis.outcomes=[];"
+        "globalThis.a=preload.src;watch.src=a;"
+        "watch.decode().then(()=>outcomes.push('stale'),e=>outcomes.push(e.name));"
+        "pocSummary='WATCHING'", "WATCHING", &result));
+    CHECK(handle_table_eval(runtime,
+        "watch.src='data:,broken';watch.src=a;watch.decode().then("
+        "()=>outcomes.push(watch.naturalWidth),e=>outcomes.push(e.name));"
+        "pocSummary='REPLACED'", "REPLACED", &result));
+    for (size_t i = 0; i < 32; i++)
+        CHECK(script_runtime_advance(runtime, 16, 8, &result));
+    CHECK(handle_table_eval(runtime, "pocSummary=outcomes.sort().join()", "6,EncodingError", &result));
+    CHECK(handle_table_eval(runtime,
+        "globalThis.replaced=0;globalThis.quota=0;watch.src='data:,bad';"
+        "for(let i=0;i<17;i++)watch.decode().catch(e=>{"
+        "if(e.name==='EncodingError')replaced++;if(e.name==='QuotaExceededError')quota++});"
+        "pocSummary='BOUND'", "BOUND", &result));
+    CHECK(handle_table_eval(runtime, "watch.src=a;pocSummary='NEW'", "NEW", &result));
+    for (size_t i = 0; i < 32; i++)
+        CHECK(script_runtime_advance(runtime, 16, 8, &result));
+    CHECK(handle_table_eval(runtime, "pocSummary=replaced+','+quota", "16,1", &result));
+    CHECK(handle_table_eval(runtime,
+        "globalThis.timers=[];for(let i=0;i<160;i++){const t=setTimeout(()=>{},60000);"
+        "if(!t)break;timers.push(t)}globalThis.denied='pending';watch.src='data:,busy';"
+        "watch.decode().catch(e=>denied=e.name);pocSummary='FULL'", "FULL", &result));
+    CHECK(handle_table_eval(runtime,
+        "timers.forEach(clearTimeout);pocSummary=denied", "EncodingError", &result));
+    /* Long data URLs spend a real image slot; short data URLs are exempt.
+       Each iteration has completed before the next source assignment. */
+    CHECK(handle_table_eval(runtime,
+        "globalThis.gallery=new Image();globalThis.slides=0;globalThis.pixel=false;"
+        "globalThis.slide=n=>'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22'"
+        "+(n%2+1)+'%22 height=%222%22%3E%3Crect width=%222%22 height=%222%22 fill=%22'"
+        "+(n%2?'blue':'red')+'%22/%3E'+' '.repeat(n<192?4200:0)+'%3C/svg%3E';"
+        "gallery.onload=()=>{if(gallery.naturalWidth!==slides%2+1) return;"
+        "if(++slides<256)gallery.src=slide(slides);else{const c=document.createElement('canvas');"
+        "const x=c.getContext('2d');x.drawImage(gallery,0,0);pixel=x.getImageData(0,0,1,1).data[2]===255}};"
+        "gallery.src=slide(0);pocSummary='CYCLING'", "CYCLING", &result));
+    for (size_t i = 0; i < 550; i++)
+        CHECK(script_runtime_advance(runtime, 16, 8, &result));
+    CHECK(handle_table_eval(runtime,"pocSummary=slides+','+pixel", "256,true", &result));
     /* The source setter never throws (a browser's does not), and teardown
        must cancel every held wrapper, including work which never reached
        transport. */
@@ -7777,6 +7969,21 @@ static int test_detached_image_preload_unrelated_clear(void)
         fprintf(stderr, "unrelated clear: requests=%zu\n", requests);
     CHECK(ok && requests == 1u);
     CHECK(preload_replay_close(&page) == 0);
+    CHECK(preload_replay_open(&page) == 0);
+    CHECK(handle_table_eval(page.runtime,
+        "globalThis.events=[];globalThis.img=new Image();"
+        "img.onload=()=>events.push(img.naturalWidth);img.onerror=()=>events.push('error');"
+        "img.src='/a.svg';img.decode().then(()=>events.push('stale'),e=>events.push(e.name));"
+        "pocSummary='QUEUED'", "QUEUED", &page.result));
+    CHECK(script_runtime_advance(page.runtime, 16u, 4u, &page.result));
+    CHECK(preload_replay_requests() == 1u);
+    CHECK(handle_table_eval(page.runtime,
+        "img.src='" PRELOAD_TEST_SVG(7, 3) "';pocSummary=events.join()", "", &page.result));
+    for (size_t i = 0; i < 32u; i++)
+        CHECK(script_runtime_advance(page.runtime, 16u, 4u, &page.result));
+    CHECK(handle_table_eval(page.runtime,
+        "pocSummary=events.sort().join()", "7,EncodingError", &page.result));
+    CHECK(preload_replay_close(&page) == 0);
     return 0;
 }
 
@@ -7960,6 +8167,15 @@ static int test_connected_image_loads_past_128(void)
                                 "pocSummary=loads+','+windowLoads", "150,0",
                                 &result);
     CHECK(ok);
+    CHECK(handle_table_eval(runtime,
+        "globalThis.first=document.images[0];globalThis.saved=first.getAttribute('src');"
+        "first.src='data:,pending';pocSummary=String(first.complete)", "false", &result));
+    CHECK(handle_table_eval(runtime, "first.src=saved;pocSummary=String(loads)", "150", &result));
+    script_runtime_set_images(runtime, &images);
+    CHECK(script_runtime_advance(runtime, 16u, 8u, &result));
+    script_runtime_set_images(runtime, &images);
+    CHECK(script_runtime_advance(runtime, 16u, 8u, &result));
+    CHECK(handle_table_eval(runtime, "pocSummary=loads+','+windowLoads", "151,0", &result));
     script_runtime_set_images(runtime, NULL);
     script_runtime_destroy(runtime);
     images_destroy(&images);
@@ -9471,16 +9687,19 @@ static int test_large_blob_worker(void)
         "Uint8ClampedArray&&image instanceof ImageData&&borrowed.data===pixels"
         "&&image.width===2&&image.height===2?'large-worker-ok':'image-data-failed')\","
         "blob=new Blob([source]);"
-        "let encoderBound=false,blobBound=false,urlBound=false;"
+        "let encoderBound=false;"
         "try{new TextEncoder().encode(padding)}catch(e){encoderBound=e.name==='RangeError'}"
-        "try{new Blob(['x'.repeat(512*1024+1)])}catch(e){blobBound=e.name==='RangeError'}"
-        "const url=URL.createObjectURL(blob);"
-        "try{URL.createObjectURL(new Blob(['x'.repeat(40*1024)]))}"
-        "catch(e){urlBound=e.name==='RangeError'}"
+        /* Blobs and blob: URLs have no cap of their own (the realm heap
+           bounds them), unlike TextEncoder. */
+        "const bigBlob=new Blob(['x'.repeat(512*1024+1)]).size===512*1024+1;"
+        "const url=URL.createObjectURL(blob),"
+        "second=URL.createObjectURL(new Blob(['x'.repeat(40*1024)]));"
+        "URL.revokeObjectURL(second);"
         "const worker=new Worker(url);URL.revokeObjectURL(url);"
         "worker.onmessage=e=>{pocSummary=e.data;worker.terminate()};"
         "worker.onerror=e=>{pocSummary='error:'+e.message};"
-        "pocSummary=String(blob.size===source.length&&encoderBound&&blobBound&&urlBound)})()",
+        "pocSummary=String(blob.size===source.length&&encoderBound&&bigBlob&&"
+        "second.startsWith('blob:'))})()",
         "true"));
     ScriptResult result = {0};
     for (unsigned tick = 0; tick < 32; tick++) {
@@ -9492,17 +9711,76 @@ static int test_large_blob_worker(void)
     }
     CHECK(strcmp(result.summary, "large-worker-ok") == 0);
     CHECK(var_cache_eval(runtime,
-        "(()=>{let byteBound=false,totalBound=false;"
-        "try{new Blob(['\u20ac'.repeat(180*1024)])}catch(e){byteBound=e.name==='RangeError'}"
-        "try{new Blob([new Uint8Array(300*1024),new Uint8Array(220*1024)])}"
-        "catch(e){totalBound=e.name==='RangeError'}"
+        "(()=>{const byteSize=new Blob(['\u20ac'.repeat(180*1024)]).size"
+        "===540*1024,totalSize=new Blob([new Uint8Array(300*1024),"
+        "new Uint8Array(220*1024)]).size===520*1024;"
         "const data=new Uint8Array([239,187,191,65,226,130,65]),blob=new Blob([data]);"
         "data[3]=66;const Decoder=TextDecoder,decode=Decoder.prototype.decode;"
         "TextDecoder=function(){throw Error('replaced')};"
         "Decoder.prototype.decode=function(){throw Error('replaced')};"
-        "try{blob.text().then(text=>pocSummary=String(byteBound&&totalBound&&"
+        "try{blob.text().then(text=>pocSummary=String(byteSize&&totalSize&&"
         "text==='A\ufffdA'))}finally{TextDecoder=Decoder;Decoder.prototype.decode=decode}"
         "pocSummary='pending'})()", "true"));
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* Runs one worker that opens a database, reads an IDBKeyRange bound (which
+   names its realm's constructors) and is terminated; true once it has. */
+static bool idb_worker_cycle(ScriptRuntime *runtime, unsigned cycle)
+{
+    char script[1024];
+    snprintf(script, sizeof(script),
+        "(()=>{const u=URL.createObjectURL(new Blob([\"const r=indexedDB.open("
+        "'realm%u');r.onsuccess=()=>{const lower=IDBKeyRange.lowerBound("
+        "new Date(1)).lower;r.result.close();postMessage(lower instanceof Date"
+        "?'done':'foreign')}\"])),w=new Worker(u);URL.revokeObjectURL(u);"
+        "w.onmessage=e=>{w.terminate();pocSummary=e.data};"
+        "w.onerror=e=>{pocSummary='error:'+e.message};"
+        "pocSummary='pending'})()", cycle);
+    if (!var_cache_eval(runtime, script, "pending")) return false;
+    ScriptResult result = {0};
+    for (unsigned tick = 0; tick < 64; tick++) {
+        if (!script_runtime_advance(runtime, 1, 512, &result)) return false;
+        if (strcmp(result.summary, "pending") != 0) break;
+    }
+    if (strcmp(result.summary, "done") != 0)
+        fprintf(stderr, "idb worker cycle %u: %s %s\n", cycle,
+                result.summary, result.error);
+    return strcmp(result.summary, "done") == 0;
+}
+
+/* A terminated worker that used IndexedDB gives back its realm: the
+   factory's record of the worker's constructors (for IDBKeyRange bounds)
+   goes with it. Before, each such worker kept its realm and global until
+   the page went away. */
+static int test_indexeddb_worker_realms_released(void)
+{
+    Budget budget; budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = var_cache_runtime(&budget, &document, &sheet,
+        "<!doctype html><body><p>Workers</p></body>");
+    CHECK(runtime != NULL);
+    /* The first cycle loads the Worker and IndexedDB modules. */
+    CHECK(idb_worker_cycle(runtime, 0));
+    JSMemoryUsage before, after;
+    JS_RunGC(runtime->runtime);
+    JS_ComputeMemoryUsage(runtime->runtime, &before);
+    for (unsigned cycle = 1; cycle <= 6; cycle++)
+        CHECK(idb_worker_cycle(runtime, cycle));
+    JS_RunGC(runtime->runtime);
+    JS_ComputeMemoryUsage(runtime->runtime, &after);
+    /* Objects, not bytes: freed realm memory stays in the allocator's
+       arenas. Each run leaves its database's records (a few dozen
+       objects); a kept realm would leave its whole global. */
+    long long objects = (long long)after.obj_count - (long long)before.obj_count;
+    printf("indexeddb worker realms: %lld objects over 6 workers\n", objects);
+    CHECK(objects < 6 * 100);
     script_runtime_destroy(runtime);
     stylesheet_destroy(&sheet);
     document_destroy(&document);
@@ -9593,8 +9871,153 @@ static int test_indexeddb_close_pending_upgrade(void)
     return 0;
 }
 
+static int test_indexeddb_write_state(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = host_state_runtime(&budget, &document, &result);
+    CHECK(runtime != NULL);
+    static const char probe[] =
+        "(async()=>{const request=r=>new Promise((ok,no)=>{r.onsuccess=()=>"
+        "ok(r.result);r.onerror=()=>no(r.error)}),"
+        "finished=tx=>new Promise(ok=>{tx.oncomplete=()=>ok('complete');"
+        "tx.onabort=()=>ok('abort')}),"
+        "throws=f=>{try{f();return 'none'}catch(e){return e.name}},"
+        "opening=indexedDB.open('write-state',1);opening.onupgradeneeded=()=>"
+        "opening.result.createObjectStore('items');const db=await request(opening);"
+        "let reads=0;const input={get value(){reads++;throw Error('unexpected getter')}};"
+        "const tx=db.transaction('items','readwrite'),done=finished(tx),"
+        "store=tx.objectStore('items');store.put('before',1);"
+        "const nil=throws(()=>store.delete(null)),"
+        "undef=throws(()=>store.delete(undefined)),missing=throws(()=>store.delete());"
+        "store.put('after',2);const committed=await done;"
+        "const inactive=[throws(()=>store.put(input,1)),throws(()=>store.add(input,2))];"
+        "const ro=db.transaction('items'),readDone=finished(ro),rs=ro.objectStore('items'),"
+        "readonly=[throws(()=>rs.put(input,1)),throws(()=>rs.add(input,null)),"
+        "throws(()=>rs.delete(null))],values=request(rs.getAll());"
+        "const cursor=rs.openCursor();let cursorError='missing';"
+        "cursor.onsuccess=()=>{if(cursor.result)"
+        "cursorError=throws(()=>cursor.result.update(input))};"
+        "const records=await values;await readDone;db.close();"
+        "pocSummary=nil==='DataError'&&undef==='DataError'&&missing==='TypeError'"
+        "&&committed==='complete'&&records.join(',')==='before,after'"
+        "&&inactive.every(n=>n==='TransactionInactiveError')"
+        "&&readonly.every(n=>n==='ReadOnlyError')&&cursorError==='ReadOnlyError'"
+        "&&reads===0?'IDB-WRITE-STATE-OK':'IDB-WRITE-STATE-FAILED:'"
+        "+JSON.stringify({nil,undef,missing,committed,records,inactive,readonly,cursorError,reads});"
+        "})().catch(e=>pocSummary='IDB-WRITE-STATE-ERROR:'+e.name+':'+e.message)";
+    CHECK(script_runtime_evaluate_diagnostic(runtime, probe, "<idb-write-state>", &result));
+    for (unsigned tick = 0; tick < 32 && strncmp(result.summary, "IDB-WRITE-STATE-", 16); tick++)
+        CHECK(script_runtime_advance(runtime, 0, 1024, &result));
+    if (strcmp(result.summary, "IDB-WRITE-STATE-OK"))
+        fprintf(stderr, "IDB write state: %s %s\n", result.summary, result.error);
+    CHECK(!strcmp(result.summary, "IDB-WRITE-STATE-OK"));
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_indexeddb_view_backing(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    ScriptResult result = {0};
+    /* Allow the fixture to allocate the source backing buffer in this realm.
+       IndexedDB's record quota must refuse it without needing a second copy. */
+    ScriptRuntime *runtime = host_state_runtime_with_heap(
+        &budget, &document, 7u * MIB, &result);
+    CHECK(runtime != NULL);
+    static const char probe[] =
+        "(async()=>{const request=r=>new Promise((ok,no)=>{r.onsuccess=()=>"
+        "ok(r.result);r.onerror=()=>no(r.error)}),"
+        "finished=tx=>new Promise((ok,no)=>{tx.oncomplete=ok;"
+        "tx.onabort=()=>no(tx.error)}),name='view-backing',"
+        "opening=indexedDB.open(name,1);opening.onupgradeneeded=()=>"
+        "opening.result.createObjectStore('items');const db=await request(opening),"
+        "stats=__tilefinchIndexedDBStats;"
+        "const graph=(size,reverse=false,distinct=false)=>{"
+        "const bytes=new ArrayBuffer(size),slice=new Uint8Array(bytes,6,2),"
+        "view=new DataView(distinct?new ArrayBuffer(size):bytes,7,1);"
+        "slice[1]=42;return reverse?[bytes,slice,view,slice]:[slice,view,bytes,slice]};"
+        "const write=async(value,key)=>{const tx=db.transaction('items','readwrite'),"
+        "done=finished(tx),put=tx.objectStore('items').put(value,key);"
+        "await Promise.all([request(put),done])};"
+        "await write(graph(256),1);const small=stats.bytes;"
+        "const original=graph(4096);const saving=write(original,2);"
+        "original[0][1]=9;await saving;const large=stats.bytes-small;"
+        "await write(graph(4096,true),3);const reversed=stats.bytes-small-large;"
+        "const beforeDistinct=stats.bytes;await write(graph(4096,false,true),4);"
+        "const distinct=stats.bytes-beforeDistinct;"
+        "const read=db.transaction('items'),readDone=finished(read),"
+        "copy=await request(read.objectStore('items').get(2));await readDone;"
+        "const [slice,view,bytes,alias]=copy;"
+        "const shape=slice instanceof Uint8Array&&view instanceof DataView"
+        "&&slice===alias&&slice.buffer===view.buffer&&view.buffer===bytes"
+        "&&bytes.byteLength===4096&&slice.byteOffset===6&&slice.length===2"
+        "&&view.byteOffset===7&&view.byteLength===1&&view.getUint8(0)===42;"
+        "const payload=new Uint8Array(65536),blob=new Blob([payload],{type:'text/plain'}),"
+        "file=new File([payload],'aliased.bin',{lastModified:7});"
+        "let blobReads=0,blobBytes=0,blobShape=false,blobError='';"
+        "const beforeBlobs=stats.bytes;try{"
+        "await write({get blobs(){blobReads++;return Array(64).fill(blob)},"
+        "files:Array(64).fill(file)},5);"
+        "blobBytes=stats.bytes-beforeBlobs;const blobTx=db.transaction('items'),"
+        "blobDone=finished(blobTx),blobCopy=await request(blobTx.objectStore('items').get(5));"
+        "await blobDone;blobShape=blobReads===1&&blobBytes>=2*payload.length"
+        "&&blobBytes<2*payload.length+4096&&blobCopy.blobs[0]===blobCopy.blobs[63]"
+        "&&blobCopy.files[0]===blobCopy.files[63]&&blobCopy.blobs[0].size===payload.length"
+        "&&blobCopy.blobs[0].type==='text/plain'&&blobCopy.files[0].size===payload.length"
+        "&&blobCopy.files[0].name==='aliased.bin'&&blobCopy.files[0].lastModified===7;"
+        "}catch(e){blobError=e.name}"
+        "const beforeQuota=stats.bytes,beforeRecords=stats.records,quotaErrors=stats.quotaErrors,"
+        "backing=new ArrayBuffer(4*1024*1024),refusals=[];let getterReads=0;"
+        "const arrayView=new Uint8Array(backing,1,1),dataView=new DataView(backing,2,1);"
+        "for(const value of [arrayView,dataView,{get item(){getterReads++;"
+        "return new Map([[1,new Set([dataView])]])}}]){"
+        "const tx=db.transaction('items','readwrite'),done=finished(tx)"
+        ".then(()=>'',e=>e.name);try{refusals.push(await request("
+        "tx.objectStore('items').put(value,6)).then(()=>'',e=>e.name))}"
+        "catch(e){refusals.push('sync:'+e.name)}refusals.push(await done)}"
+        "const unchanged=stats.bytes===beforeQuota&&stats.records===beforeRecords"
+        "&&stats.quotaErrors===quotaErrors+3;"
+        "db.close();await request(indexedDB.deleteDatabase(name));"
+        "pocSummary=shape&&blobShape&&large-small===4096-256&&reversed===large"
+        "&&distinct-large>=4096&&distinct-large<4096+64"
+        "&&refusals.every(name=>name==='QuotaExceededError')&&unchanged&&getterReads===1"
+        "?'IDB-VIEW-OK':'IDB-VIEW-FAILED:'+JSON.stringify("
+        "{shape,blobShape,blobBytes,blobError,small,large,reversed,distinct,refusals,unchanged,getterReads})"
+        "})().catch(e=>pocSummary='IDB-VIEW-ERROR:'+e.name+':'+e.message)";
+    CHECK(script_runtime_evaluate_diagnostic(runtime, probe, "<idb-view-backing>", &result));
+    for (unsigned tick = 0; tick < 32 && strncmp(result.summary, "IDB-VIEW-", 9); tick++)
+        CHECK(script_runtime_advance(runtime, 0, 1024, &result));
+    if (strcmp(result.summary, "IDB-VIEW-OK"))
+        fprintf(stderr, "IDB view backing: %s %s\n", result.summary, result.error);
+    CHECK(!strcmp(result.summary, "IDB-VIEW-OK"));
+    CHECK(result.indexed_db_records == 0 && result.indexed_db_bytes == 0);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--idb-write-state-only") == 0)
+        return test_indexeddb_write_state();
+    if (argc == 2 && strcmp(argv[1], "--idb-views-only") == 0)
+        return test_indexeddb_view_backing();
+    CHECK(test_indexeddb_write_state() == 0);
+    CHECK(test_indexeddb_view_backing() == 0);
+    if (argc == 2 && strcmp(argv[1], "--lifecycle-only") == 0)
+        return test_lifecycle_survives_full_checkpoint_queue();
+    if (argc == 2 && strcmp(argv[1], "--refused-stack-text-only") == 0)
+        return test_refusal_loop_survives_refused_stack_text();
     if (argc == 2 && strcmp(argv[1], "--manual-slot-journal-only") == 0)
         return test_manual_slot_assignment_journal();
     if (argc == 2 && strcmp(argv[1], "--heavy-frame-once-only") == 0)
@@ -9603,6 +10026,9 @@ int main(int argc, char **argv)
     if (argc == 2 && strcmp(argv[1], "--idb-close-only") == 0)
         return test_indexeddb_close_pending_upgrade();
     CHECK(test_indexeddb_close_pending_upgrade() == 0);
+    if (argc == 2 && strcmp(argv[1], "--idb-worker-realms-only") == 0)
+        return test_indexeddb_worker_realms_released();
+    CHECK(test_indexeddb_worker_realms_released() == 0);
     if (argc == 2 && strcmp(argv[1], "--profile-abandon-only") == 0)
         return test_refused_context_frees_profile();
     if (argc == 2 && strcmp(argv[1], "--component-stack-only") == 0)
@@ -9823,7 +10249,7 @@ int main(int argc, char **argv)
     if (argc == 2 && strcmp(argv[1], "--resize-observer-budget-only") == 0)
         return test_resize_observer_registration_budget();
     if (argc == 2 && strcmp(argv[1], "--job-heap-rejection-only") == 0)
-        return test_job_heap_rejection_is_fatal();
+        return test_job_heap_rejection_is_author_error();
     if (argc == 2 && strcmp(argv[1], "--inline-trackers-only") == 0)
         return test_inline_tracker_policy();
     if (argc == 2 && strcmp(argv[1], "--inline-in-place-only") == 0)
@@ -9882,8 +10308,10 @@ int main(int argc, char **argv)
     CHECK(test_computed_style_var_cache_on_demand() == 0);
     CHECK(test_watchdog_elapsed_cooperation() == 0);
     CHECK(test_reduced_dom_event_counter() == 0);
-    CHECK(test_job_heap_rejection_is_fatal() == 0);
+    CHECK(test_job_heap_rejection_is_author_error() == 0);
+    CHECK(test_lifecycle_survives_full_checkpoint_queue() == 0);
     CHECK(test_refusal_loop_stops_as_out_of_memory() == 0);
+    CHECK(test_refusal_loop_survives_refused_stack_text() == 0);
     CHECK(test_inline_tracker_policy() == 0);
     CHECK(test_inline_script_compiles_in_place() == 0);
     CHECK(test_attribute_mutation_skips_document_refresh() == 0);
@@ -13019,6 +13447,7 @@ int main(int argc, char **argv)
         "bytesRequest.headers.get('content-type'),explicit:explicitRequest.headers"
         ".get('content-type')});})().catch(error=>{globalThis.pocSummary="
         "'REQUEST-BODY-CONTENT-TYPE-ERROR:'+String(error&&error.stack||error)});";
+    size_t loads_before_multipart = result.bootstrap_lazy_module_loads;
     bool request_body_content_type_ok = script_runtime_evaluate_diagnostic(
         runtime, request_body_content_type_probe,
         "<request-body-content-type-probe>", &result);
@@ -13035,7 +13464,8 @@ int main(int argc, char **argv)
                 result.summary, result.error);
     }
     CHECK(request_body_content_type_ok
-          && strcmp(result.summary, "REQUEST-BODY-CONTENT-TYPE-OK") == 0);
+          && strcmp(result.summary, "REQUEST-BODY-CONTENT-TYPE-OK") == 0
+          && result.bootstrap_lazy_module_loads == loads_before_multipart + 1);
 
     static const char response_body_content_type_probe[] =
         "(async()=>{const params=new Response(new URLSearchParams([['a','b']])),"
@@ -13066,7 +13496,8 @@ int main(int argc, char **argv)
             runtime, 0, 1024, &result);
     }
     CHECK(response_body_content_type_ok
-          && strcmp(result.summary, "RESPONSE-BODY-CONTENT-TYPE-OK") == 0);
+          && strcmp(result.summary, "RESPONSE-BODY-CONTENT-TYPE-OK") == 0
+          && result.bootstrap_lazy_module_loads == loads_before_multipart + 1);
 
     static const char request_validation_ownership_probe[] =
         "(async()=>{const failures=[],check=(init)=>{const source=new Request("
@@ -13574,6 +14005,7 @@ int main(int argc, char **argv)
         "&&telemetry.deletes===1?'INDEXEDDB-OK':'INDEXEDDB-FAILED:'+"
         "JSON.stringify(telemetry);})().catch(error=>{globalThis.pocSummary="
         "'INDEXEDDB-ERROR:'+String(error&&error.stack||error)});";
+    size_t loads_before_indexeddb = result.bootstrap_lazy_module_loads;
     bool indexeddb_ok = script_runtime_evaluate_diagnostic(
         runtime, indexeddb_probe, "<indexeddb-probe>", &result);
     for (size_t tick = 0; indexeddb_ok && tick < 16
@@ -13597,12 +14029,21 @@ int main(int argc, char **argv)
              constructors earlier; IndexedDB is the next deferred standards
              module admitted. */
           /* Cumulative for this runtime: the compatibility probe above also
-             loads the Worker module for its close() check, the Intl probes
+             loads the Worker module for its close() check (and the worker
+             realm's FileReader and navigator.gpu load those two modules),
+             the Intl probes
              load the lazy Intl module, and an srcdoc frame's DOMParser
              document loads the secondary-documents module, and its
              postMessage() probes load the window-messaging module. The
-             WebGL probes load the WebGL interfaces before WebGL. */
-          && result.bootstrap_lazy_module_loads == 11
+             WebGL probes load the WebGL interfaces before WebGL, a
+             measurement before layout loads the layout-less geometry
+             module, and the SVG probes load detached documents and the
+             namespace module when they set xlink:href. The first multipart
+             request loads the forms encoder; the response reuses it. The
+             digest probes' first crypto.subtle read loads the other
+             SubtleCrypto operations. */
+          && result.bootstrap_lazy_module_loads == 18
+          && result.bootstrap_lazy_module_loads == loads_before_indexeddb + 1
           && result.bootstrap_lazy_module_failures == 0);
 
     static const char indexeddb_generator_probe[] =
@@ -13655,25 +14096,48 @@ int main(int argc, char **argv)
         "req.addEventListener('error',()=>reject(req.error));}),name="
         "'tilefinch-idb-success-exception',opening=indexedDB.open(name,1);"
         "opening.addEventListener('upgradeneeded',()=>opening.result."
-        "createObjectStore('records'));const db=await request(opening),"
+        "createObjectStore('records'));const db=await request(opening),states=[];"
+        "for(const kind of ['success','empty','null','nested','canceled-error','canceled-only',"
+        "'capture-throw','capture-only']){const "
         "write=db.transaction('records','readwrite'),outcome=new Promise(resolve"
-        "=>{write.addEventListener('abort',()=>resolve('abort'));write."
+        "=>{write.addEventListener('abort',()=>resolve(write.error.name));write."
         "addEventListener('complete',()=>resolve('complete'))}),put=write."
-        "objectStore('records').put('must-rollback',1);put.addEventListener("
-        "'success',()=>{throw new Error('success handler failed')});const state="
+        "objectStore('records').put('must-rollback',1),store=write.objectStore('records'),"
+        "hit=kind==='empty'?store.openCursor(2):kind.startsWith('canceled')?store.add('duplicate',1):put;"
+        "let rightResult=false,phases=[],abortBubble=0;const trackAbort=event=>{"
+        "if(event.target===write&&event.eventPhase===3&&event.bubbles&&!event.cancelable)++abortBubble};"
+        "db.addEventListener('abort',trackAbort);if(kind.startsWith('canceled')){write.addEventListener('error',event=>{"
+        "rightResult=hit.error.name==='ConstraintError'&&event.eventPhase===3;event.preventDefault();"
+        "if(kind==='canceled-error')throw null})}else if(kind.startsWith('capture')){"
+        "db.addEventListener('success',event=>{phases.push(event.eventPhase);"
+        "if(kind==='capture-throw')throw null},{capture:true,once:true});"
+        "write.addEventListener('success',event=>phases.push(event.eventPhase),true);"
+        "write.addEventListener('success',()=>phases.push('bad bubble'));"
+        "hit.addEventListener('success',event=>{phases.push(event.eventPhase);"
+        "rightResult=event.target===hit&&phases.join()==='1,1,2'});}else{"
+        "hit.addEventListener('success',()=>{rightResult=hit.result===(kind==='empty'?null:1);"
+        "if(kind==='null')throw null;throw new Error('success handler failed')});"
+        "if(kind==='nested')hit.addEventListener('success',()=>hit.dispatchEvent(new Event('other')))}"
+        "const state="
         "await outcome,read=db.transaction('records'),readDone=new Promise("
         "(resolve,reject)=>{read.addEventListener('complete',resolve);read."
         "addEventListener('abort',()=>reject(read.error))}),saved=await request("
-        "read.objectStore('records').get(1));await readDone;db.close();await request("
-        "indexedDB.deleteDatabase(name));globalThis.pocSummary=state==='abort'"
-        "&&saved===undefined?'INDEXEDDB-SUCCESS-EXCEPTION-OK':"
-        "'INDEXEDDB-SUCCESS-EXCEPTION-FAILED:'+state+':'+String(saved)})()"
+        "read.objectStore('records').get(1));await readDone;"
+        "const allowed=kind==='canceled-only'||kind==='capture-only';"
+        "db.removeEventListener('abort',trackAbort);"
+        "states.push(rightResult&&(allowed?state==='complete'&&saved==='must-rollback'&&abortBubble===0:"
+        "state==='AbortError'&&saved===undefined&&abortBubble===1));"
+        "if(saved!==undefined){const clear=db.transaction('records','readwrite');"
+        "await request(clear.objectStore('records').clear())}}"
+        "db.close();await request(indexedDB.deleteDatabase(name));"
+        "globalThis.pocSummary=states.every(Boolean)?'INDEXEDDB-SUCCESS-EXCEPTION-OK':"
+        "'INDEXEDDB-SUCCESS-EXCEPTION-FAILED:'+states.join(',')})()"
         ".catch(error=>{globalThis.pocSummary='INDEXEDDB-SUCCESS-EXCEPTION-ERROR:'"
         "+String(error&&error.stack||error)});";
     bool indexeddb_success_exception_ok = script_runtime_evaluate_diagnostic(
         runtime, indexeddb_success_exception_probe,
         "<indexeddb-success-exception-probe>", &result);
-    for (size_t tick = 0; indexeddb_success_exception_ok && tick < 32
+    for (size_t tick = 0; indexeddb_success_exception_ok && tick < 128
          && strncmp(result.summary, "INDEXEDDB-SUCCESS-EXCEPTION-", 28) != 0;
          tick++) {
         indexeddb_success_exception_ok = script_runtime_advance(

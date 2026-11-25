@@ -242,7 +242,14 @@ bool browser_engine_take_deferred_activation(BrowserEngine *engine)
     if (engine == NULL || engine->provisional_activation
             != BROWSER_DEFERRED_ACTIVATION_READY) return false;
     engine->provisional_activation = BROWSER_DEFERRED_ACTIVATION_IDLE;
-    return true;
+    lxb_dom_node_t *target = engine->deferred_activation_target;
+    engine->deferred_activation_target = NULL;
+    /* The frontend activates current focus on a true result. Do not hand
+       it an old press if intervening input or author work changed focus. */
+    return target != NULL && browser_engine_input_ready(engine)
+        && engine->deferred_activation_focus_serial
+               == engine->controller.focus_serial
+        && controller_focused_node(&engine->controller) == target;
 }
 
 bool browser_engine_provisional_raster_step(BrowserEngine *engine)

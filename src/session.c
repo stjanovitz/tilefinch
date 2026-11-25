@@ -2341,7 +2341,8 @@ bool browser_session_decoded_image_acquire(
         .source_width = entry->decoded_image_source_width,
         .source_height = entry->decoded_image_source_height,
         .width = entry->decoded_image_width,
-        .height = entry->decoded_image_height
+        .height = entry->decoded_image_height,
+        .no_natural_size = entry->decoded_image_no_natural_size
     };
     entry->stamp = ++session->clock;
     return true;
@@ -2360,6 +2361,7 @@ static void cache_decoded_image_invalidate_entry(
     entry->decoded_image_source_height = 0;
     entry->decoded_image_width = 0;
     entry->decoded_image_height = 0;
+    entry->decoded_image_no_natural_size = false;
 }
 
 void browser_session_decoded_image_forget(BrowserSession *session,
@@ -2407,7 +2409,7 @@ bool browser_session_decoded_image_put(
     const TilefinchRequestContext *request_context,
     const unsigned char *source, size_t source_length,
     BrowserSharedBody *pixels, int source_width, int source_height,
-    int width, int height)
+    int width, int height, bool no_natural_size)
 {
     if (session == NULL || pixels == NULL || pixels->data == NULL
         || pixels->length == 0 || pixels->budget != session->budget
@@ -2442,6 +2444,7 @@ bool browser_session_decoded_image_put(
     entry->decoded_image_source_height = source_height;
     entry->decoded_image_width = width;
     entry->decoded_image_height = height;
+    entry->decoded_image_no_natural_size = no_natural_size;
     entry->stamp = ++session->clock;
     session->cache_bytes += pixels->length;
     return true;
@@ -3293,6 +3296,36 @@ size_t browser_session_admission_reclaimable_bytes(
         if (cache_entry_is_script_body(session, entry))
             total += entry->body->length;
     }
+    return total;
+}
+
+static size_t cache_sole_length(const BrowserSharedBody *body)
+{
+    return body != NULL && body->references == 1u ? body->length : 0;
+}
+
+size_t browser_session_cache_reclaimable_bytes(const BrowserSession *session)
+{
+    if (session == NULL) return 0;
+    /* A deferred app's bytecode is not measured here: assume it covers. */
+    if (session->offline_deferred != NULL) return SIZE_MAX;
+    size_t total = 0;
+    for (int k = 0; k < (int) BROWSER_SCRIPT_BYTECODE_KINDS; k++)
+        total += browser_session_script_bytecode_bytes(
+            session, (BrowserScriptBytecodeKind) k);
+    for (size_t i = 0; i < BROWSER_CACHE_ENTRIES; i++) {
+        const BrowserCacheEntry *entry = &session->cache[i];
+        if (entry->data == NULL) continue;
+        total += entry->body == NULL ? entry->length
+                                     : cache_sole_length(entry->body);
+        total += cache_sole_length(entry->classic_script_bytecode)
+            + cache_sole_length(entry->stylesheet_compiled_fragment)
+            + cache_sole_length(entry->stylesheet_parsed_ir)
+            + cache_sole_length(entry->decoded_image_pixels);
+    }
+    for (size_t i = 0; i < BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRIES; i++)
+        if (session->site_adapter_document_cache[i].valid)
+            total += session->site_adapter_document_cache[i].length;
     return total;
 }
 

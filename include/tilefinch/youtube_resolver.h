@@ -198,8 +198,8 @@ typedef struct {
 
 /*
  * PSP-native pumpable resolver. Network production occurs on the bounded
- * transport worker; each pump consumes at most one response chunk or one
- * parser transition on the browser thread. Host/replay callers retain the
+ * transport worker; each regular pump consumes at most one response chunk or
+ * one parser transition on the browser thread. Host/replay callers retain the
  * synchronous deterministic API below.
  */
 YoutubeResolveJob *youtube_resolve_job_begin(
@@ -218,6 +218,11 @@ YoutubeResolveJob *youtube_resolve_job_begin_bounded(
 bool youtube_resolve_job_set_track_preferences(
     YoutubeResolveJob *job, const YoutubeTrackPreferences *preferences);
 YoutubeResolveJobStatus youtube_resolve_job_pump(YoutubeResolveJob *job);
+/* Only for an explicit Play. Consume finished player metadata and parse it
+   in one turn; replies of at most 4 KiB may also copy their last chunk.
+   Large replies and watch pages always yield after a chunk, and no pump
+   starts a second request. */
+YoutubeResolveJobStatus youtube_resolve_job_pump_playback(YoutubeResolveJob *job);
 bool youtube_resolve_job_take(
     YoutubeResolveJob *job, YoutubeStream *stream);
 bool youtube_resolve_job_copy_caption_catalog(

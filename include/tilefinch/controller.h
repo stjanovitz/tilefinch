@@ -285,6 +285,11 @@ bool controller_focused_download_url(BrowserController *controller,
    SIZE_MAX means write refusal: the unpublished candidate must be discarded. */
 size_t controller_select_history(lxb_dom_node_t *select, char *state,
                                  size_t length, bool restore);
+/* Read only an explicitly modified selection, not authored defaults. */
+size_t controller_select_history_edited(lxb_dom_node_t *select, char *state,
+                                       size_t length);
+/* The same current owning form used for native submission. */
+lxb_dom_node_t *controller_control_form_owner(lxb_dom_node_t *node);
 
 /* User-activated playback for a page-level explicit declaration. This is the
    same resolution/CSP/probe-bound action as a src-less <video>, but carries

@@ -264,33 +264,13 @@ set(TILEFINCH_VOICE_SENDUMP_ROWS 384)
 set(TILEFINCH_VOICE_SENDUMP_ROW_BYTES 5126)
 set(PSP_BROWSER_APPLY_PATCH_SCRIPT
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply_patch.cmake")
+# Every patch is a configure input, so editing one reapplies it in each
+# existing tree (cmake/apply_patch.cmake replaces the version applied there).
+file(GLOB tilefinch_dependency_patches
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/*.patch"
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/pocketsphinx/*.patch")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-    "${PSP_BROWSER_LEXBOR_PATCH}"
-    "${PSP_BROWSER_LEXBOR_FOSTER_PATCH}"
-    "${PSP_BROWSER_LEXBOR_TOKENIZER_PATCH}"
-    "${PSP_BROWSER_LEXBOR_MRAW_PATCH}"
-    "${PSP_BROWSER_LEXBOR_FRAGMENT_CLONE_PATCH}"
-    "${PSP_BROWSER_LEXBOR_ATTRIBUTE_LIFETIME_PATCH}"
-    "${PSP_BROWSER_LEXBOR_MRAW_ADOPT_PATCH}"
-    "${PSP_BROWSER_STB_JPEG_SCALE_PATCH}"
-    "${PSP_BROWSER_STB_TRUETYPE_REFUSAL_PATCH}"
-    "${PSP_BROWSER_WEBP_ALPHA_PATCH}"
-    "${PSP_BROWSER_WEBP_ALPHA_FRAME_PATCH}"
-    "${PSP_BROWSER_NANOSVG_PATCH}"
-    "${PSP_BROWSER_NANOSVG_GEOMETRY_PATCH}"
-    "${PSP_BROWSER_NANOSVG_DIVISIONS_PATCH}"
-    "${PSP_BROWSER_NANOSVG_COVERAGE_PATCH}"
-    "${PSP_BROWSER_NANOSVG_NUMBER_PATCH}"
-    "${PSP_BROWSER_NANOSVG_ROWS_PATCH}"
-    "${PSP_BROWSER_NANOSVG_STYLE_PATCH}"
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/pocketsphinx/pocketsphinx-5.1.1-psp-int32.patch"
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/pocketsphinx/pocketsphinx-5.1.1-psp-no-mmap.patch"
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/pocketsphinx/pocketsphinx-5.1.1-psp-timer.patch"
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/pocketsphinx/pocketsphinx-5.1.1-packed-lexicon.patch"
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/pocketsphinx/pocketsphinx-5.1.1-fixed-recognizer.patch"
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/pocketsphinx/pocketsphinx-5.1.1-stream-sendump.patch"
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/pocketsphinx/pocketsphinx-5.1.1-three-state-hmm.patch"
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/pocketsphinx/pocketsphinx-5.1.1-compact-search.patch"
+    ${tilefinch_dependency_patches}
     "${PSP_BROWSER_APPLY_PATCH_SCRIPT}")
 
 include(cmake/PspVoice.cmake)
@@ -434,9 +414,9 @@ endif()
 # updates the two pins in the same commit.
 set(tilefinch_quickjs_vendor_dir "${CMAKE_CURRENT_SOURCE_DIR}/third_party/quickjs")
 set(tilefinch_quickjs_vendor_c_sha256
-        "6f71f582c00cec9b2cc13180c85117a9eb584120f761541ef5b07a6051ac19b2")
+        "f67e5dd6a005e861faa4795d6925e693e8d4a0ceecab10261208dad72797e139")
 set(tilefinch_quickjs_vendor_h_sha256
-        "5d0eaf813ad992413d710786bac7a926f8a3daae5f7af62e3550d132e197c81c")
+        "c60deb2f569c242fb5aa44aeccd2c3c623b785cec0a81aaf4752e4146871e9e1")
 file(SHA256 "${tilefinch_quickjs_vendor_dir}/quickjs.c" tilefinch_quickjs_c_sha256)
 file(SHA256 "${tilefinch_quickjs_vendor_dir}/quickjs.h" tilefinch_quickjs_h_sha256)
 if(NOT tilefinch_quickjs_c_sha256 STREQUAL tilefinch_quickjs_vendor_c_sha256
@@ -458,9 +438,9 @@ endif()
 set(tilefinch_quickjs_bytecode_sources
     quickjs-atom.h quickjs-opcode.h libregexp.c libregexp.h
     libregexp-opcode.h libunicode.c libunicode.h libunicode-table.h
-    dtoa.c dtoa.h)
+    dtoa.c dtoa.h cutils.h)
 set(tilefinch_quickjs_vendor_bytecode_sources_sha256
-    "92a3ee2d500362dd2eae2ad28805da15e371a244b6e5ee4e3b0a47d0ba409c69")
+    "ab61d60fe24836e3a8b9c491709fba5b8796850edb98b6dd88d44ba032618487")
 set(tilefinch_quickjs_bytecode_source_hashes "")
 foreach(source IN LISTS tilefinch_quickjs_bytecode_sources)
     file(SHA256 "${tilefinch_quickjs_vendor_dir}/${source}"
@@ -496,7 +476,16 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-external-source.patch"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-compact-line-tables.patch"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-interface-snapshot.patch"
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-class-field-position.patch")
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-class-field-position.patch"
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-backtrace-pending-exception.patch"
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-weak-reference-cap.patch"
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-map-computed-insert.patch"
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-author-code-running.patch"
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-size-regions.patch"
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-atomics-no-block.patch"
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-bootstrap-unused-locals.patch"
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-engine-bounds.patch"
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-engine-bounds-compact.patch")
 set(quickjs_SOURCE_DIR "${tilefinch_quickjs_vendor_dir}")
 # Lab variants (a capture-getter control, compact character/byte-array
 # control, the property-fault trace) are the only remaining patch users.
@@ -513,19 +502,19 @@ if(NOT PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH
         "${PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH}-${PSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY}-${PSP_BROWSER_JS_PROPERTY_FAULT_TRACE}")
     # capture-getter, compact-char-array, property-fault-trace -> quickjs.c
     set(tilefinch_quickjs_variant_ON-OFF-OFF
-        "a907b7a259a19d10015b0cc2bb2605f08407cab585c11a73b4ecc3eeb60dcd78")
+        "73aead7e8044fb286524918b5a881edb19ab7b372e989b638bb4d3ca1826dd14")
     set(tilefinch_quickjs_variant_ON-ON-ON
-        "7d7dd1941fe783f9aaa75e4a6a7c63173186374ba079f7effc68be98ef851204")
+        "35791c8ff943489eccd023759492e4b9349748554663115dfb11075a9e2dd843")
     set(tilefinch_quickjs_variant_ON-OFF-ON
-        "d1fa61079da7887b1f0a415c11d6b9efd9717740066ffcce670be06fc1da9dd0")
+        "d52777bf553a73cf239533723934c8598d7a90e9e796f342cdc18b748e76bf2c")
     set(tilefinch_quickjs_variant_OFF-ON-OFF
-        "aa2bc07bc8f119638b571067f402affbddfa45bca1485302dc96481606bee667")
+        "84b8b6f3c9adfce56ff5ae3bc6425914e4d6e819330e21e1c1d4f91fa8c95ef0")
     set(tilefinch_quickjs_variant_OFF-ON-ON
-        "b1b3348f28bd7063664c51a8673c4edf466ba2a6fbfcfa24b2bbe9d1fe89af3c")
+        "673913bd63a7f77d72c4746a194f525cc4673cd4aed9e7e937d44afb2a69a4ac")
     set(tilefinch_quickjs_variant_OFF-OFF-OFF
-        "f0df1bde0869cf90de1987e77daeb37f45aa83ebcc52f927d7a0961b430a397f")
+        "bdb5993b1c9c16d4a2b74cbeeac625601eb4c59aa191637d62d3980424b4a7a3")
     set(tilefinch_quickjs_variant_OFF-OFF-ON
-        "e76408ff909495f135a12d0f49254550eea9dfa298b5637cdab5cffd0778e9b4")
+        "7c41d4f3f016f060cac36f8769b4dfa8cd2fe7d2fc15729de04f247d6e244af1")
     if(NOT DEFINED tilefinch_quickjs_variant_${tilefinch_quickjs_variant_key})
         message(FATAL_ERROR
             "No pinned QuickJS variant for capture-getter/compact/property-fault "
@@ -554,6 +543,13 @@ if(NOT PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH
         endforeach()
         # Reverse the default stack above the shared bounded baseline.
         foreach(layer
+                engine-bounds-compact engine-bounds bootstrap-unused-locals
+                atomics-no-block
+                size-regions
+                author-code-running
+                map-computed-insert
+                weak-reference-cap
+                backtrace-pending-exception
                 class-field-position
                 interface-snapshot
                 compact-line-tables
@@ -581,7 +577,7 @@ if(NOT PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH
         file(SHA256 "${tilefinch_quickjs_variant_dir}/quickjs.c"
              tilefinch_quickjs_variant_baseline)
         if(NOT tilefinch_quickjs_variant_baseline STREQUAL
-               "ec88d7b4b5135c7313a8cdf37f94604b9b05d26cc0e613070baf55cd24beda25")
+               "5a0e1cf0b13f891ac77773502554938feab42586bc07b886076482e55ae8139e")
             message(FATAL_ERROR
                 "Reversing the QuickJS default stack reached "
                 "${tilefinch_quickjs_variant_baseline}, not the pinned "
@@ -616,7 +612,13 @@ if(NOT PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH
             list(APPEND tilefinch_quickjs_forward allocation-safety-ordinary)
         endif()
         list(APPEND tilefinch_quickjs_forward compact-line-tables
-            interface-snapshot class-field-position)
+            interface-snapshot class-field-position
+            backtrace-pending-exception weak-reference-cap map-computed-insert
+            author-code-running size-regions atomics-no-block
+            bootstrap-unused-locals engine-bounds)
+        if(PSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY)
+            list(APPEND tilefinch_quickjs_forward engine-bounds-compact)
+        endif()
         foreach(layer IN LISTS tilefinch_quickjs_forward)
             execute_process(COMMAND "${PATCH_EXECUTABLE}" --force --forward --silent -p1
                 -i "${tilefinch_quickjs_patches}/bellard-quickjs-04be246-${layer}.patch"
@@ -703,6 +705,16 @@ if(PSP)
     # kernel bench runs most kernels at 0.6-0.9x the -Os time. Cost
     # ~270 KB of .text (user-approved; the ratchets below include it).
     target_compile_options(qjs PRIVATE -O2)
+    # libunicode.c (case conversion, normalization and character classes)
+    # stays at -Os. Case conversion and the /i matcher call into it per
+    # character, but the ASCII branch at the top of lre_case_conv and
+    # lre_canonicalize compiles to the same few instructions at either
+    # level; -Os saves on the non-ASCII paths. A source's options follow
+    # its target's, so this -Os wins (4.4 KB of .text). Cold regions
+    # inside quickjs.c and libregexp.c are -Os by pragma
+    # (third_party/quickjs/README.md).
+    set_source_files_properties("${quickjs_SOURCE_DIR}/libunicode.c"
+        PROPERTIES COMPILE_OPTIONS -Os)
 endif()
 set_target_properties(qjs PROPERTIES C_EXTENSIONS ON)
 if(PSP)
@@ -757,10 +769,14 @@ endif()
 # profile by its object's path, mangled ('/' -> '#') relative to the
 # build tree (-fprofile-prefix-path), so a profile trained in one build
 # directory applies in another, but only to the exact engine build it
-# was trained on (the fingerprint below). Functions the training never
-# ran stay at the ordinary -O2 (-fprofile-partial-training) rather than
-# being optimized for size, since other sites run engine paths
-# chatgpt.com does not.
+# was trained on (the fingerprint below) and only when configured from
+# the source path it was trained from
+# (cmake/CheckQuickjsPgoSourceDir.cmake). Functions the training never
+# ran are compiled at -O2 as if there were no profile
+# (-fprofile-partial-training) rather than optimized for size, since
+# other sites run engine paths chatgpt.com does not. The passes
+# -fprofile-use turns on for the whole file still reach them, except
+# loop unrolling, which is off (below).
 option(PSP_BROWSER_QUICKJS_PGO_GENERATE
     "Instrument the PSP QuickJS objects for profile collection (training builds)" OFF)
 set(PSP_BROWSER_QUICKJS_PGO_USE "" CACHE PATH
@@ -811,6 +827,17 @@ if(PSP_BROWSER_QUICKJS_PGO_GENERATE OR PSP_BROWSER_QUICKJS_PGO_USE)
         endif()
         string(APPEND tilefinch_quickjs_pgo_inputs
             "\n${tilefinch_quickjs_pgo_property}=${tilefinch_quickjs_pgo_value}")
+    endforeach()
+    # Per-source options (libunicode.c's -Os) shape the objects too.
+    foreach(tilefinch_quickjs_pgo_source
+            quickjs.c dtoa.c libregexp.c libunicode.c cutils.c)
+        get_source_file_property(tilefinch_quickjs_pgo_value
+            "${quickjs_SOURCE_DIR}/${tilefinch_quickjs_pgo_source}"
+            COMPILE_OPTIONS)
+        if(tilefinch_quickjs_pgo_value)
+            string(APPEND tilefinch_quickjs_pgo_inputs
+                "\n${tilefinch_quickjs_pgo_source}-options=${tilefinch_quickjs_pgo_value}")
+        endif()
     endforeach()
     string(APPEND tilefinch_quickjs_pgo_inputs
         "\nflags=${CMAKE_C_FLAGS} ${CMAKE_C_FLAGS_${tilefinch_quickjs_pgo_config}}"
@@ -878,6 +905,9 @@ elseif(PSP_BROWSER_QUICKJS_PGO_USE)
             "with scripts/train-quickjs-pgo.sh: a stale profile is worse "
             "than none.")
     endif()
+    include(cmake/CheckQuickjsPgoSourceDir.cmake)
+    tilefinch_check_quickjs_pgo_source_dir(
+        "${PSP_BROWSER_QUICKJS_PGO_USE}" "${CMAKE_SOURCE_DIR}")
     # -fno-reorder-functions: no .text.hot/.text.unlikely function
     # grouping. The EBOOT's default link script would gather those
     # sections but the PSPLink PRX's linkfile.prx does not, so the two
@@ -887,11 +917,19 @@ elseif(PSP_BROWSER_QUICKJS_PGO_USE)
     # code layout" and "Tiered hot-function order";
     # docs/engineering/CODE_LAYOUT.md). Blocks inside each function are
     # still laid out by the profile.
+    #
+    # -fno-unroll-loops: -fprofile-use enables unrolling for every loop,
+    # including functions the training never ran. That cost about 86 KB
+    # of .text for 2-3% of the PPSSPP gain. Peeling, tracing and the
+    # other profile-driven passes stay on. These options are not part of
+    # the fingerprint, so changing them needs no retrain;
+    # scripts/check-quickjs-pgo-size.sh checks the resulting size.
     target_compile_options(qjs PRIVATE
         "-fprofile-use=${PSP_BROWSER_QUICKJS_PGO_USE}"
         "-fprofile-prefix-path=${CMAKE_BINARY_DIR}"
         -fprofile-partial-training
         -fno-reorder-functions
+        -fno-unroll-loops
         -Werror=coverage-mismatch
         -Werror=missing-profile)
     # A new profile must recompile the engine, not only a new source.
@@ -903,6 +941,9 @@ endif()
 # the defaults and the PGO options above, so they can override either;
 # empty for shipping presets. The sanitizer preset uses -O1 to avoid
 # unoptimized interpreter spill frames exhausting its unchanged stack guard.
+# On the PSP these flags do not override libunicode.c's -Os or the -Os
+# pragma regions in quickjs.c and libregexp.c, except that -O0 or -Os turns
+# the pragmas off (third_party/quickjs/README.md).
 set(PSP_BROWSER_QUICKJS_OPT_FLAGS "" CACHE STRING
     "Extra compile options for the vendored QuickJS objects only")
 if(PSP_BROWSER_QUICKJS_OPT_FLAGS)
@@ -1001,7 +1042,10 @@ endif()
 # src/image_decode.c decodes a JPEG that is shown smaller than its source by
 # storing each IDCT block box-averaged by 2, 4 or 8, so the full-resolution
 # component planes never exist (stbi__jpeg.tilefinch_scale_shift; zero, the
-# default for every other stb caller, is the unchanged upstream path).
+# default for every other stb caller, is the unchanged upstream path). A
+# progressive stream at a reduced scale keeps only each block's
+# low-frequency coefficients and a map of its nonzero ones, and every
+# progressive coefficient starts at zero.
 execute_process(
     COMMAND "${CMAKE_COMMAND}"
         -DPATCH_SOURCE_DIR=${stb_SOURCE_DIR}
@@ -1078,47 +1122,20 @@ set(nanosvg_patches
     "${PSP_BROWSER_NANOSVG_COVERAGE_PATCH}"
     "${PSP_BROWSER_NANOSVG_NUMBER_PATCH}" "${PSP_BROWSER_NANOSVG_ROWS_PATCH}"
     "${PSP_BROWSER_NANOSVG_STYLE_PATCH}")
-# The NanoSVG patches form a chain: a later one may rewrite lines an earlier
-# one added (the row-bounds patch rewrites the bounded-fixed-edges limit), so
-# once it is in, the earlier patch no longer reverses cleanly on its own.
-# Find the last patch already in the source (one that reverses cleanly;
-# --forward keeps patch from offering to apply an unapplied one instead) and
-# apply only the ones after it.
-list(LENGTH nanosvg_patches nanosvg_patch_count)
-set(nanosvg_patch_index ${nanosvg_patch_count})
-set(nanosvg_patches_applied 0)
-while(nanosvg_patch_index GREATER 0)
-    math(EXPR nanosvg_patch_index "${nanosvg_patch_index} - 1")
-    list(GET nanosvg_patches ${nanosvg_patch_index} nanosvg_patch)
-    execute_process(
-        COMMAND "${PATCH_EXECUTABLE}" --forward --dry-run --silent -R -p1
-            -i "${nanosvg_patch}"
-        WORKING_DIRECTORY "${nanosvg_SOURCE_DIR}"
-        RESULT_VARIABLE nanosvg_patch_reverse_result
-        OUTPUT_QUIET
-        ERROR_QUIET)
-    if(nanosvg_patch_reverse_result EQUAL 0)
-        math(EXPR nanosvg_patches_applied "${nanosvg_patch_index} + 1")
-        break()
-    endif()
-endwhile()
-if(nanosvg_patches_applied EQUAL nanosvg_patch_count)
-    set(nanosvg_patches "")
-elseif(nanosvg_patches_applied GREATER 0)
-    list(SUBLIST nanosvg_patches ${nanosvg_patches_applied} -1 nanosvg_patches)
+# The NanoSVG patches form a chain (the row-bounds patch rewrites the
+# bounded-fixed-edges limit), so they go to cmake/apply_patch.cmake as one
+# ordered list: an earlier patch the tree has no record of is checked with
+# the later ones that rewrote it taken off.
+execute_process(
+    COMMAND "${CMAKE_COMMAND}"
+        "-DPATCH_SOURCE_DIR=${nanosvg_SOURCE_DIR}"
+        "-DPATCH_FILE=${nanosvg_patches}"
+        "-DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}"
+        -P "${PSP_BROWSER_APPLY_PATCH_SCRIPT}"
+    RESULT_VARIABLE nanosvg_patch_result)
+if(NOT nanosvg_patch_result EQUAL 0)
+    message(FATAL_ERROR "Could not prepare the NanoSVG source")
 endif()
-foreach(nanosvg_patch IN LISTS nanosvg_patches)
-    execute_process(
-        COMMAND "${CMAKE_COMMAND}"
-            -DPATCH_SOURCE_DIR=${nanosvg_SOURCE_DIR}
-            -DPATCH_FILE=${nanosvg_patch}
-            -DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}
-            -P ${PSP_BROWSER_APPLY_PATCH_SCRIPT}
-        RESULT_VARIABLE nanosvg_patch_result)
-    if(NOT nanosvg_patch_result EQUAL 0)
-        message(FATAL_ERROR "Could not prepare the NanoSVG source")
-    endif()
-endforeach()
 
 # Decode-only WebP support.  Sites increasingly sign the requested WebP
 # transform into their CDN URLs, so content negotiation or URL rewriting

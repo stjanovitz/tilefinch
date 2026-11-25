@@ -10,11 +10,37 @@ typedef struct {
     size_t body_length;
 } YoutubeReplayRecord;
 
+/* A typed image must prove its security-header snapshot was not truncated. */
+static bool youtube_write_image_replay_meta(FILE *meta, const YoutubeReplayRecord *r, unsigned delay)
+{
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (size_t i = 0; i < r->body_length; i++)
+        hash = (hash ^ (unsigned char)r->body[i]) * UINT64_C(1099511628211);
+    return fprintf(meta,
+        "psp-http-trace=10\ncookie-values=redacted\nmethod=GET\nurl=%s\nlogical-request-url=%s\n"
+        "success=1\nasync-delay-pumps=%u\nexternal-cancel=0\ntransport-timeout=0\nredirect-origin-tainted=0\nerror=\n"
+        "request-body-length=0\nrequest-body-hash=cbf29ce484222325\nrequest-content-type=\n"
+        "request-cookie-bytes=0\nrequest-has-cf-clearance=0\nrequest-extra-header-bytes=0\nrequest-extra-header-shape=\n"
+        "request-allow-http-errors=0\nrequest-enforce-cors=0\nrequest-redirect-same-origin-only=0\n"
+        "request-cors-cached-response-validated=0\nrequest-if-none-match=\nrequest-if-modified-since=\n"
+        "request-referer=\nrequest-origin=\nrequest-accept=\nrequest-sec-fetch-dest=\nrequest-sec-fetch-mode=\nrequest-sec-fetch-site=\n"
+        "request-send-client-hints=0\nrequest-client-hint-tokens=\nrequest-client-hint-origin=\nrequest-send-low-client-hints=1\n"
+        "request-sec-fetch-user=0\nrequest-upgrade-insecure=0\nrequest-user-agent=Tilefinch fixture\nrequest-diagnostic-mobile-safari=0\n"
+        "request-credentials=0\nrequest-credential-origin=\nrequest-initiator-url=\nrequest-referrer-source=\nrequest-referrer-policy=\n"
+        "status=200\nlength=%zu\nresponse-body-hash=%016llx\neffective-url=%s\ncontent-type=%s\n"
+        "etag=\nlast-modified=\ncf-mitigated=\naccept-ch=\ncritical-ch=\nserver=fixture-youtube\ncf-ray=\n"
+        "response-referrer-policy-metadata-valid=1\nresponse-referrer-policy-present=0\nresponse-referrer-policy=\n"
+        "response-security-headers-truncated=0\nresponse-header-count=1\nset-cookie-count=0\nresponse-header-0=content-type: %s\n",
+        r->url, r->url, delay, r->body_length, (unsigned long long)hash,
+        r->url, r->content_type, r->content_type) > 0;
+}
+
 /* A response-keyed replay of the given records, written to a fresh
    directory: requests are answered by method and URL, and a request with no
    record fails closed, so a test can count the requests a journey makes. */
-static bool write_youtube_records_replay(
-    char directory[128], const YoutubeReplayRecord *records, size_t count)
+static bool write_youtube_records_replay_delayed(
+    char directory[128], const YoutubeReplayRecord *records, size_t count,
+    const unsigned *delays, const unsigned *statuses)
 {
     snprintf(directory, 128, "/tmp/tilefinch-youtube-records-XXXXXX");
     if (mkdtemp(directory) == NULL) return false;
@@ -29,16 +55,23 @@ static bool write_youtube_records_replay(
         if (body != NULL && fclose(body) != 0) ok = false;
         snprintf(path, sizeof(path), "%s/%04zu.meta", directory, i);
         FILE *meta = ok ? fopen(path, "wb") : NULL;
-        ok = meta != NULL && fprintf(
+        unsigned delay = delays == NULL ? 0u : delays[i];
+        if (meta != NULL && delays != NULL && !strncmp(records[i].content_type, "image/", 6u)) {
+            ok = youtube_write_image_replay_meta(meta, &records[i], delay);
+        } else {
+            bool timeout = statuses && statuses[i] == UINT_MAX;
+            ok = meta != NULL && fprintf(
             meta,
             "psp-http-trace=1\nmethod=%s\nurl=%s\n"
-            "success=1\nasync-delay-pumps=0\nexternal-cancel=0\n"
-            "transport-timeout=0\nerror=\nstatus=200\nlength=%zu\n"
+            "success=%u\nasync-delay-pumps=%u\nexternal-cancel=0\n"
+            "transport-timeout=%u\nredirect-origin-tainted=0\nerror=%s\nstatus=%u\nlength=%zu\n"
             "effective-url=%s\ncontent-type=%s\netag=\nlast-modified=\n"
             "cf-mitigated=\naccept-ch=\ncritical-ch=\n"
             "server=fixture-youtube\ncf-ray=\nset-cookie-count=0\n",
-            records[i].method, records[i].url, records[i].body_length,
+            records[i].method, records[i].url, !timeout, delay, timeout, timeout ? "timed out" : "",
+            timeout ? 0u : statuses == NULL || statuses[i] == 0u ? 200u : statuses[i], records[i].body_length,
             records[i].url, records[i].content_type) > 0;
+        }
         if (meta != NULL && fclose(meta) != 0) ok = false;
     }
     char path[256];
@@ -49,6 +82,12 @@ static bool write_youtube_records_replay(
                "capture-complete=yes\nrecord-count=%zu\n", count) > 0;
     if (trace != NULL && fclose(trace) != 0) ok = false;
     return ok;
+}
+
+static bool write_youtube_records_replay(
+    char directory[128], const YoutubeReplayRecord *records, size_t count)
+{
+    return write_youtube_records_replay_delayed(directory, records, count, NULL, NULL);
 }
 
 static void remove_youtube_records_replay(const char *directory,
@@ -102,11 +141,15 @@ static YoutubeResolveJobStatus youtube_costs_resolve(
     return status;
 }
 
-/* YT-01: the provider caches the API identity it read from the watch page;
-   pressing play must start from it on any system language. The resolver
-   rewrites PREF to hl=en first, and a whole-jar fingerprint made the cache
-   miss on every non-English system, so each play ran the three-client
-   direct ladder instead of one enriched request. */
+static bool youtube_costs_cancel_before_parse(void *opaque)
+{
+    YoutubeResolveJobMetrics state;
+    return youtube_resolve_job_metrics(*(YoutubeResolveJob **)opaque, &state)
+        && strcmp(state.phase, "enriched-parse") == 0;
+}
+
+/* The provider caches the API identity it read from the watch page. Pressing
+   Play must start from it even when it rewrites the language preference. */
 static int test_youtube_resolver_reuses_provider_identity(void)
 {
     char *page = NULL, *next = NULL;
@@ -151,6 +194,16 @@ static int test_youtube_resolver_reuses_provider_identity(void)
               "&tilefinch_view=comments",
               1u * MIB, 1000, &document, error, sizeof(error))
           && youtube_lite_resolver_identity_get(&session, &identity));
+    /* Cancel after admission, then retry the very same address. Hold the
+       retired owner until the new one completes: its late pump, take and
+       teardown must not consume the replacement's result. */
+    YoutubeResolveJob *retired = youtube_resolve_job_begin(&budget, &session,
+        "https://www.youtube.com/watch?v=TFTEST00001", 360, 30000, NULL, NULL);
+    YoutubeResolveJobMetrics retiring = {0};
+    CHECK(retired && youtube_resolve_job_pump(retired) == YOUTUBE_RESOLVE_JOB_PENDING
+          && youtube_resolve_job_metrics(retired, &retiring) && retiring.request_active);
+    youtube_resolve_job_cancel(retired, "user cancelled open");
+    CHECK(youtube_resolve_job_metrics(retired, &retiring) && !retiring.request_active);
     for (unsigned play = 0; play < 2; play++) {
         YoutubeResolveJob *job = youtube_resolve_job_begin(
             &budget, &session,
@@ -160,8 +213,18 @@ static int test_youtube_resolver_reuses_provider_identity(void)
         CHECK(job != NULL && youtube_resolve_job_metrics(job, &begun)
               && begun.cached_identity
               && strcmp(begun.phase, "enriched-start") == 0);
-        YoutubeResolveJobStatus status = youtube_costs_resolve(job);
+        /* A complete small player response needs one turn to enqueue and one
+           to take and use it. Never wait for extra display ticks merely to
+           notice EOF and then parse an already owned body. */
+        CHECK(youtube_resolve_job_pump_playback(job) == YOUTUBE_RESOLVE_JOB_PENDING);
+        YoutubeResolveJobStatus status = youtube_resolve_job_pump_playback(job);
         YoutubeStream stream = {0};
+        if (retired != NULL) {
+            CHECK(youtube_resolve_job_pump(retired) == YOUTUBE_RESOLVE_JOB_FAILED
+                  && !youtube_resolve_job_take(retired, &stream));
+            youtube_resolve_job_destroy(retired);
+            retired = NULL;
+        }
         CHECK(youtube_resolve_job_metrics(job, &finished));
         if (status != YOUTUBE_RESOLVE_JOB_COMPLETE)
             fprintf(stderr, "resolver: %s attempts=%u phase=%s client=%zu"
@@ -177,6 +240,52 @@ static int test_youtube_resolver_reuses_provider_identity(void)
               && stream.itag == 18 && stream.client_attempts == 1u);
         youtube_resolve_job_destroy(job);
     }
+    /* Cancellation between taking the finished response and parsing still
+       wins, even when both operations share a single owner turn. */
+    YoutubeResolveJob *cancelled = NULL;
+    cancelled = youtube_resolve_job_begin(&budget, &session,
+        "https://www.youtube.com/watch?v=TFTEST00001", 360, 30000,
+        youtube_costs_cancel_before_parse, &cancelled);
+    YoutubeStream unpublished = {0};
+    CHECK(cancelled && youtube_resolve_job_pump_playback(cancelled) == YOUTUBE_RESOLVE_JOB_PENDING
+          && youtube_resolve_job_pump_playback(cancelled) == YOUTUBE_RESOLVE_JOB_FAILED
+          && !youtube_resolve_job_take(cancelled, &unpublished));
+    youtube_resolve_job_destroy(cancelled);
+    /* A larger reply is still interruptible between chunks, including the
+       final partial chunk. The next turn may take metadata and parse. */
+    fetch_trace_end();
+    char bulk_directory[128];
+    const size_t prefix = 72u * 1024u;
+    char *bulk = malloc(prefix + sizeof(youtube_costs_player_response));
+    CHECK(bulk != NULL);
+    memset(bulk, ' ', prefix);
+    memcpy(bulk + prefix, youtube_costs_player_response,
+           sizeof(youtube_costs_player_response));
+    YoutubeReplayRecord large = records[2];
+    large.body = bulk;
+    large.body_length = prefix + sizeof(youtube_costs_player_response) - 1u;
+    CHECK(write_youtube_records_replay(bulk_directory, &large, 1)
+          && fetch_trace_replay_begin_response_keyed(bulk_directory, error, sizeof(error)));
+    YoutubeResolveJob *streamed = youtube_resolve_job_begin(&budget, &session,
+        "https://www.youtube.com/watch?v=TFTEST00001", 360, 30000, NULL, NULL);
+    CHECK(streamed != NULL);
+    size_t chunks = 0;
+    YoutubeResolveJobStatus status = YOUTUBE_RESOLVE_JOB_PENDING;
+    for (size_t turn = 0; turn < 32 && status == YOUTUBE_RESOLVE_JOB_PENDING; turn++) {
+        YoutubeResolveJobMetrics step;
+        status = youtube_resolve_job_pump_playback(streamed);
+        CHECK(youtube_resolve_job_metrics(streamed, &step));
+        if (step.request_chunks != chunks) {
+            CHECK(step.request_chunks == chunks + 1 && status == YOUTUBE_RESOLVE_JOB_PENDING);
+            chunks++;
+        }
+    }
+    CHECK(chunks > 1 && status == YOUTUBE_RESOLVE_JOB_COMPLETE
+          && youtube_resolve_job_take(streamed, &unpublished) && unpublished.itag == 18);
+    youtube_resolve_job_destroy(streamed);
+    fetch_trace_end();
+    remove_youtube_records_replay(bulk_directory, 1);
+    free(bulk);
     /* Cookies the identity does not depend on keep it; a new visitor
        drops it. */
     CHECK(browser_session_cookie_set(
@@ -191,7 +300,6 @@ static int test_youtube_resolver_reuses_provider_identity(void)
               "VISITOR_INFO1_LIVE=fixture-new-visitor; Domain=.youtube.com;"
               " Path=/; Secure")
           && !youtube_lite_resolver_identity_get(&session, &identity));
-    fetch_trace_end();
     tilefinch_platform_set_services(NULL);
     youtube_lite_document_destroy(&document);
     browser_session_destroy(&session);

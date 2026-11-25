@@ -1,0 +1,148 @@
+Compile rarely run built-in regions for size in the optimizing PSP build.
+
+diff --git a/quickjs.c b/quickjs.c
+index 026fe672f..11202f8a2 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -77,6 +77,33 @@
+ #define CONFIG_STACK_CHECK
+ #endif
+ 
++/* Tilefinch: in the PSP build, which compiles the engine at -O2, regions
++   of rarely run built-ins compile for size:
++   - Iterator: the constructor, Iterator.concat and Iterator.from, the
++     wrapper and helper objects, the prototype methods (map, filter,
++     take, drop, flatMap, reduce, toArray, forEach, some, every, find)
++     and Iterator.prototype's [Symbol.iterator] and toStringTag;
++   - the URI functions, escape and unescape, and Date (the constructor,
++     methods, parsing, formatting and JS_NewDate);
++   - BigInt: the constructor, toString, valueOf, asIntN and asUintN;
++   - Atomics, WeakRef and FinalizationRegistry.
++   Everything else keeps the build's flags: the interpreter, the parser,
++   the other built-ins (Proxy and Reflect among them: frameworks run them
++   on every reactive read and write), the weak-target calls the DOM
++   bindings make, and the JS_AddIntrinsic* functions, which run for every
++   new context (frames, workers). The regions apply only to an optimizing
++   PSP compile that is not already -Os, so a -O0 build stays unoptimized;
++   other compilers, Clang host builds among them, keep their flags
++   throughout. */
++#if defined(__PSP__) && defined(__OPTIMIZE__) && !defined(__OPTIMIZE_SIZE__)
++#define TILEFINCH_SIZE_REGION_BEGIN \
++    _Pragma("GCC push_options") _Pragma("GCC optimize(\"Os\")")
++#define TILEFINCH_SIZE_REGION_END _Pragma("GCC pop_options")
++#else
++#define TILEFINCH_SIZE_REGION_BEGIN
++#define TILEFINCH_SIZE_REGION_END
++#endif
++
+ 
+ /* dump object free */
+ //#define DUMP_FREE
+@@ -55179,6 +55206,8 @@ static JSValue js_array_iterator_next(JSContext *ctx, JSValueConst this_val,
+     }
+ }
+ 
++TILEFINCH_SIZE_REGION_BEGIN
++
+ /* Iterator Wrap */
+ 
+ typedef struct JSIteratorWrapData {
+@@ -56303,6 +56332,8 @@ static const JSCFunctionListEntry js_array_iterator_proto_funcs[] = {
+     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "Array Iterator", JS_PROP_CONFIGURABLE ),
+ };
+ 
++TILEFINCH_SIZE_REGION_END
++
+ /* Number */
+ 
+ static JSValue js_number_constructor(JSContext *ctx, JSValueConst new_target,
+@@ -66445,6 +66476,8 @@ int JS_AddIntrinsicPromise(JSContext *ctx)
+                               JS_PROP_CONFIGURABLE, JS_PROP_CONFIGURABLE);
+ }
+ 
++TILEFINCH_SIZE_REGION_BEGIN
++
+ /* URI handling */
+ 
+ static int string_get_hex(JSString *p, int k, int n) {
+@@ -67885,6 +67918,8 @@ JSValue JS_NewDate(JSContext *ctx, double epoch_ms)
+     return obj;
+ }
+ 
++TILEFINCH_SIZE_REGION_END
++
+ int JS_AddIntrinsicDate(JSContext *ctx)
+ {
+     JSValue obj;
+@@ -67910,6 +67945,8 @@ int JS_AddIntrinsicEval(JSContext *ctx)
+     return 0;
+ }
+ 
++TILEFINCH_SIZE_REGION_BEGIN
++
+ /* BigInt */
+ 
+ static JSValue JS_ToBigIntCtorFree(JSContext *ctx, JSValue val)
+@@ -68091,6 +68128,8 @@ static const JSCFunctionListEntry js_bigint_proto_funcs[] = {
+     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "BigInt", JS_PROP_CONFIGURABLE ),
+ };
+ 
++TILEFINCH_SIZE_REGION_END
++
+ static int JS_AddIntrinsicBigInt(JSContext *ctx)
+ {
+     JSValue obj1;
+@@ -72253,6 +72292,8 @@ static const JSCFunctionListEntry js_dataview_proto_funcs[] = {
+ /* Atomics */
+ #ifdef CONFIG_ATOMICS
+ 
++TILEFINCH_SIZE_REGION_BEGIN
++
+ typedef enum AtomicsOpEnum {
+     ATOMICS_OP_ADD,
+     ATOMICS_OP_AND,
+@@ -72765,6 +72806,8 @@ static const JSCFunctionListEntry js_atomics_obj[] = {
+     JS_OBJECT_DEF("Atomics", js_atomics_funcs, countof(js_atomics_funcs), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE ),
+ };
+ 
++TILEFINCH_SIZE_REGION_END
++
+ static int JS_AddIntrinsicAtomics(JSContext *ctx)
+ {
+     /* add Atomics as autoinit object */
+@@ -72875,6 +72918,8 @@ int JS_AddIntrinsicTypedArrays(JSContext *ctx)
+     return 0;
+ }
+ 
++TILEFINCH_SIZE_REGION_BEGIN
++
+ /* WeakRef */
+ 
+ typedef struct JSWeakRefData {
+@@ -72944,6 +72989,8 @@ static JSValue js_weakref_deref(JSContext *ctx, JSValueConst this_val, int argc,
+         return JS_UNDEFINED;
+ }
+ 
++TILEFINCH_SIZE_REGION_END
++
+ /* Tilefinch: a weak reference the host stores itself (the DOM handle
+    table), without a WeakRef object and its record per target. It does
+    not keep the object alive; once the object dies its structure stays
+@@ -73007,6 +73054,8 @@ int JS_WeakTargetCarriesState(JSRuntime *rt, JSValueConst target,
+     return FALSE;
+ }
+ 
++TILEFINCH_SIZE_REGION_BEGIN
++
+ static const JSCFunctionListEntry js_weakref_proto_funcs[] = {
+     JS_CFUNC_DEF("deref", 0, js_weakref_deref ),
+     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "WeakRef", JS_PROP_CONFIGURABLE ),
+@@ -73205,6 +73254,8 @@ static const JSClassShortDef js_finrec_class_def[] = {
+     { JS_ATOM_FinalizationRegistry, js_finrec_finalizer, js_finrec_mark }, /* JS_CLASS_FINALIZATION_REGISTRY */
+ };
+ 
++TILEFINCH_SIZE_REGION_END
++
+ int JS_AddIntrinsicWeakRef(JSContext *ctx)
+ {
+     JSRuntime *rt = ctx->rt;

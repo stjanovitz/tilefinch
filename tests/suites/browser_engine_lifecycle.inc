@@ -487,7 +487,7 @@ static int test_engine_lifecycle(void)
         CHECK(rgba != NULL);
         BrowserSharedBody *pixels = browser_shared_body_take(owner, rgba, 128u * 64u * 4u);
         CHECK(pixels != NULL && browser_session_decoded_image_put(session, url,
-            &context, cached->data, cached->length, pixels, 128, 64, 128, 64));
+            &context, cached->data, cached->length, pixels, 128, 64, 128, 64, false));
         size_t limit = owner->limit;
         owner->limit = owner->current + 64u;
         void *allocation = budget_malloc(owner, 16384u);
@@ -2537,6 +2537,137 @@ static int computed_style_container_geometry_case(bool inline_units)
     return 0;
 }
 
+/* Puts `css` in the engine's HTTP cache as the stylesheet `url` of
+   `document_url`. */
+static bool engine_put_stylesheet(BrowserEngine *engine,
+                                  const char *document_url, const char *url,
+                                  const char *css, size_t length)
+{
+    BrowserSession *session = browser_engine_session(engine);
+    unsigned char *copy = budget_malloc(browser_engine_budget(engine), length);
+    if (copy == NULL) return false;
+    memcpy(copy, css, length);
+    BrowserSharedBody *body = browser_shared_body_take(
+        browser_engine_budget(engine), copy, length);
+    if (body == NULL) {
+        budget_free(browser_engine_budget(engine), copy);
+        return false;
+    }
+    TilefinchRequestContext context = {
+        .target_url = url, .initiator_url = document_url,
+        .top_level_url = document_url, .method = "GET",
+        .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .destination = TILEFINCH_DESTINATION_STYLE
+    };
+    TilefinchResourceGrant grant = {
+        .destination = TILEFINCH_DESTINATION_STYLE,
+        .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .final_same_origin = true, .cors_validated = true
+    };
+    bool stored = browser_session_cache_put_http_shared_resource(
+            session, url, body, NULL, NULL, "text/css", "immutable", NULL,
+            0, &context, &grant)
+        && browser_session_cache_set_resource_response_provenance(
+            session, url, &context, url, "");
+    browser_shared_body_release(body);
+    return stored;
+}
+
+/* A stylesheet a script adds when memory is short applies whether or not
+   the page's layout reuse cache holds resolved styles at that moment: the
+   cache gives its memory back before the sheet is refused. Before, the
+   sheet applied when earlier restyles had happened to empty the cache
+   (the first case) and was cut to a prefix when the cache was full. */
+static int test_stylesheet_admission_takes_reuse_memory(void)
+{
+    static const char url[] = "https://late-sheet.test/";
+    static char css[24576];
+    size_t css_length = 0;
+    for (unsigned i = 0; i < 600; i++)
+        css_length += (size_t) snprintf(css + css_length,
+            sizeof(css) - css_length, ".r%u{margin-left:%upx}", i, i % 7u);
+    css_length += (size_t) snprintf(css + css_length,
+        sizeof(css) - css_length, ".card{color:#0a0b0c}");
+    CHECK(css_length < sizeof(css) - 1u);
+    static char page[65536];
+    size_t length = (size_t) snprintf(page, sizeof(page),
+        "<!doctype html><style>.card{height:14px}</style><main>");
+    for (unsigned i = 0; i < 900; i++)
+        length += (size_t) snprintf(page + length, sizeof(page) - length,
+            "<div class=card style='padding-left:%upx'>Card %u</div>",
+            i, i);
+    length += (size_t) snprintf(page + length, sizeof(page) - length,
+        "</main>");
+    CHECK(length < sizeof(page) - 1u);
+    for (unsigned full = 0; full < 2; full++) {
+        BrowserDeviceProfile profile;
+        browser_device_profile_psp3000(&profile);
+        BrowserConfig config;
+        browser_config_init(&config, &profile);
+        config.javascript.enabled = true;
+        config.resources.enabled = true;
+        config.resources.web_fonts_enabled = false;
+        char error[256] = {0};
+        BrowserEngine *engine = browser_engine_create(&config, error,
+                                                      sizeof(error));
+        CHECK(engine != NULL && engine_put_stylesheet(engine, url,
+            "https://late-sheet.test/late.css", css, css_length));
+        CHECK(browser_engine_commit_html(engine, url, page, length, true));
+        NavigationSession *nav = browser_engine_navigation(engine);
+        CHECK(nav->page.layout_reuse != NULL);
+        LayoutReuseStats stats = {0};
+        layout_reuse_cache_stats(nav->page.layout_reuse, &stats);
+        /* Room for the sheet and the layout reserve, short by the run
+           measurements (which were always released) and half the rest of
+           the cache. */
+        size_t held = stats.retained_bytes - stats.text_measure_bytes;
+        CHECK(held > 64u * 1024u);
+        size_t need = stylesheet_source_cost_estimate(css, css_length)
+            + 2u * MIB;
+        size_t short_by = stats.text_measure_bytes + held / 2u;
+        size_t remaining = budget_remaining(nav->budget);
+        CHECK(remaining > need);
+        size_t pressure_bytes = remaining - need + short_by;
+        if (!full) {
+            layout_reuse_cache_destroy(nav->page.layout_reuse);
+            nav->page.layout_reuse = NULL;
+        }
+        void *pressure = budget_malloc(nav->budget, pressure_bytes);
+        CHECK(pressure != NULL);
+        size_t skipped = nav->page.external_stylesheets.skipped_pressure;
+        size_t truncated = nav->page.external_stylesheets.truncated;
+        ScriptResult result = {0};
+        CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+            "(()=>{const link=document.createElement('link');"
+            "link.rel='stylesheet';link.href='/late.css';"
+            "document.head.appendChild(link)})()",
+            "<late-sheet>", &result));
+        for (unsigned i = 0; i < 8; i++)
+            CHECK(navigation_advance_runtime(nav, 16, 8));
+        CHECK(navigation_relayout(nav));
+        CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+            "pocSummary=getComputedStyle(document.querySelector('.card'))"
+            ".color", "<late-sheet-result>", &result));
+        bool applied = strcmp(result.summary, "rgb(10, 11, 12)") == 0
+            && nav->page.external_stylesheets.skipped_pressure == skipped
+            && nav->page.external_stylesheets.truncated == truncated;
+        if (!applied)
+            fprintf(stderr, "late sheet (%s cache): %s skipped=%zu "
+                    "truncated=%zu held=%zu measures=%zu\n",
+                    full ? "full" : "empty", result.summary,
+                    nav->page.external_stylesheets.skipped_pressure - skipped,
+                    nav->page.external_stylesheets.truncated - truncated,
+                    held, stats.text_measure_bytes);
+        CHECK(applied);
+        budget_free(nav->budget, pressure);
+        CHECK(browser_engine_shutdown(engine));
+        browser_engine_destroy(engine);
+    }
+    return 0;
+}
+
 static int test_opacity_geometry_snapshot_reuse(void)
 {
     {
@@ -2775,6 +2906,311 @@ static int test_inert_attribute_geometry_snapshot_reuse(void)
         browser_engine_destroy(engine);
     }
     return 0;
+}
+
+/* jQuery measures an element without a box by writing position, visibility
+   and display inline, reading its size and writing the old values back
+   (jQuery.swap), element after element, and carousels toggle classes on
+   their items between such reads. Under a display:none ancestor none of
+   those writes can give anything a box: one build for the loop, not one
+   per read. A :has() that sees the class keeps the rebuild, and so does an
+   element that is hidden only by its own style (the swap shows it). */
+static int test_hidden_subtree_geometry_snapshot_reuse(void)
+{
+    static const char *const rules[] = {
+        ".pop{display:none}",
+        ".pop{display:none}.box:has(.on){height:5px}",
+        "#item{display:none}",
+    };
+    for (unsigned mode = 0; mode < 3; mode++) {
+        BrowserDeviceProfile profile;
+        browser_device_profile_psp3000(&profile);
+        BrowserConfig config;
+        browser_config_init(&config, &profile);
+        config.javascript.enabled = true;
+        config.resources.enabled = false;
+        char page[512], script[1024], error[256] = {0};
+        int length = snprintf(page, sizeof(page),
+            "<!doctype html><style>body{margin:0}#card{width:100px;height:32px}"
+            ".item{width:60px;height:10px}%s</style><div id=card></div>"
+            "<div class=box><div class=pop><div id=item class=item>x</div>"
+            "</div></div>", rules[mode]);
+        CHECK(length > 0 && (size_t) length < sizeof(page));
+        BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+        CHECK(engine != NULL && browser_engine_commit_html(engine,
+            "https://geometry-reuse.test/", page, (size_t) length, true));
+        NavigationSession *nav = browser_engine_navigation(engine);
+        int script_length = snprintf(script, sizeof(script),
+            "(()=>{const M=%u,n=document.getElementById('item'),"
+            "c=document.getElementById('card'),s=n.style,w=c.offsetWidth;"
+            "for(let i=0;i<20;i++){const o=[s.position,s.visibility,s.display];"
+            "s.position='absolute';s.visibility='hidden';s.display='block';"
+            "const a=n.offsetWidth;"
+            "s.position=o[0];s.visibility=o[1];s.display=o[2];"
+            "n.className=i%%2?'item on':'item';const b=n.offsetWidth;"
+            "if(a!==60||b!==(M===2?0:60))throw Error('item '+i+':'+a+','+b);"
+            "if(c.offsetWidth!==w)throw Error('card '+i)}"
+            "globalThis.pocSummary=String(w)})()", mode);
+        CHECK(script_length > 0 && (size_t) script_length < sizeof(script));
+        ScriptResult result = {0};
+        CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime, script,
+            "<hidden-geometry>", &result) && result.success);
+        CHECK(strcmp(result.summary, "100") == 0);
+        CHECK(mode == 0 ? result.geometry_snapshot_builds == 1
+                && result.geometry_snapshot_hits >= 60
+            : result.geometry_snapshot_builds >= 20);
+        LayoutDocument declined = {0};
+        if (mode == 0) CHECK(!script_runtime_take_geometry_layout(
+            nav->page.runtime, &nav->viewport, &declined));
+        CHECK(script_runtime_has_pending_mutations(nav->page.runtime));
+        /* A box change in the same turn as a kept write is still seen, and
+           so is the hidden ancestor becoming visible. */
+        CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+            "(()=>{const n=document.getElementById('item'),"
+            "c=document.getElementById('card');"
+            "n.style.display='block';c.style.width='130px';"
+            "if(c.offsetWidth!==130)throw Error('lost invalidation');"
+            "n.className='item';n.parentNode.style.display='block';"
+            "if(n.offsetWidth!==60)throw Error('stale hidden')})()",
+            "<hidden-mixed-change>", &result) && result.success);
+        CHECK(result.geometry_snapshot_builds >= 2);
+        CHECK(navigation_relayout(nav));
+        CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+            "(()=>{if(document.getElementById('card').offsetWidth!==130"
+            "||document.getElementById('item').offsetWidth!==60)"
+            "throw Error('published')})()",
+            "<hidden-published>", &result) && result.success);
+        browser_engine_destroy(engine);
+    }
+    return 0;
+}
+
+/* A forced geometry read after writes that cannot have moved a box reads
+   the layout it has (geometry read proofs, docs/STYLE_INVALIDATION.md):
+   class tokens no rule names, inline values equal to the cascade's, and
+   content inserted and removed again before any read. Every guard keeps
+   the build: an element shown by the swap, a selector or attr() that
+   reads the written attribute from elsewhere, counters, list markers,
+   :has(), more changed styles than the proof can hold, and a journal that
+   stopped recording. Each case also checks the values read. */
+/* `value` alternates between two different values, one per parity of
+   the iteration `i`. */
+#define GEOMETRY_PROOF_FLIP(value) \
+    "const v=" value ",k='v'+i%2;" \
+    "if(k in globalThis?globalThis[k]!==v:(globalThis[k]=v,false))" \
+    "throw Error('value '+i+':'+v);" \
+    "if(i===1&&globalThis.v0===v)throw Error('unchanged')"
+
+typedef struct {
+    const char *rules;
+    const char *body;
+    /* One iteration `i` (writes and reads, throwing on a wrong value);
+       `n` is #item, `s` its style, `c` #card, `b` .box, `t` #sib, `w`
+       the card's starting width. */
+    const char *step;
+    unsigned iterations;
+    bool holds;
+} GeometryProofCase;
+
+static int geometry_proof_case_builds(const GeometryProofCase *test,
+                                      size_t *builds)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.javascript.enabled = true;
+    config.resources.enabled = false;
+    char page[8192], script[2048], error[256] = {0};
+    /* Pages of fewer than 256 nodes keep no reuse cache. */
+    char filler[2400];
+    size_t at = 0;
+    for (unsigned i = 0; i < 300; i++) at += (size_t) snprintf(
+        filler + at, sizeof(filler) - at, "<i></i>");
+    int length = snprintf(page, sizeof(page),
+        "<!doctype html><style>body{margin:0}#card{width:100px;height:32px}"
+        ".item{width:60px;height:10px}.sib{display:inline-block}"
+        ".fill{display:none}%s</style>"
+        "<div id=card></div><div class=box><div class=pop>"
+        "<div id=item class=item>x</div><span id=sib class=sib>y</span>"
+        "</div></div>%s<div class=fill>%s</div>", test->rules, test->body,
+        filler);
+    CHECK(length > 0 && (size_t) length < sizeof(page));
+    BrowserEngine *engine = browser_engine_create(&config, error,
+                                                  sizeof(error));
+    CHECK(engine != NULL && browser_engine_commit_html(engine,
+        "https://geometry-proof.test/", page, (size_t) length, true));
+    NavigationSession *nav = browser_engine_navigation(engine);
+    /* A relayout gives the page its reuse cache, as a load does. */
+    CHECK(navigation_relayout(nav) && nav->page.layout_reuse != NULL);
+    int script_length = snprintf(script, sizeof(script),
+        "(()=>{const n=document.getElementById('item'),s=n.style,"
+        "c=document.getElementById('card'),t=document.getElementById('sib'),"
+        "b=document.querySelector('.box'),w=c.offsetWidth;"
+        "for(let i=0;i<%u;i++){%s;"
+        "if(c.offsetWidth!==w)throw Error('card '+i)}"
+        "globalThis.pocSummary=String(w)})()", test->iterations, test->step);
+    CHECK(script_length > 0 && (size_t) script_length < sizeof(script));
+    ScriptResult result = {0};
+    bool ran = script_runtime_evaluate_diagnostic(nav->page.runtime, script,
+        "<geometry-proof>", &result) && result.success;
+    if (!ran) fprintf(stderr, "geometry proof case %s failed: %s\n",
+                      test->rules, result.error);
+    CHECK(ran && strcmp(result.summary, "100") == 0);
+    *builds = result.geometry_snapshot_builds;
+    /* What the reads saw is what the page publishes. */
+    CHECK(navigation_relayout(nav));
+    CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+        "(()=>{if(document.getElementById('card').offsetWidth!==100)"
+        "throw Error('published')})()", "<geometry-proof-published>",
+        &result) && result.success);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* An image that arrives after the layout a read would keep, with only a
+   style-identical write pending: the read lays it out. */
+static int test_geometry_proof_image_arrival(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.javascript.enabled = true;
+    config.resources.enabled = false;
+    static char page[4096];
+    size_t at = (size_t) snprintf(page, sizeof(page),
+        "<!doctype html><style>body{margin:0}.fill{display:none}</style>"
+        "<div id=item>x</div><img id=im src='https://image.test/a.png'>"
+        "<div class=fill>");
+    for (unsigned i = 0; i < 300; i++)
+        at += (size_t) snprintf(page + at, sizeof(page) - at, "<i></i>");
+    at += (size_t) snprintf(page + at, sizeof(page) - at, "</div>");
+    CHECK(at < sizeof(page));
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error,
+                                                  sizeof(error));
+    CHECK(engine != NULL && browser_engine_commit_html(engine,
+        "https://geometry-image.test/", page, at, true));
+    NavigationSession *nav = browser_engine_navigation(engine);
+    CHECK(navigation_relayout(nav) && nav->page.layout_reuse != NULL);
+    lxb_dom_node_t *image = test_reader_find_id(
+        lxb_dom_interface_node(nav->page.document.html), "im");
+    CHECK(image != NULL && nav->page.images.count == 0
+          && images_reserve_capacity(&nav->page.images, nav->budget, 1));
+    unsigned char *rgba = budget_malloc(nav->budget, 40u * 30u * 4u);
+    CHECK(rgba != NULL);
+    memset(rgba, 255, 40u * 30u * 4u);
+    nav->page.images.items[0] = (ImageResource) {
+        .node = image, .pixels = rgba, .width = 40, .height = 30,
+        .source_width = 40, .source_height = 30, .owns_pixels = true};
+    nav->page.images.count = 1;
+    ScriptResult result = {0};
+    bool ran = script_runtime_evaluate_diagnostic(nav->page.runtime,
+        "(()=>{document.getElementById('item').className='on';"
+        "const w=document.getElementById('im').offsetWidth;"
+        "if(w!==40)throw Error('image '+w)})()",
+        "<geometry-proof-image>", &result) && result.success;
+    if (!ran) fprintf(stderr, "geometry proof image: %s\n", result.error);
+    CHECK(ran);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+static int test_geometry_read_proofs(void)
+{
+    static const GeometryProofCase cases[] = {
+        /* A class token no selector names, on a rendered element. */
+        {"", "", "n.className=i%2?'item on':'item';"
+         "if(n.offsetWidth!==60)throw Error('item')", 20, true},
+        /* Inline values the cascade already gives it. */
+        {"", "", "s.width=i%2?'60px':'';s.height=i%2?'10px':'';"
+         "if(n.offsetWidth!==60)throw Error('item')", 20, true},
+        /* The jQuery swap under a display:none ancestor (whose elements
+           read their own size), after content inserted and removed again
+           (the write-time check declines once a record asks for a
+           conservative resource scan). */
+        {".pop{display:none}", "",
+         "const e=document.createElement('div');e.innerHTML='<b>z</b>';"
+         "c.appendChild(e);c.removeChild(e);"
+         "const o=[s.position,s.visibility,s.display];"
+         "s.position='absolute';s.visibility='hidden';s.display='block';"
+         "if(n.offsetWidth!==60)throw Error('swap');"
+         "s.position=o[0];s.visibility=o[1];s.display=o[2];"
+         "if(n.offsetWidth!==60)throw Error('hidden')", 20, true},
+        /* Hidden only by its own style: the swap shows it. */
+        {"#item{display:none}", "",
+         "const o=[s.position,s.visibility,s.display];"
+         "s.position='absolute';s.visibility='hidden';s.display='block';"
+         "if(n.offsetWidth!==60)throw Error('swap');"
+         "s.position=o[0];s.visibility=o[1];s.display=o[2];"
+         "if(n.offsetWidth!==0)throw Error('hidden')", 20, false},
+        /* A selector that reads the style attribute for a sibling. */
+        {"[style*=absolute]+.sib{width:10px}", "",
+         "s.position=i%2?'absolute':'';" GEOMETRY_PROOF_FLIP("t.offsetWidth"),
+         20, false},
+        /* attr() in a pseudo-element reads a data attribute. */
+        {"#sib::before{content:attr(data-x)}", "",
+         "t.dataset.x=i%2?'wwww':'';" GEOMETRY_PROOF_FLIP("t.offsetWidth"),
+         20, false},
+        /* A sibling combinator sees the class. */
+        {".item.on+.sib{width:10px}", "",
+         "n.className=i%2?'item on':'item';"
+         GEOMETRY_PROOF_FLIP("t.offsetWidth"), 20, false},
+        /* The class moves a counter another element prints. (Two reads:
+           a later removal of the class still reads the old count.) */
+        {".item.on{counter-increment:k 100}#sib::before{content:counter(k)}",
+         "", "n.className=i%2?'item on':'item';"
+         GEOMETRY_PROOF_FLIP("t.offsetWidth"), 2, false},
+        /* A list item stops being one: the marker inside goes. */
+        {"ol{list-style-position:inside;margin:0;padding:0}"
+         ".li.off{display:block}",
+         "<ol><li id=l class=li><span id=x class=sib>z</span></li></ol>",
+         "const l=document.getElementById('l'),"
+         "x=document.getElementById('x');l.className=i%2?'li off':'li';"
+         GEOMETRY_PROOF_FLIP("x.offsetLeft"), 20, false},
+        /* :has() sees the class. */
+        {".box:has(.on){height:5px;overflow:hidden}", "",
+         "n.className=i%2?'item on':'item';"
+         GEOMETRY_PROOF_FLIP("b.offsetHeight"), 20, false},
+        /* More changed styles than the proof holds, though all are equal. */
+        {".box.on .c{width:60px}.c{width:60px;height:1px}",
+         "<div class=box2>"
+         "<p class=c></p><p class=c></p><p class=c></p><p class=c></p>"
+         "<p class=c></p><p class=c></p><p class=c></p><p class=c></p>"
+         "<p class=c></p><p class=c></p><p class=c></p><p class=c></p>"
+         "<p class=c></p><p class=c></p><p class=c></p><p class=c></p>"
+         "<p class=c></p><p class=c></p><p class=c></p><p class=c></p>"
+         "<p class=c></p><p class=c></p><p class=c></p><p class=c></p>"
+         "<p class=c></p><p class=c></p><p class=c></p><p class=c></p>"
+         "<p class=c></p><p class=c></p><p class=c></p><p class=c></p>"
+         "<p class=c></p><p class=c></p><p class=c></p><p class=c></p>"
+         "</div>",
+         "const d=document.querySelector('.box2');"
+         "d.className=i%2?'box2 box on':'box2';"
+         "if(d.firstChild.offsetWidth!==60)throw Error('c')", 20, false},
+        /* A journal that overflowed no longer says what changed. */
+        {"", "", "for(let j=0;j<700;j++){n.setAttribute('aria-k'+j,'1');"
+         "n.removeAttribute('aria-k'+j)}"
+         "if(n.offsetWidth!==60)throw Error('item')", 6, false},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        size_t builds = 0;
+        CHECK(geometry_proof_case_builds(&cases[i], &builds) == 0);
+        bool expected = cases[i].holds ? builds <= 1
+            : builds >= cases[i].iterations - 1u;
+        if (!expected)
+            fprintf(stderr, "geometry proof case %zu: %zu builds\n", i,
+                    builds);
+        CHECK(expected);
+    }
+    /* The kill switch restores a build per read. */
+    CHECK(setenv("TILEFINCH_DISABLE_GEOMETRY_PROOF", "1", 1) == 0);
+    size_t builds = 0;
+    int failed = geometry_proof_case_builds(&cases[0], &builds);
+    unsetenv("TILEFINCH_DISABLE_GEOMETRY_PROOF");
+    CHECK(failed == 0 && builds >= cases[0].iterations - 1u);
+    return test_geometry_proof_image_arrival();
 }
 
 /* A mixed generated-content expression also reads an attribute. Keeping a
@@ -6364,9 +6800,20 @@ static int test_staged_optional_fonts_relayout_before_repaint(void)
     static const char provider_home[] =
         "<!doctype html><style>b{font-weight:700}</style>"
         "<body><b>Search videos</b><input autofocus>";
+    const char policy[] = "b{color:red}";
+    NavigationSession *nav = browser_engine_navigation(engine);
+    CHECK(nav != NULL
+          && browser_engine_set_user_css(engine, policy, sizeof(policy) - 1)
+          && nav->style_rebuild_required
+          && browser_engine_set_user_css(engine, policy, sizeof(policy) - 1)
+          && nav->style_rebuild_required);
     CHECK(browser_engine_commit_html(
               engine, "https://www.youtube.com/", provider_home,
               sizeof(provider_home) - 1u, true));
+    CHECK(!nav->style_rebuild_required
+          && browser_engine_set_user_css(engine, policy, sizeof(policy) - 1)
+          && !nav->style_rebuild_required
+          && !browser_engine_set_user_css(engine, NULL, sizeof(policy) - 1));
     for (size_t i = 0; i < 8; i++) {
         bool visual_changed = false;
         (void) browser_engine_run_idle_work(engine, &visual_changed);
@@ -6386,6 +6833,9 @@ static int test_staged_optional_fonts_relayout_before_repaint(void)
                  browser_engine_fonts(engine),
                  browser_engine_font_face_variant(
                      engine, FONT_METRIC_SANS, false, true))
+          && browser_engine_set_user_css(engine, "b{color:tan}", sizeof(policy) - 1)
+          && nav->style_rebuild_required
+          && !memcmp(nav->user_css, "b{color:tan}", sizeof(policy) - 1)
           && browser_engine_shutdown(engine));
     browser_engine_destroy(engine);
     return 0;

@@ -10,7 +10,7 @@
  * the least-significant bit upward, so device builds use BBBBBGGGGGGRRRRR.
  * Packing in the rasterizer avoids a 480x272 channel-swap pass at present.
  */
-#if defined(__PSP__)
+#if defined(__PSP__) || defined(TILEFINCH_TEST_PSP_PIXEL_ORDER)
 #define TILEFINCH_RGB565_RED_SHIFT 0u
 #define TILEFINCH_RGB565_BLUE_SHIFT 11u
 #else
@@ -25,7 +25,7 @@
                  | (((uint16_t) (blue) & 31u) \
                     << TILEFINCH_RGB565_BLUE_SHIFT)))
 
-#if defined(__PSP__)
+#if TILEFINCH_RGB565_RED_SHIFT == 0u
 _Static_assert(TILEFINCH_RGB565_PACK_CODES_CONST(31u, 0u, 0u) == 0x001fu,
                "PSP 5650 red must occupy the least-significant field");
 _Static_assert(TILEFINCH_RGB565_PACK_CODES_CONST(0u, 0u, 31u) == 0xf800u,

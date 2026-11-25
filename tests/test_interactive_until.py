@@ -146,6 +146,56 @@ class InteractiveUntilTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout)
             self.assertIn('loop-js ok=yes value="[2,1]" error=""', result.stdout)
 
+    def test_cold_apis_are_built_on_first_touch(self):
+        """EventSource, FileReader and WebGPU's interfaces start as lazy
+        placeholders; the first touch builds each, which then works."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'trace.meta').write_text(
+                'psp-http-trace-clock=1\norigin-ms=1000\ncapture-complete=yes\nrecord-count=1\n')
+            body = b'retry: 30000\nid: 7\ndata: first\ndata: second\n\n'
+            (root / '0000.body').write_bytes(body)
+            (root / '0000.meta').write_text(
+                'psp-http-trace=3\nmethod=GET\nurl=https://events.test/feed\nsuccess=1\n'
+                'request-body-length=0\nrequest-body-hash=cbf29ce484222325\n'
+                f'status=200\nlength={len(body)}\neffective-url=https://events.test/feed\n'
+                'content-type=text/event-stream\nresponse-header-count=2\nset-cookie-count=0\n'
+                'response-header-0=content-type: text/event-stream\n'
+                'response-header-1=access-control-allow-origin: *\n')
+            result = self.run_lab(
+                'until 120 16 done.length===2\njs JSON.stringify({cold,done})\nquit\n',
+                ('--replay-http-response-keyed', str(root)),
+                '''<!doctype html><script>
+                const names=['EventSource','FileReader','GPU','WGSLLanguageFeatures'];
+                globalThis.cold=names.map(n=>typeof Object.getOwnPropertyDescriptor(window,n).get);
+                globalThis.done=[];
+                const source=new EventSource('https://events.test/feed');
+                source.onmessage=e=>{done.push(['message',e.data,e.lastEventId,
+                  e instanceof MessageEvent,source.readyState]);source.close()};
+                const reader=new FileReader();
+                reader.onload=e=>done.push(['load',reader.result,e instanceof ProgressEvent,
+                  e.isTrusted,e.loaded,reader.readyState]);
+                reader.readAsText(new Blob(['caf\\u00e9']));
+                let refused=0;
+                for(const C of [GPU,WGSLLanguageFeatures])try{new C()}catch(e){
+                  if(e instanceof TypeError)refused++}
+                cold.push(refused,String(GPU.prototype[Symbol.toStringTag]),
+                  Object.getOwnPropertyDescriptor(GPU.prototype,'requestAdapter').enumerable,
+                  WGSLLanguageFeatures.prototype[Symbol.iterator]===
+                    WGSLLanguageFeatures.prototype.values,
+                  names.map(n=>typeof Object.getOwnPropertyDescriptor(window,n).value).join());
+                </script>'''.replace('\n', ' '))
+            self.assertEqual(result.returncode, 0, result.stdout)
+            probe = re.search(r'^loop-js ok=yes value="(.*)" error=""$', result.stdout,
+                              re.MULTILINE)
+            self.assertIsNotNone(probe, result.stdout)
+            value = json.loads(probe[1])
+            self.assertEqual(value['cold'], ['function'] * 4 + [
+                2, 'GPU', True, True, 'function,function,function,function'])
+            self.assertCountEqual(value['done'], [
+                ['message', 'first\nsecond', '7', True, 1],
+                ['load', 'café', True, True, 5, 2]])
+
     def test_resize_observer_uses_laid_out_sizes(self):
         self.assertEqual(self.web_result("""
           <style>#cascade {width:150px !important} #clamp{max-width:100px}</style>

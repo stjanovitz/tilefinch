@@ -66,6 +66,16 @@
    presentation reserve; the factory's first call keeps only this). */
 #define SCRIPT_ADMISSION_EXECUTION_RESERVE_BYTES (512u * 1024u)
 
+/* The heap a realm must still be able to obtain after a refused
+   allocation to keep running (navigation_judge_realm_memory,
+   docs/engineering/SCRIPT_MEMORY.md, "Exhaustion"). A script a page
+   inserts whose compile unit (the whole script, a lazy bundle's largest
+   factory, or a loader aggregate's statement) is at least
+   SCRIPT_HEAVY_UNIT_BYTES must leave this much obtainable beside that
+   compile, or it is refused before it compiles: admitted into less, a refusal anywhere in its first run stops
+   the realm. */
+#define SCRIPT_ADMISSION_MEMORY_STOP_HEADROOM_BYTES (2u * 1024u * 1024u)
+
 /* The per-script unit before memory-based admission. It still bounds work
    that is not a compile: the inline script text the parser keeps in the
    DOM, the parser stage's spent-work threshold, and the size above which a

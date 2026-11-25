@@ -3,6 +3,7 @@
 #include "tilefinch/platform.h"
 #include "tilefinch_test_faults.h"
 
+#include <float.h>
 #include <limits.h>
 #include <math.h>
 #include <stdint.h>
@@ -12,6 +13,7 @@
 static Budget *svg_budget;
 static unsigned svg_allocations;
 static bool svg_allocation_failed;
+static size_t svg_budget_shortfall;
 /* The parse stopped at this engine's nesting limits (image_svg_viewport.inc):
    a limit, like a refused allocation, not markup no decoder takes. */
 static bool svg_limit_refused;
@@ -58,6 +60,14 @@ bool image_svg_decode_busy(void)
     return svg_budget != NULL;
 }
 
+static void svg_note_allocation_failure(size_t charge)
+{
+    svg_allocation_failed = true;
+    size_t available = budget_remaining(svg_budget);
+    if (charge > available && charge - available > svg_budget_shortfall)
+        svg_budget_shortfall = charge - available;
+}
+
 /* NanoSVG parses a document in one call (a 10 KB wordmark takes 0.2 s on
    the PSP, mostly software double math) but allocates throughout, as path
    point arrays grow. Its allocator is therefore where the decode can let
@@ -83,7 +93,8 @@ static void *svg_malloc(size_t size)
     svg_cooperate();
     void *result = budget_malloc_category(
         svg_budget, BUDGET_CATEGORY_RESOURCE, size);
-    if (result == NULL && size != 0) svg_allocation_failed = true;
+    if (result == NULL && size != 0)
+        svg_note_allocation_failure(budget_malloc_charge(size));
     return result;
 }
 
@@ -92,7 +103,12 @@ static void *svg_realloc(void *pointer, size_t size)
     svg_cooperate();
     void *result = budget_realloc_category(
         svg_budget, BUDGET_CATEGORY_RESOURCE, pointer, size);
-    if (result == NULL && size != 0) svg_allocation_failed = true;
+    if (result == NULL && size != 0) {
+        size_t old_size = budget_usable_size(pointer);
+        svg_note_allocation_failure(pointer == NULL
+            ? budget_malloc_charge(size) : size > old_size
+            ? size - old_size : 0);
+    }
     return result;
 }
 
@@ -138,7 +154,7 @@ unsigned char *image_svg_decode_bounded(
     return image_svg_decode_deferrable(
         data, length, budget, maximum_decoded_bytes, width, height, target,
         opaque, NULL, NULL, source_width, source_height, limited, NULL, 0,
-        NULL);
+        NULL, NULL);
 }
 
 /* A parsed document held between calls (image_svg_decode_deferrable's
@@ -172,10 +188,13 @@ static unsigned char *svg_rasterize(Budget *budget,
                                     SvgViewportParser *context,
                                     int output_width, int output_height)
 {
+    size_t pixel_bytes = (size_t) output_width * (size_t) output_height * 4u;
     unsigned char *pixels = budget_calloc_category(
-        budget, BUDGET_CATEGORY_RESOURCE, 1,
-        (size_t) output_width * (size_t) output_height * 4u);
-    if (pixels == NULL) return NULL;
+        budget, BUDGET_CATEGORY_RESOURCE, 1, pixel_bytes);
+    if (pixels == NULL) {
+        svg_note_allocation_failure(budget_malloc_charge(pixel_bytes));
+        return NULL;
+    }
     svg_clips = context;
     BudgetAllocationOwner previous_owner =
         budget_allocation_owner_enter(budget, scratch_owner);
@@ -217,6 +236,7 @@ static void svg_begin(Budget *budget)
 {
     svg_allocations = 0;
     svg_allocation_failed = false;
+    svg_budget_shortfall = 0;
     svg_limit_refused = false;
     svg_slice_started_us = tilefinch_platform_monotonic_time_us();
     svg_caller_owner = budget->active_allocation_owner;
@@ -269,11 +289,18 @@ unsigned char *image_svg_decode_deferrable(
     ImageSvgOversizeTarget target, void *opaque,
     ImageSvgDefer defer, void *defer_opaque,
     int *source_width, int *source_height, bool *limited, bool *deferred,
-    size_t keep_limit, ImageSvgParse **kept)
+    size_t keep_limit, ImageSvgParse **kept, ImageSvgLimit *limit)
 {
     if (limited != NULL) *limited = true;
     if (deferred != NULL) *deferred = false;
     if (kept != NULL) *kept = NULL;
+    if (limit != NULL) *limit = (ImageSvgLimit) {0};
+    if (limit != NULL) {
+        if (svg_budget != NULL)
+            limit->reason = IMAGE_SVG_LIMIT_TRANSIENT;
+        else if (maximum_decoded_bytes < 4)
+            limit->reason = IMAGE_SVG_LIMIT_SIZE;
+    }
     if (data == NULL || budget == NULL || width == NULL || height == NULL
         || maximum_decoded_bytes < 4 || svg_budget != NULL) return NULL;
     int target_width = *width, target_height = *height;
@@ -295,7 +322,7 @@ unsigned char *image_svg_decode_deferrable(
         memcpy(source, data, length);
         source[length] = '\0';
     } else {
-        svg_allocation_failed = true;
+        svg_note_allocation_failure(budget_malloc_charge(length + 1));
     }
     NSVGimage *svg = NULL;
     if (source != NULL) {
@@ -319,21 +346,28 @@ unsigned char *image_svg_decode_deferrable(
         output_height = (int) ceilf(svg->height);
         intrinsic_width = output_width;
         intrinsic_height = output_height;
-        if (defer != NULL && deferred != NULL && target_width <= 0
-            && target_height <= 0
+        int painted_width = 0, painted_height = 0;
+        if (target_width > 0 && target_height > 0) {
+            output_width = target_width;
+            output_height = target_height;
+        } else if (target != NULL && svg_clips != NULL
+                   && !svg_clips->natural_size
+                   && target(opaque, intrinsic_width, intrinsic_height, true,
+                             &painted_width, &painted_height)
+                   && painted_width > 0 && painted_height > 0) {
+            output_width = painted_width;
+            output_height = painted_height;
+        } else if (defer != NULL && deferred != NULL
             && defer(defer_opaque, intrinsic_width, intrinsic_height)) {
             *deferred = true;
             output_width = output_height = 0;
-        } else if (target_width > 0 && target_height > 0) {
-            output_width = target_width;
-            output_height = target_height;
         }
         else if (target != NULL
             && (size_t) output_width * (size_t) output_height
                    > maximum_decoded_bytes / 4u) {
             /* Both dimensions are <=32767: the product fits on PSP too.
                This fallback is admission, not a second allocation attempt. */
-            if (!target(opaque, intrinsic_width, intrinsic_height,
+            if (!target(opaque, intrinsic_width, intrinsic_height, false,
                         &output_width, &output_height)) {
                 output_width = output_height = 0;
             }
@@ -347,7 +381,7 @@ unsigned char *image_svg_decode_deferrable(
                    <= maximum_decoded_bytes) {
             pixels = svg_rasterize(budget, scratch_owner, svg, svg_clips,
                                    output_width, output_height);
-        }
+        } else if (limit != NULL) limit->reason = IMAGE_SVG_LIMIT_SIZE;
     }
     if (deferred != NULL && *deferred) {
         if (kept != NULL)
@@ -362,6 +396,8 @@ unsigned char *image_svg_decode_deferrable(
         if (source_height != NULL) *source_height = intrinsic_height;
         return NULL;
     }
+    if (pixels == NULL && limit != NULL && svg_allocation_failed)
+        *limit = (ImageSvgLimit) {IMAGE_SVG_LIMIT_BUDGET, svg_budget_shortfall};
     svg_finish(budget, scratch_owner, svg);
     if (pixels == NULL) {
         if (limited != NULL) *limited = !markup_rejected;

@@ -48,6 +48,10 @@ bool psp_profile_store_forget_site_storage(
    holds. */
 bool psp_profile_store_flush(PspProfileStore *store);
 
+/* Save an explicit edit now. A failed commit leaves the edit in memory
+   and dirty for the normal retry path. */
+bool psp_profile_store_commit_edit(PspProfileStore *store, uint64_t now_us);
+
 /* Saves once `delay_us` passed since the latest edit, and, while `busy`,
    only once PSP_PROFILE_STORE_MAXIMUM_HOLD_US passed since the first
    unsaved edit. *attempted reports whether a save was tried. */

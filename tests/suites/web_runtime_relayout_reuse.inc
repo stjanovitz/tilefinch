@@ -41,7 +41,7 @@ static int test_relayout_style_reuse(void)
         "<!doctype html><html><head><style>"
         ".row{padding:1px}.row:last-child .mark{color:#c00}"
         ".mark{color:#00c}.esc\\:wide{width:1px}");
-    for (int i = 0; i < 20; i++)
+    for (int i = 0; i < 140; i++)
         used += (size_t) snprintf(page + used, sizeof(page) - used,
                                   ".k%d:first-child .x{margin-left:%dpx}",
                                   i, i % 3);
@@ -182,6 +182,508 @@ static int test_relayout_style_reuse(void)
               "g.insertBefore(d,g.firstChild)"));
     after = relayout_reuse_signature(&session.page.layout);
     CHECK(relayout_reuse_fresh_signature(&session) == after);
+
+    navigation_destroy(&session);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+/* The color of the text command reading `wanted`, UINT32_MAX if none. */
+static uint32_t relayout_reuse_text_color(const LayoutDocument *layout,
+                                          const char *wanted)
+{
+    size_t length = strlen(wanted);
+    for (size_t i = 0; i < layout->count; i++) {
+        const DrawCommand *command = &layout->commands[i];
+        if (command->type == DRAW_TEXT && command->text_length == length
+            && memcmp(command->text, wanted, length) == 0)
+            return command->color;
+    }
+    return UINT32_MAX;
+}
+
+/* A child inserted in front of <body>'s first child moves every child's
+   position. A tag-keyed sibling test that reaches descendants
+   (`div:first-child em`) restyles only the elements its selector names,
+   not the whole document, even with more such keys than the sheet once
+   kept apart. */
+static int test_relayout_structure_subjects(void)
+{
+    puts("test: a positional test reaching descendants restyles its subjects");
+    Budget budget;
+    budget_init(&budget, 24 * MIB);
+    budget_install_lexbor(&budget);
+    static char page[128 * 1024];
+    size_t used = (size_t) snprintf(
+        page, sizeof(page),
+        "<!doctype html><html><head><style>"
+        ".cell{padding:1px}em{color:#00c}div:first-child em{color:#c00}");
+    for (int i = 0; i < 100; i++)
+        used += (size_t) snprintf(page + used, sizeof(page) - used,
+                                  ".k%d:first-child .x%d{margin-left:1px}",
+                                  i, i);
+    used += (size_t) snprintf(page + used, sizeof(page) - used,
+                              "</style></head><body>"
+                              "<div id=lead><em>LEAD</em></div><div id=grid>");
+    for (int i = 0; i < 900 && used + 64 < sizeof(page); i++)
+        used += (size_t) snprintf(page + used, sizeof(page) - used,
+                                  "<p class=cell><i>%d</i><b>%d</b></p>",
+                                  i % 10, i % 7);
+    used += (size_t) snprintf(page + used, sizeof(page) - used,
+                              "</div></body></html>");
+    CHECK(used + 1 < sizeof(page));
+    static NavigationSession session;
+    CHECK(navigation_init(&session, &budget, 2));
+    navigation_enable_scripts(&session, 4 * MIB, 1000);
+    uint64_t generation = navigation_begin(&session);
+    CHECK(navigation_commit_html(&session, generation,
+                                 "https://relayout-subjects.test/", page,
+                                 used, 480, NULL, NULL, true)
+          && session.page.runtime != NULL
+          && session.page.layout_reuse != NULL);
+    CHECK(navigation_relayout(&session) && navigation_relayout(&session));
+    CHECK(relayout_reuse_text_color(&session.page.layout, "LEAD")
+          == 0xcc0000);
+
+    size_t misses = session.performance.layout_reuse_style_misses;
+    size_t hits = session.performance.layout_reuse_style_hits;
+    CHECK(hidden_mutation_turn(&session,
+              "const d=document.createElement('div');"
+              "d.innerHTML='<em>FRONT</em>';"
+              "document.body.insertBefore(d,document.body.firstChild)"));
+    size_t missed = session.performance.layout_reuse_style_misses - misses;
+    size_t hit = session.performance.layout_reuse_style_hits - hits;
+    if (missed * 20 >= hit)
+        fprintf(stderr, "structure subjects missed=%zu hit=%zu\n", missed,
+                hit);
+    CHECK(missed * 20 < hit);
+    CHECK(relayout_reuse_text_color(&session.page.layout, "FRONT")
+              == 0xcc0000
+          && relayout_reuse_text_color(&session.page.layout, "LEAD")
+              == 0x0000cc);
+    uint64_t after = relayout_reuse_signature(&session.page.layout);
+    CHECK(relayout_reuse_fresh_signature(&session) == after);
+
+    /* Removed again: LEAD is its parent's first child once more. */
+    CHECK(hidden_mutation_turn(&session,
+              "document.body.firstElementChild.remove()")
+          && relayout_reuse_text_color(&session.page.layout, "LEAD")
+              == 0xcc0000);
+    after = relayout_reuse_signature(&session.page.layout);
+    CHECK(relayout_reuse_fresh_signature(&session) == after);
+
+    navigation_destroy(&session);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+/* A [class] test off its subject reads every class but no id, and an [id]
+   test every id but no class: a script that briefly sets an id on <body>
+   restyles only the subjects of [id] tests, not the whole document, and
+   class and id changes still reach the subjects of the tests they meet. */
+static int test_relayout_identity_attribute_kinds(void)
+{
+    puts("test: [class]/[id] tests off the subject reach only their kind");
+    Budget budget;
+    budget_init(&budget, 24 * MIB);
+    budget_install_lexbor(&budget);
+    static char page[128 * 1024];
+    size_t used = (size_t) snprintf(
+        page, sizeof(page),
+        "<!doctype html><html><head><style>"
+        ".cell{padding:1px}em{color:#00c}"
+        "[class*=wrap] [class*=hot]{color:#c00}[id^=on] .flag{color:#0c0}"
+        "</style></head><body>"
+        "<div id=lead><em class=flag>LEAD</em></div>"
+        "<div id=grid><span class=hotspot>HOT</span>");
+    for (int i = 0; i < 900 && used + 64 < sizeof(page); i++)
+        used += (size_t) snprintf(page + used, sizeof(page) - used,
+                                  "<p class=cell><i>%d</i><b>%d</b></p>",
+                                  i % 10, i % 7);
+    used += (size_t) snprintf(page + used, sizeof(page) - used,
+                              "</div></body></html>");
+    CHECK(used + 1 < sizeof(page));
+    static NavigationSession session;
+    CHECK(navigation_init(&session, &budget, 2));
+    navigation_enable_scripts(&session, 4 * MIB, 1000);
+    uint64_t generation = navigation_begin(&session);
+    CHECK(navigation_commit_html(&session, generation,
+                                 "https://relayout-identity.test/", page,
+                                 used, 480, NULL, NULL, true)
+          && session.page.runtime != NULL
+          && session.page.layout_reuse != NULL);
+    CHECK(navigation_relayout(&session) && navigation_relayout(&session));
+    CHECK(relayout_reuse_text_color(&session.page.layout, "LEAD")
+          == 0x0000cc);
+
+    const char *turns[] = {
+        "document.body.id='tmp';document.body.removeAttribute('id')",
+        "document.body.id='on1'",
+    };
+    for (size_t t = 0; t < sizeof(turns) / sizeof(turns[0]); t++) {
+        size_t misses = session.performance.layout_reuse_style_misses;
+        size_t hits = session.performance.layout_reuse_style_hits;
+        CHECK(hidden_mutation_turn(&session, turns[t]));
+        size_t missed = session.performance.layout_reuse_style_misses
+            - misses;
+        size_t hit = session.performance.layout_reuse_style_hits - hits;
+        /* Over 24 runs the turns missed at most 6.6% (evictions, see the
+           bounds note above); with the identity scan unbounded the first
+           turn misses three times as many as it hits. */
+        if (missed * 8 >= hit)
+            fprintf(stderr, "identity kinds turn %zu missed=%zu hit=%zu\n",
+                    t, missed, hit);
+        CHECK(missed * 8 < hit);
+        uint64_t after = relayout_reuse_signature(&session.page.layout);
+        CHECK(relayout_reuse_fresh_signature(&session) == after);
+    }
+    CHECK(relayout_reuse_text_color(&session.page.layout, "LEAD")
+          == 0x00cc00);
+
+    CHECK(hidden_mutation_turn(&session,
+              "document.getElementById('grid').className='wrapper'")
+          && relayout_reuse_text_color(&session.page.layout, "HOT")
+              == 0xcc0000);
+    uint64_t after = relayout_reuse_signature(&session.page.layout);
+    CHECK(relayout_reuse_fresh_signature(&session) == after);
+
+    navigation_destroy(&session);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+/* Class tests that read the element itself, inside :is()/:not() in the
+   subject (`:is([class^=ad-])`, `x :not([class~=off])`), restyle only the
+   changed element, as the subject's own compound does; `[class~=name]`
+   elsewhere reads `name` as `.name` would. Read as any class, both left a
+   rule with no subject key reading every class change, so a class change
+   on <html> restyled the whole document. */
+static int test_relayout_identity_subject_arguments(void)
+{
+    puts("test: class tests on the subject inside :is()/:not() stay local");
+    Budget budget;
+    budget_init(&budget, 24 * MIB);
+    budget_install_lexbor(&budget);
+    static char page[128 * 1024];
+    size_t used = (size_t) snprintf(
+        page, sizeof(page),
+        "<!doctype html><html><head><style>"
+        ".cell{padding:1px}em{color:#00c}"
+        ":is([class^=\"ad-x-\"],[class*=\" ad-x-\"]){display:none}"
+        ".wrap [class~=price] :not([class~=off]){color:#0a0}"
+        ".on .flag{color:#c00}"
+        "</style></head><body>"
+        "<div class=wrap><span id=p><em>PRICE</em></span></div>"
+        "<div id=lead><em class=flag>LEAD</em></div><div id=grid>");
+    for (int i = 0; i < 900 && used + 64 < sizeof(page); i++)
+        used += (size_t) snprintf(page + used, sizeof(page) - used,
+                                  "<p class=cell><i>%d</i><b>%d</b></p>",
+                                  i % 10, i % 7);
+    used += (size_t) snprintf(page + used, sizeof(page) - used,
+                              "</div></body></html>");
+    CHECK(used + 1 < sizeof(page));
+    static NavigationSession session;
+    CHECK(navigation_init(&session, &budget, 2));
+    navigation_enable_scripts(&session, 4 * MIB, 1000);
+    uint64_t generation = navigation_begin(&session);
+    CHECK(navigation_commit_html(&session, generation,
+                                 "https://relayout-subject-args.test/", page,
+                                 used, 480, NULL, NULL, true)
+          && session.page.runtime != NULL
+          && session.page.layout_reuse != NULL);
+    CHECK(navigation_relayout(&session) && navigation_relayout(&session));
+    struct {
+        const char *script, *text;
+        uint32_t color;
+        bool scoped;
+    } turns[] = {
+        /* <html>: only the rules keyed by .flag reach past it. */
+        {"document.documentElement.className='on'", "LEAD", 0xcc0000, true},
+        {"document.getElementById('p').className='price'", "PRICE",
+         0x00aa00, false},
+        {"document.getElementById('p').className='price ad-x-1'", "PRICE",
+         UINT32_MAX, false},
+        {"document.documentElement.className=''", "LEAD", 0x0000cc, true},
+    };
+    for (size_t t = 0; t < sizeof(turns) / sizeof(turns[0]); t++) {
+        size_t misses = session.performance.layout_reuse_style_misses;
+        size_t hits = session.performance.layout_reuse_style_hits;
+        CHECK(hidden_mutation_turn(&session, turns[t].script));
+        size_t missed = session.performance.layout_reuse_style_misses
+            - misses;
+        size_t hit = session.performance.layout_reuse_style_hits - hits;
+        uint32_t color = relayout_reuse_text_color(&session.page.layout,
+                                                   turns[t].text);
+        bool scoped = missed * 8 < hit;
+        if (color != turns[t].color || (turns[t].scoped && !scoped))
+            fprintf(stderr, "subject arguments turn %zu missed=%zu hit=%zu "
+                    "color=%06x\n", t, missed, hit, (unsigned) color);
+        CHECK(color == turns[t].color && (!turns[t].scoped || scoped));
+        uint64_t after = relayout_reuse_signature(&session.page.layout);
+        CHECK(relayout_reuse_fresh_signature(&session) == after);
+    }
+    navigation_destroy(&session);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+/* A <style> a script adds joins the sheet in place. When each of its
+   rules' subjects carries a key (a class, id, tag or attribute) and it
+   adds no at-rule besides @media and @supports, only the elements
+   carrying those keys restyle; a rule whose subject carries no key, or
+   keyframes, still restyle the whole document. Every result is a fresh
+   build's. */
+static int test_relayout_style_append_keyed(void)
+{
+    puts("test: an appended style restyles only its subjects' elements");
+    Budget budget;
+    budget_init(&budget, 24 * MIB);
+    budget_install_lexbor(&budget);
+    static char page[128 * 1024];
+    size_t used = (size_t) snprintf(
+        page, sizeof(page),
+        "<!doctype html><html><head><style>"
+        ".cell{padding:1px}span{color:#00c}"
+        "</style></head><body>"
+        "<p class=tgt><span>TGT</span></p><div id=box><span>BOX</span></div>"
+        "<div id=grid>");
+    for (int i = 0; i < 900 && used + 64 < sizeof(page); i++)
+        used += (size_t) snprintf(page + used, sizeof(page) - used,
+                                  "<p class=cell><i>%d</i><b>%d</b></p>",
+                                  i % 10, i % 7);
+    used += (size_t) snprintf(page + used, sizeof(page) - used,
+                              "</div></body></html>");
+    CHECK(used + 1 < sizeof(page));
+    static NavigationSession session;
+    CHECK(navigation_init(&session, &budget, 2));
+    navigation_enable_scripts(&session, 4 * MIB, 1000);
+    uint64_t generation = navigation_begin(&session);
+    CHECK(navigation_commit_html(&session, generation,
+                                 "https://style-append-keyed.test/", page,
+                                 used, 480, NULL, NULL, true)
+          && session.page.runtime != NULL
+          && session.page.layout_reuse != NULL);
+    CHECK(navigation_relayout(&session) && navigation_relayout(&session));
+    struct {
+        const char *css, *text;
+        uint32_t color;
+        bool scoped;
+    } turns[] = {
+        {".tgt span{color:#c00}", "TGT", 0xcc0000, true},
+        {"@media all{.tgt>span{color:#0c0}}", "TGT", 0x00cc00, true},
+        {"#box{display:none}", "BOX", UINT32_MAX, true},
+        {"[data-k]{color:#cc0}p.tgt span{color:#0cc}", "TGT", 0x00cccc,
+         true},
+        /* No key on the subject: anything may match. */
+        {"body p.tgt *{color:#00c}", "TGT", 0x0000cc, false},
+        /* An element no new selector names may run these. */
+        {"@keyframes k{from{color:#c00}}body p.tgt span{color:#c0c}",
+         "TGT",
+         0xcc00cc, false},
+    };
+    for (size_t t = 0; t < sizeof(turns) / sizeof(turns[0]); t++) {
+        char script[256];
+        snprintf(script, sizeof(script),
+                 "{const s=document.createElement('style');"
+                 "s.textContent='%s';document.body.append(s)}",
+                 turns[t].css);
+        size_t appends = session.performance.mutation_style_appends;
+        size_t misses = session.performance.layout_reuse_style_misses;
+        size_t hits = session.performance.layout_reuse_style_hits;
+        CHECK(hidden_mutation_turn(&session, script));
+        size_t appended = session.performance.mutation_style_appends
+            - appends;
+        size_t missed = session.performance.layout_reuse_style_misses
+            - misses;
+        size_t hit = session.performance.layout_reuse_style_hits - hits;
+        uint32_t color = relayout_reuse_text_color(&session.page.layout,
+                                                   turns[t].text);
+        bool scoped = missed * 8 < hit;
+        if (appended != 1 || color != turns[t].color
+            || scoped != turns[t].scoped)
+            fprintf(stderr, "keyed append turn %zu appended=%zu missed=%zu "
+                    "hit=%zu color=%06x\n", t, appended, missed, hit,
+                    (unsigned) color);
+        CHECK(appended == 1 && color == turns[t].color
+              && scoped == turns[t].scoped);
+        uint64_t after = relayout_reuse_signature(&session.page.layout);
+        CHECK(relayout_reuse_fresh_signature(&session) == after);
+    }
+    navigation_destroy(&session);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+/* A <style> a script adds that changes nothing a style reads (no rules:
+   empty, comments in several text nodes, an at-rule the sheet ignores)
+   keeps every computed style. One that adds no rule but a custom property
+   or keyframes still restyles the page. Every result is a fresh build's. */
+static int test_relayout_style_append_unchanged(void)
+{
+    puts("test: an appended style that changes nothing keeps every style");
+    Budget budget;
+    budget_init(&budget, 24 * MIB);
+    budget_install_lexbor(&budget);
+    static char page[128 * 1024];
+    size_t used = (size_t) snprintf(
+        page, sizeof(page),
+        "<!doctype html><html><head><style>"
+        ":root{--c:#00c}.cell{padding:1px}.tgt span{color:var(--c)}"
+        "</style></head><body><p class=tgt><span>TGT</span></p>"
+        "<div id=grid>");
+    for (int i = 0; i < 900 && used + 64 < sizeof(page); i++)
+        used += (size_t) snprintf(page + used, sizeof(page) - used,
+                                  "<p class=cell><i>%d</i><b>%d</b></p>",
+                                  i % 10, i % 7);
+    used += (size_t) snprintf(page + used, sizeof(page) - used,
+                              "</div></body></html>");
+    CHECK(used + 1 < sizeof(page));
+    static NavigationSession session;
+    CHECK(navigation_init(&session, &budget, 2));
+    navigation_enable_scripts(&session, 4 * MIB, 1000);
+    uint64_t generation = navigation_begin(&session);
+    CHECK(navigation_commit_html(&session, generation,
+                                 "https://style-append-unchanged.test/", page,
+                                 used, 480, NULL, NULL, true)
+          && session.page.runtime != NULL
+          && session.page.layout_reuse != NULL);
+    CHECK(navigation_relayout(&session) && navigation_relayout(&session));
+    struct {
+        const char *script;
+        uint32_t color;
+        bool scoped;
+    } turns[] = {
+        {"document.body.append(document.createElement('style'))", 0x0000cc,
+         true},
+        {"{const s=document.createElement('style');"
+         "s.append('/* a */','/* b */');document.body.append(s)}",
+         0x0000cc, true},
+        {"{const s=document.createElement('style');"
+         "s.textContent='@page{margin:0}';document.body.append(s)}",
+         0x0000cc, true},
+        {"{const s=document.createElement('style');"
+         "s.textContent=':root{--c:#c00}';document.body.append(s)}",
+         0xcc0000, false},
+        {"{const s=document.createElement('style');"
+         "s.textContent='@keyframes k{from{color:#0c0}}';"
+         "document.body.append(s)}", 0xcc0000, false},
+    };
+    for (size_t t = 0; t < sizeof(turns) / sizeof(turns[0]); t++) {
+        size_t appends = session.performance.mutation_style_appends;
+        size_t misses = session.performance.layout_reuse_style_misses;
+        size_t hits = session.performance.layout_reuse_style_hits;
+        CHECK(hidden_mutation_turn(&session, turns[t].script));
+        size_t appended = session.performance.mutation_style_appends
+            - appends;
+        size_t missed = session.performance.layout_reuse_style_misses
+            - misses;
+        size_t hit = session.performance.layout_reuse_style_hits - hits;
+        uint32_t color = relayout_reuse_text_color(&session.page.layout,
+                                                   "TGT");
+        bool scoped = missed * 8 < hit;
+        if (appended != 1 || color != turns[t].color
+            || scoped != turns[t].scoped)
+            fprintf(stderr, "unchanged append turn %zu appended=%zu "
+                    "missed=%zu hit=%zu color=%06x\n", t, appended, missed,
+                    hit, (unsigned) color);
+        CHECK(appended == 1 && color == turns[t].color
+              && scoped == turns[t].scoped);
+        uint64_t after = relayout_reuse_signature(&session.page.layout);
+        CHECK(relayout_reuse_fresh_signature(&session) == after);
+    }
+    navigation_destroy(&session);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+/* A page with more style sources than the sheet records. A <style> a
+   script adds after every other source, or in front of a source the sheet
+   recorded, joins the sheet in place; one it adds in front of any other
+   source, and new text in a source the sheet already parsed, still
+   rebuild the sheet, so the cascade is a fresh load's. */
+static int test_relayout_tail_style_past_source_bound(void)
+{
+    puts("test: a style added after every source of a large sheet appends");
+    Budget budget;
+    budget_init(&budget, 24 * MIB);
+    budget_install_lexbor(&budget);
+    static char page[32 * 1024];
+    size_t used = (size_t) snprintf(page, sizeof(page),
+                                    "<!doctype html><html><head>"
+                                    "<style>.w{color:#c00}</style>");
+    for (unsigned i = 0; i < STYLE_SOURCE_NODE_LIMIT + 8u; i++)
+        used += (size_t) snprintf(page + used, sizeof(page) - used,
+                                  "<style>.s%u{margin-left:1px}</style>", i);
+    used += (size_t) snprintf(page + used, sizeof(page) - used,
+        "</head><body><p class=t>TAIL</p><p class=m>MID</p><p class=w>WIN</p>"
+        "<style>.m{color:#00c}</style></body></html>");
+    CHECK(used + 1 < sizeof(page));
+    static NavigationSession session;
+    CHECK(navigation_init(&session, &budget, 2));
+    navigation_enable_scripts(&session, 4 * MIB, 1000);
+    uint64_t generation = navigation_begin(&session);
+    CHECK(navigation_commit_html(&session, generation,
+                                 "https://tail-style.test/", page, used, 480,
+                                 NULL, NULL, true)
+          && session.page.runtime != NULL);
+    CHECK(navigation_relayout(&session)
+          && session.page.stylesheet.style_sources_bounded_out);
+    struct {
+        const char *script, *text;
+        uint32_t color;
+        bool appended;
+    } turns[] = {
+        {"{const s=document.createElement('style');"
+         "s.textContent='.t{color:#c00}';document.body.append(s)}",
+         "TAIL", 0xcc0000, true},
+        {"{const s=document.createElement('style');"
+         "s.textContent='.m{color:#0c0}';document.head.append(s)}",
+         "MID", 0x0000cc, false},
+        {"document.querySelectorAll('head style')[100].textContent="
+         "'.t{color:#00c}'", "TAIL", 0xcc0000, false},
+        {"{const s=document.createElement('style');"
+         "s.textContent='.t{color:#0c0}';document.body.append(s)}",
+         "TAIL", 0x00cc00, true},
+        /* The last source, now in the sheet, loses its rule. */
+        {"{const all=document.querySelectorAll('style');"
+         "all[all.length-1].textContent='.u{color:#00c}'}",
+         "TAIL", 0xcc0000, false},
+        /* In front of a recorded head source: it beats the first head rule
+           and loses to the later body rule. */
+        {"{const s=document.createElement('style');s.id='n5';"
+         "s.textContent='.w{color:#0c0}.m{color:#0c0}';"
+         "document.querySelectorAll('head style')[51].before(s)}",
+         "WIN", 0x00cc00, true},
+        /* After that new (unrecorded) source, before the recorded one. */
+        {"{const s=document.createElement('style');s.id='n6';"
+         "s.textContent='.w{color:#00c}';"
+         "document.getElementById('n5').after(s)}",
+         "WIN", 0x0000cc, true},
+        /* In front of the new source: its place is not recorded. */
+        {"{const s=document.createElement('style');"
+         "s.textContent='.w{color:#cc0}';"
+         "document.getElementById('n5').before(s)}",
+         "WIN", 0x0000cc, false},
+    };
+    for (size_t t = 0; t < sizeof(turns) / sizeof(turns[0]); t++) {
+        size_t appends = session.performance.mutation_style_appends;
+        CHECK(hidden_mutation_turn(&session, turns[t].script));
+        size_t appended = session.performance.mutation_style_appends
+            - appends;
+        uint32_t color = relayout_reuse_text_color(&session.page.layout,
+                                                   turns[t].text);
+        /* The later body rule keeps MID blue throughout. */
+        CHECK(relayout_reuse_text_color(&session.page.layout, "MID")
+              == 0x0000cc);
+        if (appended != (turns[t].appended ? 1u : 0u)
+            || color != turns[t].color)
+            fprintf(stderr, "tail style turn %zu appended=%zu color=%06x\n",
+                    t, appended, (unsigned) color);
+        CHECK(appended == (turns[t].appended ? 1u : 0u)
+              && color == turns[t].color);
+        uint64_t after = relayout_reuse_signature(&session.page.layout);
+        CHECK(relayout_reuse_fresh_signature(&session) == after);
+    }
 
     navigation_destroy(&session);
     CHECK(budget.current == 0);
@@ -363,6 +865,348 @@ static int test_full_rebuild_shares_discovery_styles(void)
             CHECK(false);
         }
     }
+    navigation_destroy(&session);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+static bool relayout_reuse_has_text(const LayoutDocument *layout,
+                                    const char *text)
+{
+    size_t length = strlen(text);
+    for (size_t i = 0; i < layout->count; i++) {
+        const DrawCommand *command = &layout->commands[i];
+        if (command->type == DRAW_TEXT && command->text_length == length
+            && memcmp(command->text, text, length) == 0) return true;
+    }
+    return false;
+}
+
+/* The user stylesheet ends a built sheet, after the adopted sheets. A
+   sheet a shadow root adopts later joins the sheet in place: numbered
+   after the user rules, the adopted order range took them in, so they
+   applied only inside shadow trees and a user rule hiding an element in
+   the document stopped hiding it. */
+static int test_relayout_adopted_append_keeps_user_rules(void)
+{
+    puts("test: a sheet adopted in place leaves user rules on the document");
+    Budget budget;
+    budget_init(&budget, 24 * MIB);
+    budget_install_lexbor(&budget);
+    static char page[16 * 1024];
+    size_t used = (size_t) snprintf(page, sizeof(page),
+        "<!doctype html><html><head><style>.in{color:#00c}</style></head>"
+        "<body><p class=hide>GONE</p><p>KEEP</p><div id=a></div>"
+        "<div id=b></div><div>");
+    /* Pages under 256 nodes keep no layout reuse cache. */
+    for (int i = 0; i < 300; i++)
+        used += (size_t) snprintf(page + used, sizeof(page) - used,
+                                  "<i>%d</i>", i % 10);
+    used += (size_t) snprintf(page + used, sizeof(page) - used,
+        "</div><script>{const r=document.getElementById('a')"
+        ".attachShadow({mode:'open'});r.innerHTML='<span class=in>AIN</span>';"
+        "const s=new CSSStyleSheet();s.replaceSync('.in{color:#0c0}');"
+        "r.adoptedStyleSheets=[s]}</script></body></html>");
+    CHECK(used + 1 < sizeof(page));
+    static const char user_css[] = ".hide{display:none!important}";
+    static NavigationSession session;
+    CHECK(navigation_init(&session, &budget, 2));
+    navigation_enable_scripts(&session, 4 * MIB, 1000);
+    CHECK(navigation_set_user_css(&session, user_css, sizeof(user_css) - 1));
+    uint64_t generation = navigation_begin(&session);
+    CHECK(navigation_commit_html(&session, generation,
+                                 "https://adopted-user.test/", page, used,
+                                 480, NULL, NULL, true)
+          && session.page.runtime != NULL);
+    CHECK(navigation_relayout(&session));
+    /* A rebuild puts the adopted sheet in front of the user rules. */
+    CHECK(navigation_set_user_css(&session, user_css, sizeof(user_css) - 1)
+          && navigation_relayout(&session));
+    CHECK(session.page.stylesheet.scopes.adopted_source_count == 1);
+    CHECK(relayout_reuse_has_text(&session.page.layout, "AIN")
+          && !relayout_reuse_has_text(&session.page.layout, "GONE"));
+    size_t appends = session.performance.mutation_style_appends;
+    CHECK(hidden_mutation_turn(&session,
+        "{const r=document.getElementById('b').attachShadow({mode:'open'});"
+        "r.innerHTML='<span class=in>BIN</span>';"
+        "const t=new CSSStyleSheet();t.replaceSync('.in{color:#c0c}');"
+        "r.adoptedStyleSheets=[t]}"));
+    /* Taken in place, as a second adopted source. */
+    CHECK(session.performance.mutation_style_appends == appends + 1u);
+    CHECK(session.page.stylesheet.scopes.adopted_source_count == 2);
+    uint64_t in_place = relayout_reuse_signature(&session.page.layout);
+    /* Laid out again from no cached styles, on the same sheet. */
+    CHECK(relayout_reuse_fresh_signature(&session) == in_place);
+    bool hidden = !relayout_reuse_has_text(&session.page.layout, "GONE");
+    if (!hidden) fprintf(stderr, "adopted append: user rule lost\n");
+    CHECK(hidden && relayout_reuse_has_text(&session.page.layout, "KEEP")
+          && relayout_reuse_has_text(&session.page.layout, "BIN"));
+    /* The same tree from a rebuilt sheet. */
+    CHECK(navigation_set_user_css(&session, user_css, sizeof(user_css) - 1)
+          && navigation_relayout(&session));
+    CHECK(relayout_reuse_signature(&session.page.layout) == in_place);
+    navigation_destroy(&session);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+/* An adopted sheet with no rules still joins the sheet in place, at the
+   user rules, and still ends the adopted range there: ended at the tail,
+   the range took the user rules in for the empty source's shadow tree.
+   The next adoption goes in front of the user rules too, after the empty
+   source; numbered past it, the empty source's first order overtook it,
+   and taking an adopted sheet out then refused and rebuilt the sheet. */
+static int test_relayout_empty_adopted_append_stays_in_order(void)
+{
+    puts("test: an empty adopted sheet leaves later appends in place");
+    Budget budget;
+    budget_init(&budget, 24 * MIB);
+    budget_install_lexbor(&budget);
+    static char page[16 * 1024];
+    size_t used = (size_t) snprintf(page, sizeof(page),
+        "<!doctype html><html><head><style>.in{color:#00c}</style></head>"
+        "<body><p class=hide>GONE</p><p>KEEP</p><div id=a></div>"
+        "<div id=b></div><div id=c></div><div>");
+    /* Pages under 256 nodes keep no layout reuse cache. */
+    for (int i = 0; i < 300; i++)
+        used += (size_t) snprintf(page + used, sizeof(page) - used,
+                                  "<i>%d</i>", i % 10);
+    used += (size_t) snprintf(page + used, sizeof(page) - used,
+        "</div><script>{const r=document.getElementById('a')"
+        ".attachShadow({mode:'open'});r.innerHTML='<span class=in>AIN</span>';"
+        "const s=new CSSStyleSheet();s.replaceSync('.in{color:#0c0}');"
+        "r.adoptedStyleSheets=[s]}</script></body></html>");
+    CHECK(used + 1 < sizeof(page));
+    static const char user_css[] = ".hide{display:none!important}";
+    static NavigationSession session;
+    CHECK(navigation_init(&session, &budget, 2));
+    navigation_enable_scripts(&session, 4 * MIB, 1000);
+    CHECK(navigation_set_user_css(&session, user_css, sizeof(user_css) - 1));
+    uint64_t generation = navigation_begin(&session);
+    CHECK(navigation_commit_html(&session, generation,
+                                 "https://adopted-empty.test/", page, used,
+                                 480, NULL, NULL, true)
+          && session.page.runtime != NULL);
+    CHECK(navigation_relayout(&session));
+    /* A rebuild puts the adopted sheet in front of the user rules. */
+    CHECK(navigation_set_user_css(&session, user_css, sizeof(user_css) - 1)
+          && navigation_relayout(&session));
+    CHECK(session.page.stylesheet.scopes.adopted_source_count == 1);
+    CHECK(!relayout_reuse_has_text(&session.page.layout, "GONE"));
+    size_t appends = session.performance.mutation_style_appends;
+    size_t fallbacks = session.performance.mutation_style_append_fallbacks;
+    CHECK(hidden_mutation_turn(&session,
+        "{const r=document.getElementById('b').attachShadow({mode:'open'});"
+        "r.innerHTML='<span class=in>BIN</span>';"
+        "r.adoptedStyleSheets=[new CSSStyleSheet()]}"));
+    CHECK(session.performance.mutation_style_appends == appends + 1u);
+    CHECK(session.page.stylesheet.scopes.adopted_source_count == 2);
+    /* The append changed no rule, so the relayout kept every style: a
+       layout from no cached styles reads the range. */
+    uint64_t empty = relayout_reuse_signature(&session.page.layout);
+    bool same = relayout_reuse_fresh_signature(&session) == empty;
+    bool hidden = !relayout_reuse_has_text(&session.page.layout, "GONE");
+    if (!same || !hidden)
+        fprintf(stderr, "empty adopted append: user rule lost (fresh "
+                "layout %s)\n", same ? "same" : "differs");
+    CHECK(same);
+    CHECK(hidden && relayout_reuse_has_text(&session.page.layout, "BIN"));
+    CHECK(hidden_mutation_turn(&session,
+        "{const r=document.getElementById('c').attachShadow({mode:'open'});"
+        "r.innerHTML='<span class=in>CIN</span>';"
+        "const u=new CSSStyleSheet();u.replaceSync('.in{color:#c0c}');"
+        "r.adoptedStyleSheets=[u]}"));
+    CHECK(session.performance.mutation_style_appends == appends + 2u);
+    CHECK(session.page.stylesheet.scopes.adopted_source_count == 3);
+    CHECK(!relayout_reuse_has_text(&session.page.layout, "GONE")
+          && relayout_reuse_has_text(&session.page.layout, "CIN"));
+    /* The first adopted sheet leaves: taken out in place, not rebuilt. */
+    CHECK(hidden_mutation_turn(&session,
+        "document.getElementById('a').shadowRoot.adoptedStyleSheets=[]"));
+    bool in_place = session.performance.mutation_style_appends
+            == appends + 3u
+        && session.performance.mutation_style_append_fallbacks == fallbacks;
+    if (!in_place)
+        fprintf(stderr, "empty adopted append: removal rebuilt (appends=%zu "
+                "fallbacks=%zu)\n",
+                session.performance.mutation_style_appends - appends,
+                session.performance.mutation_style_append_fallbacks
+                    - fallbacks);
+    CHECK(in_place);
+    CHECK(session.page.stylesheet.scopes.adopted_source_count == 2);
+    uint64_t kept = relayout_reuse_signature(&session.page.layout);
+    CHECK(!relayout_reuse_has_text(&session.page.layout, "GONE")
+          && relayout_reuse_has_text(&session.page.layout, "KEEP"));
+    /* Laid out again from no cached styles, on the same sheet. */
+    CHECK(relayout_reuse_fresh_signature(&session) == kept);
+    /* The same tree from a rebuilt sheet. */
+    CHECK(navigation_set_user_css(&session, user_css, sizeof(user_css) - 1)
+          && navigation_relayout(&session));
+    CHECK(relayout_reuse_signature(&session.page.layout) == kept);
+    navigation_destroy(&session);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+/* One turn of `turn` (after `setup`, its own turn) over a page whose
+   leaf is red only while `rule`'s :has() argument matches inside #p.
+   The relayout must lay out what a fresh build does: blue. 1 when not. */
+static int relayout_stale_children_case(const char *label, const char *rule,
+                                        const char *children,
+                                        const char *setup, const char *turn)
+{
+    Budget budget;
+    budget_init(&budget, 24 * MIB);
+    budget_install_lexbor(&budget);
+    static char page[16 * 1024];
+    size_t used = (size_t) snprintf(page, sizeof(page),
+        "<!doctype html><html><head><style>.leaf{color:#00c}"
+        "%s{color:#c00}</style></head><body><div class=a id=a>"
+        "<div id=p>%s</div><p class=leaf>LEAF</p></div><div id=other>"
+        "</div><div>", rule, children);
+    /* Pages under 256 nodes keep no layout reuse cache. */
+    for (int i = 0; i < 300; i++)
+        used += (size_t) snprintf(page + used, sizeof(page) - used,
+                                  "<i>%d</i>", i % 10);
+    used += (size_t) snprintf(page + used, sizeof(page) - used,
+                              "</div></body></html>");
+    static NavigationSession session;
+    int failed = 1;
+    if (used + 1 < sizeof(page) && navigation_init(&session, &budget, 2)) {
+        navigation_enable_scripts(&session, 4 * MIB, 1000);
+        uint64_t generation = navigation_begin(&session);
+        bool ready = navigation_commit_html(
+                         &session, generation, "https://stale-children.test/",
+                         page, used, 480, NULL, NULL, true)
+            && session.page.runtime != NULL
+            && session.page.layout_reuse != NULL
+            && navigation_relayout(&session)
+            && (setup == NULL || hidden_mutation_turn(&session, setup));
+        uint32_t before = ready
+            ? relayout_reuse_text_color(&session.page.layout, "LEAF")
+            : UINT32_MAX;
+        bool turned = ready && before == 0xcc0000
+            && hidden_mutation_turn(&session, turn);
+        uint32_t reused = turned
+            ? relayout_reuse_text_color(&session.page.layout, "LEAF")
+            : UINT32_MAX;
+        uint64_t signature = relayout_reuse_signature(&session.page.layout);
+        bool fresh = turned
+            && relayout_reuse_fresh_signature(&session) == signature;
+        failed = !(turned && reused == 0x0000cc && fresh);
+        if (failed)
+            fprintf(stderr, "stale children %s: ready=%d before=%06x "
+                    "reused=%06x fresh=%d error=%s\n", label, ready,
+                    (unsigned) before, (unsigned) reused, fresh,
+                    session.page.script_result.error);
+        navigation_destroy(&session);
+    }
+    if (budget.current != 0) failed = 1;
+    return failed;
+}
+
+/* A write earlier in the turn takes a :has() argument off an old child
+   that the turn then removes (innerHTML, removal or a move): the record
+   of that write cannot reach the anchor once the child is gone, so the
+   tree change's own record must (fails while its probe saw the children
+   only as they were by then). */
+static int test_relayout_stale_children_reach_has(void)
+{
+    puts("test: a tree change reaches :has() answers earlier writes moved");
+    static const char x_rule[] = ".a:has(.x) .leaf";
+    static const char x_child[] = "<span id=c class=x>C</span>";
+    static const char replace[] =
+        "document.getElementById('p').innerHTML='<b>N</b>'";
+    static const struct {
+        const char *label, *rule, *children, *setup, *turn;
+    } cases[] = {
+        {"innerHTML, child freed", x_rule, x_child, NULL,
+         "document.getElementById('c').className='';"
+         "document.getElementById('p').innerHTML='<b>N</b>'"},
+        {"innerHTML, child kept", x_rule, x_child, NULL,
+         "globalThis.k=document.getElementById('c');k.className='';"
+         "document.getElementById('p').innerHTML='<b>N</b>'"},
+        {"innerHTML, attribute removed", ".a:has([data-x]) .leaf",
+         "<span id=c data-x>C</span>", NULL,
+         "document.getElementById('c').removeAttribute('data-x');"
+         "document.getElementById('p').innerHTML='<b>N</b>'"},
+        {"innerHTML, descendant removed first", x_rule,
+         "<i><span id=c class=x>C</span></i>", NULL,
+         "document.getElementById('c').remove();"
+         "document.getElementById('p').innerHTML='<b>N</b>'"},
+        {"innerHTML, focused child", ".a:has(:focus) .leaf",
+         "<input id=c>", "document.getElementById('c').focus()", replace},
+        {"innerHTML, focus within", ".a:focus-within .leaf",
+         "<input id=c>", "document.getElementById('c').focus()", replace},
+        {"removal", x_rule, x_child, NULL,
+         "document.getElementById('c').className='';"
+         "document.getElementById('p').remove()"},
+        {"move", x_rule, x_child, NULL,
+         "document.getElementById('c').className='';"
+         "document.getElementById('other').appendChild("
+         "document.getElementById('p'))"},
+    };
+    int failed = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+        failed |= relayout_stale_children_case(
+            cases[i].label, cases[i].rule, cases[i].children,
+            cases[i].setup, cases[i].turn);
+    CHECK(failed == 0);
+    return 0;
+}
+
+/* A class write while the sheet holds more partial [class] tests than the
+   identity table keeps carries only the empty-name token. A sheet removed
+   later in the turn brings the count back under the bound: the table must
+   not then register the document's own [class*=x] test under a token the
+   pending write never carried (fails while incompleteness lasted only for
+   the sheet generation). */
+static int test_relayout_identity_bound_survives_removal(void)
+{
+    puts("test: a pending class write reaches tests a removed sheet unbounded");
+    Budget budget;
+    budget_init(&budget, 24 * MIB);
+    budget_install_lexbor(&budget);
+    static char page[32 * 1024];
+    size_t used = (size_t) snprintf(page, sizeof(page),
+        "<!doctype html><html><head><style>.leaf{color:#00c}"
+        "[class*=x] .leaf{color:#c00}</style></head><body>"
+        "<div id=a class=a><p class=leaf>LEAF</p></div><div id=h></div><div>");
+    for (int i = 0; i < 300; i++)
+        used += (size_t) snprintf(page + used, sizeof(page) - used,
+                                  "<i>%d</i>", i % 10);
+    used += (size_t) snprintf(page + used, sizeof(page) - used,
+        "</div><script>{let css='';for(let i=0;i<300;i++)"
+        "css+='[class*=k'+i+'] b{margin-left:1px}';"
+        "const s=new CSSStyleSheet();s.replaceSync(css);"
+        "document.getElementById('h').attachShadow({mode:'open'})"
+        ".adoptedStyleSheets=[s]}</script></body></html>");
+    CHECK(used + 1 < sizeof(page));
+    static NavigationSession session;
+    CHECK(navigation_init(&session, &budget, 2));
+    navigation_enable_scripts(&session, 4 * MIB, 1000);
+    uint64_t generation = navigation_begin(&session);
+    CHECK(navigation_commit_html(&session, generation,
+                                 "https://identity-bound.test/", page, used,
+                                 480, NULL, NULL, true)
+          && session.page.runtime != NULL
+          && session.page.layout_reuse != NULL);
+    CHECK(navigation_relayout(&session) && navigation_relayout(&session));
+    CHECK(session.page.stylesheet.scopes.adopted_source_count == 1
+          && relayout_reuse_text_color(&session.page.layout, "LEAF")
+                 == 0x0000cc);
+    CHECK(hidden_mutation_turn(&session,
+              "document.getElementById('a').className='ax';"
+              "document.getElementById('h').shadowRoot"
+              ".adoptedStyleSheets=[]"));
+    uint32_t color = relayout_reuse_text_color(&session.page.layout, "LEAF");
+    uint64_t reused = relayout_reuse_signature(&session.page.layout);
+    bool fresh = relayout_reuse_fresh_signature(&session) == reused;
+    if (color != 0xcc0000 || !fresh)
+        fprintf(stderr, "identity bound: color=%06x fresh=%d adopted=%u\n",
+                (unsigned) color, fresh,
+                (unsigned) session.page.stylesheet.scopes.adopted_source_count);
+    CHECK(color == 0xcc0000 && fresh);
     navigation_destroy(&session);
     CHECK(budget.current == 0);
     return 0;

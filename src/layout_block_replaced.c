@@ -96,7 +96,8 @@ bool layout_block_replaced_section(LayoutContext *context,
         }
         if (image_width < 1) image_width = 1;
         if (image_height < 1) image_height = 1;
-        bool fixed_image_slot = layout_fixed_image_slot(node, style, parent);
+        bool fixed_image_slot = layout_fixed_image_slot(
+            node, style, parent, containing_height);
         if (image_available || fixed_image_slot) {
             DrawCommand command = {
                 .type = DRAW_IMAGE, .x = content_x, .y = line->y,

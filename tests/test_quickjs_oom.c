@@ -7,6 +7,7 @@
 
 #include "tilefinch/budget.h"
 #include "tilefinch/budget_quickjs.h"
+#include "../third_party/quickjs/cutils.h"
 
 #define MIB (1024u * 1024u)
 
@@ -3382,8 +3383,206 @@ static int run_set_prototype_refusals(void)
     return refusals != 0 && successes != 0 ? 0 : 1;
 }
 
+/* Stack text for an error is built after the error is thrown, and its
+   allocation can be refused. That refusal must not replace the pending
+   exception: an uncatchable interrupt whose stack capture was refused
+   became a catchable "out of memory", and a page loop that caught errors
+   at the heap wall kept running through every later interrupt (a census
+   page spun for minutes, about 150,000 refusals a second). The allocator
+   below refuses only fresh host blocks over 4 KiB once armed, so the
+   error itself and the text buffer fit and the text string does not. */
+typedef struct {
+    bool armed;
+    unsigned polls;
+    unsigned refused;
+} BacktraceGuard;
+
+static void *backtrace_guard_malloc(JSMallocState *ms, size_t size)
+{
+    BacktraceGuard *guard = ms->opaque;
+    if (guard->armed && size > 4096u) {
+        guard->refused++;
+        return NULL;
+    }
+    return malloc(size);
+}
+
+static void backtrace_guard_free(JSMallocState *ms, void *ptr)
+{
+    (void) ms;
+    free(ptr);
+}
+
+static void *backtrace_guard_realloc(JSMallocState *ms, void *ptr,
+                                     size_t size)
+{
+    (void) ms;
+    if (size == 0) {
+        free(ptr);
+        return NULL;
+    }
+    return realloc(ptr, size);
+}
+
+static size_t backtrace_guard_usable_size(const void *ptr)
+{
+    (void) ptr;
+    return 0;
+}
+
+static const JSMallocFunctions backtrace_guard_functions = {
+    backtrace_guard_malloc, backtrace_guard_free, backtrace_guard_realloc,
+    backtrace_guard_usable_size,
+};
+
+static int backtrace_guard_interrupt(JSRuntime *runtime, void *opaque)
+{
+    (void) runtime;
+    BacktraceGuard *guard = opaque;
+    if (!guard->armed) return 0;
+    guard->polls++;
+    return 1;
+}
+
+static JSValue backtrace_guard_arm(JSContext *context, JSValueConst self,
+                                   int argc, JSValueConst *argv)
+{
+    (void) self; (void) argc; (void) argv;
+    BacktraceGuard *guard = JS_GetRuntimeOpaque(JS_GetRuntime(context));
+    guard->armed = true;
+    return JS_UNDEFINED;
+}
+
+static int run_backtrace_refusal(void)
+{
+    BacktraceGuard guard = { false, 0, 0 };
+    JSRuntime *runtime = JS_NewRuntime2(&backtrace_guard_functions, &guard);
+    if (runtime == NULL) return 1;
+    JS_SetRuntimeOpaque(runtime, &guard);
+    JS_SetMaxStackSize(runtime, test_stack_limit());
+    JSContext *context = JS_NewContext(runtime);
+    if (context == NULL) { JS_FreeRuntime(runtime); return 1; }
+    JSValue global = JS_GetGlobalObject(context);
+    JS_SetPropertyStr(context, global, "arm",
+                      JS_NewCFunction(context, backtrace_guard_arm, "arm", 0));
+    JS_FreeValue(context, global);
+    JS_SetInterruptHandler(runtime, backtrace_guard_interrupt, &guard);
+    /* Eighty frames with long names: well over 4 KiB of stack text. */
+    static const char deep[] =
+        "var caught = 0;"
+        "function descend_with_a_long_name_so_each_stack_line_is_long(n, f) {"
+        "  if (n === 0) return f();"
+        "  var r = descend_with_a_long_name_so_each_stack_line_is_long("
+        "    n - 1, f);"
+        "  return r; }";
+    JSValue value = JS_Eval(context, deep, sizeof(deep) - 1u,
+                            "<backtrace-refusal>", JS_EVAL_TYPE_GLOBAL);
+    int failed = JS_IsException(value);
+    JS_FreeValue(context, value);
+    /* 1. The interrupt stays uncatchable: the loop's catch never runs. */
+    static const char spin[] =
+        "descend_with_a_long_name_so_each_stack_line_is_long(80, function () {"
+        "  arm();"
+        "  for (;;) { try { for (;;) {} }"
+        "    catch (e) { if (++caught >= 32) return 'escaped'; } } })";
+    value = JS_Eval(context, spin, sizeof(spin) - 1u, "<backtrace-refusal>",
+                    JS_EVAL_TYPE_GLOBAL);
+    guard.armed = false;
+    const char *message = NULL;
+    if (JS_IsException(value)) {
+        JSValue exception = JS_GetException(context);
+        message = JS_ToCString(context, exception);
+        JS_FreeValue(context, exception);
+    }
+    int32_t caught = -1;
+    JSValue count = JS_Eval(context, "caught", 6, "<backtrace-refusal>",
+                            JS_EVAL_TYPE_GLOBAL);
+    if (JS_ToInt32(context, &caught, count) < 0) caught = -1;
+    JS_FreeValue(context, count);
+    if (message == NULL || strcmp(message, "InternalError: interrupted") != 0
+        || caught != 0 || guard.refused == 0) {
+        fprintf(stderr, "backtrace refusal: %s, caught %d, polls %u, "
+                "refused %u\n", message == NULL ? "(no exception)" : message,
+                caught, guard.polls, guard.refused);
+        failed = 1;
+    }
+    JS_FreeCString(context, message);
+    JS_FreeValue(context, value);
+    /* 2. An error built with its text refused keeps its message, has a null
+       stack, and leaves no exception behind. */
+    unsigned refused_before = guard.refused;
+    static const char built[] =
+        "(function () { var e = descend_with_a_long_name_so_each_stack_line_"
+        "is_long(80, function () { arm(); return new Error('kept'); });"
+        "  return e.message + ':' + (e.stack === null); })()";
+    guard.armed = false;
+    JS_SetInterruptHandler(runtime, NULL, NULL);
+    value = JS_Eval(context, built, sizeof(built) - 1u, "<backtrace-refusal>",
+                    JS_EVAL_TYPE_GLOBAL);
+    guard.armed = false;
+    const char *text = JS_IsException(value) ? NULL
+        : JS_ToCString(context, value);
+    if (text == NULL || strcmp(text, "kept:true") != 0
+        || guard.refused == refused_before) {
+        fprintf(stderr, "backtrace refusal: built error read %s\n",
+                text == NULL ? "(exception)" : text);
+        failed = 1;
+    }
+    JS_FreeCString(context, text);
+    JS_FreeValue(context, value);
+    JS_FreeContext(context);
+    JS_FreeRuntime(runtime);
+    if (!failed) printf("QuickJS refused stack text keeps the exception: PASS\n");
+    return failed;
+}
+
+/* Model the PSP word size without requesting a large allocation. Exercise
+   parser unwind with a small limit, then use the same context normally. */
+static int run_engine_bounds(void)
+{
+    const size_t edge = (UINT32_MAX - 4096u) / 8u;
+    if (!qjs_array_count_fits(edge - 1, 8, UINT32_MAX)
+        || qjs_array_count_fits(edge, 8, UINT32_MAX)
+        || qjs_array_count_fits(SIZE_MAX, 2, SIZE_MAX)
+        || !qjs_scope_index_fits(65532) || qjs_scope_index_fits(65533))
+        return 1;
+    JSRuntime *rt = JS_NewRuntime();
+    JSContext *ctx = rt ? JS_NewContext(rt) : NULL;
+    if (!ctx) { if (rt) JS_FreeRuntime(rt); return 1; }
+    const char *programs[] = {
+        "let a=1; {let b=2; a+=b} a", "for(let i=0;i<2;++i){}",
+        "class C { #n=1; }", "try {throw 1} catch(e) { e }"
+    };
+    int failed = 0;
+    for (size_t i = 0; i < sizeof(programs)/sizeof(programs[0]); ++i) {
+        for (int limited = 1; limited >= 0; --limited) {
+            JS_TestSetScopeLimit(limited ? 2 : 0);
+            JSValue v = JS_Eval(ctx, programs[i], strlen(programs[i]), "bounds",
+                                JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+            if (JS_IsException(v)) {
+                JSValue ex = JS_GetException(ctx);
+                const char *msg = JS_ToCString(ctx, ex);
+                if (!limited || !msg || !strstr(msg, "too many scopes"))
+                    failed = 1;
+                JS_FreeCString(ctx, msg);
+                JS_FreeValue(ctx, ex);
+            } else if (limited) {
+                failed = 1;
+            }
+            JS_FreeValue(ctx, v);
+        }
+    }
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    return failed;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--engine-bounds-only"))) {
+        int bounds = run_engine_bounds();
+        if (bounds || argc == 2) return bounds;
+    }
     if (argc == 2 && strcmp(argv[1], "--bigint-decrement-only") == 0)
         return run_bigint_decrement();
     if (argc == 2 && strcmp(argv[1], "--inherited-autoinit-only") == 0)
@@ -3404,6 +3603,8 @@ int main(int argc, char **argv)
         return run_single_capture_refusals();
     if (argc == 2 && strcmp(argv[1], "--metadata-refusal-only") == 0)
         return run_function_metadata_refusals();
+    if (argc == 2 && strcmp(argv[1], "--backtrace-refusal-only") == 0)
+        return run_backtrace_refusal();
     if (argc == 2) {
         char *end = NULL;
         unsigned long requested = strtoul(argv[1], &end, 10);
@@ -3420,6 +3621,7 @@ int main(int argc, char **argv)
     if (run_bigint_decrement() != 0) return 1;
     if (run_bound_function_refusals() != 0) return 1;
     if (run_float_array_indexed_stores() != 0) return 1;
+    if (run_backtrace_refusal() != 0) return 1;
 
     /* Refused bytecode growth inside the regexp compiler must raise, not
        patch jump offsets past the end of the buffer (a saved Mastodon page

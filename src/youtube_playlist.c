@@ -25,6 +25,8 @@ struct YoutubePlaylistQueue {
     char expected_video[YOUTUBE_VIDEO_ID_CAPACITY];
     bool initialized, selecting, relative, ready, failed, retry_requested;
     unsigned pages;
+    unsigned empty_span, empty_distance;
+    char empty_checkpoint[sizeof(((YoutubePlaylistPage *) 0)->next_url)];
     uint64_t initial_start_us;
 };
 
@@ -63,6 +65,22 @@ static bool playlist_fail(YoutubePlaylistQueue *q, const char *error)
     return false;
 }
 
+/* Brent's cycle check: remember one exact URL and move the checkpoint at
+   exponentially spaced intervals. Distinct empty pages are allowed, and
+   the existing page limit still bounds a walk that never repeats. */
+static bool playlist_empty_page_advances(YoutubePlaylistQueue *q, const char *next)
+{
+    if (q->empty_span && !strcmp(next, q->empty_checkpoint))
+        return playlist_fail(q, "Playlist continuation did not advance");
+    if (!q->empty_span || ++q->empty_distance == q->empty_span) {
+        memcpy(q->empty_checkpoint, next, strlen(next) + 1);
+        if (!q->empty_span) q->empty_span = 2;
+        else if (q->empty_span <= PLAYLIST_PAGE_LIMIT) q->empty_span *= 2u;
+        q->empty_distance = 0;
+    }
+    return true;
+}
+
 bool youtube_playlist_accept_page(YoutubePlaylistQueue *q, const YoutubePlaylistPage *p)
 {
     if (!q || !p || p->count > YOUTUBE_LITE_MAXIMUM_RESULTS
@@ -92,11 +110,13 @@ bool youtube_playlist_accept_page(YoutubePlaylistQueue *q, const YoutubePlaylist
         q->target += p->first;
         q->relative = false;
     }
-    if (!q->initialized) { q->first = p->first; q->count = 0; q->initialized = true; }
     size_t drop = q->count + p->count > YOUTUBE_PLAYLIST_QUEUE_LIMIT
         ? q->count + p->count - YOUTUBE_PLAYLIST_QUEUE_LIMIT : 0;
     /* Prefetch must never evict the currently playing position. */
     if (!q->selecting && drop && q->current < q->first + drop) return false;
+    if (p->count || !p->next_url[0]) q->empty_span = 0;
+    else if (!playlist_empty_page_advances(q, p->next_url)) return false;
+    if (!q->initialized) { q->first = p->first; q->count = 0; q->initialized = true; }
     memmove(q->entries, q->entries + drop, (q->count - drop) * sizeof(q->entries[0]));
     q->first += drop; q->count -= drop;
     memcpy(q->entries + q->count, p->entries, p->count * sizeof(p->entries[0]));
@@ -119,6 +139,7 @@ bool youtube_playlist_select(YoutubePlaylistQueue *q, size_t position)
     q->initial_start_us = 0;
     q->target = position; q->selecting = true; q->relative = false;
     q->failed = false; q->error[0] = 0; q->ready = false; q->pages = 0;
+    q->empty_span = 0;
     q->retry_requested = false;
     if (q->initialized && position >= q->first && position - q->first < q->count) {
         q->current = position; q->selecting = false; q->ready = true; q->request[0] = 0;
@@ -146,6 +167,7 @@ void youtube_playlist_retry(YoutubePlaylistQueue *q)
             snprintf(q->request, sizeof(q->request), "%s", q->next);
         youtube_lite_forget_playlist_page(q->session, q->request);
         q->failed = false; q->error[0] = 0; q->pages = 0;
+        q->empty_span = 0;
         q->retry_requested = true;
     }
 }

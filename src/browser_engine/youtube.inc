@@ -30,12 +30,15 @@ static void browser_engine_clear_youtube_work(BrowserEngine *engine)
         engine->youtube.feed_state = BROWSER_YOUTUBE_FEED_FAILED;
 }
 
-static void browser_engine_youtube_browsing(BrowserEngine *engine)
+static void browser_engine_youtube_browsing(BrowserEngine *engine, bool user_input)
 {
     if (youtube_lite_route(engine->navigation.page.document_url) != YOUTUBE_LITE_ROUTE_HOME)
         return;
     engine->youtube.browsing_generation = engine->navigation.generation;
     engine->youtube.browsing = true;
+    /* A later interaction supersedes confirmation; an already-scrolled
+       viewport observed by the idle pump does not. */
+    if (user_input) engine->youtube.refresh_confirmed = false;
 }
 
 static bool browser_engine_youtube_result_focused(BrowserEngine *engine)
@@ -266,17 +269,30 @@ bool browser_engine_youtube_topics(const BrowserEngine *engine)
     return engine == NULL || engine->youtube.topics;
 }
 
+static bool browser_engine_youtube_signin_pending(const BrowserEngine *engine)
+{
+    return engine->youtube.signin_state >= YOUTUBE_SIGNIN_ACCOUNT
+        && engine->youtube.signin_state <= YOUTUBE_SIGNIN_VERIFYING;
+}
+
 bool browser_engine_set_youtube_topics(BrowserEngine *engine, bool enabled)
 {
     if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE) return false;
     if (engine->youtube.topics == enabled) return true;
     engine->youtube.topics = enabled;
-    if (!enabled) {
-        if (engine->youtube.feed_job == NULL
-            && !youtube_lite_session_signed_in(&engine->session))
-            browser_engine_clear_youtube_work(engine);
-    } else {
-        engine->youtube.topics_attempted = false;
+
+    /* This preference controls anonymous topics, not personalized work. */
+    if (engine->youtube.feed_job != NULL || engine->youtube.feed_pending_identity != 0
+        || browser_engine_youtube_signin_pending(engine)
+        || youtube_lite_session_signed_in(&engine->session)) return true;
+    if (enabled) {
+        if (engine->youtube.topics_job == NULL && engine->youtube.feed_pending.html == NULL)
+            engine->youtube.topics_attempted = false;
+    } else if (engine->youtube.topics_job != NULL || engine->youtube.feed_pending.html != NULL) {
+        youtube_lite_load_destroy(engine->youtube.topics_job);
+        engine->youtube.topics_job = NULL;
+        youtube_lite_document_destroy(&engine->youtube.feed_pending);
+        engine->youtube.feed_state = BROWSER_YOUTUBE_FEED_IDLE;
     }
     return true;
 }
@@ -299,12 +315,6 @@ bool browser_engine_youtube_login_verified(const BrowserEngine *engine)
 uint64_t browser_engine_youtube_login_identity(const BrowserEngine *engine)
 {
     return browser_engine_youtube_login_verified(engine) ? engine->youtube.login_verified : 0;
-}
-
-static bool browser_engine_youtube_signin_pending(const BrowserEngine *engine)
-{
-    return engine->youtube.signin_state >= YOUTUBE_SIGNIN_ACCOUNT
-        && engine->youtube.signin_state <= YOUTUBE_SIGNIN_VERIFYING;
 }
 
 void browser_engine_set_youtube_signin_diagnostics(BrowserEngine *engine, bool enabled)
@@ -430,6 +440,21 @@ static void browser_engine_youtube_note_text_edit(BrowserEngine *engine)
         && browser_engine_youtube_signin_page_class(
                engine->navigation.page.document_url) != 0u)
         engine->youtube.signin_trail.text_edits++;
+}
+
+static void browser_engine_youtube_search_edited(BrowserEngine *engine)
+{
+    if (!engine->youtube.refresh_confirmed || !engine->navigation.page.loaded
+        || engine->navigation.page.runtime != NULL
+        || youtube_lite_route(engine->navigation.page.document_url) != YOUTUBE_LITE_ROUTE_HOME)
+        return;
+    size_t length = 0;
+    const char *id = document_attribute(controller_focused_node(&engine->controller), "id", &length);
+    if (id == NULL || length != sizeof("yt-search") - 1u
+        || memcmp(id, "yt-search", length) != 0) return;
+    /* A refresh confirmed before this edit does not own the live field.
+       Hold recommendations until the user explicitly chooses Refresh again. */
+    browser_engine_youtube_browsing(engine, true);
 }
 
 /* Lengths only; no field contents enter diagnostics. */
@@ -695,6 +720,17 @@ static bool browser_engine_youtube_signout_command(BrowserEngine *engine,
     return true;
 }
 
+static void browser_engine_youtube_sync_like_owner(BrowserEngine *engine)
+{
+    if (engine->youtube.like_generation != engine->navigation.generation
+        || (engine->youtube.like_state == BROWSER_YOUTUBE_FEED_CURRENT
+            && engine->youtube.like_identity != youtube_lite_session_login_identity(&engine->session))) {
+        engine->youtube.like_generation = engine->navigation.generation;
+        engine->youtube.like_state = BROWSER_YOUTUBE_FEED_IDLE;
+        engine->youtube.like_identity = 0;
+    }
+}
+
 static bool browser_engine_youtube_rating_command(BrowserEngine *engine,
                                                   ControllerAction *action,
                                                   lxb_dom_node_t *control)
@@ -702,10 +738,7 @@ static bool browser_engine_youtube_rating_command(BrowserEngine *engine,
     if (control == NULL
         || controller_focused_node(&engine->controller) != control) return false;
     bool liked = controller_focused_node(&engine->controller) == engine->youtube.like_node;
-    if (engine->youtube.like_generation != engine->navigation.generation) {
-        engine->youtube.like_generation = engine->navigation.generation;
-        engine->youtube.like_state = BROWSER_YOUTUBE_FEED_IDLE;
-    }
+    browser_engine_youtube_sync_like_owner(engine);
     if (engine->youtube.like_job == NULL
         && (engine->youtube.like_state != BROWSER_YOUTUBE_FEED_CURRENT
             || engine->youtube.like_selected != liked)) {
@@ -741,9 +774,28 @@ static bool browser_engine_youtube_unlike_command(BrowserEngine *engine,
         engine, action, engine->youtube.unlike_node);
 }
 
+static void browser_engine_youtube_sync_topics_generation(BrowserEngine *engine)
+{
+    uint64_t generation = engine->navigation.generation;
+    if (engine->youtube.topics_generation == generation) return;
+    browser_engine_clear_youtube_work(engine);
+    engine->youtube.topics_generation = generation;
+    engine->youtube.topics_attempted = false;
+    engine->youtube.refresh_confirmed = false;
+    engine->youtube.feed_state = BROWSER_YOUTUBE_FEED_IDLE;
+    const NavigationEntry *entry = navigation_current(&engine->navigation);
+    engine->youtube.browsing = (engine->youtube.browsing_generation == generation
+                                && engine->youtube.browsing)
+        || (entry != NULL && entry->scroll_y > 0)
+        || browser_engine_youtube_result_focused(engine);
+}
+
 static bool browser_engine_youtube_refresh_command(BrowserEngine *engine,
                                                    ControllerAction *action)
 {
+    /* Refresh can be pressed before the first idle turn. Establish its page
+       owner before arming it so generation setup will not discard it. */
+    browser_engine_youtube_sync_topics_generation(engine);
     engine->youtube.refresh_confirmed = true;
     engine->youtube.header_attempts = 0;
     if (engine->youtube.feed_pending.html == NULL && engine->youtube.feed_job == NULL
@@ -824,11 +876,18 @@ static bool browser_engine_publish_youtube_home(BrowserEngine *engine,
     const char *search = search_node == NULL ? NULL : document_control_value(search_node, &search_length);
     if (search == NULL && search_node != NULL) search = document_attribute(search_node, "value", &search_length);
     if (!youtube_lite_home_set_search_value(document, search == NULL ? "" : search, search_length)) return false;
-    char focus_id[64] = {0};
+    int focus_kind = CONTROLLER_FOCUS_NONE;
+    size_t focus_ordinal = 0;
+    uint64_t focus_identity = 0;
+    bool focus_has_id = false;
     if (preserve_focus) {
-        size_t length = 0;
-        const char *id = document_attribute(controller_focused_node(&engine->controller), "id", &length);
-        if (id != NULL && length < sizeof(focus_id)) memcpy(focus_id, id, length);
+        focus_kind = engine->controller.focus_kind;
+        focus_ordinal = browser_engine_focus_ordinal(engine);
+        focus_identity = browser_engine_focus_identity(&engine->navigation,
+            focus_kind, engine->controller.focus_index);
+        size_t id_length = 0;
+        focus_has_id = document_attribute(controller_focused_node(&engine->controller),
+            "id", &id_length) != NULL && id_length != 0;
     }
     const NavigationEntry *entry = navigation_current(&engine->navigation);
     int scroll = preserve_focus && entry != NULL ? entry->scroll_y : 0;
@@ -859,15 +918,18 @@ static bool browser_engine_publish_youtube_home(BrowserEngine *engine,
     engine->youtube.topics_generation = engine->navigation.generation;
     engine->youtube.browsing_generation = engine->navigation.generation;
     navigation_set_scroll(&engine->navigation, scroll);
-    lxb_dom_node_t *root = lxb_dom_interface_node(engine->navigation.page.document.html), *node = root;
-    for (unsigned visited = 0; focus_id[0] != '\0' && node != NULL && visited < BROWSER_ENGINE_DOM_WALK_LIMIT;
-         visited++, node = browser_engine_history_walk_next(root, node)) {
-        size_t length = 0;
-        const char *id = document_attribute(node, "id", &length);
-        if (id != NULL && length == strlen(focus_id) && memcmp(id, focus_id, length) == 0) {
-            (void) browser_engine_focus_node(engine, node); break;
-        }
-    }
+    /* Header controls may disappear; never pick an unrelated link by
+       position. Surviving recommendation cards need no DOM id: their exact
+       destination and occurrence still identify them in the retained body. */
+    lxb_dom_node_t *focus = browser_engine_match_history_focus(engine,
+        focus_kind, focus_ordinal, focus_identity);
+    /* Account becomes a Sign-in link (or the reverse), with the same id. */
+    if (focus == NULL && focus_has_id)
+        focus = browser_engine_match_history_focus(engine,
+            focus_kind == CONTROLLER_FOCUS_LINK ? CONTROLLER_FOCUS_CONTROL : CONTROLLER_FOCUS_LINK,
+            focus_ordinal, focus_identity);
+    if (focus != NULL && controller_restore_focus_node(&engine->controller, focus))
+        (void) browser_engine_finish_input(engine, true);
     return true;
 }
 
@@ -905,19 +967,7 @@ static bool browser_engine_run_youtube_topics(BrowserEngine *engine,
         || youtube_lite_route(engine->navigation.page.document_url)
                != YOUTUBE_LITE_ROUTE_HOME
         || engine->render.frames_rendered == 0) return false;
-    uint64_t generation = engine->navigation.generation;
-    if (engine->youtube.topics_generation != generation) {
-        browser_engine_clear_youtube_work(engine);
-        engine->youtube.topics_generation = generation;
-        engine->youtube.topics_attempted = false;
-        engine->youtube.refresh_confirmed = false;
-        engine->youtube.feed_state = BROWSER_YOUTUBE_FEED_IDLE;
-        const NavigationEntry *entry = navigation_current(&engine->navigation);
-        engine->youtube.browsing = (engine->youtube.browsing_generation == generation
-                                    && engine->youtube.browsing)
-            || (entry != NULL && entry->scroll_y > 0)
-            || browser_engine_youtube_result_focused(engine);
-    }
+    browser_engine_youtube_sync_topics_generation(engine);
     /* The page that asks before Sign out is not a feed. */
     if (youtube_lite_signout_confirmation(engine->navigation.page.document_url))
         return false;
@@ -925,7 +975,8 @@ static bool browser_engine_run_youtube_topics(BrowserEngine *engine,
     const char *path = host == NULL ? NULL : strchr(host + 3, '/');
     bool subscriptions = path != NULL && strcspn(path, "?#") == 19u
         && memcmp(path, "/feed/subscriptions", 19u) == 0;
-    if (!engine->youtube.topics_attempted) {
+    if (!engine->youtube.topics_attempted
+        && engine->youtube.feed_job == NULL && engine->youtube.topics_job == NULL) {
         bool authenticated = youtube_lite_session_signed_in(&engine->session);
         engine->youtube.topics_attempted = true;
         engine->youtube.feed_state = BROWSER_YOUTUBE_FEED_LOADING;
@@ -1044,7 +1095,7 @@ static bool browser_engine_run_youtube_topics(BrowserEngine *engine,
         engine->youtube.signin_feed.failure = YOUTUBE_FEED_FAILURE_SESSION_CHANGED;
     }
     if (current != NULL && current->scroll_y > 0)
-        browser_engine_youtube_browsing(engine);
+        browser_engine_youtube_browsing(engine, false);
     if (engine->youtube.feed_pending.html != NULL)
         engine->youtube.feed_publication_outcome = engine->youtube.browsing ? 4u : 1u;
     if (engine->youtube.feed_pending.html != NULL
@@ -1112,10 +1163,7 @@ static bool browser_engine_run_youtube_like(BrowserEngine *engine, bool *visual_
     if (browser_engine_navigation_pending(engine) || !engine->navigation.page.loaded
         || youtube_lite_route(engine->navigation.page.document_url) != YOUTUBE_LITE_ROUTE_WATCH)
         return false;
-    if (engine->youtube.like_generation != engine->navigation.generation) {
-        engine->youtube.like_generation = engine->navigation.generation;
-        engine->youtube.like_state = BROWSER_YOUTUBE_FEED_IDLE;
-    }
+    browser_engine_youtube_sync_like_owner(engine);
     bool working = engine->youtube.like_job != NULL;
     if (working) {
         FetchPumpQuota quota = {.maximum_body_callbacks = 1, .maximum_body_bytes = 16u * KIB,
@@ -1128,6 +1176,8 @@ static bool browser_engine_run_youtube_like(BrowserEngine *engine, bool *visual_
 #endif
             engine->youtube.like_state = status == YOUTUBE_LITE_LOAD_SUCCEEDED
                 ? BROWSER_YOUTUBE_FEED_CURRENT : BROWSER_YOUTUBE_FEED_FAILED;
+            engine->youtube.like_identity = status == YOUTUBE_LITE_LOAD_SUCCEEDED
+                ? youtube_lite_session_login_identity(&engine->session) : 0;
             youtube_lite_feed_destroy(engine->youtube.like_job);
             engine->youtube.like_job = NULL;
         }

@@ -282,6 +282,25 @@ static bool test_psp_network_reinitialization_policy(void)
         /* A clock read before the pause began never wraps. */
         if (psp_navigation_watchdog_expired(&watchdog, 1000u, units))
             return false;
+        /* The PSP app counts a load's progress_units plus its
+           parser_progress_units. A parser still working through delivered
+           bytes keeps the load alive for a minute while the transport's
+           count stands still; 30 s after both stop, it expires. */
+        size_t transport = 4096u, parser = 0u;
+        psp_navigation_watchdog_start(&watchdog, 1000u, transport + parser);
+        at = 1000u;
+        for (int step = 0; step < 12; step++) {
+            at += 5000000u;
+            parser += 512u;
+            if (psp_navigation_watchdog_expired(
+                    &watchdog, at, transport + parser)) return false;
+        }
+        if (psp_navigation_watchdog_expired(
+                &watchdog, at + PSP_NAVIGATION_STALL_US - 1u,
+                transport + parser)
+            || !psp_navigation_watchdog_expired(
+                   &watchdog, at + PSP_NAVIGATION_STALL_US,
+                   transport + parser)) return false;
     }
     /* Wi-Fi join retry. An attempt that dropped back to DISCONNECTED is
        reissued after a one-second pause; a Connect that never started
@@ -2196,7 +2215,7 @@ static bool test_youtube_lite_document_builder(Budget *layout_budget)
            Details link, where it restores the search form on the watch page. */
         && strstr(document.html,
                   "data-tilefinch-provider-media href=\""
-                  "https://www.youtube.com/watch?v=abc_DEF-123\">")
+                  "https://www.youtube.com/watch?v=abc_DEF-123\" id=yt-result-card-abc_DEF-123>")
                != NULL
         && strstr(document.html,
                   "class=details href=\"https://www.youtube.com/watch?v=")
@@ -2222,7 +2241,7 @@ static bool test_youtube_lite_document_builder(Budget *layout_budget)
         && strstr(document.html,
                   "width=160 height=90 loading=lazy alt=\"\"") != NULL
         && strstr(document.html, "Channel One") != NULL
-        && strstr(document.html, "<span class=channel>Channel One</span>")
+        && strstr(document.html, "<span class=\"meta channel\">Channel One</span>")
                != NULL
         && strstr(document.html, "<a class=channel") == NULL
         && strstr(document.html, "Second Video") != NULL

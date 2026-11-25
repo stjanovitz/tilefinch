@@ -708,10 +708,13 @@ static void psp_media_settle_displayed(bool published)
 {
     if (!psp_media_displayed_pending.pending) return;
     psp_media_displayed_pending.pending = false;
-    if (published && psp_active_media != NULL)
+    if (published && psp_active_media != NULL) {
         media_playback_note_frame_displayed(
             psp_active_media->playback, &psp_media_displayed_pending.frame,
             psp_media_displayed_pending.path);
+        psp_media_note_resume_output(psp_active_media,
+                                     psp_media_displayed_pending.frame.pts_us);
+    }
 }
 
 /* The Sharp option, and every present that reaches the 16-bit surface. The
@@ -2546,7 +2549,7 @@ void psp_navigation_cooperate_end(const char *scope)
         printf("tilefinch-ui-supervisor: scope=%s available=%u "
                "checkpoints=%zu presentations=%zu max-gap=%lluus/%s "
                "cancelled=%u input-acks=%zu max-ack=%lluus "
-               "cancel-drain=%lluus drained=%u injected=%u\n",
+               "cancel-drain=%lluus drained=%u injected=%u cancel-at-us=%llu\n",
                scope == NULL ? "unknown" : scope,
                atomic_load_explicit(
                    &psp_background_ui_available,
@@ -2565,7 +2568,8 @@ void psp_navigation_cooperate_end(const char *scope)
                (unsigned long long) cancel_drain_us,
                psp_navigation_cooperate.presenting == 0 ? 1u : 0u,
                psp_navigation_cooperate.validation_cancel_injected
-                   ? 1u : 0u);
+                   ? 1u : 0u,
+               (unsigned long long) psp_navigation_cooperate.cancellation_requested_us);
     }
     /* The reading hint belongs to the load this scope supervised. */
     psp_ui_set_preview_hint(psp_navigation_cooperate.ui, false);

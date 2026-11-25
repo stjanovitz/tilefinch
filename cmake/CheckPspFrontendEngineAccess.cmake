@@ -30,7 +30,8 @@
 # migration. Comments, string and character literals are stripped first.
 # Those rules took the counts from 15/107/3 to 13/104/1 (the validation
 # units held 2, 3 and 2; comments and headers held none) and added the alias
-# count at 19.
+# count at 19. Tab transitions now capture through the engine facade instead
+# of passing borrowed NavigationSession pointers, lowering the alias count to 17.
 #
 #   cmake -DTILEFINCH_SOURCE_DIR=<repo> -P CheckPspFrontendEngineAccess.cmake
 #
@@ -134,7 +135,7 @@ check_frontend_engine_access("NavigationSession alias reads" 103
 check_frontend_engine_access("navigation_current() calls" 1
     "(^|[^A-Za-z0-9_])navigation_current[ 	]*\\("
     "Use a facade query for the current entry instead.")
-check_frontend_engine_access("NavigationSession pointer declarations" 19
+check_frontend_engine_access("NavigationSession pointer declarations" 17
     "(^|[^A-Za-z0-9_])NavigationSession[ 	\n]*\\*"
     "A local NavigationSession alias reads the live session out of sight of the other counts; copy the fact into a snapshot or facade query instead.")
 

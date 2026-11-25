@@ -423,6 +423,60 @@ static void diff_print_root(const LayoutDocument *fresh,
 }
 #endif
 
+LayoutValidationCompare layout_validation_compare(
+    const LayoutDocument *expected, const LayoutDocument *actual,
+    char *detail, size_t detail_size)
+{
+    if (detail_size != 0) detail[0] = '\0';
+    if (expected->node_box_count != actual->node_box_count
+        || expected->width != actual->width
+        || expected->height != actual->height
+        || expected->scroll_width != actual->scroll_width) {
+        snprintf(detail, detail_size, "boxes=%zu/%zu size=%dx%d/%dx%d",
+                 expected->node_box_count, actual->node_box_count,
+                 expected->width, expected->height, actual->width,
+                 actual->height);
+        return LAYOUT_VALIDATION_BOXES_DIFFER;
+    }
+    for (size_t i = 0; i < expected->node_box_count; i++) {
+        const LayoutNodeBox *a = &expected->node_boxes[i];
+        const LayoutNodeBox *b = &actual->node_boxes[i];
+        if (a->node == b->node && a->x == b->x && a->y == b->y
+            && a->width == b->width && a->height == b->height
+            && a->client_width == b->client_width
+            && a->client_height == b->client_height
+            && a->content_width == b->content_width
+            && a->content_height == b->content_height
+            && a->scroll_x == b->scroll_x && a->scroll_y == b->scroll_y)
+            continue;
+        size_t tag_length = 0;
+        const char *tag = a->node == NULL ? NULL
+            : document_element_name(a->node, &tag_length);
+        snprintf(detail, detail_size,
+                 "box=%zu node=%.*s%s %d,%d %dx%d/%d,%d %dx%d", i,
+                 (int) (tag_length > 16 ? 16 : tag_length),
+                 tag == NULL ? "" : tag, a->node == b->node ? "" : "(other)",
+                 a->x, a->y, a->width, a->height, b->x, b->y, b->width,
+                 b->height);
+        return LAYOUT_VALIDATION_BOXES_DIFFER;
+    }
+    bool commands = expected->count == actual->count;
+    for (size_t i = 0; commands && i < expected->count; i++) {
+        const DrawCommand *a = &expected->commands[i];
+        const DrawCommand *b = &actual->commands[i];
+        commands = a->x == b->x && a->y == b->y
+            && diff_command_shape(a) == diff_command_shape(b);
+        if (!commands)
+            snprintf(detail, detail_size, "command=%zu/%zu type=%d/%d", i,
+                     expected->count, (int) a->type, (int) b->type);
+    }
+    if (!commands && detail[0] == '\0')
+        snprintf(detail, detail_size, "commands=%zu/%zu", expected->count,
+                 actual->count);
+    return commands ? LAYOUT_VALIDATION_SAME
+                    : LAYOUT_VALIDATION_COMMANDS_DIFFER;
+}
+
 void layout_validation_report_build(const LayoutDocument *fresh)
 {
 #ifndef __PSP__

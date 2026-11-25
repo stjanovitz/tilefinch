@@ -178,16 +178,47 @@ static bool interactive_pending_load(BrowserEngine *engine, const char *url,
     return job.status == BROWSER_NAVIGATION_JOB_SUCCEEDED;
 }
 
+/* The built-in presentation sheets in the PSP app's order
+   (psp_set_presentation_css): page-ad hiding (--hide-page-ads, the default
+   "Hide page ads" setting while content blocking is on), then the
+   cookie-notice sheet (--hide-cookie-banners). */
+#define INTERACTIVE_PRESENTATION_CSS_LIMIT \
+    (CONTENT_BLOCKER_COSMETIC_CSS_LIMIT + CONTENT_BLOCKER_COOKIE_CSS_LIMIT)
+
+static bool interactive_presentation_css(
+    bool hide_page_ads, bool hide_cookie_banners, char *css,
+    size_t capacity, size_t *length)
+{
+    size_t used = 0u, part = 0u;
+    if (hide_page_ads) {
+        if (!content_blocker_cosmetic_css(css, capacity, &part)) return false;
+        used = part;
+    }
+    if (hide_cookie_banners) {
+        if (used != 0u) {
+            if (used + 1u >= capacity) return false;
+            css[used++] = '\n';
+        }
+        if (!content_blocker_cookie_banner_css(
+                css + used, capacity - used, &part)) return false;
+        used += part;
+    }
+    if (used == 0u && capacity != 0u) css[0] = '\0';
+    *length = used;
+    return true;
+}
+
 static bool interactive_restore_base_user_css(
     BrowserEngine *engine, NavigationSession *navigation,
-    bool hide_cookie_banners, const char *user_css)
+    bool hide_page_ads, bool hide_cookie_banners, const char *user_css)
 {
     if (engine == NULL || navigation == NULL) return false;
-    if (hide_cookie_banners) {
-        char css[CONTENT_BLOCKER_COOKIE_CSS_LIMIT];
+    if (hide_page_ads || hide_cookie_banners) {
+        char css[INTERACTIVE_PRESENTATION_CSS_LIMIT];
         size_t length = 0u;
-        return content_blocker_cookie_banner_css(
-                   css, sizeof(css), &length)
+        return interactive_presentation_css(
+                   hide_page_ads, hide_cookie_banners, css, sizeof(css),
+                   &length)
             && browser_engine_apply_user_css(engine, css, length);
     }
     if (user_css == NULL)
@@ -200,19 +231,21 @@ static bool interactive_restore_base_user_css(
     return restored;
 }
 
-/* --user-css-before-load: the user sheet (cookie-banner CSS or --user-css)
-   is set before the first load, as the PSP app sets its presentation CSS
+/* --user-css-before-load: the user sheet (the presentation sheets or
+   --user-css) is set before the first load, as the PSP app sets its presentation CSS
    before each navigation (psp_set_presentation_css), so the page's first
    sheet is compiled with it and no whole-sheet rebuild follows the load.
    Without it the lab applies the sheet after the load and rebuilds. */
 static bool interactive_set_user_css_before_load(
-    NavigationSession *navigation, bool hide_cookie_banners,
-    const char *user_css)
+    NavigationSession *navigation, bool hide_page_ads,
+    bool hide_cookie_banners, const char *user_css)
 {
-    if (hide_cookie_banners) {
-        char css[CONTENT_BLOCKER_COOKIE_CSS_LIMIT];
+    if (hide_page_ads || hide_cookie_banners) {
+        char css[INTERACTIVE_PRESENTATION_CSS_LIMIT];
         size_t length = 0u;
-        return content_blocker_cookie_banner_css(css, sizeof(css), &length)
+        return interactive_presentation_css(
+                   hide_page_ads, hide_cookie_banners, css, sizeof(css),
+                   &length)
             && navigation_set_user_css(navigation, css, length);
     }
     if (user_css == NULL) return true;
@@ -529,6 +562,7 @@ int main(int argc, char **argv)
     unsigned pending_load_page_downs = 0;
     uint64_t relayout_preview_us = UINT64_C(150000);
     bool hide_cookie_banners = false;
+    bool hide_page_ads = false;
     bool user_css_before_load = false;
     bool reader_mode = false;
     bool wpt_test_rendered = false;
@@ -622,6 +656,9 @@ int main(int argc, char **argv)
         }
         else if (strcmp(argv[i], "--hide-cookie-banners") == 0) {
             hide_cookie_banners = true;
+        }
+        else if (strcmp(argv[i], "--hide-page-ads") == 0) {
+            hide_page_ads = true;
         }
         else if (strcmp(argv[i], "--user-css-before-load") == 0) {
             user_css_before_load = true;
@@ -979,7 +1016,11 @@ int main(int argc, char **argv)
                 || strlen(frame_activate_event)
                        >= sizeof(((NavigationSession *) 0)
                                      ->last_frame_message_event)))
-        || (reader_mode && (user_css != NULL || hide_cookie_banners))) {
+        || (reader_mode
+            && (user_css != NULL || hide_cookie_banners || hide_page_ads))
+        || (hide_page_ads
+            && (user_css != NULL || content_blocker_name == NULL
+                || strcmp(content_blocker_name, "off") == 0))) {
         usage(argv[0]); return 2;
     }
 
@@ -1414,7 +1455,7 @@ int main(int argc, char **argv)
             goto cleanup;
         }
         if (!interactive_set_user_css_before_load(
-                &navigation, hide_cookie_banners, user_css)) {
+                &navigation, hide_page_ads, hide_cookie_banners, user_css)) {
             fprintf(stderr, "interactive user stylesheet before load failed\n");
             goto cleanup;
         }
@@ -1960,15 +2001,16 @@ int main(int argc, char **argv)
     }
     if (user_css_before_load) {
         /* Set before the load; the first sheet already holds it. */
-    } else if (hide_cookie_banners) {
-        char cookie_css[8192];
-        size_t cookie_css_length = 0;
-        if (!content_blocker_cookie_banner_css(
-                cookie_css, sizeof(cookie_css), &cookie_css_length)
+    } else if (hide_page_ads || hide_cookie_banners) {
+        char presentation_css[INTERACTIVE_PRESENTATION_CSS_LIMIT];
+        size_t presentation_css_length = 0;
+        if (!interactive_presentation_css(
+                hide_page_ads, hide_cookie_banners, presentation_css,
+                sizeof(presentation_css), &presentation_css_length)
             || !navigation_set_user_css(
-                &navigation, cookie_css, cookie_css_length)
+                &navigation, presentation_css, presentation_css_length)
             || !navigation_relayout(&navigation)) {
-            fprintf(stderr, "interactive cookie-banner CSS failed\n");
+            fprintf(stderr, "interactive presentation CSS failed\n");
             goto cleanup;
         }
     } else if (!apply_user_css(&navigation, user_css)) {
@@ -2026,11 +2068,12 @@ int main(int argc, char **argv)
                     recovery_adapter, sizeof(recovery_adapter));
             size_t recovery_css_length = css_ready
                 ? strlen(recovery_css) : 0u;
-            if (css_ready && hide_cookie_banners) {
+            if (css_ready && (hide_page_ads || hide_cookie_banners)) {
                 size_t cookie_css_length = 0u;
-                char cookie_css[CONTENT_BLOCKER_COOKIE_CSS_LIMIT];
-                css_ready = content_blocker_cookie_banner_css(
-                    cookie_css, sizeof(cookie_css), &cookie_css_length)
+                char cookie_css[INTERACTIVE_PRESENTATION_CSS_LIMIT];
+                css_ready = interactive_presentation_css(
+                    hide_page_ads, hide_cookie_banners, cookie_css,
+                    sizeof(cookie_css), &cookie_css_length)
                     && recovery_css_length < sizeof(recovery_css)
                     && cookie_css_length
                            <= sizeof(recovery_css) - recovery_css_length - 1u;
@@ -2048,7 +2091,8 @@ int main(int argc, char **argv)
                           : browser_engine_activate_reader_view(engine));
             if (applied && !activated) {
                 (void) interactive_restore_base_user_css(
-                    engine, &navigation, hide_cookie_banners, user_css);
+                    engine, &navigation, hide_page_ads, hide_cookie_banners,
+                    user_css);
             }
             printf("%s-recovery available=%s kind=%s "
                    "high-confidence=%s entries=%u visited=%u bounded=%s "
@@ -2672,11 +2716,14 @@ int main(int argc, char **argv)
            (unsigned long long) cache.idle_us,
            (unsigned long long) cache.max_idle_slice_us,
            (unsigned long long) cache.max_idle_unit_us);
-    printf("image-work-us decode=%llu/%llu scale=%llu/%llu\n",
+    printf("image-work-us decode=%llu/%llu scale=%llu/%llu decodes=%zu "
+           "held-hits=%zu held-reclaims=%zu\n",
            (unsigned long long) cache.decoded_image_us,
            (unsigned long long) cache.max_decoded_image_us,
            (unsigned long long) cache.scaled_image_us,
-           (unsigned long long) cache.max_scaled_image_us);
+           (unsigned long long) cache.max_scaled_image_us,
+           cache.decoded_image_builds, cache.held_image_hits,
+           cache.held_image_reclaims);
     printf("startup-visual-work slices=%zu total-us=%llu max-slice-us=%llu "
            "max-unit-us=%llu\n",
            cache.startup_visual_slices,

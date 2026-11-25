@@ -83,7 +83,7 @@ static uint64_t browser_engine_focus_identity(
     return hash ? hash : 1;
 }
 
-static lxb_dom_node_t *browser_engine_history_focus(
+static lxb_dom_node_t *browser_engine_match_history_focus(
     const BrowserEngine *engine, int kind, size_t ordinal, uint64_t identity)
 {
     const LayoutDocument *layout = &engine->navigation.page.layout;
@@ -111,7 +111,14 @@ static lxb_dom_node_t *browser_engine_history_focus(
         }
         if (found != NULL) return found;
     }
-    return browser_engine_semantic_focus(engine, kind, ordinal, NULL);
+    return NULL;
+}
+
+static lxb_dom_node_t *browser_engine_history_focus(
+    const BrowserEngine *engine, int kind, size_t ordinal, uint64_t identity)
+{
+    lxb_dom_node_t *matched = browser_engine_match_history_focus(engine, kind, ordinal, identity);
+    return matched != NULL ? matched : browser_engine_semantic_focus(engine, kind, ordinal, NULL);
 }
 
 /* Copies the restorable view of a history entry, the one place its
@@ -140,6 +147,24 @@ static bool browser_engine_navigation_restore_view(
         engine, work->restore.focus_kind, work->restore.focus_index,
         work->restore.focus_identity);
     if (focus != NULL) (void) controller_focus_node(&engine->controller, focus);
+    /* A native result can move out of the saved viewport in a fresh search
+       response. Keep the controller's reveal in that case; the old scroll
+       still wins for unchanged ordering and for ordinarily restored pages. */
+    if (focus != NULL && work->restore.focus_kind == CONTROLLER_FOCUS_LINK
+        && engine->navigation.page.runtime == NULL
+        && youtube_lite_route(engine->navigation.page.document_url) == YOUTUBE_LITE_ROUTE_SEARCH
+        && browser_engine_focus_ordinal(engine) != work->restore.focus_index) {
+        size_t length = 0;
+        const char *id = document_attribute(focus, "id", &length);
+        int y = 0, height = 0;
+        int scroll = work->restore.scroll_y;
+        if (id != NULL && length > sizeof("yt-result-") - 1u
+            && !memcmp(id, "yt-result-", sizeof("yt-result-") - 1u)
+            && controller_focused_rect(&engine->controller, NULL, &y, NULL, &height)
+            && ((int64_t)y + height <= scroll
+                || (int64_t)y >= (int64_t)scroll + engine->navigation.viewport.css_height))
+            return true;
+    }
     /* Focus notifications may relayout or reveal. History owns the exact
        viewport, so apply its saved position after those side effects. */
     return navigation_set_scroll(
@@ -184,10 +209,80 @@ static lxb_dom_node_t *browser_engine_history_walk_next(
     return NULL;
 }
 
-static void browser_engine_store_current_controls(BrowserEngine *engine)
+static bool browser_engine_history_sensitive_control(lxb_dom_node_t *node)
+{
+    size_t length = 0;
+    const char *type = node == NULL ? NULL : document_attribute(node, "type", &length);
+    return type != NULL
+        && ((length == 8u && strncasecmp(type, "password", 8u) == 0)
+            || (length == 4u && strncasecmp(type, "file", 4u) == 0));
+}
+
+static bool browser_engine_live_text_draft(const BrowserEngine *engine)
+{
+    const LayoutDocument *layout = &engine->navigation.page.layout;
+    for (size_t i = 0; i < layout->control_count; i++)
+        if (document_control_value_changed(layout->controls[i].node)) return true;
+    return false;
+}
+
+static uint64_t browser_engine_history_hash_attribute(
+    uint64_t identity, lxb_dom_node_t *node, const char *attribute)
+{
+    size_t length = 0;
+    const char *value = document_attribute(node, attribute, &length);
+    if (length >= NAVIGATION_URL_LIMIT) return 0;
+    for (size_t i = 0; value != NULL && i < length; i++)
+        identity = (identity ^ (unsigned char) value[i]) * UINT64_C(1099511628211);
+    identity *= UINT64_C(1099511628211);
+    return identity ? identity : 1u;
+}
+
+static uint64_t browser_engine_history_control_identity(
+    const NavigationSession *nav, size_t index)
+{
+    lxb_dom_node_t *node = nav->page.layout.controls[index].node;
+    if (node == NULL || browser_engine_history_sensitive_control(node)) return 0;
+    uint64_t identity = browser_engine_focus_identity(nav, CONTROLLER_FOCUS_CONTROL, index);
+    if (identity == 0) return 0;
+    identity = (identity ^ node->local_name) * UINT64_C(1099511628211);
+    static const char *const attributes[] = { "type", "name", "form", "formaction" };
+    for (size_t at = 0; identity != 0 && at < sizeof(attributes) / sizeof(*attributes); at++)
+        identity = browser_engine_history_hash_attribute(identity, node, attributes[at]);
+    if (identity == 0) return 0;
+    lxb_dom_node_t *form = controller_control_form_owner(node);
+    if (form == NULL) return identity;
+    identity ^= UINT64_C(0x731a3d0a4d0e04b1);
+    static const char *const form_attributes[] = { "id", "name", "action", "method" };
+    for (size_t at = 0; identity != 0 && at < sizeof(form_attributes) / sizeof(*form_attributes); at++)
+        identity = browser_engine_history_hash_attribute(identity, form, form_attributes[at]);
+    if (identity == 0) return 0;
+    /* A relative action is only the same action under the same document base. */
+    size_t n = strnlen(nav->page.resource_base_url, sizeof(nav->page.resource_base_url));
+    for (size_t i = 0; i < n && nav->page.resource_base_url[i] != '#'; i++)
+        identity = (identity ^ (unsigned char) nav->page.resource_base_url[i]) * UINT64_C(1099511628211);
+    return identity ? identity : 1u;
+}
+
+static size_t browser_engine_history_unique_control(
+    const NavigationSession *navigation, uint64_t identity)
+{
+    if (identity == 0) return SIZE_MAX;
+    size_t matched = SIZE_MAX;
+    size_t count = navigation->page.layout.control_count;
+    for (size_t i = 0; i < count; i++) {
+        if (browser_engine_history_control_identity(navigation, i) != identity)
+            continue;
+        if (matched != SIZE_MAX) return SIZE_MAX;
+        matched = i;
+    }
+    return matched;
+}
+
+static bool browser_engine_store_current_controls(BrowserEngine *engine)
 {
     NavigationEntry *entry = browser_engine_restorable_entry(engine);
-    if (entry == NULL) return;
+    if (entry == NULL) return true;
     entry->control_count = 0u;
     /* Disclosure visibility determines all subsequent control ordinals, so
        it is recorded first: one record whose bits are the open states by
@@ -208,7 +303,7 @@ static void browser_engine_store_current_controls(BrowserEngine *engine)
         }
         if (ordinal >= 8u * sizeof(disclosures->value)) {
             disclosures->control_index = (uint16_t) ordinal;
-            return;
+            break;
         }
         if (lxb_dom_element_has_attribute(lxb_dom_interface_element(node),
                 (const lxb_char_t *) "open", 4u))
@@ -217,41 +312,37 @@ static void browser_engine_store_current_controls(BrowserEngine *engine)
     }
     if (disclosures != NULL) disclosures->control_index = (uint16_t) ordinal;
     const LayoutDocument *layout = &engine->navigation.page.layout;
-    for (size_t index = 0;
-         index < layout->control_count
-         && entry->control_count < NAVIGATION_HISTORY_CONTROL_LIMIT;
-         index++) {
+    bool complete = true;
+    for (size_t index = 0; index < layout->control_count; index++) {
         lxb_dom_node_t *node = layout->controls[index].node;
-        size_t type_length = 0u;
-        const char *type = node == NULL ? NULL
-            : document_attribute(node, "type", &type_length);
-        if (type != NULL
-            && ((type_length == 8u
-                 && strncasecmp(type, "password", 8u) == 0)
-                || (type_length == 4u
-                    && strncasecmp(type, "file", 4u) == 0))) {
-            continue;
-        }
+        if (node == NULL || browser_engine_history_sensitive_control(node)) continue;
         size_t value_length = 0u;
         char selected[128];
-        size_t option_count = controller_select_history(
-            node, selected, sizeof(selected), false);
-        const char *value = node == NULL ? NULL
-            : document_control_value(node, &value_length);
+        size_t option_count = controller_select_history_edited(node, selected, sizeof(selected));
+        bool text_changed = document_control_value_changed(node);
+        if (!text_changed && option_count == 0) continue;
+        const char *value = document_control_value(node, &value_length);
         if (option_count != 0) {
             value = selected;
             value_length = option_count;
         }
-        if (value == NULL || (!option_count && value_length >= 128u) || index > UINT16_MAX)
+        uint64_t identity = browser_engine_history_control_identity(&engine->navigation, index);
+        if (value == NULL || (!option_count && value_length >= 128u)
+            || index > UINT16_MAX || entry->control_count == NAVIGATION_HISTORY_CONTROL_LIMIT
+            || browser_engine_history_unique_control(&engine->navigation, identity) != index) {
+            complete &= !text_changed;
             continue;
+        }
         NavigationHistoryControl *saved =
             &entry->controls[entry->control_count++];
+        saved->identity = identity;
         saved->control_index = (uint16_t) index;
         saved->value_length = (uint16_t) value_length | (option_count ? NAVIGATION_HISTORY_CONTROL_OPTIONS : 0u);
         if (value_length != 0u)
             memcpy(saved->value, value, value_length);
         if (value_length < sizeof(saved->value)) saved->value[value_length] = '\0';
     }
+    return complete;
 }
 
 static bool browser_engine_restore_controls(
@@ -297,11 +388,11 @@ static bool browser_engine_restore_controls(
     for (size_t at = 0; at < count; at++) {
         const NavigationHistoryControl *saved = &controls[at];
         if (saved->value_length == NAVIGATION_HISTORY_CONTROL_DISCLOSURES) continue;
-        if (saved->control_index >= navigation->page.layout.control_count)
+        size_t matched = browser_engine_history_unique_control(navigation, saved->identity);
+        if (matched == SIZE_MAX)
             continue;
-        lxb_dom_node_t *node = navigation->page.layout.controls[
-            saved->control_index].node;
-        if (node != NULL) {
+        lxb_dom_node_t *node = navigation->page.layout.controls[matched].node;
+        if (node != NULL && !browser_engine_history_sensitive_control(node)) {
             if (saved->value_length & NAVIGATION_HISTORY_CONTROL_OPTIONS) {
                 char state[128];
                 memcpy(state, saved->value, sizeof(state));
@@ -309,10 +400,13 @@ static bool browser_engine_restore_controls(
                     saved->value_length & NAVIGATION_HISTORY_CONTROL_LENGTH_MASK, true);
                 if (restored == SIZE_MAX) return false;
                 selected |= restored != 0;
-            } else if (saved->value_length < sizeof(saved->value))
-                (void) document_control_value_set(
-                &navigation->page.document, node, saved->value,
-                saved->value_length);
+            } else if ((node->local_name == LXB_TAG_INPUT
+                         || node->local_name == LXB_TAG_TEXTAREA)
+                       && saved->value_length < sizeof(saved->value)
+                       && !document_control_value_set(&navigation->page.document,
+                               node, saved->value, saved->value_length)) {
+                return false;
+            }
         }
     }
     /* Select labels are layout commands, unlike live editable text. Rebuild
@@ -424,8 +518,10 @@ static bool browser_engine_apply_autofocus(BrowserEngine *engine)
 static void browser_engine_apply_or_defer_autofocus(BrowserEngine *engine)
 {
     lxb_dom_node_t *target = browser_engine_autofocus_target(engine);
-    if (target != NULL)
-        (void) controller_focus_node(&engine->controller, target);
+    bool applied = target != NULL
+        && controller_focus_node(&engine->controller, target);
+    engine->autofocus_layout_at_commit = applied
+        ? engine->navigation.incremental_relayouts : SIZE_MAX;
     /* The commit layout can precede the first bounded font/resource relayout.
        Keep one obligation through idle settling even when the initial target
        is not represented by a focus region yet. This is not standing work:
@@ -461,6 +557,15 @@ static bool browser_engine_retry_deferred_autofocus(
     if (target == NULL) {
         if (!layout_still_settling)
             engine->autofocus_pending = false;
+        return false;
+    }
+    /* A static page's initial focus already revealed this exact node.
+       Manual input cancels this obligation; a resource relayout must still
+       re-resolve and reveal it, even when its DOM identity did not change. */
+    if (engine->navigation.page.runtime == NULL
+        && engine->autofocus_layout_at_commit == engine->navigation.incremental_relayouts
+        && controller_focused_node(&engine->controller) == target) {
+        engine->autofocus_pending = false;
         return false;
     }
     if (!controller_focus_node(&engine->controller, target)) return false;

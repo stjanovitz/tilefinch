@@ -20,9 +20,8 @@ globalThis.__tilefinchEventInterfaces.defineProperty(globalThis,
   __proto__: null,
   configurable: true,
   value({
-    constructors: { Array, BigInt, Date, Map, Number, RegExp, Set, String },
-    errorTypes,
-    viewTypes,
+    constructors,
+    BigInt,
     ordinaryClonePrototypeKind,
     isProxy,
     base64Encode,
@@ -56,8 +55,20 @@ globalThis.__tilefinchEventInterfaces.defineProperty(globalThis,
     trustedDataViewByteLength,
     trustedJSONStringify,
     trustedJSONParse,
+    domShared,
+    zeroBytes,
   }) {
-    const { DOMException } = globalThis.__tilefinchEventInterfaces,
+    const { Array, Date, Map, Number, RegExp, Set, String, Error, EvalError,
+        RangeError, ReferenceError, SyntaxError, TypeError, URIError,
+        Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array,
+        Int32Array, Uint32Array, Float32Array, Float64Array,
+        BigInt64Array, BigUint64Array, DataView } = constructors,
+      errorTypes = { __proto__: null, Error, EvalError, RangeError, ReferenceError,
+        SyntaxError, TypeError, URIError },
+      viewTypes = { __proto__: null, Int8Array, Uint8Array, Uint8ClampedArray,
+        Int16Array, Uint16Array, Int32Array, Uint32Array, Float32Array, Float64Array,
+        BigInt64Array, BigUint64Array, DataView },
+      { DOMException } = globalThis.__tilefinchEventInterfaces,
       frameCloneMagic = "tilefinch-clone-v1",
       frameCloneObjectLimit = 512,
       frameClonePropertyLimit = 4096,
@@ -85,11 +96,39 @@ globalThis.__tilefinchEventInterfaces.defineProperty(globalThis,
           bytes[at] = trustedCharCodeAt(binary, at);
         return bytes;
       },
+      packKeys = (wire, entries, count, size) => {
+        /* Charge UTF-8 bytes just as the native queue does. No extra string
+           copy is needed, and the codec already bounds wire.length. */
+        let remaining = frameCloneWireLimit - size;
+        for (let i = 0; i < wire.length; i++) {
+          const unit = trustedCharCodeAt(wire, i);
+          if (unit >= 0xd800 && unit <= 0xdbff && i + 1 < wire.length) {
+            const tail = trustedCharCodeAt(wire, i + 1);
+            if (tail >= 0xdc00 && tail <= 0xdfff) {
+              remaining -= 4;
+              i++;
+            } else remaining -= 3;
+          } else remaining -= unit < 0x80 ? 1 : unit < 0x800 ? 2 : 3;
+          if (remaining < 0)
+            throw frameCloneError("message exceeds bounded wire size");
+        }
+        const keys = new TrustedUint8Array(size);
+        try {
+          for (let i = 0; i < count; i++) {
+            const entry = entries[i];
+            domShared.writeFrameKey(entry.item, keys, entry.offset);
+          }
+          return keys;
+        } catch (error) {
+          zeroBytes(keys, 0);
+          throw error;
+        }
+      },
       encodeFrameMessage = (value) => {
         const memory = new Map(),
           nodes = [];
         let propertyCount = 0,
-          diagnosticEvent = "";
+          diagnosticEvent = "", keyEntries, keyCount = 0, keyBytes = 0;
         const encode = (item, depth) => {
           if (depth > frameCloneDepthLimit)
             throw frameCloneError("message nesting exceeds bounded depth");
@@ -115,10 +154,20 @@ globalThis.__tilefinchEventInterfaces.defineProperty(globalThis,
           if (seen !== undefined) return ["r", seen];
           if (nodes.length >= frameCloneObjectLimit)
             throw frameCloneError("message object count exceeds bounded size");
-          const id = nodes.length,
-            tag = trustedObjectTag(item);
+          const id = nodes.length;
           trustedMapSet(memory, item, id);
           nodes[id] = null;
+          const keySize = domShared.frameKeySize?.(item);
+          if (keySize !== undefined) {
+            if (keySize > frameCloneWireLimit - keyBytes)
+              throw frameCloneError("message key data exceeds bounded size");
+            keyEntries ??= { __proto__: null };
+            keyEntries[keyCount++] = { item, offset: keyBytes };
+            nodes[id] = { t: "k", o: keyBytes };
+            keyBytes += keySize;
+            return ["r", id];
+          }
+          const tag = trustedObjectTag(item);
           if (tag === "[object ArrayBuffer]") {
             nodes[id] = {
               t: "b",
@@ -225,21 +274,25 @@ globalThis.__tilefinchEventInterfaces.defineProperty(globalThis,
           wire = trustedJSONStringify(envelope);
         if (wire.length > frameCloneWireLimit)
           throw frameCloneError("message exceeds bounded wire size");
-        return wire;
+        return keyCount === 0 ? wire
+          : { wire, keys: packKeys(wire, keyEntries, keyCount, keyBytes) };
       },
-      decodeFrameMessage = (wire) => {
+      decodeFrameMessage = (wire, keys) => {
         const text = String(field(wire));
         if (text.length > frameCloneWireLimit)
           throw frameCloneError("message exceeds bounded wire size");
         const envelope = trustedJSONParse(text);
         if (!envelope || envelope.tilefinchClone !== frameCloneMagic ||
-            !trustedArrayIsArray(envelope.nodes))
+            !trustedArrayIsArray(envelope.nodes)) {
+          if (keys !== undefined) throw frameCloneError("invalid message key sequence");
           return envelope;
+        }
         if (envelope.nodes.length > frameCloneObjectLimit)
           throw frameCloneError("message object count exceeds bounded size");
         const nodes = new Array(envelope.nodes.length),
           source = envelope.nodes;
-        let decodedItemCount = 0;
+        let decodedItemCount = 0, nextKey = 0;
+        if (keys !== undefined) domShared.ensureSubtleOperations();
         for (let at = 0; at < source.length; at++) {
           const node = source[at];
           if (!node || typeof node.t !== "string")
@@ -259,6 +312,17 @@ globalThis.__tilefinchEventInterfaces.defineProperty(globalThis,
             nodes[at] = new RegExp(field(node.s), field(node.f));
           else if (node.t === "m") nodes[at] = new Map();
           else if (node.t === "s") nodes[at] = new Set();
+          else if (node.t === "k") {
+            /* The JSON graph can only name complete records, once in order.
+               Never interpret bytes at arbitrary offsets in the sidecar. */
+            if (keys === undefined || node.o !== nextKey)
+              throw frameCloneError("message contains an invalid key reference");
+            const key = domShared.readFrameKey(keys, nextKey);
+            nextKey += domShared.frameKeySize(key);
+            trustedDefineProperty(nodes, at, {
+              __proto__: null, value: key,
+            });
+          }
           else if (node.t === "e") {
             const ErrorType = errorTypes[String(field(node.n))] ||
               errorTypes.Error;
@@ -267,6 +331,8 @@ globalThis.__tilefinchEventInterfaces.defineProperty(globalThis,
           } else if (node.t !== "v")
             throw frameCloneError("message contains an invalid node type");
         }
+        if (keys !== undefined && nextKey !== trustedTypedArrayLength(keys))
+          throw frameCloneError("invalid message key sequence");
         const decode = (item) => {
           if (!trustedArrayIsArray(item)) return item;
           if (item[0] === "u") return undefined;

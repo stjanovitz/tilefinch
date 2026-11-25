@@ -545,10 +545,12 @@ static int test_frames_policy(void)
 static bool drop_message(void *opaque, ScriptRuntime *source,
                          long target_frame_handle, const char *json,
                          const char *target_origin, const char *task_kind,
-                         uint64_t task_sequence)
+                         uint64_t task_sequence,
+                         const uint8_t *key_bytes, size_t key_length)
 {
     (void) opaque; (void) source; (void) target_frame_handle; (void) json;
     (void) target_origin; (void) task_kind; (void) task_sequence;
+    (void) key_bytes; (void) key_length;
     return true;
 }
 

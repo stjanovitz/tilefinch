@@ -11,7 +11,10 @@
  * chatgpt.com mid-load on hardware: its ~60 ES modules over the PSP's Wi-Fi
  * took 46-88 s of steady progress. The load expires after
  * PSP_NAVIGATION_STALL_US without its progress counter moving (a stalled
- * module fetch was seen waiting 15 s), or at the absolute cap. Circle still
+ * module fetch was seen waiting 15 s), or at the absolute cap. The counter
+ * is the load's progress_units plus its parser_progress_units: a parser
+ * working through bytes the transport already delivered (its scripts and
+ * their style checkpoints) is progress too. Circle still
  * cancels at any time. Time the user spends answering a page's alert(),
  * confirm() or prompt(), or typing in the keyboard opened over the loading
  * page, is paused out: the load waits on the reader, not the network.

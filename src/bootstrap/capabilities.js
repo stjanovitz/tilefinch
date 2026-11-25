@@ -271,7 +271,7 @@
     has(face) { requireFontSet(this); return false; }
     clear() { requireFontSet(this); }
     check(font, text) { requireFontSet(this); parseFont(font); return true; }
-    load(font, text) {
+    load(font) {
       try {
         requireFontSet(this);
         parseFont(font);

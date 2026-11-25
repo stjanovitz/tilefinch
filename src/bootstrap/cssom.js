@@ -203,6 +203,12 @@
       writable: false,
       value: transitionStats,
     });
+  /* dom.js's private share, handed over once dom.js builds it: the
+     transition and effect clocks take reserved timer slots from it. */
+  let domShared = null;
+  globalThis.__tilefinchTakeDomShared = (share) => {
+    domShared = share;
+  };
   let transitionClock = 0,
     transitionClockDue = Infinity;
   const transitionNow = () => {
@@ -255,11 +261,11 @@
         }
       }
       if (transitionClock && due >= transitionClockDue) return;
-      if (transitionClock) globalThis.__tilefinchCancelTimer(transitionClock);
+      if (transitionClock) domShared.cancelTimer(transitionClock);
       transitionClock = 0;
       transitionClockDue = Infinity;
       if (!Number.isFinite(due)) return;
-      transitionClock = globalThis.__tilefinchScheduleReservedTask(
+      transitionClock = domShared.scheduleReservedTask(
         serviceTransitionClock, Math.max(0, Math.ceil(due - transitionNow())));
       /* Only a broken reservation refuses; the next arm retries. */
       if (transitionClock) transitionClockDue = due;
@@ -398,11 +404,8 @@
       typeof requestAnimationFrame !== "function"
     )
       return;
-    const reserved = globalThis.__tilefinchScheduleReservedFrame;
     /* Only a broken reservation refuses; the next request retries. */
-    effectFramePending = !!(typeof reserved === "function"
-      ? reserved(runEffectFrame)
-      : __tilefinchRealmGlobal.__tilefinchScheduleFrame(runEffectFrame));
+    effectFramePending = !!domShared.scheduleReservedFrame(runEffectFrame);
   };
   /* The frame visits the effects that were active when it began. Transition
      events run author handlers in the middle of it, and one may cancel or

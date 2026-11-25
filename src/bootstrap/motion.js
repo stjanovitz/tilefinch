@@ -9,8 +9,13 @@
      without reserved hooks takes plain globals). */
   const publish = claimHooks?.()
     || ((name, value) => { globalThis[name] = value; });
-  const nativeMotionSource = globalThis.__tilefinchMotionSourceBridge;
+  /* The loader lends both for this evaluation only: the source bridge,
+     and dom.js's private share for the reserved timer slots and their
+     cancel. */
+  const nativeMotionSource = globalThis.__tilefinchMotionSourceBridge,
+    { scheduleReservedTask, cancelTimer } = globalThis.__tilefinchDomShared;
   delete globalThis.__tilefinchMotionSourceBridge;
+  delete globalThis.__tilefinchDomShared;
   /* Loaded on first use, after the page may have replaced Event and
      Element: extend and check against the interfaces hardening.js
      captured. */
@@ -477,14 +482,14 @@
         else if (!state.ended) due = Math.min(due, state.endAt);
       }
       if (lifecycleTimer && due >= lifecycleTimerDue) return;
-      if (lifecycleTimer) globalThis.__tilefinchCancelTimer?.(lifecycleTimer);
+      if (lifecycleTimer) cancelTimer?.(lifecycleTimer);
       lifecycleTimer = 0;
       lifecycleTimerDue = due;
       if (!Number.isFinite(due)) return;
       const delay = Math.max(0, Math.ceil(due - lifecycleNow()));
       /* A reserved slot: nothing would arm this again if a page that had
          filled the timer table got it refused. */
-      lifecycleTimer = globalThis.__tilefinchScheduleReservedTask(
+      lifecycleTimer = scheduleReservedTask(
         serviceLifecycles,
         delay,
       ) || 0;
@@ -912,7 +917,7 @@
       /* A timer task, not another microtask: the owner gets an input/render
          turn between bounded parsing/matching chunks. One reserved task is
          live, so author timers cannot exhaust continuation admission. */
-      const handle = globalThis.__tilefinchScheduleReservedTask?.(advanceScan, 1);
+      const handle = scheduleReservedTask?.(advanceScan, 1);
       if (!handle) { scanIterator = null; pending = false; }
     } catch (error) {
       scanIterator = null;

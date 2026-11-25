@@ -56,12 +56,13 @@ struct StyleRuleFilter {
        selectors, more tokens than fit). */
     uint32_t relational_offset;
     uint8_t relational_count;
-    bool relational_opaque;
+    uint8_t relational_opaque : 1;
     /* The rule can change display/visibility or supply an image (background,
        mask, generated content) or carries deferred declarations that might.
        Image discovery resolves an element's rules only when one of its
        candidate rules has this set. */
-    bool discovery;
+    uint8_t discovery : 1;
+    uint8_t attribute_alternatives;
     /* STYLE_RULE_SVG_RASTER_* bits: the rule can change what an inline SVG
        raster resolves. INHERITED (colour, font size, var()) reaches the SVG
        from any element the rule matches; SIZE (width/height) only from the
@@ -124,16 +125,39 @@ void stylesheet_note_style_source(Stylesheet *sheet,
 /* Calls `visit` with the identity hash of each class and id the selector
    tests: every one (`every_position`), or only those it reads on elements
    other than its subject (before `split`, the rightmost compound, or in a
-   functional argument), leaving out :has() arguments, which the :has()
-   plan scopes. False when some identity cannot be named by a token (a
-   [class]/[id] test, an escape that does not decode). With
+   functional argument other than the last compound of an :is()/:where()/
+   :not() argument in the subject), leaving out :has() arguments, which
+   the :has() plan scopes. A [class~=name] or [id=name] test reads that
+   token; another [class]/[id] test reads its own token when `tests` (the
+   sheet's table, style_sheet.c) lists it, else its kind's empty-name
+   token.
+   False when some identity cannot be named by a token (a [class]/[id]
+   test inside :has(), an escape that does not decode). With
    `attributes_opaque`, attribute selectors' names are visited the same way
    (stylesheet_identity_attribute_hash), and one this scan cannot name
    (escaped, namespaced) sets *attributes_opaque. */
 bool style_selector_identity_tokens(const char *text, size_t length,
                                     size_t split, bool every_position,
                                     StyleIdentityTokenVisit visit,
-                                    void *context, bool *attributes_opaque);
+                                    void *context, bool *attributes_opaque,
+                                    const StyleIdentityTests *tests);
+/* One attribute test (the string matcher's parse of every attribute
+   selector; the identity tables take the [class]/[id] ones), given the text
+   inside its brackets: its form (STYLE_ATTRIBUTE_TEST_EXISTS, or an operator plus one,
+   with STYLE_ATTRIBUTE_TEST_CASELESS for an `i` flag) and its decoded value
+   (STYLE_SELECTOR_IDENTIFIER_CAPACITY bytes). False when the matcher would
+   reject the test. ..._matches answers it for an attribute value as the
+   matcher does (`actual` NULL: the attribute is absent). */
+#define STYLE_ATTRIBUTE_TEST_EXISTS 0u
+#define STYLE_ATTRIBUTE_TEST_CASELESS 8u
+bool style_attribute_identity_test_parse(const char *text, size_t length,
+                                         unsigned *form, char *wanted,
+                                         size_t *wanted_length);
+bool style_attribute_identity_test_matches(unsigned form,
+                                           const char *wanted,
+                                           size_t wanted_length,
+                                           const char *actual,
+                                           size_t actual_length);
 size_t stylesheet_rules_affected_by_tokens(
     const Stylesheet *sheet, const uint32_t *hashes, size_t hash_count,
     uint32_t *out, size_t capacity);
@@ -338,6 +362,14 @@ typedef struct {
 
 void style_match_subject_prepare(lxb_dom_node_t *node,
                                  StyleMatchSubject *subject);
+
+/* The low three bits of each byte are unchanged by ASCII case folding.
+   A collision only sends a candidate to the normal matcher. */
+static inline uint8_t style_attribute_bit(const unsigned char *name)
+{
+    return (uint8_t) (1u << ((name[0] + 2u * name[1]) & 7u));
+}
+uint8_t style_subject_attribute_bits(lxb_dom_node_t *node);
 bool style_subject_tag_matches(const StyleMatchSubject *subject,
                                const char *wanted, size_t length);
 bool style_rule_selector_matches_subject(

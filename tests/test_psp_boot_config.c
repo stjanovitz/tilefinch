@@ -360,6 +360,24 @@ static int test_final_line_without_newline(void)
     CHECK(psp_boot_config_validation_js_heap_detail() && warning.calls == 0);
     psp_boot_config_disable_automation(&config);
     CHECK(!psp_boot_config_validation_js_heap_detail());
+    /* So does the offline-harness preconnect switch: on unless a load says
+       0, kept by a later file that omits it, restored by a rejected file,
+       and back on once automation is disabled. */
+    CHECK(!psp_boot_config_validation_preconnect_disabled());
+    CHECK(write_text(path, "validation_preconnect=0\n") == 0);
+    CHECK(psp_boot_config_load(&config, path, capture_warning, &warning));
+    CHECK(psp_boot_config_validation_preconnect_disabled()
+          && warning.calls == 0);
+    CHECK(write_text(path, "network_profile=1\n") == 0);
+    CHECK(psp_boot_config_load(&config, path, capture_warning, &warning));
+    CHECK(psp_boot_config_validation_preconnect_disabled());
+    psp_boot_config_disable_automation(&config);
+    CHECK(!psp_boot_config_validation_preconnect_disabled());
+    CHECK(write_text(path, "validation_preconnect=0\n"
+                           "validation_game_audio_reference=2\n") == 0);
+    CHECK(!psp_boot_config_load(&config, path, capture_warning, &warning));
+    CHECK(!psp_boot_config_validation_preconnect_disabled());
+    warning = (WarningCapture) {0};
     psp_boot_config_defaults(&config);
 
     static char long_line[2048];
@@ -616,8 +634,19 @@ static int test_script_heap_profiles(void)
     return 0;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    if (argc == 4 && !strcmp(argv[1], "--restart-profile")) {
+        PspBootConfig config; psp_boot_config_defaults(&config);
+        CHECK(psp_boot_config_load(&config, argv[2], NULL, NULL));
+        if (!strcmp(argv[3], "read")) {
+            CHECK(config.network_profile == 7);
+        } else {
+            config.network_profile = 8;
+            CHECK(!psp_boot_config_write_overrides(&config, argv[2], PSP_BOOT_CONFIG_KEY_NETWORK_PROFILE));
+        }
+        return 0;
+    }
     char timing_argument[PSP_BOOT_TIMING_ARGUMENT_BYTES + 1u];
     PspBootHandoffTiming timing = {100u, 200u}, decoded = {0};
     psp_boot_timing_encode(timing_argument, timing);

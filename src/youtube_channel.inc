@@ -402,7 +402,7 @@ static bool lite_channel_item(YoutubeLiteBuildWork *work, size_t kind,
     }
     channel->shelf_items++;
     work->video_count++;
-    return video ? lite_html_video(&work->html, &record, false, NULL, SIZE_MAX)
+    return video ? lite_html_video(&work->html, &record, false, NULL, SIZE_MAX, false)
         : lite_html_playlist_row(&work->html, &record);
 }
 

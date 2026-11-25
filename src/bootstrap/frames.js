@@ -28,6 +28,8 @@ globalThis.__tilefinchInstallFrames = (support) => {
     wrap,
     encodeFrameMessage,
     decodeFrameMessage,
+    postNativeFrameMessage,
+    discardFrameKeyBytes,
     trustedStringLower,
     trustedCharCodeAt,
     trustedStringSlice,
@@ -36,6 +38,7 @@ globalThis.__tilefinchInstallFrames = (support) => {
     normalizePostMessageTarget,
     location,
     browserDispatch,
+    domShared,
   } = support;
   const frameSandboxPolicy = (element) => {
       const value = element?.getAttribute?.("sandbox");
@@ -67,6 +70,14 @@ globalThis.__tilefinchInstallFrames = (support) => {
       };
     },
     frameScope = globalThis.__tilefinchFrameScope,
+    /* A frame window's own Crypto (compat.js, which loads after this
+       module and fills stopCryptoScope) names the scope of its pending
+       derivations. They stop with its document (removed, navigated away or
+       closed): rejected while its realm runs, else dropped. The scope then
+       stays stopped (subtle-crypto.js) until observable is null: the same
+       realm is live again, put back in the document. */
+    stopFrameCrypto = (state, observable) =>
+      domShared.stopCryptoScope?.(state.crypto, observable),
     frameWindows = new Map(),
     frameTargetName = (state, handle) =>
       state?.targetName ??
@@ -85,6 +96,7 @@ globalThis.__tilefinchInstallFrames = (support) => {
       candidate[1].active = false;
       candidate[1].scope.document = null;
       candidate[1].scope.location = null;
+      stopFrameCrypto(candidate[1], false);
       frameScope(candidate[1].scope);
       frameWindows.delete(candidate[0]);
     },
@@ -110,6 +122,7 @@ globalThis.__tilefinchInstallFrames = (support) => {
       };
       globalThis.__tilefinchBindFrameDocument(
         scope.document, scope.location, proxy);
+      scope.crypto = state.crypto = globalThis.__tilefinchCreateWorkerCrypto();
       scope.window = proxy;
       scope.self = proxy;
       scope.globalThis = proxy;
@@ -157,26 +170,21 @@ globalThis.__tilefinchInstallFrames = (support) => {
       __tilefinchBindFrameRealm(scope, proxy, handle);
       /* A WebIDL operation: named, length 1, not a constructor. */
       scope.postMessage = { postMessage(data, targetOrigin = "/") {
-        const current = wrap(handle);
-        if (!state.active || !current?.isConnected) return;
         const normalizedTarget = normalizePostMessageTarget(
           targetOrigin,
           location.origin,
+          arguments.length,
         );
-        const wire = encodeFrameMessage(data);
-        __tilefinchPostMessage(
-          handle,
-          wire,
-          normalizedTarget,
-          globalThis.__tilefinchActiveTaskKind,
-          globalThis.__tilefinchActiveTaskSequence,
-        );
+        const current = wrap(handle);
+        if (!state.active || !current?.isConnected) return;
+        postNativeFrameMessage(handle, data, normalizedTarget);
       } }.postMessage;
       return scope;
     },
     replaceFrameRealm = (state, handle, proxy, documentValue, locationValue) => {
       const previous = state.scope;
       if (previous) {
+        stopFrameCrypto(state, false);
         frameScope(previous);
         state.scope = null;
       }
@@ -210,6 +218,7 @@ globalThis.__tilefinchInstallFrames = (support) => {
         localSandboxSameOrigin: false,
         proxy: null,
         scope: null,
+        crypto: null,
       };
       let proxy;
       proxy = new Proxy(Object.create(null), {
@@ -333,7 +342,10 @@ globalThis.__tilefinchInstallFrames = (support) => {
       __tilefinchKeepNodeHandle(handle);
       frameWindows.set(handle, state);
       } catch (error) {
-        if (state?.scope) frameScope(state.scope);
+        if (state?.scope) {
+          stopFrameCrypto(state, false);
+          frameScope(state.scope);
+        }
         throw error;
       }
     } else if (!state.managed) state.active = !!element?.isConnected;
@@ -427,6 +439,7 @@ globalThis.__tilefinchInstallFrames = (support) => {
     state.active = !!active;
     state.managed = true;
     if (!state.active) {
+      stopFrameCrypto(state, true);
       state.scope.document = null;
       state.scope.location = null;
       state.localSource = null;
@@ -461,14 +474,15 @@ globalThis.__tilefinchInstallFrames = (support) => {
           else
             replaceFrameRealm(
               state, handle, proxy, frameDocument, frameLocation);
-        }
+        } else stopFrameCrypto(state, true);
         state.initialAboutBlank = false;
       } catch (_) {}
     }
     return proxy;
   };
-  globalThis.__tilefinchReceiveMessage = (wire, origin, sourceHandle) =>
-    globalThis.__tilefinchRunTask(
+  const runMessageTask = globalThis.__tilefinchRunTask,
+    receiveMessage = (readData, origin, sourceHandle) =>
+    runMessageTask(
       "window-message:source=" + String(sourceHandle),
       () => {
         const source =
@@ -479,35 +493,72 @@ globalThis.__tilefinchInstallFrames = (support) => {
             : Number(sourceHandle) === 0
             ? globalThis.parent
             : __tilefinchFrameWindow(Number(sourceHandle));
+        /* HTML: a message that fails to deserialize fires messageerror
+           (data null) instead; it never fails the receiving document. */
+        let type = "message", data = null;
+        try {
+          data = readData();
+        } catch (_) {
+          type = "messageerror";
+        }
         /* compat.js installs this private factory after frames.js has been
            initialized, but before any author task can deliver a message. */
         const event = trustedEvent(
           globalThis.__tilefinchCreateMessageEvent(
-          "message", decodeFrameMessage(wire), String(origin), source, []));
+          type, data, String(origin), source, []));
         globalThis.__tilefinchDispatchWindowEventCheckpointed(event);
       },
     );
-  const postMessage = (data, targetOrigin = "/") => {
-    const normalizedTarget = normalizePostMessageTarget(
+  globalThis.__tilefinchReceiveMessage = (wire, origin, sourceHandle) =>
+    receiveMessage(() => decodeFrameMessage(wire), origin, sourceHandle);
+  /* Native captures and removes this separate entry point during bootstrap.
+     Hydration is synchronous: native erases its buffer on return, and only
+     the reconstructed value can reach the public event machinery. */
+  globalThis.__tilefinchReceiveKeyMessage = (wire, origin, sourceHandle, keys) => {
+    let read;
+    try {
+      const data = decodeFrameMessage(wire, keys);
+      read = () => data;
+    } catch (error) {
+      read = () => { throw error; };
+    }
+    return receiveMessage(read, origin, sourceHandle);
+  };
+  const { postMessage } = { postMessage(data, targetOrigin = "/") {
+    const senderOrigin = location.origin,
+      normalizedTarget = normalizePostMessageTarget(
       targetOrigin,
-      location.origin,
+      senderOrigin,
+      arguments.length,
     ),
-      wire = encodeFrameMessage(data);
+      encoded = encodeFrameMessage(data),
+      keyed = typeof encoded !== "string";
     if (
       normalizedTarget !== "*" &&
-      normalizedTarget !== String(location.origin)
-    )
+      normalizedTarget !== String(senderOrigin)
+    ) {
+      if (keyed) discardFrameKeyBytes(encoded.keys, 0);
       return;
+    }
+    if (keyed) {
+      const copied = decodeFrameMessage(encoded.wire, encoded.keys);
+      /* The scheduler is installed after frames and its task entry point
+         is protected before author script runs. Only the opaque clone
+         survives until the scheduled task. */
+      __tilefinchRealmGlobal.__tilefinchScheduleTask(
+        () => receiveMessage(() => copied, senderOrigin, -1), 0);
+      return;
+    }
     __tilefinchRealmGlobal.__tilefinchScheduleTask(
       () =>
         __tilefinchReceiveMessage(
-          wire,
+          encoded,
           location.origin,
           -1,
         ),
       0,
     );
-  };
+  } };
   globalThis.postMessage = postMessage;
   /* Window child navigables (HTML: the document-tree child navigables).
      Every <iframe> and <frame> in this document's tree has a nested
@@ -615,6 +666,10 @@ globalThis.__tilefinchInstallFrames = (support) => {
       const state = frameWindows.get(Number(renamed.__handle));
       if (state) state.targetName = null;
     }
+    for (const entry of frameWindows)
+      if (!wrap(entry[0])?.isConnected) stopFrameCrypto(entry[1], true);
+      else if (entry[1].active && entry[1].sameOrigin)
+        stopFrameCrypto(entry[1], null);
     /* A child Window.name assignment changes names without changing the
        DOM version, so notifications always force name synchronization. */
     syncChildNavigables(childFrameHandles(), true);

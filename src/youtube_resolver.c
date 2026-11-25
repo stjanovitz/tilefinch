@@ -2285,7 +2285,7 @@ static YoutubeRequestStartStatus youtube_resolve_job_start_request(
 
 static bool youtube_resolve_job_poll_response(
     YoutubeResolveJob *job, size_t maximum_bytes,
-    YoutubeResolvePhase parse_phase)
+    YoutubeResolvePhase parse_phase, bool foreground)
 {
     job->request_pumps++;
     FetchBackgroundProgress progress = {0};
@@ -2311,7 +2311,16 @@ static bool youtube_resolve_job_poll_response(
             job->response.data[job->response.length] = '\0';
             job->request_chunks++;
         }
-        return true;
+        /* A streaming transport can expose completion as soon as the last
+           published chunk is consumed. Inspect metadata once; never drain a
+           second chunk or wait for a worker here. Keep large copies and the
+           incremental watch-page scanner on separate turns. */
+        if (!foreground
+            || taken == 0 || taken != progress.available_body_bytes
+            || job->response.length > 4096u
+            || !fetch_background_transport_progress(job->request_id, &progress)
+            || progress.available_body_bytes != 0)
+            return true;
     }
     if (!progress.complete) return true;
     if (!youtube_resolve_job_reserve(job, 0, maximum_bytes)) {
@@ -2634,9 +2643,25 @@ static bool youtube_resolve_job_prepare(
     return true;
 }
 
+static YoutubeResolveJobStatus youtube_resolve_pump(
+    YoutubeResolveJob *job, bool foreground);
+
 YoutubeResolveJobStatus youtube_resolve_job_pump(YoutubeResolveJob *job)
 {
+    return youtube_resolve_pump(job, false);
+}
+
+YoutubeResolveJobStatus youtube_resolve_job_pump_playback(YoutubeResolveJob *job)
+{
+    return youtube_resolve_pump(job, true);
+}
+
+static YoutubeResolveJobStatus youtube_resolve_pump(
+    YoutubeResolveJob *job, bool foreground)
+{
     if (job == NULL) return YOUTUBE_RESOLVE_JOB_FAILED;
+    YoutubeResolvePhase entered = job->phase;
+check_cancel_and_deadline:
     if (job->phase == YOUTUBE_RESOLVE_PHASE_COMPLETE)
         return YOUTUBE_RESOLVE_JOB_COMPLETE;
     if (job->phase == YOUTUBE_RESOLVE_PHASE_FAILED)
@@ -2684,7 +2709,7 @@ YoutubeResolveJobStatus youtube_resolve_job_pump(YoutubeResolveJob *job)
     case YOUTUBE_RESOLVE_PHASE_DIRECT_WAIT:
         (void) youtube_resolve_job_poll_response(
             job, job->player_maximum_bytes,
-            YOUTUBE_RESOLVE_PHASE_DIRECT_PARSE);
+            YOUTUBE_RESOLVE_PHASE_DIRECT_PARSE, foreground);
         break;
     case YOUTUBE_RESOLVE_PHASE_DIRECT_PARSE: {
         job->total_player_bytes += job->response.received_body_bytes != 0
@@ -2747,7 +2772,7 @@ YoutubeResolveJobStatus youtube_resolve_job_pump(YoutubeResolveJob *job)
     case YOUTUBE_RESOLVE_PHASE_WATCH_WAIT:
         (void) youtube_resolve_job_poll_response(
             job, job->watch_maximum_bytes,
-            YOUTUBE_RESOLVE_PHASE_WATCH_PARSE);
+            YOUTUBE_RESOLVE_PHASE_WATCH_PARSE, false);
         if (job->phase == YOUTUBE_RESOLVE_PHASE_WATCH_WAIT)
             (void) youtube_resolve_job_take_watch_prefix(job);
         break;
@@ -2806,7 +2831,7 @@ YoutubeResolveJobStatus youtube_resolve_job_pump(YoutubeResolveJob *job)
     case YOUTUBE_RESOLVE_PHASE_ENRICHED_WAIT:
         (void) youtube_resolve_job_poll_response(
             job, job->player_maximum_bytes,
-            YOUTUBE_RESOLVE_PHASE_ENRICHED_PARSE);
+            YOUTUBE_RESOLVE_PHASE_ENRICHED_PARSE, foreground);
         break;
     case YOUTUBE_RESOLVE_PHASE_ENRICHED_PARSE: {
         job->total_player_bytes += job->response.received_body_bytes != 0
@@ -2878,6 +2903,16 @@ YoutubeResolveJobStatus youtube_resolve_job_pump(YoutubeResolveJob *job)
     case YOUTUBE_RESOLVE_PHASE_COMPLETE:
     case YOUTUBE_RESOLVE_PHASE_FAILED:
         break;
+    }
+    /* A completed player response is owned by this job. Parse it without a
+       display tick between operations. Recheck cancellation and deadline,
+       and never chain to another request, retry, or watch-page parse. */
+    if (foreground && ((entered == YOUTUBE_RESOLVE_PHASE_DIRECT_WAIT
+         && job->phase == YOUTUBE_RESOLVE_PHASE_DIRECT_PARSE)
+        || (entered == YOUTUBE_RESOLVE_PHASE_ENRICHED_WAIT
+            && job->phase == YOUTUBE_RESOLVE_PHASE_ENRICHED_PARSE))) {
+        entered = job->phase;
+        goto check_cancel_and_deadline;
     }
     return job->phase == YOUTUBE_RESOLVE_PHASE_COMPLETE
         ? YOUTUBE_RESOLVE_JOB_COMPLETE

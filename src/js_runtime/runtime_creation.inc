@@ -538,8 +538,9 @@ static bool runtime_evaluate_bootstrap_profiled(
 }
 
 /* hardening.js names the features that publish hooks by these values
-   (canvas 0, IndexedDB 1, motion 2, WebGL 5, WebAssembly 7, WebGL
-   interfaces 19). */
+   (canvas 0, IndexedDB 1, motion 2, WebGL 5, WebAssembly 7, traversal 11,
+   WebGL interfaces 19, DOM attribute namespaces 23, EventSource 25,
+   FileReader 26, multiplayer 27, WebGPU 28). */
 typedef enum {
     LAZY_BOOTSTRAP_CANVAS = 0,
     LAZY_BOOTSTRAP_INDEXED_DB,
@@ -561,12 +562,27 @@ typedef enum {
     LAZY_BOOTSTRAP_SERIALIZE,
     LAZY_BOOTSTRAP_FRAME_CLONE,
     LAZY_BOOTSTRAP_WEBGL_INTERFACES,
+    LAZY_BOOTSTRAP_GEOMETRY,
+    LAZY_BOOTSTRAP_VALIDATION,
+    LAZY_BOOTSTRAP_DETACHED_DOCUMENTS,
+    LAZY_BOOTSTRAP_DOM_ATTRIBUTES,
+    LAZY_BOOTSTRAP_SUBTLE_CRYPTO,
+    LAZY_BOOTSTRAP_EVENT_SOURCE,
+    LAZY_BOOTSTRAP_FILE_READER,
+    LAZY_BOOTSTRAP_MULTIPLAYER,
+    LAZY_BOOTSTRAP_GPU,
     LAZY_BOOTSTRAP_COUNT
 } LazyBootstrapFeature;
 
 _Static_assert(LAZY_BOOTSTRAP_INDEXED_DB == 1 && LAZY_BOOTSTRAP_MOTION == 2
                && LAZY_BOOTSTRAP_WEBGL == 5 && LAZY_BOOTSTRAP_WASM == 7
-               && LAZY_BOOTSTRAP_WEBGL_INTERFACES == 19,
+               && LAZY_BOOTSTRAP_TRAVERSAL == 11
+               && LAZY_BOOTSTRAP_WEBGL_INTERFACES == 19
+               && LAZY_BOOTSTRAP_DOM_ATTRIBUTES == 23
+               && LAZY_BOOTSTRAP_EVENT_SOURCE == 25
+               && LAZY_BOOTSTRAP_FILE_READER == 26
+               && LAZY_BOOTSTRAP_MULTIPLAYER == 27
+               && LAZY_BOOTSTRAP_GPU == 28,
                "hardening.js names hook features by these values");
 _Static_assert(LAZY_BOOTSTRAP_COUNT == SCRIPT_LAZY_BOOTSTRAP_FEATURE_COUNT,
                "lazy bootstrap state must cover every feature");
@@ -725,7 +741,13 @@ static const LazyBootstrapProperty lazy_bootstrap_properties[] = {
     {"getHTML", LAZY_BOOTSTRAP_SERIALIZE,
      LAZY_BOOTSTRAP_SHADOW_ROOT_PROTOTYPE},
     {"outerText", LAZY_BOOTSTRAP_SERIALIZE,
-     LAZY_BOOTSTRAP_HTML_ELEMENT_PROTOTYPE}
+     LAZY_BOOTSTRAP_HTML_ELEMENT_PROTOTYPE},
+    {"EventSource", LAZY_BOOTSTRAP_EVENT_SOURCE, LAZY_BOOTSTRAP_GLOBAL},
+    {"FileReader", LAZY_BOOTSTRAP_FILE_READER, LAZY_BOOTSTRAP_GLOBAL},
+    /* navigator.gpu's getter (platform.js) loads it through a private
+       native, in secure contexts only. */
+    {"GPU", LAZY_BOOTSTRAP_GPU, LAZY_BOOTSTRAP_GLOBAL},
+    {"WGSLLanguageFeatures", LAZY_BOOTSTRAP_GPU, LAZY_BOOTSTRAP_GLOBAL}
 };
 _Static_assert(sizeof(lazy_bootstrap_properties)
                    / sizeof(lazy_bootstrap_properties[0])
@@ -755,6 +777,15 @@ static const char *runtime_lazy_bootstrap_name(LazyBootstrapFeature feature)
     case LAZY_BOOTSTRAP_SERIALIZE: return "Markup serialization";
     case LAZY_BOOTSTRAP_FRAME_CLONE: return "Window messaging";
     case LAZY_BOOTSTRAP_WEBGL_INTERFACES: return "WebGL interfaces";
+    case LAZY_BOOTSTRAP_GEOMETRY: return "Layout-less geometry";
+    case LAZY_BOOTSTRAP_VALIDATION: return "Constraint validation";
+    case LAZY_BOOTSTRAP_DETACHED_DOCUMENTS: return "Detached documents";
+    case LAZY_BOOTSTRAP_DOM_ATTRIBUTES: return "DOM attribute namespaces";
+    case LAZY_BOOTSTRAP_SUBTLE_CRYPTO: return "SubtleCrypto operations";
+    case LAZY_BOOTSTRAP_EVENT_SOURCE: return "EventSource";
+    case LAZY_BOOTSTRAP_FILE_READER: return "FileReader";
+    case LAZY_BOOTSTRAP_MULTIPLAYER: return "Multiplayer";
+    case LAZY_BOOTSTRAP_GPU: return "WebGPU";
     default: return "Platform feature";
     }
 }
@@ -928,10 +959,9 @@ static JSValue runtime_harden_global_hooks(JSContext *context,
         "__tilefinchBlobBytes",
         "__tilefinchBlobForURL",
         "__tilefinchCloneWorkerValue",
-        "__tilefinchAbortFileReaderForWorker",
         "__tilefinchAbortIndexedDBForWorker",
         "__tilefinchAbortSignalBrand",
-        "__tilefinchBlobTextForWorker",
+        "__tilefinchBlobText",
         "__tilefinchAbortXHRForWorker",
         "__tilefinchCloseWebSocketForWorker",
         "__tilefinchPrepareMessagePortTransfer",
@@ -962,10 +992,7 @@ static JSValue runtime_harden_global_hooks(JSContext *context,
         "__tilefinchScheduleTask",
         "__tilefinchScheduleOwnedTimer",
         "__tilefinchScheduleFrame",
-        "__tilefinchCancelTimer",
         "__tilefinchSchedulerTime",
-        "__tilefinchScheduleReservedTask",
-        "__tilefinchScheduleReservedFrame",
         "__tilefinchPointerHoverEventsObserved",
         "__tilefinchPointerMarkupChanged",
         "__tilefinchPointerMoveEventsObserved",
@@ -980,9 +1007,7 @@ static JSValue runtime_harden_global_hooks(JSContext *context,
         /* Invoked by native code or later bootstrap modules by name.
            ReceiveMessage deliberately remains replaceable for failure tests. */
         "__tilefinchCommitSameDocument",
-        "__tilefinchDeliverEventSource",
         "__tilefinchDeliverWebSocket",
-        "__tilefinchDeliverMultiplayer",
         "__tilefinchDeliverNetwork",
         "__tilefinchDocumentURLRevision",
         "__tilefinchIntersectionRecheck",
@@ -1158,6 +1183,38 @@ static bool runtime_lazy_test_probes(ScriptRuntime *runtime, bool open)
     return ok;
 }
 
+/* The dom.js share, and with `trusted` the trusted-event marker, for one
+   lazy module's evaluation (event-source.js, file-reader.js): defined over
+   any page-defined value before it and removed before author code
+   resumes. Only TRUE counts, as for the test-probe flag above: a page's
+   non-configurable name fails the load instead of reaching the module. */
+static bool runtime_lazy_privileges(ScriptRuntime *runtime, bool trusted,
+                                    bool open)
+{
+    static const char *const names[2] = {
+        "__tilefinchDomShared", "__tilefinchTrustedEvent" };
+    JSContext *context = runtime->context;
+    JSValue global = JS_GetGlobalObject(context);
+    bool ok = !JS_IsException(global);
+    for (size_t i = 0; !JS_IsException(global) && i < (trusted ? 2u : 1u);
+         i++) {
+        JSValueConst value = i == 0 ? runtime->dom_share
+                                    : runtime->host_trusted_event;
+        JSAtom atom = JS_NewAtom(context, names[i]);
+        bool step = atom != JS_ATOM_NULL
+            && (open ? JS_IsObject(value)
+                           && JS_DefinePropertyValue(
+                                  context, global, atom,
+                                  JS_DupValue(context, value),
+                                  JS_PROP_CONFIGURABLE) > 0
+                     : JS_DeleteProperty(context, global, atom, 0) > 0);
+        ok = ok && step;
+        if (atom != JS_ATOM_NULL) JS_FreeAtom(context, atom);
+    }
+    JS_FreeValue(context, global);
+    return ok;
+}
+
 /* Bridges a lazy bootstrap group needs only while it initializes. */
 static const JsRtNative runtime_checkpoint_continuation = {
     "__tilefinchQueueCheckpointContinuation",
@@ -1308,10 +1365,18 @@ static bool runtime_load_lazy_bootstrap_module(
         JSValue global = JS_GetGlobalObject(runtime->context);
         JSAtom bridge_atom = JS_NewAtom(
             runtime->context, "__tilefinchMotionSourceBridge");
+        JSAtom share_atom = JS_NewAtom(
+            runtime->context, "__tilefinchDomShared");
+        /* Only TRUE counts for the share: a page-owned non-configurable
+           name fails the load instead of reaching the module. */
         bool bridge_ready = !JS_IsException(global)
-            && bridge_atom != JS_ATOM_NULL
+            && bridge_atom != JS_ATOM_NULL && share_atom != JS_ATOM_NULL
             && js_rt_install_native(
                 runtime->context, global, &runtime_motion_source_bridge)
+            && JS_DefinePropertyValue(
+                runtime->context, global, share_atom,
+                JS_DupValue(runtime->context, runtime->dom_share),
+                JS_PROP_CONFIGURABLE) > 0
             && runtime_define_host_channel(runtime, false);
         if (bridge_ready) {
             evaluated = runtime_evaluate_bootstrap_profiled(
@@ -1328,6 +1393,11 @@ static bool runtime_load_lazy_bootstrap_module(
         if (bridge_atom != JS_ATOM_NULL) {
             (void) JS_DeleteProperty(runtime->context, global, bridge_atom, 0);
             JS_FreeAtom(runtime->context, bridge_atom);
+        }
+        if (share_atom != JS_ATOM_NULL) {
+            if (JS_DeleteProperty(runtime->context, global, share_atom, 0) <= 0)
+                evaluated = false;
+            JS_FreeAtom(runtime->context, share_atom);
         }
         if (bridge_ready
             && !runtime_take_host_channel(runtime, "styleFlushed",
@@ -1479,6 +1549,7 @@ static bool runtime_load_lazy_bootstrap_module(
         bool installed = hidden
             && JS_IsFunction(runtime->context, installer)
             && JS_IsFunction(runtime->context, runtime->host_trusted_event)
+            && JS_IsObject(runtime->dom_share)
             && !JS_IsException(run_worker)
             && !JS_IsException(trace_worker_message)
             && !JS_IsException(create_realm)
@@ -1487,14 +1558,14 @@ static bool runtime_load_lazy_bootstrap_module(
             && !JS_IsException(creator_secure_context)
             && !JS_IsException(creator_url_value);
         if (installed) {
-            JSValue arguments[8] = {
+            JSValue arguments[9] = {
                 run_worker, trace_worker_message, create_realm,
                 destroy_realm, creator_origin_value,
                 creator_secure_context, creator_url_value,
-                runtime->host_trusted_event};
+                runtime->host_trusted_event, runtime->dom_share};
             JSValue result = JS_Call(
                 runtime->context, installer, JS_UNDEFINED,
-                8, arguments);
+                9, arguments);
             installed = !JS_IsException(result);
             JS_FreeValue(runtime->context, result);
         }
@@ -1600,6 +1671,83 @@ static bool runtime_load_lazy_bootstrap_module(
             "<browser-frame-clone-lazy>",
             &browser_bootstrap_frame_clone_bytecode, false, trace,
             &total_us, &compile_us);
+    } else if (feature == LAZY_BOOTSTRAP_GEOMETRY) {
+        evaluated = runtime_evaluate_bootstrap_profiled(
+            runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
+                         browser_bootstrap_geometry,
+                         browser_bootstrap_geometry_bytecode),
+            "<browser-geometry-lazy>",
+            &browser_bootstrap_geometry_bytecode, false, trace,
+            &total_us, &compile_us);
+    } else if (feature == LAZY_BOOTSTRAP_VALIDATION) {
+        evaluated = runtime_evaluate_bootstrap_profiled(
+            runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
+                         browser_bootstrap_validation,
+                         browser_bootstrap_validation_bytecode),
+            "<browser-validation-lazy>",
+            &browser_bootstrap_validation_bytecode, false, trace,
+            &total_us, &compile_us);
+    } else if (feature == LAZY_BOOTSTRAP_DETACHED_DOCUMENTS) {
+        evaluated = runtime_evaluate_bootstrap_profiled(
+            runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
+                         browser_bootstrap_detached_documents,
+                         browser_bootstrap_detached_documents_bytecode),
+            "<browser-detached-documents-lazy>",
+            &browser_bootstrap_detached_documents_bytecode, false, trace,
+            &total_us, &compile_us);
+    } else if (feature == LAZY_BOOTSTRAP_DOM_ATTRIBUTES) {
+        evaluated = runtime_evaluate_bootstrap_profiled(
+            runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
+                         browser_bootstrap_dom_attributes,
+                         browser_bootstrap_dom_attributes_bytecode),
+            "<browser-dom-attributes-lazy>",
+            &browser_bootstrap_dom_attributes_bytecode, false, trace,
+            &total_us, &compile_us);
+    } else if (feature == LAZY_BOOTSTRAP_SUBTLE_CRYPTO) {
+        evaluated = runtime_evaluate_bootstrap_profiled(
+            runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
+                         browser_bootstrap_subtle_crypto,
+                         browser_bootstrap_subtle_crypto_bytecode),
+            "<browser-subtle-crypto-lazy>",
+            &browser_bootstrap_subtle_crypto_bytecode, false, trace,
+            &total_us, &compile_us);
+    } else if (feature == LAZY_BOOTSTRAP_EVENT_SOURCE
+               || feature == LAZY_BOOTSTRAP_FILE_READER) {
+        bool reader = feature == LAZY_BOOTSTRAP_FILE_READER;
+        if (runtime_lazy_privileges(runtime, reader, true)) {
+            evaluated = reader
+                ? runtime_evaluate_bootstrap_profiled(
+                      runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
+                                   browser_bootstrap_file_reader,
+                                   browser_bootstrap_file_reader_bytecode),
+                      "<browser-file-reader-lazy>",
+                      &browser_bootstrap_file_reader_bytecode, false, trace,
+                      &total_us, &compile_us)
+                : runtime_evaluate_bootstrap_profiled(
+                      runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
+                                   browser_bootstrap_event_source,
+                                   browser_bootstrap_event_source_bytecode),
+                      "<browser-event-source-lazy>",
+                      &browser_bootstrap_event_source_bytecode, false, trace,
+                      &total_us, &compile_us);
+        }
+        if (!runtime_lazy_privileges(runtime, reader, false))
+            evaluated = false;
+    } else if (feature == LAZY_BOOTSTRAP_MULTIPLAYER) {
+        evaluated = runtime_evaluate_bootstrap_profiled(
+            runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
+                         browser_bootstrap_multiplayer,
+                         browser_bootstrap_multiplayer_bytecode),
+            "<browser-multiplayer-lazy>",
+            &browser_bootstrap_multiplayer_bytecode, false, trace,
+            &total_us, &compile_us);
+    } else if (feature == LAZY_BOOTSTRAP_GPU) {
+        evaluated = runtime_evaluate_bootstrap_profiled(
+            runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
+                         browser_bootstrap_gpu,
+                         browser_bootstrap_gpu_bytecode),
+            "<browser-gpu-lazy>", &browser_bootstrap_gpu_bytecode,
+            false, trace, &total_us, &compile_us);
     } else if (feature == LAZY_BOOTSTRAP_CSSOM_RULES) {
         evaluated = runtime_evaluate_bootstrap_profiled(
             runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
@@ -2081,6 +2229,24 @@ RUNTIME_ENSURE_NATIVE(rule, LAZY_BOOTSTRAP_CSSOM_RULES,
                       "CSSOM rules could not be initialized")
 RUNTIME_ENSURE_NATIVE(frame_clone, LAZY_BOOTSTRAP_FRAME_CLONE,
                       "Window messaging could not be initialized")
+RUNTIME_ENSURE_NATIVE(geometry, LAZY_BOOTSTRAP_GEOMETRY,
+                      "Layout-less geometry could not be initialized")
+RUNTIME_ENSURE_NATIVE(validation, LAZY_BOOTSTRAP_VALIDATION,
+                      "Constraint validation could not be initialized")
+RUNTIME_ENSURE_NATIVE(detached_documents, LAZY_BOOTSTRAP_DETACHED_DOCUMENTS,
+                      "Detached documents could not be initialized")
+RUNTIME_ENSURE_NATIVE(dom_attributes, LAZY_BOOTSTRAP_DOM_ATTRIBUTES,
+                      "DOM attribute namespaces could not be initialized")
+RUNTIME_ENSURE_NATIVE(subtle_crypto, LAZY_BOOTSTRAP_SUBTLE_CRYPTO,
+                      "SubtleCrypto could not be initialized")
+RUNTIME_ENSURE_NATIVE(multiplayer, LAZY_BOOTSTRAP_MULTIPLAYER,
+                      "Multiplayer could not be initialized")
+RUNTIME_ENSURE_NATIVE(gpu, LAZY_BOOTSTRAP_GPU,
+                      "WebGPU could not be initialized")
+RUNTIME_ENSURE_NATIVE(event_source, LAZY_BOOTSTRAP_EVENT_SOURCE,
+                      "EventSource could not be initialized")
+RUNTIME_ENSURE_NATIVE(file_reader, LAZY_BOOTSTRAP_FILE_READER,
+                      "FileReader could not be initialized")
 RUNTIME_ENSURE_NATIVE(canvas, LAZY_BOOTSTRAP_CANVAS,
                       "Canvas support could not be initialized")
 RUNTIME_ENSURE_NATIVE(motion, LAZY_BOOTSTRAP_MOTION,
@@ -2147,6 +2313,35 @@ static bool js_runtime_copy_scope_properties(
     }
     JS_FreePropertyEnum(context, properties, count);
     return ok;
+}
+
+/* The worker platform initializer's nested Worker copies the owner's
+   Worker members onto a prototype of its own: a platform layer (QuickJS
+   JS_MarkPlatformLayer), so that a nested Worker passes their receiver
+   checks. Runs before the worker's script. */
+static void runtime_mark_nested_worker(JSContext *realm, JSValueConst global)
+{
+    JSPropertyDescriptor worker, prototype;
+    JSAtom worker_atom = JS_NewAtom(realm, "Worker");
+    JSAtom prototype_atom = JS_NewAtom(realm, "prototype");
+    if (worker_atom != JS_ATOM_NULL && prototype_atom != JS_ATOM_NULL
+        && JS_GetOwnProperty(realm, &worker, global, worker_atom) > 0) {
+        if ((worker.flags & JS_PROP_GETSET) == 0
+            && JS_IsFunction(realm, worker.value)
+            && JS_GetOwnProperty(realm, &prototype, worker.value,
+                                 prototype_atom) > 0) {
+            JS_MarkPlatformLayer(realm, prototype.value);
+            JS_FreeValue(realm, prototype.value);
+            JS_FreeValue(realm, prototype.getter);
+            JS_FreeValue(realm, prototype.setter);
+        }
+        JS_FreeValue(realm, worker.value);
+        JS_FreeValue(realm, worker.getter);
+        JS_FreeValue(realm, worker.setter);
+    }
+    if (worker_atom != JS_ATOM_NULL) JS_FreeAtom(realm, worker_atom);
+    if (prototype_atom != JS_ATOM_NULL) JS_FreeAtom(realm, prototype_atom);
+    if (JS_HasException(realm)) JS_FreeValue(realm, JS_GetException(realm));
 }
 
 /* createWorkerRealm(scope, prototype, internal_init): a fresh context whose global object
@@ -2218,6 +2413,7 @@ static JSValue js_runtime_create_worker_realm(
             JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_TRUSTED);
         ok = !JS_IsException(initializer_result);
     }
+    if (ok && initializer != NULL) runtime_mark_nested_worker(realm, global);
     if (ok && host->interface_snapshot)
         runtime_snapshot_interfaces(realm, true);
     if (initializer != NULL) JS_FreeCString(context, initializer);
@@ -2531,10 +2727,14 @@ static void runtime_configure_property_fault_trace(JSRuntime *runtime)
    belongs in that order, not grouped by owner. Flags carry each native's
    descriptor policy (js_runtime_internal.h); a native without flags is
    frozen (neither writable nor configurable), which is also why the
-   bootstrap's protected-hook list leaves natives out. */
+   bootstrap's protected-hook list leaves natives out. The ensure natives
+   of the features whose eager consumer loads them are TRANSIENT, and
+   hardening.js deletes them before page script; Canvas, Motion and WebGL
+   stay, as eager code calls them by name. */
 static const JsRtNative runtime_entry_natives[] = {
     { "__tilefinchEnsureShadowBootstrap",
-      js_runtime_ensure_shadow_bootstrap, 0, 0 },
+      js_runtime_ensure_shadow_bootstrap, 0,
+      JS_RT_NATIVE_TRANSIENT },
     { "__tilefinchEnsureCanvasBootstrap",
       js_runtime_ensure_canvas_bootstrap, 0, JS_RT_NATIVE_UNPROFILED },
     { "__tilefinchEnsureMotionBootstrap",
@@ -2542,20 +2742,65 @@ static const JsRtNative runtime_entry_natives[] = {
     { "__tilefinchEnsureWebGLBootstrap",
       js_runtime_ensure_webgl_bootstrap, 0, JS_RT_NATIVE_UNPROFILED },
     { "__tilefinchEnsureDocumentsBootstrap",
-      js_runtime_ensure_documents_bootstrap, 0, 0 },
+      js_runtime_ensure_documents_bootstrap, 0,
+      JS_RT_NATIVE_TRANSIENT },
     { "__tilefinchEnsureFormsBootstrap",
-      js_runtime_ensure_forms_bootstrap, 0, 0 },
+      js_runtime_ensure_forms_bootstrap, 0,
+      JS_RT_NATIVE_TRANSIENT },
     { "__tilefinchEnsureTraversalBootstrap",
-      js_runtime_ensure_traversal_bootstrap, 0, 0 },
+      js_runtime_ensure_traversal_bootstrap, 0,
+      JS_RT_NATIVE_TRANSIENT },
     { "__tilefinchEnsureRuleBootstrap",
-      js_runtime_ensure_rule_bootstrap, 0, JS_RT_NATIVE_UNPROFILED },
+      js_runtime_ensure_rule_bootstrap, 0,
+      JS_RT_NATIVE_UNPROFILED | JS_RT_NATIVE_TRANSIENT },
     { "__tilefinchEnsureFrameCloneBootstrap",
-      js_runtime_ensure_frame_clone_bootstrap, 0, 0 },
+      js_runtime_ensure_frame_clone_bootstrap, 0,
+      JS_RT_NATIVE_TRANSIENT },
+    { "__tilefinchEnsureGeometryBootstrap",
+      js_runtime_ensure_geometry_bootstrap, 0,
+      JS_RT_NATIVE_TRANSIENT },
+    { "__tilefinchEnsureValidationBootstrap",
+      js_runtime_ensure_validation_bootstrap, 0,
+      JS_RT_NATIVE_TRANSIENT },
+    { "__tilefinchEnsureDetachedDocumentsBootstrap",
+      js_runtime_ensure_detached_documents_bootstrap, 0,
+      JS_RT_NATIVE_TRANSIENT },
+    { "__tilefinchEnsureDOMAttributesBootstrap",
+      js_runtime_ensure_dom_attributes_bootstrap, 0,
+      JS_RT_NATIVE_TRANSIENT },
+    { "__tilefinchEnsureSubtleCryptoBootstrap",
+      js_runtime_ensure_subtle_crypto_bootstrap, 0,
+      JS_RT_NATIVE_TRANSIENT },
+    { "__tilefinchEnsureMultiplayerBootstrap",
+      js_runtime_ensure_multiplayer_bootstrap, 0,
+      JS_RT_NATIVE_TRANSIENT },
+    { "__tilefinchEnsureGPUBootstrap",
+      js_runtime_ensure_gpu_bootstrap, 0,
+      JS_RT_NATIVE_TRANSIENT },
+    { "__tilefinchEnsureEventSourceBootstrap",
+      js_runtime_ensure_event_source_bootstrap, 0,
+      JS_RT_NATIVE_TRANSIENT },
+    { "__tilefinchEnsureFileReaderBootstrap",
+      js_runtime_ensure_file_reader_bootstrap, 0,
+      JS_RT_NATIVE_TRANSIENT },
     { "__tilefinchLazyLoading", js_runtime_lazy_loading, 0,
       JS_RT_NATIVE_TRANSIENT | JS_RT_NATIVE_UNPROFILED },
 };
 
+/* dom.js marks each native layer it builds with this (QuickJS
+   JS_MarkPlatformLayer) and deletes it before any page script runs. */
+static JSValue js_runtime_mark_platform_layer(
+    JSContext *context, JSValueConst this_value, int argc,
+    JSValueConst *argv)
+{
+    (void) this_value;
+    if (argc > 0) JS_MarkPlatformLayer(context, argv[0]);
+    return JS_UNDEFINED;
+}
+
 static const JsRtNative runtime_natives_first[] = {
+    { "__tilefinchMarkPlatformLayer", js_runtime_mark_platform_layer, 1,
+      JS_RT_NATIVE_TRANSIENT | JS_RT_NATIVE_UNPROFILED },
     { "__tilefinchCssSupports", js_css_supports, 2, 0 },
     { "__tilefinchSelectorSyntaxValid", js_selector_syntax_valid, 1, 0 },
     { "__tilefinchFontShorthandValid", js_font_shorthand_valid, 1, 0 },
@@ -2579,8 +2824,11 @@ static const JsRtNative runtime_natives_first[] = {
     { "__tilefinchDocumentElement", js_dom_document_element, 0, 0 },
     { "__tilefinchQuery", js_dom_query, 1, 0 },
     { "__tilefinchQueryAll", js_dom_query_all, 2, 0 },
-    { "__tilefinchRegisterShadowRoot", js_dom_register_shadow_root, 1, 0 },
-    { "__tilefinchAssignSlot", js_dom_assign_slot, 1, 0 },
+    /* dom.js captures and deletes both. */
+    { "__tilefinchRegisterShadowRoot", js_dom_register_shadow_root, 1,
+      JS_RT_NATIVE_TRANSIENT },
+    { "__tilefinchAssignSlot", js_dom_assign_slot, 1,
+      JS_RT_NATIVE_TRANSIENT },
     { "__tilefinchConstructedSheetText",
       js_dom_constructed_sheet_text, 2, JS_RT_NATIVE_TRANSIENT },
     { "__tilefinchSheetRevision",
@@ -2729,15 +2977,19 @@ static const JsRtNative runtime_natives_third[] = {
     { "__tilefinchScriptAsyncAssigned", js_script_async_assigned, 1, 0 },
     { "__tilefinchElementNonce", js_element_nonce, 2, 0 },
     { "__tilefinchCryptoRandomFill", js_crypto_random_fill, 1, 0 },
-    { "__tilefinchMediaMatches", js_media_matches, 4, 0 },
+    { "__tilefinchMediaMatches", js_media_matches, 6, 0 },
     { "__tilefinchDecodeUtf8Valid",
       js_utf8_decode_valid, 2, JS_RT_NATIVE_TRANSIENT },
     { "__tilefinchEncodingName", js_encoding_name, 1, JS_RT_NATIVE_TRANSIENT },
     { "__tilefinchDecodeBytes", js_decode_bytes, 3, JS_RT_NATIVE_TRANSIENT },
     { "__tilefinchEncodeUtf8", js_utf8_encode, 1, JS_RT_NATIVE_TRANSIENT },
+    { "__tilefinchBlobFits", js_blob_fits, 1, JS_RT_NATIVE_TRANSIENT },
+    { "__tilefinchBlobUtf8Chunk", js_blob_utf8_chunk, 1, JS_RT_NATIVE_TRANSIENT },
     { "__tilefinchDetachArrayBuffer", js_detach_array_buffer, 1, 0 },
     { "__tilefinchIsProxy", js_is_proxy, 1, 0 },
-    { "__tilefinchCryptoDigest", js_crypto_digest, 2, 0 },
+    { "__tilefinchCryptoDigest", js_crypto_digest, 3, 0 },
+    { "__tilefinchCryptoKey", js_crypto_key, 1, JS_RT_NATIVE_TRANSIENT },
+    { "__tilefinchCryptoRun", js_crypto_run, 6, JS_RT_NATIVE_TRANSIENT },
     { "__tilefinchVerifyResourceIntegrity",
       js_resource_integrity_verify, 2, 0 },
     { "__tilefinchBase64EncodeBytes", js_base64_encode_bytes, 1, 0 },
@@ -2752,7 +3004,9 @@ static const JsRtNative runtime_natives_third[] = {
     { "__tilefinchEnqueueMicrotask",
       js_enqueue_microtask, 1, JS_RT_NATIVE_TRANSIENT },
     { "__tilefinchDateNow", js_date_now, 1, 0 },
-    { "__tilefinchPostMessage", js_post_message, 3, 0 },
+    { "__tilefinchPostMessage", js_post_message, 3, JS_RT_NATIVE_TRANSIENT },
+    { "__tilefinchPostKeyMessage", js_post_key_message, 6,
+      JS_RT_NATIVE_TRANSIENT },
     { "__tilefinchRequestNavigation", js_request_navigation, 2, 0 },
     { "__tilefinchNoteNewWindow", js_note_new_window, 1, JS_RT_NATIVE_TRANSIENT },
     { "__tilefinchUserActivationState",
@@ -2975,6 +3229,7 @@ static ScriptRuntime *runtime_create_host(
     host->host_viewport_dispatch = JS_UNDEFINED;
     host->host_event_constructor = JS_UNDEFINED;
     host->host_trusted_event = JS_UNDEFINED;
+    host->dom_share = JS_UNDEFINED;
     host->viewport_resize_dispatch = JS_UNDEFINED;
 #ifdef JS_RT_XHR_DIAGNOSTICS
     host->private_outcome_classifier = JS_UNDEFINED;
@@ -3557,6 +3812,8 @@ static const RuntimeBootstrapStep runtime_bootstrap_sequence[] = {
     RUNTIME_BOOTSTRAP_MODULE(RUNTIME_BOOTSTRAP_ALWAYS,
         browser_bootstrap_platform, "<browser-platform>", false),
     RUNTIME_BOOTSTRAP_LAZY_MODULE(RUNTIME_BOOTSTRAP_ALWAYS,
+                                  LAZY_BOOTSTRAP_GPU),
+    RUNTIME_BOOTSTRAP_LAZY_MODULE(RUNTIME_BOOTSTRAP_ALWAYS,
                                   LAZY_BOOTSTRAP_CANVAS),
     RUNTIME_BOOTSTRAP_MODULE(RUNTIME_BOOTSTRAP_ALWAYS,
         browser_bootstrap_custom_elements, "<browser-custom-elements>",
@@ -3587,6 +3844,10 @@ static const RuntimeBootstrapStep runtime_bootstrap_sequence[] = {
       NULL, NULL, NULL, NULL },
     RUNTIME_BOOTSTRAP_MODULE(RUNTIME_BOOTSTRAP_ALWAYS,
         browser_bootstrap_compat, "<browser-compat>", false),
+    RUNTIME_BOOTSTRAP_LAZY_MODULE(RUNTIME_BOOTSTRAP_ALWAYS,
+                                  LAZY_BOOTSTRAP_FILE_READER),
+    RUNTIME_BOOTSTRAP_LAZY_MODULE(RUNTIME_BOOTSTRAP_ALWAYS,
+                                  LAZY_BOOTSTRAP_EVENT_SOURCE),
 #if !defined(TILEFINCH_BOOTSTRAP_BYTECODE_ONLY)
     /* Diagnostic source only: no bytecode is generated for it. */
     { RUNTIME_BOOTSTRAP_EVALUATE, RUNTIME_BOOTSTRAP_IF_TRACE_DPU, false, 0,
@@ -3667,18 +3928,24 @@ static bool runtime_evaluate_bootstrap_sequence(
     return true;
 }
 
-/* Promise-returning operations reject for a wrong receiver themselves;
-   the engine check would make them throw, so they stay unmarked
-   ("Interface\0operation"). Reads own data properties only, so no lazy
-   trigger and no page getter runs. */
+/* Promise-returning operations ("Interface\0operation"; "window\0name" is
+   the global's own): a call with a wrong receiver (undefined included) or
+   too few arguments returns a promise rejected with the TypeError the
+   engine check would throw (JS_SetPromiseOperation). Reads own data
+   properties only, so no lazy trigger and no page getter runs. */
 static const char *const runtime_promise_operations[] = {
+    "BaseAudioContext\0close",
     "BaseAudioContext\0decodeAudioData",
+    "BaseAudioContext\0resume",
+    "BaseAudioContext\0suspend",
+    "Blob\0arrayBuffer",
+    "Blob\0bytes",
+    "Blob\0text",
     "CSSStyleSheet\0replace",
     "Clipboard\0readText",
     "Clipboard\0writeText",
     "CustomElementRegistry\0whenDefined",
     "Document\0exitFullscreen",
-    "Document\0webkitExitFullscreen",
     "Element\0requestFullscreen",
     "Element\0scrollBy",
     "Element\0scrollTo",
@@ -3693,6 +3960,8 @@ static const char *const runtime_promise_operations[] = {
     "FileSystemHandle\0isSameEntry",
     "FileSystemHandle\0queryPermission",
     "FileSystemHandle\0requestPermission",
+    "FileSystemWritableFileStream\0seek",
+    "FileSystemWritableFileStream\0truncate",
     "FileSystemWritableFileStream\0write",
     "FontFaceSet\0load",
     "GPU\0requestAdapter",
@@ -3707,25 +3976,46 @@ static const char *const runtime_promise_operations[] = {
     "Navigator\0getBattery",
     "NavigatorUAData\0getHighEntropyValues",
     "Permissions\0query",
+    "ReadableStream\0cancel",
     "ReadableStream\0pipeTo",
     "ReadableStreamDefaultReader\0cancel",
     "ReadableStreamDefaultReader\0read",
     "Request\0arrayBuffer",
     "Request\0blob",
     "Request\0bytes",
+    "Request\0formData",
+    "Request\0json",
     "Request\0text",
     "Response\0arrayBuffer",
     "Response\0blob",
+    "Response\0bytes",
+    "Response\0formData",
+    "Response\0json",
     "Response\0text",
     "ScreenOrientation\0lock",
     "StorageManager\0estimate",
     "StorageManager\0getDirectory",
     "StorageManager\0persist",
     "StorageManager\0persisted",
+    "SubtleCrypto\0decrypt",
+    "SubtleCrypto\0deriveBits",
+    "SubtleCrypto\0deriveKey",
     "SubtleCrypto\0digest",
+    "SubtleCrypto\0encrypt",
+    "SubtleCrypto\0exportKey",
+    "SubtleCrypto\0generateKey",
+    "SubtleCrypto\0importKey",
+    "SubtleCrypto\0sign",
+    "SubtleCrypto\0unwrapKey",
+    "SubtleCrypto\0verify",
+    "SubtleCrypto\0wrapKey",
+    "WritableStream\0abort",
+    "WritableStream\0close",
     "WritableStreamDefaultWriter\0abort",
     "WritableStreamDefaultWriter\0close",
     "WritableStreamDefaultWriter\0write",
+    "window\0createImageBitmap",
+    "window\0fetch",
 };
 
 /* The prototype own data property `operation` of the global's interface
@@ -3738,6 +4028,17 @@ static JSValue runtime_promise_operation(JSContext *context,
     const char *operation = interface + strlen(interface) + 1u;
     JSValue result = JS_UNDEFINED;
     JSPropertyDescriptor descriptor;
+    if (!strcmp(interface, "window")) {
+        JSAtom own = JS_NewAtom(context, operation);
+        if (own != JS_ATOM_NULL
+            && JS_GetOwnProperty(context, &descriptor, global, own) > 0) {
+            result = descriptor.value;
+            JS_FreeValue(context, descriptor.getter);
+            JS_FreeValue(context, descriptor.setter);
+        }
+        if (own != JS_ATOM_NULL) JS_FreeAtom(context, own);
+        return result;
+    }
     JSAtom interface_atom = JS_NewAtom(context, interface);
     JSAtom atom = JS_NewAtom(context, operation);
     JSAtom prototype_atom = JS_NewAtom(context, "prototype");
@@ -3810,27 +4111,193 @@ static JSValue js_unresolved_promise_operations(JSContext *context,
 }
 #endif
 
-static void runtime_unmark_promise_operations(JSContext *context,
-                                              JSValueConst global)
+/* Runs before a marking pass, so that a promise operation written as an
+   async function gets the receiver check too. */
+static void runtime_mark_promise_operations(JSContext *context,
+                                            JSValueConst global)
 {
     for (size_t i = 0; i < sizeof(runtime_promise_operations)
                                / sizeof(runtime_promise_operations[0]); i++) {
         JSValue operation = runtime_promise_operation(
             context, global, runtime_promise_operations[i]);
-        JS_SetPlatformMember(context, operation, 0);
+        JS_SetPromiseOperation(context, operation);
         JS_FreeValue(context, operation);
     }
+}
+
+/* Web IDL required arguments, in one place: a call of each operation or
+   constructor named here with fewer arguments than its `length` throws
+   the TypeError browsers throw ("1 argument required, but only 0
+   present."), in the engine and before the function runs
+   (JS_SetRequiredArguments). Web IDL defines `length` as that count, so
+   the bootstrap's parameter lists are the counts; a promise-returning
+   operation (runtime_promise_operations) rejects instead. Each row is
+   "receivers:members". A receiver is the prototype of the global's
+   interface so named; "window" is the global object, a lowercase name the
+   global's object so named, and "=Name" the global's Name itself (its
+   static operations or a namespace). Each member is the function a call
+   on that receiver finds: its own data property, or the nearest one up
+   its prototype chain, so "HTMLDivElement" reaches the element wrappers'
+   shared native-node members (dom.js nativeLayer) above that prototype.
+   A row starting with '*' belongs to a lazy module and is resolved when
+   that module's marking window closes. Reads data properties only, so no
+   lazy trigger and no page getter runs. */
+static const char *const runtime_required_arguments[] = {
+    "window:atob btoa cancelAnimationFrame getComputedStyle matchMedia "
+        "queueMicrotask requestAnimationFrame requestIdleCallback "
+        "setInterval setTimeout structuredClone fetch "
+        "BroadcastChannel CloseEvent CustomEvent ErrorEvent Event "
+        "FocusEvent HashChangeEvent InputEvent IntersectionObserver "
+        "KeyboardEvent MessageEvent "
+        "MouseEvent MutationObserver PerformanceObserver PointerEvent "
+        "PopStateEvent ProgressEvent Request ResizeObserver StorageEvent "
+        "TransitionEvent UIEvent URL WebSocket",
+    "Document:adoptNode createComment createElement createElementNS "
+        "createEvent createTextNode elementFromPoint getElementById "
+        "getElementsByClassName getElementsByName getElementsByTagName "
+        "importNode querySelector querySelectorAll",
+    "Element HTMLDivElement:closest getAttribute getAttributeNS "
+        "getAttributeNode getElementsByClassName getElementsByTagName "
+        "hasAttribute insertAdjacentElement insertAdjacentHTML "
+        "insertAdjacentText matches querySelector querySelectorAll "
+        "removeAttribute setAttribute setAttributeNS toggleAttribute",
+    "Node HTMLDivElement:appendChild compareDocumentPosition contains "
+        "insertBefore isEqualNode isSameNode removeChild replaceChild",
+    "EventTarget Document HTMLDivElement MediaQueryList visualViewport:"
+        "addEventListener dispatchEvent removeEventListener",
+    "DOMTokenList:contains replace toggle",
+    "Range:selectNode selectNodeContents setEnd setEndAfter setEndBefore "
+        "setStart setStartAfter setStartBefore",
+    "XMLHttpRequest:getResponseHeader open setRequestHeader",
+    "Crypto:getRandomValues",
+    "Storage:getItem key removeItem setItem",
+    "history:pushState replaceState",
+    "Navigator:sendBeacon",
+    "Performance:getEntriesByName getEntriesByType mark measure",
+    "=CSS:escape supports",
+    "=URL:createObjectURL revokeObjectURL",
+    "CustomElementRegistry:define get whenDefined",
+    "Clipboard:writeText",
+    "NavigatorUAData:getHighEntropyValues",
+    "Permissions:query",
+    "FormData Headers URLSearchParams:append delete get has set",
+    "FormData URLSearchParams:getAll",
+    "*window:AnimationEvent EventSource Worker createImageBitmap",
+    "*FontFaceSet:load",
+    "*ReadableStream:pipeTo",
+    "*SubtleCrypto:decrypt deriveBits deriveKey digest encrypt exportKey "
+        "generateKey importKey sign unwrapKey verify wrapKey",
+    "*HTMLCanvasElement:getContext",
+    "*CanvasRenderingContext2D:arc arcTo bezierCurveTo clearRect "
+        "createLinearGradient createPattern createRadialGradient drawImage "
+        "ellipse fillRect fillText getImageData lineTo measureText moveTo "
+        "putImageData quadraticCurveTo rect rotate scale strokeRect "
+        "strokeText transform translate",
+};
+
+/* The object a runtime_required_arguments receiver names, or
+   JS_UNDEFINED. */
+static JSValue runtime_required_receiver(JSContext *context,
+                                         JSValueConst global,
+                                         const char *name, size_t length)
+{
+    bool itself = name[0] == '=';
+    if (itself) {
+        name++;
+        length--;
+    }
+    if (length == 6 && !memcmp(name, "window", 6))
+        return JS_DupValue(context, global);
+    JSPropertyDescriptor descriptor;
+    JSAtom atom = JS_NewAtomLen(context, name, length);
+    JSValue value = JS_UNDEFINED;
+    if (atom != JS_ATOM_NULL
+        && JS_GetBrowserGlobalProperty(context, &descriptor, atom) > 0) {
+        value = descriptor.value;
+        JS_FreeValue(context, descriptor.getter);
+        JS_FreeValue(context, descriptor.setter);
+    }
+    if (atom != JS_ATOM_NULL) JS_FreeAtom(context, atom);
+    if (!itself && name[0] >= 'A' && name[0] <= 'Z' && JS_IsObject(value)) {
+        JSAtom prototype_atom = JS_NewAtom(context, "prototype");
+        JSValue prototype = JS_UNDEFINED;
+        if (prototype_atom != JS_ATOM_NULL
+            && JS_GetOwnProperty(context, &descriptor, value,
+                                 prototype_atom) > 0) {
+            prototype = descriptor.value;
+            JS_FreeValue(context, descriptor.getter);
+            JS_FreeValue(context, descriptor.setter);
+        }
+        if (prototype_atom != JS_ATOM_NULL)
+            JS_FreeAtom(context, prototype_atom);
+        JS_FreeValue(context, value);
+        value = prototype;
+    }
+    return JS_IsObject(value) ? value : (JS_FreeValue(context, value),
+                                         JS_UNDEFINED);
+}
+
+/* Applies the runtime_required_arguments rows: the eager ones, or with
+   `lazy` those a lazy module's load may have defined. */
+static void runtime_require_arguments(JSContext *context, bool lazy)
+{
+    JSValue global = JS_GetGlobalObject(context);
+    for (size_t i = 0; i < sizeof(runtime_required_arguments)
+                               / sizeof(runtime_required_arguments[0]); i++) {
+        const char *row = runtime_required_arguments[i];
+        if ((row[0] == '*') != lazy) continue;
+        if (lazy) row++;
+        const char *members = strchr(row, ':') + 1;
+        for (const char *receiver = row; receiver < members - 1;) {
+            size_t receiver_length = strcspn(receiver, " :");
+            JSValue start = runtime_required_receiver(context, global,
+                                                      receiver,
+                                                      receiver_length);
+            for (const char *member = members;
+                 JS_IsObject(start) && *member;) {
+                size_t member_length = strcspn(member, " ");
+                JSAtom atom = JS_NewAtomLen(context, member, member_length);
+                JSValue object = JS_DupValue(context, start);
+                for (unsigned depth = 0; atom != JS_ATOM_NULL
+                     && JS_IsObject(object) && depth < 16u; depth++) {
+                    JSPropertyDescriptor descriptor;
+                    int own = JS_GetOwnProperty(context, &descriptor, object,
+                                                atom);
+                    if (own > 0) {
+                        (void) JS_SetRequiredArguments(context,
+                                                       descriptor.value);
+                        JS_FreeValue(context, descriptor.value);
+                        JS_FreeValue(context, descriptor.getter);
+                        JS_FreeValue(context, descriptor.setter);
+                    }
+                    if (own != 0) break;
+                    JSValue next = JS_GetPrototype(context, object);
+                    JS_FreeValue(context, object);
+                    object = next;
+                }
+                if (JS_HasException(context))
+                    JS_FreeValue(context, JS_GetException(context));
+                JS_FreeValue(context, object);
+                if (atom != JS_ATOM_NULL) JS_FreeAtom(context, atom);
+                member += member_length;
+                if (*member == ' ') member++;
+            }
+            JS_FreeValue(context, start);
+            receiver += receiver_length;
+            if (*receiver == ' ') receiver++;
+        }
+    }
+    JS_FreeValue(context, global);
 }
 
 /* Web IDL receiver checks, in one place. Every constructor among the
    global's own properties is an interface: its prototype's operations and
    attribute accessors throw "Illegal invocation" for a receiver that is not
-   a platform object (QuickJS JS_MarkPlatformInterfaces). Three cases stay
-   as the bootstrap wrote them: the [LegacyLenientThis] on* attributes of
-   Window and Document (and of the element interfaces, which share their
-   accessor functions); a value iterator's keys/values/entries; and
-   promise-returning operations, which must reject rather than throw and do
-   so themselves. Runs once, after the eager bootstrap and before any page
+   a platform object (QuickJS JS_MarkPlatformInterfaces); a promise-returning
+   operation rejects with it instead (runtime_promise_operations). Two cases
+   stay as the bootstrap wrote them: the [LegacyLenientThis] on* attributes
+   of Window and Document (and of the element interfaces, which share their
+   accessor functions), and a value iterator's keys/values/entries. Runs once, after the eager bootstrap and before any page
    script; a lazy module's interfaces are marked when it loads
    (runtime_mark_lazy_platform_members). */
 static void runtime_mark_platform_interfaces(ScriptRuntime *host)
@@ -3852,12 +4319,13 @@ static void runtime_mark_platform_interfaces(ScriptRuntime *host)
         }
         JS_FreeValue(context, constructor);
     }
+    runtime_mark_promise_operations(context, global);
     (void) JS_MarkPlatformInterfaces(context, global, NULL);
     for (size_t i = 0; i < 3u; i++) {
         JS_MarkPlatformInterface(context, lenient[i], 1);
         JS_FreeValue(context, lenient[i]);
     }
-    runtime_unmark_promise_operations(context, global);
+    runtime_require_arguments(context, false);
     /* A lazy module's trigger stands in for a data property until the
        module loads: reading it from any object, a prototype included,
        must not throw. */
@@ -3910,9 +4378,9 @@ static void runtime_mark_lazy_platform_members(ScriptRuntime *runtime,
                     : JS_GetOwnProperty(context, &descriptor, target, atom))
                    > 0) {
             if (property->target != LAZY_BOOTSTRAP_GLOBAL) {
-                JS_SetPlatformMember(context, descriptor.value, 1);
-                JS_SetPlatformMember(context, descriptor.getter, 1);
-                JS_SetPlatformMember(context, descriptor.setter, 1);
+                JS_SetPlatformMemberOf(context, descriptor.value, target);
+                JS_SetPlatformMemberOf(context, descriptor.getter, target);
+                JS_SetPlatformMemberOf(context, descriptor.setter, target);
             } else if (JS_IsFunction(context, descriptor.value)) {
                 JSPropertyDescriptor prototype;
                 JSAtom prototype_atom = JS_NewAtom(context, "prototype");
@@ -3938,7 +4406,7 @@ static void runtime_mark_lazy_platform_members(ScriptRuntime *runtime,
         JS_FreeValue(context, target);
     }
     JSValue global = JS_GetGlobalObject(context);
-    runtime_unmark_promise_operations(context, global);
+    runtime_mark_promise_operations(context, global);
     JS_FreeValue(context, global);
 }
 
@@ -3988,9 +4456,10 @@ static void runtime_platform_window_close(ScriptRuntime *runtime,
     runtime->platform_window_loaded = false;
     if (mark && before != NULL) {
         JSValue global = JS_GetGlobalObject(context);
+        runtime_mark_promise_operations(context, global);
         (void) JS_MarkPlatformInterfaces(context, global, before);
-        runtime_unmark_promise_operations(context, global);
         JS_FreeValue(context, global);
+        runtime_require_arguments(context, true);
     }
     JS_FreePlatformSnapshot(context, before);
 }
@@ -4052,6 +4521,8 @@ static bool runtime_capture_trusted_hooks(ScriptRuntime *host,
             host->context, global, "Event");
         host->host_trusted_event = JS_GetPropertyStr(
             host->context, global, "__tilefinchTrustedEvent");
+        host->dom_share = JS_GetPropertyStr(
+            host->context, global, "__tilefinchDomShared");
         host->host_viewport_dispatch = JS_GetPropertyStr(
             host->context, global, "__tilefinchDispatchEventTargetCheckpointed");
         evaluated = !JS_IsException(host->host_visual_viewport)
@@ -4059,16 +4530,22 @@ static bool runtime_capture_trusted_hooks(ScriptRuntime *host,
             && JS_IsFunction(host->context, host->host_viewport_dispatch)
             && JS_IsFunction(host->context, host->host_event_constructor)
             && JS_IsFunction(host->context, host->host_trusted_event)
+            && JS_IsObject(host->dom_share)
             && runtime_capture_host_callbacks(host, global);
         /* The marker sets an event's isTrusted. compat.js leaves it for
            this capture only; a page that could call it could forge
-           trusted events. Lazy worker.js receives it from its loader. */
-        if (evaluated) {
-            JSAtom marker = JS_NewAtom(host->context,
-                                       "__tilefinchTrustedEvent");
-            evaluated = marker != JS_ATOM_NULL
-                && JS_DeleteProperty(host->context, global, marker, 0) > 0;
-            if (marker != JS_ATOM_NULL) JS_FreeAtom(host->context, marker);
+           trusted events. dom.js's share is left for it too: a page that
+           could reach it could fill the reserved timer slots or stop the
+           browser's own work. Lazy worker.js receives both from its
+           loader, and motion.js the share. */
+        static const char *const taken[] = {
+            "__tilefinchTrustedEvent", "__tilefinchDomShared"
+        };
+        for (size_t i = 0; evaluated && i < 2; i++) {
+            JSAtom atom = JS_NewAtom(host->context, taken[i]);
+            evaluated = atom != JS_ATOM_NULL
+                && JS_DeleteProperty(host->context, global, atom, 0) > 0;
+            if (atom != JS_ATOM_NULL) JS_FreeAtom(host->context, atom);
         }
     }
     return evaluated;
@@ -4153,6 +4630,17 @@ static bool runtime_remove_transient_globals(ScriptRuntime *host,
         JS_FreeAtom(host->context, visibility_apply_atom);
         JS_FreeAtom(host->context, visibility_query_atom);
         JS_FreeAtom(host->context, user_activation_atom);
+    }
+    /* platform.js captured and deleted the frame message senders; a page
+       that could call one would queue bytes no encoder produced. */
+    static const char *const senders[] = {
+        "__tilefinchPostMessage", "__tilefinchPostKeyMessage"
+    };
+    for (size_t i = 0; evaluated && i < 2; i++) {
+        JSAtom sender = JS_NewAtom(host->context, senders[i]);
+        evaluated = sender != JS_ATOM_NULL
+            && JS_DeleteProperty(host->context, global, sender, 0) > 0;
+        if (sender != JS_ATOM_NULL) JS_FreeAtom(host->context, sender);
     }
     return evaluated;
 }
@@ -4300,6 +4788,14 @@ static ScriptRuntime *script_runtime_create_internal(
     } else {
         evaluated = runtime_evaluate_bootstrap_sequence(
             host, trace_startup, &clock);
+        /* dom.js deletes it; keep it from author code even when its
+           evaluation failed first. */
+        JSAtom marker = JS_NewAtom(host->context,
+                                   "__tilefinchMarkPlatformLayer");
+        if (marker != JS_ATOM_NULL) {
+            (void) JS_DeleteProperty(host->context, global, marker, 0);
+            JS_FreeAtom(host->context, marker);
+        }
         if (evaluated)
             evaluated = runtime_install_late_surface(host, global);
         if (evaluated) runtime_mark_platform_interfaces(host);

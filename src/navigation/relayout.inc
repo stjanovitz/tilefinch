@@ -402,9 +402,12 @@ static bool navigation_sweep_stylesheet_events(NavigationSession *session)
     if (session->page.resource_scheduler != NULL
         && navigation_page_document_url(session) != NULL
         && !navigation_settle_unseen_style_preloads(session)) return false;
+    /* A failure in a realm refused memory is its author code's when the
+       realm was kept, and over when it was stopped. */
     return navigation_dispatch_stylesheet_events(
                session, session->page.resource_base_url)
-        || navigation_retire_exhausted_script_realms(session, false);
+        || navigation_assess_script_memory(session, "stylesheet-events")
+               != NAVIGATION_SCRIPT_MEMORY_UNREFUSED;
 }
 
 static size_t navigation_live_deferred_nodes(
@@ -784,7 +787,7 @@ static bool navigation_rebuild_static_after_layout_refusal(
        nodes the realm kept alive; rebuild them against the static cascade. */
     layout_reuse_cache_destroy(session->page.layout_reuse);
     session->page.layout_reuse = NULL;
-    if (!navigation_retire_exhausted_script_realms(session, true))
+    if (!navigation_stop_script_realms_for_memory(session, true))
         return false;
     session->performance.mutation_layout_script_retirements++;
     return navigation_build_layout(session, next, session->fonts,
@@ -834,7 +837,7 @@ static bool navigation_relayout_preview_eligible(
 static bool navigation_build_provisional_layout_limit(
     NavigationSession *session, LayoutDocument *layout, int keep_height,
     int minimum_limit, int *limit_out, const lxb_dom_node_t *const *through,
-    size_t through_count)
+    size_t through_count, int *prefetch_start)
 {
     const NavigationEntry *entry = navigation_current(session);
     int scroll_y = entry == NULL || entry->scroll_y < 0 ? 0 : entry->scroll_y;
@@ -850,11 +853,9 @@ static bool navigation_build_provisional_layout_limit(
               &session->page.stylesheet, session->fonts, session->images,
               &session->viewport, session->page.layout_reuse, through,
               through_count, 3 * session->viewport.css_height, &truncated)
-        : layout_build_context_preview(
-              layout, session->budget, &session->page.document,
-              &session->page.stylesheet, session->fonts, session->images,
-              &session->viewport, session->page.layout_reuse, limit,
-              &truncated);
+        : navigation_build_reader_band(session, layout, session->fonts,
+              session->images, limit, prefetch_start != NULL ? INT_MAX : 0,
+              &truncated, prefetch_start);
     session->layout_build_cancelled = !built && layout->performance.cancelled;
     if (!built) return false;
     if (truncated) {
@@ -875,7 +876,7 @@ static bool navigation_build_provisional_layout(
     int minimum_limit)
 {
     return navigation_build_provisional_layout_limit(
-        session, layout, keep_height, minimum_limit, NULL, NULL, 0);
+        session, layout, keep_height, minimum_limit, NULL, NULL, 0, NULL);
 }
 
 /* Whether `node` comes after `anchor` in document order without lying
@@ -1266,6 +1267,8 @@ static NavigationLayoutCompletion navigation_complete_layout_step(
     const NavigationEntry *entry = navigation_current(session);
     int scroll_y = entry == NULL || entry->scroll_y < 0 ? 0 : entry->scroll_y;
     int limit = session->page.layout.content_limit_y;
+    if (session->page.layout_prefetch_start > 0)
+        limit = session->page.layout_prefetch_start;
     int old_height = session->page.layout.height;
     /* A reader scrolling toward the placeholder gets the next screens in a
        fraction of the whole build, which input may preempt again. A page
@@ -1273,7 +1276,7 @@ static NavigationLayoutCompletion navigation_complete_layout_step(
        layout before reading past the region, and a larger provisional
        layout would need its region proven again. */
     bool extend = allow_extend && runtime == NULL
-        && scroll_y + 2 * session->viewport.css_height > limit;
+        && (int64_t) scroll_y + 2 * (int64_t) session->viewport.css_height > limit;
     navigation_evict_layout_reuse_under_pressure(session);
     LayoutDocument next = {0};
     /* Visuals a provisional commit skipped are queued from the first
@@ -1285,16 +1288,29 @@ static NavigationLayoutCompletion navigation_complete_layout_step(
         layout_reuse_cache_record_unresolved_visuals(
             session->page.layout_reuse, true);
     }
-    /* Each extension lays the document out from the top, so it goes at
-       least twice as deep as the last: a reader paging to depth D waits
-       for about 2D of layout in total, not one wait every few screens. */
+    /* Each extension lays out from the top. Double the ordinary depth
+       rather than counting last time's optional band twice. */
     int64_t doubled = 2 * (int64_t) limit;
+    /* An ordinary cut stops at an actual block/line boundary; the
+       prefetch marker is a requested coordinate inside the layout, not
+       that rounded boundary. Keep an overlap screen on its next pass so
+       the last reader viewport isn't clipped by the new cut. */
+    if (session->page.layout_prefetch_start > 0)
+        doubled += session->viewport.css_height;
     /* Script that read geometry meanwhile already built the complete
        layout (js_rt_bridge_layout): adopt it rather than build it again. */
     bool adopted = !extend && runtime != NULL && !discover
         && script_runtime_take_geometry_layout(
                runtime, &session->viewport, &next);
     bool built = adopted;
+    /* Prepare the band while the reader is still at or before the ordinary
+       frontier. Once they are consuming the reserve (or at the clamp),
+       don't make them wait for another optional band. */
+    bool runway = extend
+        && (int64_t) scroll_y + session->viewport.css_height < old_height;
+    int prefetch_start = 0;
+    layout_reuse_cache_set_extending(session->page.layout_reuse,
+        runway);
 #if !defined(__PSP__)
     if (!built && tilefinch_test_faults()->refuse_next_layout_completion) {
         tilefinch_test_faults()->refuse_next_layout_completion = false;
@@ -1307,9 +1323,12 @@ static NavigationLayoutCompletion navigation_complete_layout_step(
         ? navigation_build_provisional_layout_limit(
               session, &next, old_height,
               doubled > INT_MAX ? INT_MAX : (int) doubled, NULL, through,
-              through_count)
+              through_count, runway && scroll_y <= limit
+                  && limit >= 8 * (int64_t) session->viewport.css_height
+                  ? &prefetch_start : NULL)
         : navigation_build_layout(
               session, &next, session->fonts, session->images);
+    layout_reuse_cache_set_extending(session->page.layout_reuse, false);
     if (discover)
         layout_reuse_cache_record_unresolved_visuals(
             session->page.layout_reuse, false);
@@ -1343,6 +1362,7 @@ static NavigationLayoutCompletion navigation_complete_layout_step(
     session->performance.layout_us += elapsed;
     session->performance.relayout_us += elapsed;
     navigation_attach_layout(session);
+    session->page.layout_prefetch_start = prefetch_start;
     navigation_clamp_scroll_to_layout(session);
     if (discover && !session->page.layout_provisional)
         navigation_queue_discovered_visuals(session);
@@ -1726,7 +1746,7 @@ static const char *navigation_hidden_record_refusal(
    above). `reuse_prepared` reports that the journal's layout reuse
    invalidations were applied; the caller must not apply them again. */
 static bool navigation_mutations_are_hidden_only(
-    NavigationSession *session, const ScriptMutationJournal *mutations,
+    NavigationSession *session, ScriptMutationJournal *mutations,
     bool *reuse_prepared, const bool *local_focus)
 {
     if (session == NULL || mutations == NULL || mutations->count == 0
@@ -1767,6 +1787,60 @@ static bool navigation_mutations_are_hidden_only(
                     refusal, i, mutations->count);
 #endif
         return false;
+    }
+    return true;
+}
+
+/* Whether the journal left the document's tree exactly as it was: every
+   record is transient (navigation_mutation_is_transient) or names a node
+   that has left the document since, by way of transient content (a
+   removal from a connected parent names that parent as its scope, and a
+   write to a connected node names that node). Nothing that renders
+   changed, so the published layout stands. A conservative resource scan
+   only asks whether the resources moved: the fingerprint says they did
+   not. Shadow trees are not reachable through parents, so a page with
+   one keeps the ordinary path, as does a turn whose read installed a
+   sheet change (`read_sheet_settled`). */
+static bool navigation_mutations_left_tree_unchanged(
+    NavigationSession *session, const ScriptMutationJournal *mutations,
+    bool read_sheet_settled)
+{
+    if (session == NULL || mutations == NULL || mutations->count == 0
+        || mutations->overflowed || mutations->resource_rebuild_required
+        || mutations->stylesheet_rebuild_required
+        || mutations->image_rebuild_required
+        || mutations->image_resource_scan_required
+        || mutations->image_resource_refresh_required
+        || mutations->retirement_unobserved
+        || session->style_rebuild_required
+        || read_sheet_settled
+        || script_runtime_has_shadow_roots(session->page.runtime))
+        return false;
+#ifndef TILEFINCH_NO_TRACE
+    if (getenv("TILEFINCH_DISABLE_TRANSIENT_RELAYOUT_SKIP") != NULL)
+        return false;
+#endif
+    for (size_t i = 0; i < mutations->count; i++) {
+        const ScriptMutationRecord *record = &mutations->records[i];
+        ScriptMutationKind kind = record->kind;
+        if (kind != SCRIPT_MUTATION_HEAD_SCRIPT
+            && kind != SCRIPT_MUTATION_CHILD_LIST
+            && kind != SCRIPT_MUTATION_TEXT
+            && kind != SCRIPT_MUTATION_INNER_HTML
+            && kind != SCRIPT_MUTATION_ATTRIBUTE
+            && kind != SCRIPT_MUTATION_INLINE_STYLE) return false;
+        /* A retired record no longer says where it was. */
+        if (record->node == NULL) return false;
+        if (navigation_mutation_is_transient(mutations, i)) continue;
+        if (navigation_node_connected(record->node)
+            || (record->scope != NULL
+                && navigation_node_connected(record->scope))) return false;
+    }
+    if (mutations->conservative_resource_scan) {
+        uint64_t fingerprint = 0;
+        if (!navigation_resource_fingerprint(
+                session, &session->page.document, &fingerprint)
+            || fingerprint != session->resource_fingerprint) return false;
     }
     return true;
 }
@@ -1874,6 +1948,8 @@ bool navigation_relayout(NavigationSession *session)
             : after->fast_relayouts != before.fast_relayouts ? "build"
             : after->hidden_relayout_skips != before.hidden_relayout_skips
                 ? "skip-hidden"
+            : after->transient_relayout_skips != before.transient_relayout_skips
+                ? "skip-transient"
             : after->semantic_relayout_skips != before.semantic_relayout_skips
                 ? "skip-semantic"
             : after->focus_outline_relayout_skips
@@ -2007,7 +2083,7 @@ NavigationRelayoutPlan navigation_test_relayout_plan(
    the history entry, the start stamp and the resource fingerprint the plan
    settled on. */
 typedef struct {
-    const ScriptMutationJournal *mutations;
+    ScriptMutationJournal *mutations;
     const NavigationEntry *entry;
     uint64_t started;
     uint64_t fingerprint;
@@ -2050,7 +2126,7 @@ static bool navigation_build_bounded_focus_layout(
     int limit = 0;
     if (!navigation_build_provisional_layout_limit(
             session, next, incumbent->height,
-            minimum > INT_MAX ? INT_MAX : (int) minimum, &limit, NULL, 0))
+            minimum > INT_MAX ? INT_MAX : (int) minimum, &limit, NULL, 0, NULL))
         return false;
     if (next->content_limit_y == 0) return true;
     /* The page's extent (scroll range, scrollbar): the incumbent's, moved
@@ -2384,8 +2460,8 @@ static bool navigation_full_rebuild_restart_without_scripts(
     if (session->layout_build_cancelled || session->page.runtime == NULL
         || session->budget->failure_count == failures_before
         || session->budget->injected_failure_count != injections_before
-        || !navigation_retire_exhausted_script_realms_mode(
-               session, true, false)) return false;
+        || !navigation_stop_script_realms_for_memory(session, false))
+        return false;
     session->style_rebuild_required = true;
     *restart_after_retirement = true;
     return true;
@@ -2439,7 +2515,7 @@ static TILEFINCH_OUT_OF_LINE bool navigation_relayout_full(
 #else
 #define FULL_RELAYOUT_STEP() ((void) 0)
 #endif
-    navigation_prepare_layout_reuse(session, mutations, true, NULL);
+    navigation_prepare_layout_reuse(session, pass->mutations, true, NULL);
     navigation_evict_layout_reuse_under_pressure(session);
     fonts_external_loader_cancel(
         &session->page.external_font_loader,
@@ -2522,7 +2598,8 @@ static TILEFINCH_OUT_OF_LINE bool navigation_relayout_full(
         FULL_RELAYOUT_STEP();
         if (!navigation_dispatch_stylesheet_events(
                 session, session->page.resource_base_url)
-            && !navigation_retire_exhausted_script_realms(session, false)) {
+            && navigation_assess_script_memory(session, "stylesheet-events")
+                   == NAVIGATION_SCRIPT_MEMORY_UNREFUSED) {
             session->page.loaded = false;
             return navigation_relayout_failed(session, true);
         }
@@ -2579,8 +2656,8 @@ static TILEFINCH_OUT_OF_LINE bool navigation_relayout_full(
             if (attempt == 0)
                 (void) script_runtime_collect_and_trim(session->page.runtime);
             else {
-                if (!navigation_retire_exhausted_script_realms_mode(
-                        session, true, false)) break;
+                if (!navigation_stop_script_realms_for_memory(
+                        session, false)) break;
                 /* CSS admission may already have skipped sources while
                    memory was tight. Rebuild it with the released headroom,
                    not with an unstyled or fallback-expanded component tree.
@@ -2669,7 +2746,7 @@ static TILEFINCH_OUT_OF_LINE bool navigation_relayout_full(
                borrowed commands from the failed update are published. */
             layout_reuse_cache_destroy(session->page.layout_reuse);
             session->page.layout_reuse = NULL;
-            if (navigation_retire_exhausted_script_realms(session, true))
+            if (navigation_stop_script_realms_for_memory(session, true))
                 built = navigation_build_layout(session, &session->page.layout,
                                                 session->fonts, session->images);
         }
@@ -2737,6 +2814,17 @@ static TILEFINCH_OUT_OF_LINE bool navigation_relayout_full(
     return true;
 }
 
+/* The turn's mutations left the published layout standing (they rendered
+   nothing new): what script and the reuse cache took from the tree part
+   way through the turn must not outlive it. */
+static void navigation_relayout_skipped(NavigationSession *session,
+                                        ScriptMutationJournal *mutations,
+                                        bool reuse_prepared)
+{
+    if (!reuse_prepared) navigation_settle_transient_reuse(session, mutations);
+    script_runtime_keep_published_layout(session->page.runtime);
+}
+
 static bool navigation_relayout_body(NavigationSession *session,
                                      StyleWebFonts **retained_fonts,
                                      bool *restart_after_retirement)
@@ -2774,12 +2862,16 @@ static bool navigation_relayout_body(NavigationSession *session,
     }
     if (mutation_driven
         && navigation_mutations_are_canvas_paint_only(
-            session, &mutations)) return true;
+            session, &mutations)) {
+        navigation_relayout_skipped(session, &mutations, false);
+        return true;
+    }
     session->canvas_paint_damage_pending = false;
     NavigationRelayoutPlan plan =
         navigation_relayout_plan(session, &mutations, mutation_driven);
     if (plan.rebuild_bounded_out_sheet)
         session->style_rebuild_required = true;
+    const bool read_sheet_settled = session->page.read_sheet_settle.pending;
     if (plan.pause_image_preloads) {
         /* Detached-image jobs borrow this cascade and share the JPEG lane.
            Requeue them before changing resources, not after the replacement
@@ -2862,11 +2954,20 @@ static bool navigation_relayout_body(NavigationSession *session,
         } else {
             session->performance.focus_outline_relayout_skips++;
         }
+        navigation_relayout_skipped(session, &mutations, false);
         return true;
     }
     if (plan.mutation_driven
         && navigation_mutations_are_semantic_only(session, &mutations)) {
         session->performance.semantic_relayout_skips++;
+        navigation_relayout_skipped(session, &mutations, false);
+        return true;
+    }
+    if (plan.mutation_driven && !plan.full_rebuild
+        && navigation_mutations_left_tree_unchanged(session, &mutations,
+                                                    read_sheet_settled)) {
+        session->performance.transient_relayout_skips++;
+        navigation_relayout_skipped(session, &mutations, false);
         return true;
     }
     bool journal_reuse_prepared = false;
@@ -2874,6 +2975,7 @@ static bool navigation_relayout_body(NavigationSession *session,
         && navigation_mutations_are_hidden_only(session, &mutations,
                                                 &journal_reuse_prepared, local_focus)) {
         session->performance.hidden_relayout_skips++;
+        navigation_relayout_skipped(session, &mutations, true);
         return true;
     }
     if (plan.mutation_driven && mutations.image_reveal_possible) {
@@ -3219,6 +3321,11 @@ static bool navigation_relayout_static_fallback(
 #endif
     if (!navigation_build_layout(
             session, &next, session->fonts, session->images)) {
+        /* An author may already have hidden its loading shell. Keeping
+           the last layout is safe, but if it was empty no input on that
+           page can request another layout. Give idle work one attempt. */
+        session->page.static_layout_retry_pending = session->page.runtime == NULL
+            && session->page.script_memory_limited && session->page.layout.count == 0;
         if (fingerprint_valid) session->resource_fingerprint = fingerprint;
         return false;
     }

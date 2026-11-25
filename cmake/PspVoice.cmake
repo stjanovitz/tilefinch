@@ -71,6 +71,20 @@ function(tilefinch_configure_psp_voice)
                 "-DTILEFINCH_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
                 -P "${_patch_driver}")
         FetchContent_MakeAvailable(pocketsphinx)
+        # PATCH_COMMAND runs only when the archive is first populated, never
+        # again in an existing or FETCHCONTENT_FULLY_DISCONNECTED tree, so
+        # the driver also runs on every configure; with nothing changed it
+        # is a no-op. The patches touch sources only, which build later.
+        execute_process(
+            COMMAND "${CMAKE_COMMAND}"
+                "-DPATCH_SOURCE_DIR=${pocketsphinx_SOURCE_DIR}"
+                "-DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}"
+                "-DTILEFINCH_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+                -P "${_patch_driver}"
+            RESULT_VARIABLE _patch_result)
+        if(NOT _patch_result EQUAL 0)
+            message(FATAL_ERROR "Could not prepare the PocketSphinx source")
+        endif()
     endif()
 
     if(NOT TARGET pocketsphinx)

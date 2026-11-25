@@ -1,0 +1,17 @@
+# Offline continuity check: use a results trace with a recorded watch
+# response for row nine. The normal youtube-bbb timing journey covers row one.
+wait 1
+press 8 down
+tap right
+wait 1
+mark deep-details
+tap cross
+wait 1
+mark deep-watch
+tap circle
+wait 1
+mark deep-return
+tap cross
+wait 1
+mark deep-reopen
+end

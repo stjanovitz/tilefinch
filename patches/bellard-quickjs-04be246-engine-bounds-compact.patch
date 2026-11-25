@@ -1,0 +1,13 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -12486,9 +12486,9 @@
+         return -1;
+     }
+     values = NULL;
+     if (count != 0) {
+-        values = js_malloc(ctx, sizeof(*values) * (size_t)count);
++        values = js_malloc_array(ctx, count, sizeof(*values));
+         if (!values)
+             return -1;
+         for (i = 0; i < count; i++) {
+             values[i] = compact_array_value(ctx, p, i);

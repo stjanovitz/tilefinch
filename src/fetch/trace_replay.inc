@@ -1937,11 +1937,20 @@ static bool trace_replay_response_with_scratch(
            a USB round trip. */
         unsigned char *hash_buffer = budget_malloc(budget, 32u * 1024u);
         uint64_t hash_started_ns = tilefinch_platform_monotonic_time_ns();
+        size_t cancel_offset = SIZE_MAX;
         bool hashed = trace_open_body_hash_buffer(
             body, recorded_length, &body_hash, hash_buffer,
-            hash_buffer == NULL ? 0 : 32u * 1024u);
-        TRACE_REPLAY_IO_READ(hash_started_ns, recorded_length);
+            hash_buffer == NULL ? 0 : 32u * 1024u, &cancel_offset);
+        TRACE_REPLAY_IO_READ(hash_started_ns,
+                             cancel_offset == SIZE_MAX ? recorded_length : cancel_offset);
         budget_free(budget, hash_buffer);
+        if (cancel_offset != SIZE_MAX) {
+            (void) fclose(body);
+            *record_status = TRACE_REPLAY_RECORD_INTERRUPTED;
+            snprintf(result->error, sizeof(result->error),
+                     "HTTP replay verification cancelled");
+            return false;
+        }
         if (!hashed || body_hash != recorded_response_hash) {
             (void) fclose(body);
             snprintf(result->error, sizeof(result->error),
@@ -2376,6 +2385,12 @@ static bool trace_media_query_alias_allowed(const char *url)
 
 static bool trace_replay_media_request(const FetchRequest *request)
 {
+    /* The worker also carries YouTube's player POSTs. These resolve
+       different videos at the same API URL; select by request body and
+       occurrence, not the reusable media-byte route. */
+    const char *method = request == NULL ? NULL : request->method;
+    if (method != NULL && strcmp(method, "GET") != 0
+        && strcmp(method, "HEAD") != 0) return false;
     if (fetch_trace.replay_media_lane_call) return true;
     const char *destination = request == NULL ? NULL : request->sec_fetch_dest;
     return destination != NULL
@@ -2908,7 +2923,9 @@ static bool trace_replay_response(Budget *budget, const char *method,
                     &status, &rejected);
             }
             terminal_accounted = true;
-            if (status == TRACE_REPLAY_RECORD_MATCHED && (ok || rejected)) {
+            if (status == TRACE_REPLAY_RECORD_INTERRUPTED) {
+                /* Not claimed or served; a new attempt must verify it. */
+            } else if (status == TRACE_REPLAY_RECORD_MATCHED && (ok || rejected)) {
                 trace_replay_claim_record(sequence);
                 fetch_trace.replay_matched_request_count++;
                 fetch_trace.replay_reusable_claim_count++;
@@ -2955,7 +2972,9 @@ static bool trace_replay_response(Budget *budget, const char *method,
                 request, effective_user_agent, diagnostic_mobile_safari,
                 maximum_bytes, result, scratch, writer, sequence, false,
                 &status, &rejected);
-            if (status == TRACE_REPLAY_RECORD_MATCHED
+            if (status == TRACE_REPLAY_RECORD_INTERRUPTED) {
+                terminal_accounted = true;
+            } else if (status == TRACE_REPLAY_RECORD_MATCHED
                 && (ok || rejected)) {
                 trace_replay_claim_record(sequence);
                 fetch_trace.replay_matched_request_count++;
@@ -3055,6 +3074,10 @@ static bool trace_replay_response(Budget *budget, const char *method,
             if (status == TRACE_REPLAY_RECORD_NO_MATCH) {
                 fetch_result_destroy(result);
                 continue;
+            }
+            if (status == TRACE_REPLAY_RECORD_INTERRUPTED) {
+                terminal_accounted = true;
+                break;
             }
             if (status == TRACE_REPLAY_RECORD_MATCHED) {
                 trace_replay_claim_record(sequence);

@@ -696,7 +696,44 @@ bool layout_insert_commands(LayoutContext *context, size_t index,
             if (index <= range->command_start) range->command_start += count;
             if (index < range->command_end) range->command_end += count;
         }
+        /* An anchor moves with an insertion at it: that is the containing
+           block's own border strokes or ::before content, which precede
+           the deferred box in tree order. */
+        for (size_t i = 0; i < context->positioned_height_job_count; i++) {
+            size_t *anchor = &context->positioned_height_jobs[i].paint_anchor;
+            if (index <= *anchor) *anchor += count;
+        }
+        for (size_t i = context->deferred_paint_count; i != 0; i--) {
+            LayoutDeferredPaint *range = &context->deferred_paint[i - 1u];
+            if (index > range->end) break;
+            if (index <= range->anchor) range->anchor += (uint32_t) count;
+            if (index <= range->start) range->start += (uint32_t) count;
+            if (index < range->end) range->end += (uint32_t) count;
+        }
     }
+    return true;
+}
+
+bool layout_record_deferred_paint(LayoutContext *context, size_t anchor,
+                                  size_t start, size_t end)
+{
+    if (end <= start || anchor >= start || end > UINT32_MAX) return true;
+    if (context->deferred_paint_count == context->deferred_paint_capacity) {
+        size_t capacity = context->deferred_paint_capacity == 0
+            ? 8 : context->deferred_paint_capacity * 2u;
+        LayoutDeferredPaint *ranges = budget_realloc(
+            context->layout->budget, context->deferred_paint,
+            capacity * sizeof(*ranges));
+        if (ranges == NULL) return false;
+        context->deferred_paint = ranges;
+        context->deferred_paint_capacity = capacity;
+    }
+    context->deferred_paint[context->deferred_paint_count++] =
+        (LayoutDeferredPaint) {
+            .anchor = (uint32_t) anchor,
+            .start = (uint32_t) start,
+            .end = (uint32_t) end
+        };
     return true;
 }
 
@@ -1145,6 +1182,11 @@ typedef struct {
     const LayoutContext *context;
     const uint32_t *owners;
     uint32_t root;
+    /* Paint-source order of commands [rank_base, rank_limit) when deferred
+       positioned boxes moved some of them (paint_deferred_ranks). */
+    const uint32_t *rank;
+    uint32_t rank_base;
+    uint32_t rank_limit;
 } PaintTreeSortContext;
 
 typedef struct {
@@ -1170,9 +1212,80 @@ static int paint_tree_z_index(const PaintTreeSortContext *sort,
 static uint32_t paint_tree_source_order(
     const PaintTreeSortContext *sort, uint32_t node)
 {
-    if (node < sort->layout->count) return node;
-    return sort->context->stacking_contexts[
-        node - sort->layout->count].command_start;
+    uint32_t command = node < sort->layout->count ? node
+        : sort->context->stacking_contexts[
+              node - sort->layout->count].command_start;
+    if (sort->rank == NULL || command < sort->rank_base
+        || command >= sort->rank_limit) return command;
+    return sort->rank_base + sort->rank[command - sort->rank_base];
+}
+
+static void paint_reverse_ranks(uint32_t *sequence, size_t from, size_t to)
+{
+    while (from + 1u < to) {
+        uint32_t swap = sequence[from];
+        sequence[from] = sequence[--to];
+        sequence[to] = swap;
+        from++;
+    }
+}
+
+/* Deferred positioned boxes (LayoutDeferredPaint) were laid out after
+   their containing block, so their commands follow later siblings. Move
+   each, in record order, to just before its anchor in a virtual sequence of
+   the affected command window; records are post-order and nest, so every
+   record's commands are contiguous there when it is moved. Returns each
+   window command's position, or NULL (physical order) without records or
+   memory. */
+static uint32_t *paint_deferred_ranks(const LayoutDocument *layout,
+                                      const LayoutContext *context,
+                                      uint32_t *base_out, uint32_t *limit_out)
+{
+    if (context == NULL || context->deferred_paint_count == 0) return NULL;
+    uint32_t base = UINT32_MAX;
+    uint32_t limit = 0;
+    for (size_t i = 0; i < context->deferred_paint_count; i++) {
+        const LayoutDeferredPaint *range = &context->deferred_paint[i];
+        if (range->anchor < base) base = range->anchor;
+        if (range->end > limit) limit = range->end;
+    }
+    if (limit > layout->count || base >= limit) return NULL;
+    size_t window = limit - base;
+    uint32_t *sequence = budget_malloc(layout->budget,
+                                       window * sizeof(*sequence));
+    uint32_t *position = budget_malloc(layout->budget,
+                                       window * sizeof(*position));
+    if (sequence == NULL || position == NULL) {
+        budget_free(layout->budget, sequence);
+        budget_free(layout->budget, position);
+        return NULL;
+    }
+    for (size_t i = 0; i < window; i++) {
+        sequence[i] = (uint32_t) i;
+        position[i] = (uint32_t) i;
+    }
+    for (size_t i = 0; i < context->deferred_paint_count; i++) {
+        const LayoutDeferredPaint *range = &context->deferred_paint[i];
+        size_t start = range->start - base;
+        size_t length = range->end - range->start;
+        size_t first = position[start];
+        for (size_t at = start + 1u; at < start + length; at++) {
+            if (position[at] < first) first = position[at];
+        }
+        size_t target = position[range->anchor - base];
+        if (target >= first || first + length > window) continue;
+        /* Rotate [target, first + length) so the block leads it. */
+        paint_reverse_ranks(sequence, target, first);
+        paint_reverse_ranks(sequence, first, first + length);
+        paint_reverse_ranks(sequence, target, first + length);
+        for (size_t at = target; at < first + length; at++) {
+            position[sequence[at]] = (uint32_t) at;
+        }
+    }
+    budget_free(layout->budget, sequence);
+    *base_out = base;
+    *limit_out = limit;
+    return position;
 }
 
 static unsigned paint_tree_group(const PaintTreeSortContext *sort,
@@ -1362,6 +1475,7 @@ bool build_paint_order(LayoutDocument *layout, LayoutContext *context)
     }
 
     size_t work = 0;
+    uint32_t *rank = NULL;
     /* Context records are appended post-order. Assign parents before
        children, then let the deepest range win command ownership. */
     for (size_t reverse = context_count; reverse != 0; reverse--) {
@@ -1461,6 +1575,9 @@ bool build_paint_order(LayoutDocument *layout, LayoutContext *context)
         .owners = order,
         .root = root
     };
+    rank = paint_deferred_ranks(layout, context, &sort.rank_base,
+                                &sort.rank_limit);
+    sort.rank = rank;
     for (size_t i = 0; i <= context_count; i++) {
         uint32_t node_index = i == context_count
             ? root : (uint32_t) (layout->count + i);
@@ -1495,6 +1612,7 @@ bool build_paint_order(LayoutDocument *layout, LayoutContext *context)
     if (context != NULL && (work & (LAYOUT_BATCH_STRIDE - 1u)) != 0
         && !layout_batch_cooperate(
                context, work & (LAYOUT_BATCH_STRIDE - 1u))) goto cancelled;
+    budget_free(layout->budget, rank);
     budget_free(layout->budget, stack);
     budget_free(layout->budget, nodes);
     layout->paint_order = order;
@@ -1502,6 +1620,7 @@ bool build_paint_order(LayoutDocument *layout, LayoutContext *context)
     return true;
 
 cancelled:
+    budget_free(layout->budget, rank);
     budget_free(layout->budget, context_map);
     budget_free(layout->budget, stack);
     budget_free(layout->budget, nodes);
@@ -1540,17 +1659,16 @@ static void draw_command_vertical_ink_bounds(const LayoutDocument *layout,
 
 static bool draw_commands_intersect(const LayoutDocument *layout,
                                     const DrawCommand *left,
+                                    int64_t left_top, int64_t left_bottom,
                                     const DrawCommand *right)
 {
-    int64_t left_top = 0, left_bottom = 0;
+    if ((int64_t) left->x >= (int64_t) right->x + right->width
+        || (int64_t) right->x >= (int64_t) left->x + left->width)
+        return false;
     int64_t right_top = 0, right_bottom = 0;
     draw_command_vertical_ink_bounds(
-        layout, left, &left_top, &left_bottom);
-    draw_command_vertical_ink_bounds(
         layout, right, &right_top, &right_bottom);
-    return (int64_t) left->x < (int64_t) right->x + right->width
-        && (int64_t) right->x < (int64_t) left->x + left->width
-        && left_top < right_bottom && right_top < left_bottom;
+    return left_top < right_bottom && right_top < left_bottom;
 }
 
 /* Range marking precedes the ordinary band-building checkpoints. Nested
@@ -1778,7 +1896,8 @@ bool build_spatial_index(LayoutDocument *layout,
     if (has_overflow) {
         /* For small overflow sets, the unique list is cheaper than visiting
            dense bands of unrelated commands. Keep that bounded fast path. */
-        bool scan_all_overflow = all_overflow_at <= 128;
+        bool scan_all_overflow = all_overflow_at <= 128
+            && all_overflow_at <= total / layout->spatial_band_count;
         /* The normal bands already index local overflow commands. Retain
            only exceptions in the temporary list: fixed, global and commands
            omitted from the bands. These must still participate in the old
@@ -1859,7 +1978,7 @@ bool build_spatial_index(LayoutDocument *layout,
                         if ((layout->command_flags[prior_index]
                              & LAYOUT_COMMAND_OVERFLOW) != 0
                             && draw_commands_intersect(
-                                layout, candidate,
+                                layout, candidate, top, bottom,
                                 &layout->commands[prior_index])) {
                             overlaps_prior_overflow = true;
                         }

@@ -846,6 +846,22 @@ bool psp_offline_store_install_prepared_zip(PspOfflineStore *store)
     return okay;
 }
 
+bool psp_offline_store_remove_item(PspOfflineStore *store, uint32_t id)
+{
+    if (store == NULL || id == 0) return false;
+    uint32_t active = 0;
+    if (offline_download_manager_active(&store->download, &active)
+        && active == id) {
+        /* Pause detaches the request before saving its progress. Even if
+           that save fails, only the active lane can still write its files. */
+        (void) offline_download_manager_pause(&store->download, id);
+        if (offline_download_manager_active(&store->download, &active)
+            && active == id) return false;
+        if (store->last_active_id == id) store->last_active_id = 0;
+    }
+    return offline_library_remove(&store->library, id);
+}
+
 bool psp_offline_store_open_library(
     PspOfflineStore *store, BrowserEngine *engine, bool record_history)
 {
@@ -1124,11 +1140,7 @@ PspOfflineRouteResult psp_offline_store_handle_url(
         return offline_open_video_page(store, engine, id, record_history)
             ? PSP_OFFLINE_ROUTE_PAGE : PSP_OFFLINE_ROUTE_ERROR;
     if (offline_route_id(url, "delete", &id)) {
-        uint32_t active = 0;
-        if (offline_download_manager_active(&store->download, &active)
-            && active == id)
-            (void) offline_download_manager_pause(&store->download, id);
-        bool removed = offline_library_remove(&store->library, id);
+        bool removed = psp_offline_store_remove_item(store, id);
         (void) psp_offline_store_open_library(
             store, engine, record_history);
         offline_status(store, removed ? "SAVED ITEM DELETED"

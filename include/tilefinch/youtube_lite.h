@@ -170,6 +170,10 @@ YoutubeLiteRoute youtube_lite_route(const char *url);
    /live/ID, /embed/ID and http links name the same video as watch?v=ID. */
 bool youtube_lite_watch_video_id(const char *url,
                                  char output[YOUTUBE_VIDEO_ID_CAPACITY]);
+/* Native Play for a watch entry, including its current start time. On failure,
+   leaves the destination unchanged. */
+bool youtube_lite_watch_playback_url(const char *entry_url, char *output,
+                                     size_t capacity);
 bool youtube_lite_navigation_requires_network(const char *url);
 /* Only the service's HTTPS session handoff, never an executable feed page. */
 bool youtube_lite_signin_handoff_url(const char *url);

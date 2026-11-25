@@ -119,6 +119,16 @@ static inline int is_digit(int c) {
     return c >= '0' && c <= '9';
 }
 
+/* Tilefinch: the compiler (parser, character classes, code emission) runs
+   once per regexp literal or RegExp() and, in an optimizing PSP compile
+   that is not already -Os (the engine is -O2 there), compiles for size;
+   the matcher below, lre_exec(), keeps the engine's flags. Other
+   compilers, Clang host builds among them, keep their flags. */
+#if defined(__PSP__) && defined(__OPTIMIZE__) && !defined(__OPTIMIZE_SIZE__)
+#pragma GCC push_options
+#pragma GCC optimize("Os")
+#endif
+
 /* insert 'len' bytes at position 'pos'. Return < 0 if error. */
 static int dbuf_insert(DynBuf *s, int pos, int len)
 {
@@ -2631,6 +2641,10 @@ uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
     *plen = s->byte_code.size;
     return s->byte_code.buf;
 }
+
+#if defined(__PSP__) && defined(__OPTIMIZE__) && !defined(__OPTIMIZE_SIZE__)
+#pragma GCC pop_options
+#endif
 
 static BOOL is_line_terminator(uint32_t c)
 {

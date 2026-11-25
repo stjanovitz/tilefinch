@@ -390,6 +390,67 @@
     stylesheet_destroy(&final_row_sheet);
     document_destroy(&final_row_document);
 
+    puts("test: fr row shrinks a scroll container to fit its grid");
+    /* A fixed-height grid: a content-sized header, a 1fr editor that is a
+       scroll container, a fixed button row and a fixed console row. The fr
+       row took its share before the header was measured; the header then
+       pushed every row down and the console ran past the grid onto the
+       next heading. A scroll container's automatic minimum is zero (CSS
+       Grid 6.6), so the fr row shrinks to what is left, as in Chrome,
+       whether the editor stretches or has a percentage height. */
+    static const char *const scroller_grid_editors[] = {
+        "", "height:100%;"
+    };
+    for (size_t variant = 0; variant < 2; variant++) {
+        char scroller_grid_page[1024];
+        snprintf(scroller_grid_page, sizeof(scroller_grid_page),
+            "<!doctype html><style>html,body{margin:0;padding:0}"
+            "body{font:16px/22px sans-serif}#host{height:300px}"
+            "#grid{display:grid;gap:8px;align-content:start;height:100%%;"
+            "grid-template-rows:max-content 1fr max-content 80px}"
+            "#head{padding:8px}#editor{%soverflow:auto}#inner{height:100%%}"
+            "#buttons{height:30px}#console{overflow:auto}</style><body>"
+            "<div id=host><div id=grid><div id=head>Head</div>"
+            "<div id=editor><div id=inner>1<br>2<br>3<br>4<br>5<br>6<br>7"
+            "<br>8</div></div><div id=buttons></div><div id=console></div>"
+            "</div></div><h2 id=after>After</h2></body>",
+            scroller_grid_editors[variant]);
+        PocDocument scroller_grid_document;
+        Stylesheet scroller_grid_sheet;
+        LayoutDocument scroller_grid_layout;
+        CHECK(document_parse(&scroller_grid_document, &budget,
+                             scroller_grid_page, strlen(scroller_grid_page), 47)
+              && stylesheet_build(&scroller_grid_sheet, &budget,
+                                  &scroller_grid_document, 480)
+              && layout_build(&scroller_grid_layout, &budget,
+                              &scroller_grid_document, &scroller_grid_sheet,
+                              NULL, NULL, 480));
+        lxb_dom_node_t *scroller_grid_root =
+            lxb_dom_interface_node(scroller_grid_document.html);
+        const LayoutNodeBox *scroller_grid_head = layout_box_for_node(
+            &scroller_grid_layout, find_id(scroller_grid_root, "head"));
+        const LayoutNodeBox *scroller_grid_editor = layout_box_for_node(
+            &scroller_grid_layout, find_id(scroller_grid_root, "editor"));
+        const LayoutNodeBox *scroller_grid_console = layout_box_for_node(
+            &scroller_grid_layout, find_id(scroller_grid_root, "console"));
+        const LayoutNodeBox *scroller_grid_box = layout_box_for_node(
+            &scroller_grid_layout, find_id(scroller_grid_root, "grid"));
+        CHECK(scroller_grid_head && scroller_grid_editor
+              && scroller_grid_console && scroller_grid_box);
+        /* 300 - 38 (head) - 30 - 80 - 3 x 8 gaps leaves 128 for the fr
+           row; the editor's eight lines scroll inside it. */
+        CHECK(scroller_grid_head->height == 38
+              && scroller_grid_editor->y == 46
+              && scroller_grid_editor->height == 128
+              && scroller_grid_editor->content_height > 128
+              && scroller_grid_console->y == 220
+              && scroller_grid_console->y + scroller_grid_console->height
+                 <= scroller_grid_box->y + scroller_grid_box->height);
+        layout_destroy(&scroller_grid_layout);
+        stylesheet_destroy(&scroller_grid_sheet);
+        document_destroy(&scroller_grid_document);
+    }
+
     puts("test: absolutely positioned grid item without column tracks");
     /* A rows-only grid whose sole child is absolutely positioned has no
        column tracks, so grid-column:1 names a line that does not exist and
@@ -588,7 +649,7 @@
         "#diagnostic-probe{color:#123456;unsupported-visual:1;"
         "text-decoration:underline;"
         "%s:red}"
-        "@media (dynamic-range:high){#diagnostic-probe{display:none}}"
+        "@media (unknown-feature:high){#diagnostic-probe{display:none}}"
         "@supports (display:subgrid){#diagnostic-probe{display:none}}"
         "</style><body><div id=diagnostic-probe>DIAGNOSTIC</div></body>",
         oversized_name);

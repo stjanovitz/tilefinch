@@ -279,6 +279,8 @@ static bool browser_engine_compose_provisional(
             engine->provisional_frame_pixels)
         && tile_cache_render_frame(front, y, width, height, NULL);
     front->placeholder_missing = false;
+    /* The load runs between fill steps: hold no decode across them. */
+    tile_cache_end_paint_pass(front);
     if (!rendered) return false;
     browser_engine_paint_provisional_focus(
         engine, engine->provisional_layout, y);

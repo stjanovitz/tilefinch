@@ -13,7 +13,8 @@ in [Vendored QuickJS](../../third_party/quickjs/README.md).
 
 The committed bootstrap bytecode is stripped of source text, line tables, and
 local-variable names, which QuickJS would otherwise copy into every realm's
-heap; the generated manifest and the regeneration rule are in
+heap, and of the variable tables of functions whose locals no closure
+captures; the generated manifest and the regeneration rule are in
 [src/bootstrap/README.md](../../src/bootstrap/README.md#regenerating).
 `TILEFINCH_TRACE_JS_STARTUP=1` prints the heap each module's evaluation
 retained, by QuickJS category, so growth is attributed before the footprint
@@ -41,7 +42,24 @@ task. Its global inherits from `DedicatedWorkerGlobalScope.prototype`; names
 it does not define resolve, read-only, through a fallback to the owner's
 platform implementations, so each realm stays small instead of instantiating
 the platform again. Values a worker API returns are created in the worker's
-realm, so `instanceof` and brand checks hold there.
+realm, so `instanceof` and brand checks hold there. IndexedDB is the
+owner's implementation behind an `IDBFactory` of the worker's own, which
+builds every value and key its connections read (cursor keys, `getKey`,
+`getAllKeys`, the key `add` and `put` return) with the worker's
+constructors. Only the Worker module makes such a factory, from the
+constructors it captured when it made the realm, through the bootstrap's
+private share (platform.js passes on the maker the IndexedDB module hands
+it); `new IDBFactory()` takes no constructors, and the Worker module never
+reads the page's `indexedDB.constructor`. A page that replaced `indexedDB`
+before the module loaded gives workers its own. The worker's termination
+drops the factory's record of its constructors, so its realm can be freed.
+Key checks and ordering use brand checks that hold across
+realms (the `Date` and `ArrayBuffer` getters and `ArrayBuffer.isView`, with
+an `instanceof` fast path for the owner's own objects), so a worker's
+`Date`, binary and array keys are valid and sort as the page's do. An
+`IDBKeyRange` made through the worker's `IDBKeyRange` returns its bounds in
+the worker's realm once the worker has read `indexedDB`; before that, they
+are the owner's objects.
 
 ### Loaded child documents
 
@@ -58,6 +76,18 @@ element has a box. A child realm returns its allocator's cached free blocks to
 the page after its bootstrap and again once its document has loaded, and, like
 every realm, allocates its mutation journal only at its first connected
 mutation.
+
+`postMessage` between documents sends the bounded structured-clone wire
+that `frame-clone.js` encodes. The native senders are captured by
+`platform.js` and deleted before author code (the `JS_RT_NATIVE_TRANSIENT`
+rule under Interface snapshot), so a page can queue only what the encoder
+produced. A child's `parent.postMessage` and `top.postMessage` go through
+two more senders that `platform.js` defines; runtime creation captures and
+deletes them with the host callbacks, and the child messaging set-up
+(`script_runtime_configure_messaging`) lends them to its own snippet alone.
+The receiver still treats the wire as untrusted: a message it
+cannot decode fires `messageerror` (data `null`) at its window and is
+dropped, and never fails the receiving document's turn.
 
 ### Same-origin frames and WindowProxy
 
@@ -184,6 +214,139 @@ because the host may act on it a turn later; that snapshot, not the presence
 of a referrer, is what request context and Fetch Metadata report as
 user-activated.
 
+## Blobs and blob: URLs
+
+A `Blob` or `File` keeps its bytes in an `ArrayBuffer` of its realm, so the
+realm's heap limit bounds them and the QuickJS pool charges them to the page
+Budget; neither Blobs nor `URL.createObjectURL()` have a count or size cap of
+their own. A Blob (or `slice()`) larger than the heap the realm can obtain
+(`script_runtime_heap_obtainable`, after one collection) is refused with a
+`RangeError` before anything is allocated, so the page gets an error it can
+catch rather than an allocation refusal for the
+[memory stop rule](SCRIPT_MEMORY.md#exhaustion) to judge. A blob: URL holds
+its Blob, not a copy, until it is revoked or its realm is retired, so URLs a
+page never revokes go with its document. Reading one (`fetch`, XHR,
+`FileReader`) copies into the same heap, and storage keeps its own quotas.
+`text()` decodes in streamed 512 KiB pieces, so it reads any Blob the heap
+holds. A blob: iframe document or Worker source is decoded in one
+`TextDecoder` call, so each is limited to 1 MiB, and a Worker's source also
+to the realm's per-script file limit (`maximum_script_file_bytes`).
+
+## Web Crypto
+
+`crypto.subtle` implements the secret-key algorithms: AES-GCM, AES-CBC and
+AES-CTR (`encrypt`, `decrypt`, `wrapKey`, `unwrapKey`), HMAC with SHA-1,
+SHA-256, SHA-384 or SHA-512 (`sign`, `verify`), PBKDF2 and HKDF
+(`deriveBits`, `deriveKey`), and `importKey`, `exportKey` and `generateKey`
+in the `raw` and `jwk` formats; `digest` covers the same four hashes. Other
+algorithms (RSA, ECDSA, ECDH, Ed25519, X25519, AES-KW) and the `spki` and
+`pkcs8` formats are refused with `NotSupportedError`. The primitives are
+`src/web_crypto.c`, over the Mbed TLS that the PSP already links for TLS
+(OpenSSL on the host); a host test runs the published vectors through both.
+
+`digest` and `CryptoKey` (its constructor, which always throws) are
+defined eagerly in `compat.js`. The other operations and `CryptoKey`'s
+attributes are the lazy `subtle-crypto.js` module: the first read of
+`crypto.subtle` loads it and adds them to `SubtleCrypto.prototype` and
+`CryptoKey.prototype` before returning, so feature tests through
+`crypto.subtle` see every operation, and a realm that never reads it holds
+none of them. compat.js keeps the module's factory, and then the step the
+factory returns that adds the members, until each completes, so a read that
+runs out of memory part way leaves digest and the members already added,
+and the next read adds the rest; a module that failed to load is not loaded
+again. A key's secret is a native
+object with no prototype or properties that only the key's private state
+holds, so script can read the bytes only through `exportKey` on an
+extractable key; the object's finalizer zeroes and frees them when the key
+is collected. Workers and frames use their owner's implementation through
+`Crypto` and `SubtleCrypto` objects of their own; a worker's results that
+are `ArrayBuffer`s are copied into the worker's realm.
+
+`structuredClone`, window and worker messages, and IndexedDB copy supported
+`CryptoKey` objects without exporting the secret. The copy retains the
+algorithm, permitted operations, and extractability of the original.
+Between documents, key material travels separately from the message JSON
+and is delivered only after origin and document-generation checks. Both
+parts share the existing 64 KiB message limit. IndexedDB charges each
+distinct key, Blob, File, or shared backing buffer once per record. It
+checks backing-buffer bytes during cloning, before allocating a copy.
+
+The operations run on the script thread, in slices of about 8 ms, each in
+a task, so a long operation leaves input and the page's other tasks their
+turns, and stops when the page's realm goes. Eight milliseconds is half of
+the 16 ms a turn's tasks may take before input and presentation get theirs.
+An operation belongs to the scope whose `SubtleCrypto` started it: the
+page, a frame or a worker. One task runs one slice, from a timer slot
+reserved above the page's 128 (`scheduler.js`, through the private share
+below Interface snapshot, so a page cannot take one), so a page that fills the
+task table neither stalls an operation nor makes it finish in one task.
+The scopes with pending work take those tasks in turn, and each scope's
+running operations take its turns in turn, so a scope with many cannot
+hold up another. A terminated or closed worker drops its operations
+unsettled, as does a frame whose realm is replaced or evicted; a frame
+whose document goes while its realm stays (the frame is removed or closed,
+or a cross-origin document commits in it) rejects them with
+`OperationError`. Either way they give up their turns and charges at once.
+The stopped scope stays stopped: what code still holding its
+`SubtleCrypto` asks for later rejects with `OperationError` at once. A
+removed frame put back in the document, whose realm is then live again,
+resumes its scope. A scope stopped before any script read
+`crypto.subtle` (so none of its operations could be pending) is not
+recorded; a removed frame's is, at the page's next frame change.
+
+PBKDF2 runs in slices of its iterations (`tilefinch_web_pbkdf2_slice`),
+the first in the call when no other derivation is pending. A scope runs at
+most 16 derivations at once; further requests wait in order and start as
+its derivations end.
+
+The other operations (`digest`, AES, HMAC, HKDF) estimate their work before
+starting (`tilefinch_web_job_plan`), in units of about 0.14 us in PPSSPP at
+333 MHz (`TILEFINCH_WEB_CRYPTO_SLICE_WORK`; an instruction-count proxy, not
+device timing). Work up to one slice, 57,344 units, runs in the call. More
+runs as a job
+(`tilefinch_web_job_run`): a native object holding copies of its inputs and
+its output, which runs chunks of 4 KiB (1 KiB for AES-GCM, and one output
+block for HKDF) until the slice's time is up, and hands its output to an
+`ArrayBuffer` without a copy. A slice always runs one chunk, so a job always
+advances. A job's output is byte for byte what the call gives. These
+operations of a scope settle in the order they were asked for, failures
+included: while one is pending, a later one, short or long, waits behind
+it, and one job of the scope runs at a time; results already known when the
+job ahead ends settle in that task. PBKDF2 derivations keep their own order.
+A job sets up its cipher, hash or MAC contexts, which Mbed TLS takes from
+the C heap outside the script budget, in its first slice and frees them as
+it ends, so only running jobs, one per scope, hold any; a waiting job holds
+only its record and input copies in the script heap, so the page's heap
+limit bounds how many can wait. A 1 MiB AES-GCM message takes about 175
+slices; a 1 MiB digest or HMAC 8 to 40. A GCM IV other than 12 bytes is
+hashed in the job's first slice, in one call, as Mbed TLS takes the IV
+whole: about 1.3 s in PPSSPP for a 1 MiB IV.
+
+Messages, salts,
+IVs and derived output are bounded at 1 MiB
+(`TILEFINCH_WEB_CRYPTO_INPUT_LIMIT`), and PBKDF2's iterations times output
+blocks at ten million (`TILEFINCH_WEB_CRYPTO_PBKDF2_WORK_LIMIT`). PBKDF2
+checks both before allocating its output. The derivations of a page and all
+its frames and workers, running and waiting, share one ceiling, as they
+share one heap: each is charged its key, copied salt, output and progress
+and 2 KiB for its promise, closures and records (a waiting derivation
+measures about 2.2 KB on the 64-bit host), against 3 MiB plus one 136-byte
+state record and those 2 KiB, so the largest single request fits when
+nothing else is pending, and at most about 1,400 derivations can be
+pending. A request that would pass the ceiling
+rejects with `OperationError` without displacing an admitted job; a
+waiting derivation allocates nothing beyond its charge until it starts.
+Each block of HKDF's output hashes `info` again (RFC 5869 section 2.3), so
+255 blocks of a 1 MiB `info` would hash about 255 MiB. Its work is bounded
+at 32 Mi units (`TILEFINCH_WEB_CRYPTO_HKDF_WORK_LIMIT`), about 4.7 s in
+PPSSPP, checked before any hashing: the bytes its hashes compress, counted
+in whole blocks with padding and HMAC's key pads, SHA-384 and SHA-512 bytes
+counting twice. That admits a full 255-block output for every hash with an
+`info` of up to 65,454 bytes (SHA-512) and one block with an `info` of up
+to about 16 MiB, past the 1 MiB input bound.
+An operation over any of these limits is an
+`OperationError`, and key data over 1 MiB a `DataError`.
+
 ## Platform object identity
 
 ### Web IDL receiver checks
@@ -197,18 +360,76 @@ page script, the host marks the prototype of every constructor on the global
 as an interface prototype and each function among its members as an interface
 member (`runtime_mark_platform_interfaces` in
 `src/js_runtime/runtime_creation.inc`, QuickJS `JS_MarkPlatformInterfaces`).
-Calling a marked member with a receiver that has no interface prototype on its
-prototype chain, or that is one, throws "Illegal invocation" before the member
-runs. The same pass gives each interface prototype its class string
-(`@@toStringTag`).
+Each interface prototype gets an interface id, and each member the id of the
+interface it belongs to. Calling a marked member with a receiver that does not
+have that interface's prototype on its prototype chain, or that is an
+interface prototype itself, throws "Illegal invocation" before the member
+runs, so `Node.prototype.appendChild.call(window)` fails as
+`Node.prototype.appendChild.call({})` does, and a subclass's instances (a
+custom element, a page's `EventTarget` class) pass. A frame's objects share
+the page's interface objects, so they pass too. A member that several
+interfaces share (the reflected attributes of the element interfaces, or a
+member a lazy module's interface shares with an earlier one) belongs to the
+nearest interface they all inherit from, or, when there is none, accepts any
+receiver with an interface prototype on its chain. Calls from the
+browser's own scripts keep that looser check, since their helpers call
+members on other interfaces' objects. A node also inherits members its own
+interface lacks from its native layer (a text node's layer holds
+`Element.prototype.remove` and `tagName`, a `<meta>` element's the
+`content` accessor of `HTMLTemplateElement`), and a nested `Worker` in a
+worker inherits the page's `Worker` members from a prototype of its own.
+The browser marks those objects as platform layers (QuickJS
+`JS_MarkPlatformLayer`, from `nativeLayer` in `src/bootstrap/dom.js` and
+`runtime_mark_nested_worker` in `src/js_runtime/runtime_creation.inc`). A
+receiver that lacks the member's interface passes for that one call when a
+platform layer on its prototype chain holds the member and the member was
+on a layer when that layer was marked; the member's interface stays as it
+is, so `Element.prototype.remove.call(Object.create(Node.prototype))`
+fails before and after a text node's `remove()`. Page code cannot mark a
+layer (the marker is deleted before any page script runs), so a page's
+copy of a member onto its own prototype object fails as the plain object
+does. The ids are 10 bits of the engine's per-object word and the layer
+mark one more, leaving room for 16,383 simultaneous weak references to
+one object. Acquiring another throws a `RangeError`; releasing a reference
+makes its slot available again. Reaching the limit does not keep the
+object's storage alive once its owners are gone. The same
+pass gives each interface prototype its class string (`@@toStringTag`).
 
-What stays as the bootstrap wrote it: promise-returning operations, which
-reject instead; the `on*` handler attributes of Window, Document and the
-element interfaces, which share their accessors and answer as
-`[LegacyLenientThis]` does; and a value iterator's `keys`, `values` and
-`entries`. The check accepts an object that merely inherits from an interface
-prototype (`Object.create(Node.prototype)`), and a Proxy; the members' own
+A promise-returning operation named in `runtime_promise_operations`
+(`ReadableStream.prototype.cancel`, `Blob.prototype.text`, `fetch`,
+`HTMLMediaElement.prototype.play` and about 80 more) returns a promise
+rejected with that TypeError instead of throwing it (QuickJS
+`JS_SetPromiseOperation`), and for it an undefined or null receiver fails the
+check too, since the global object implements none of their interfaces; an
+async function there is checked as well. What stays as the bootstrap wrote
+it: the `on*` handler attributes of Window, Document and the element
+interfaces, which share their accessors and answer as `[LegacyLenientThis]`
+does; and a value iterator's `keys`, `values` and `entries`. The check accepts an object that merely inherits from the member's interface prototype (`Object.create(Node.prototype)`) or from a platform layer, and a Proxy; the members' own
 private checks still apply there.
+
+### Web IDL required arguments
+
+Web IDL also makes an operation or constructor called with fewer arguments
+than it requires throw a `TypeError`, and bot checks call
+`document.createElement()` or `postMessage()` with none to see whether it
+does. One table names the operations and constructors that check
+(`runtime_required_arguments` in `src/js_runtime/runtime_creation.inc`, about
+150 of the most used, from `atob` to the 2D canvas drawing calls). The same
+pass that marks the interfaces hands each named function to QuickJS
+`JS_SetRequiredArguments`, which keeps its `length` as the count; a call with
+fewer arguments throws Chrome's message ("Failed to execute 'createElement'
+on 'Document': 1 argument required, but only 0 present.") after the receiver
+check and before the function runs. Web IDL defines `length` as that count,
+so a listed function's parameter list must match the standard
+(`tilefinch-web-platform-conformance-tests` checks both). A row names
+receivers rather than interfaces where the element wrappers' shared
+native-node members sit above an interface prototype (`HTMLDivElement`
+reaches them), and a lazy module's rows are resolved when it loads.
+A promise-returning operation in `runtime_promise_operations` rejects with
+that TypeError instead (`fetch()`, `crypto.subtle.digest()`,
+`customElements.whenDefined()`, `document.fonts.load()`).
+Unlisted operations accept missing arguments as `undefined`; workers and
+the inline style declaration are not covered yet.
 
 A lazy module's interfaces and members are marked when it loads, and only
 what the module itself defined: before it runs, the host snapshots the
@@ -316,6 +537,37 @@ variables that held a primitive or nothing at the snapshot (`name`, a
 handler slot set to `null`). Own-property reflection on the global object,
 and `in` on it, are always live: they report the page's bindings, also for
 a name the browser's view has unbound.
+
+So a browser definition over a global the page created first stays shared,
+not pinned, and a page's later change to that name reaches browser code
+that reads it. A lazy module that hands its eager consumer a factory on
+the global (`geometry.js` defines `__tilefinchCreateLayoutlessGeometry`,
+which `dom.js` reads and deletes) is safe only while no page code can run
+between the module's definition and the consumer's read. Such a feature
+therefore has no placeholder row in `lazy_bootstrap_properties` (a page
+read would load the module when the page chose) and no page-visible ensure
+native: its row in `runtime_entry_natives` is `JS_RT_NATIVE_TRANSIENT`, the
+consumer captures the native while the bootstrap runs, `hardening.js`
+deletes it before page script, and the consumer reads and deletes the
+factory in the statement after the native returns. A lazy module that
+publishes functions for eager code to call later does it through the hook
+publisher `hardening.js` hands each load (`claimHooks`), either as a
+reserved global getter or, for the traversal module's NodeIterator hooks,
+straight to the eager module's setter that `hardening.js` captured, never
+through a setter or name a page can reach first. A native the bootstrap
+captures and deletes is `JS_RT_NATIVE_TRANSIENT`: deleting a frozen one
+fails silently and leaves it page-callable.
+
+Helpers that only browser code may call (the reserved timer slots, the
+cancel that reaches every timer, the crypto-scope stop) are never globals.
+They live in `dom.js`'s private share (`domShared`): `cssom.js` receives it
+from a one-shot call, `frames.js` from `platform.js`, and `scheduler.js` and
+`compat.js` read it and fill those helpers. Runtime creation then takes the
+share off the global with the trusted-event marker
+(`runtime_capture_trusted_hooks`) and holds it: `motion.js`'s load sees it
+on the global for its evaluation only, and the Worker installer receives it
+as an argument. Tests in host and validation realms reach it as
+`__tilefinchTestDomShared`.
 
 A browser script that runs after the snapshot declares nothing at its top
 level (`var`, `function`, `let`, `const`, `class`): the engine refuses it.
@@ -555,8 +807,16 @@ every packed representation here must keep:
 
 The PSP image is optimized for size, except QuickJS, which is built at `-O2`
 because the larger engine is faster on the device despite the instruction
-cache (`cmake/TilefinchDependencies.cmake`). Release builds add
-profile-guided optimization; training, the fingerprint that refuses a stale
-profile, and the release choice are in
+cache (`cmake/TilefinchDependencies.cmake`). The engine code pages seldom run
+(rarely used built-ins, the regexp compiler, `libunicode.c`) stays at `-Os`;
+[the engine README](../../third_party/quickjs/README.md#code-compiled-for-size)
+lists it. Release builds add
+profile-guided optimization with loop unrolling turned off
+(`-fno-unroll-loops`): `-fprofile-use` unrolls every loop, including those in
+functions the training never ran, which cost about 86 KB of `.text` for 2–3%
+of the gain under PPSSPP. Peeling and the other profile-driven passes stay on.
+Training, the fingerprint that refuses a stale profile, the check that
+refuses a profile trained from another checkout path, and the release choice
+are in
 [Release process](../RELEASE_PROCESS.md) and
 [Validation records](VALIDATION_RECORDS.md#engine-profile-collection-pgo-under-ppsspp).

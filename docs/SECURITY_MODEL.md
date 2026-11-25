@@ -664,7 +664,10 @@ the header's, and every policy must allow:
   earlier meta one is not stored again, and a policy that does not fit the
   bounded table makes the document fail closed.
 - The speculative preload scanner stops at a meta policy instead of fetching
-  past it.
+  past it. A script or module preload made before a meta policy is not used
+  by a later script or import, which fetches the URL itself; a redirected
+  module preload is not kept in the HTTP cache, whose hits skip the
+  redirect-time checks.
 - A document parsed whole before any of its scripts run (a fetched child
   frame, a document committed from memory) adopts all of its head's meta
   policies before its first script; a site adapter's static page adopts

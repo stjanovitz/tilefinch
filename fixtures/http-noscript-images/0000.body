@@ -1,0 +1,5 @@
+<!doctype html><style>html,body{margin:0}img,div{display:block;width:40px;height:20px}</style><body>
+<p>Placeholders</p>
+<img id=a alt="" style="display:inline;width:auto;height:auto"><!-- placeholder -->
+<noscript><img alt="" src="/a.svg?x=1&amp;y=2"></noscript>
+<script>globalThis.loads=0;document.getElementById('a').onload=()=>loads++</script>

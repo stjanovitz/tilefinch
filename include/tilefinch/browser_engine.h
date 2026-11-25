@@ -698,7 +698,8 @@ BrowserPreviewActivation browser_engine_provisional_activate(
     BrowserEngine *engine, bool at_point, int device_x, int device_y,
     ControllerAction *action);
 /* True once, after a commit that focused an item whose activation waited
-   for the page; the frontend then activates the focused item. */
+   for the page, provided that page and focus have not been superseded.
+   The frontend then activates the focused item. */
 bool browser_engine_take_deferred_activation(BrowserEngine *engine);
 bool browser_engine_history_move(BrowserEngine *engine, bool forward);
 /*
@@ -724,6 +725,15 @@ bool browser_engine_history_restore_scroll(
 bool browser_engine_replace_history(
     BrowserEngine *engine, const NavigationHistoryRecord *records,
     size_t count, size_t current_index);
+/* PSP tab transitions capture the incumbent before choosing another tab and
+   arm its exact target's RAM-only controls before any candidate can commit.
+   Clear by passing NULL when the transition finishes or rolls back. */
+bool browser_engine_capture_history_controls(BrowserEngine *engine);
+/* Explicit tab switch only: ask before leaving an unretainable draft.
+   Background snapshots use capture_history_controls and never prompt. */
+bool browser_engine_prepare_tab_departure(BrowserEngine *engine);
+bool browser_engine_set_tab_restore(BrowserEngine *engine,
+                                    const NavigationHistoryRecord *record);
 void browser_engine_recover_tab_history(BrowserEngine *engine);
 bool browser_engine_restore_view(
     BrowserEngine *engine, int scroll_y, int focus_kind,
@@ -946,6 +956,15 @@ void browser_engine_restore_script_navigation_attribution(
     BrowserEngine *engine, const BrowserScriptNavigationAttribution *attribution);
 bool browser_engine_activate(BrowserEngine *engine,
                              ControllerAction *action);
+/* Known search-row metadata for this exact Details action, before fetching.
+   Copies plain text only; confers no authority to play or change an account. */
+bool browser_engine_youtube_details_summary(BrowserEngine *engine,
+    const ControllerAction *action, char *title, size_t title_capacity,
+    char *channel, size_t channel_capacity);
+/* Resolve Play on the native Details preview against both the pending
+   destination and the still-displayed result. Never fires page handlers. */
+bool browser_engine_youtube_preview_play(BrowserEngine *engine, ControllerAction *out);
+
 /* Read the focused built-in provider's direct-media target without firing
  * page handlers or changing focus. This is intentionally narrower than an
  * activation preview: callers may use it for bounded speculation, while the

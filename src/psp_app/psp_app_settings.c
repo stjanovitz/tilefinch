@@ -1273,8 +1273,7 @@ static void psp_setting_playback_positions(
         profile, intent->setting.value.boolean);
     /* No stale in-memory dirty flag should resurrect a cleared record.
        Continued playback may record a new position only when opted in. */
-    app->browser->media.resume_profile_dirty = false;
-    app->browser->media.last_resume_saved_us = app->browser->media.clock_us;
+    psp_media_clear_resume_evidence(&app->browser->media);
     psp_profile_store_mark_dirty(
         &app->browser->profile_store, frame->ui_sample_us);
     psp_ui_show_status(&app->process->presentation.ui,
@@ -1506,9 +1505,9 @@ static void psp_setting_restore_last_page(
     bool restore = intent->setting.value.boolean;
     browser_profile_set_restore_last_page(
         profile, restore);
-    psp_profile_store_mark_dirty(
-        &app->browser->profile_store, frame->ui_sample_us);
     if (restore) {
+        psp_profile_store_mark_dirty(
+            &app->browser->profile_store, frame->ui_sample_us);
         const BrowserEngine *engine = app->browser->engine;
         bool saved = psp_recovery_record_current(
             profile, recovery_path, engine);
@@ -1527,11 +1526,19 @@ static void psp_setting_restore_last_page(
                        : "RESTORE ON - SAVES NEXT PAGE",
             180);
     } else {
-        (void) browser_recovery_clear(recovery_path);
-        (void) remove(tab_session_path);
+        bool recovery_cleared = browser_recovery_clear(recovery_path);
+        bool tabs_cleared = browser_tabs_clear_session(
+            app->browser->tabs, tab_session_path);
+        bool setting_saved = psp_profile_store_commit_edit(
+            &app->browser->profile_store, frame->ui_sample_us);
         app->interactive->recovery.dirty = false;
         psp_ui_show_status(
-            &app->process->presentation.ui, "LAST PAGE RESTORE OFF", 180);
+            &app->process->presentation.ui,
+            !recovery_cleared || !tabs_cleared
+                ? (setting_saved ? "RESTORE OFF - SAVED TABS OR PAGE REMAIN"
+                    : "RESTORE OFF THIS RUN - SAVED DATA MAY REMAIN")
+                : (!setting_saved ? "RESTORE OFF THIS RUN - SETTING NOT SAVED"
+                    : "LAST PAGE RESTORE OFF"), 240);
     }
 }
 

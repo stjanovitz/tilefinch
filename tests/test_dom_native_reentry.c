@@ -989,6 +989,17 @@ static const struct {
     {"serialize",
      "document.body.innerHTML='<b>x</b>';"
      "want(document.body.getHTML()==='<b>x</b>','getHTML');"},
+    {"geometry",
+     "const h=document.createElement('div');h.style.display='none';"
+     "const c=h.appendChild(document.createElement('span'));"
+     "document.body.appendChild(h);"
+     "want(c.getBoundingClientRect() instanceof DOMRect,'rect');"},
+    {"validation",
+     "const i=document.createElement('input');i.required=true;"
+     "want(!i.validity.valid&&i.validationMessage.length>0,'validity');"},
+    {"detached-documents",
+     "const x=document.implementation.createDocument(null,'r');"
+     "want(x.documentElement.localName==='r','createDocument');"},
     {"indexeddb",
      "pending++;const r=indexedDB.open('tf-define');"
      "r.onsuccess=()=>{r.result.close();settle()};"
@@ -1665,6 +1676,28 @@ static bool run_cases(void)
         "globalThis.pocSummary=made===0&&e.message==='m'&&"
         "e.name==='constructor'&&e.code===0?'OK':"
         "'BAD made='+made+' code='+typeof e.code})()");
+    /* A Worker reads the shared EventSource, FileReader, GPU and
+       WGSLLanguageFeatures names from what their lazy modules recorded as
+       they loaded, not from the owner's globals: an owner that replaced
+       FileReader after its first read, or deleted EventSource and GPU
+       before theirs, still gives its workers the browser's own, and the
+       globals it deleted stay deleted. */
+    ok &= run_case("lazy-worker-names-are-captured",
+        "(()=>{globalThis.pocSummary='PENDING';const bad=[],"
+        "want=(c,m)=>{if(!c)bad.push(m)},NFR=FileReader;"
+        "globalThis.FileReader=function FileReader(){};"
+        "delete globalThis.EventSource;delete globalThis.GPU;"
+        "const w=new Worker(URL.createObjectURL(new Blob([\"postMessage(["
+        "typeof EventSource,typeof EventSource==='function'&&EventSource.CLOSED,"
+        "new FileReader().readyState,typeof GPU,typeof WGSLLanguageFeatures,"
+        "'EventSource' in self].join(':'))\"])));"
+        "w.onmessage=e=>{want(e.data==='function:2:0:function:function:true',"
+        "'worker saw '+e.data);"
+        "want(!('EventSource' in globalThis)&&!('GPU' in globalThis),"
+        "'deleted globals came back');"
+        "want(FileReader!==NFR&&typeof NFR==='function','owner global');"
+        "w.terminate();pocSummary=bad.length?'BAD '+bad.join(' | '):'OK'};"
+        "w.onerror=e=>{pocSummary='BAD worker error '+(e&&e.message)}})()");
     /* What hardening.js publishes for the lazy modules to extend: a frozen,
        null-prototype table whose every entry is the same interface object
        the page already sees at the global of that name (so it grants

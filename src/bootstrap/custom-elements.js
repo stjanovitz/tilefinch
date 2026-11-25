@@ -561,18 +561,8 @@
   {
     const internalsByElement = new WeakMap(),
       customStateLimit = 32,
-      validityKeys = new Set([
-        "badInput",
-        "customError",
-        "patternMismatch",
-        "rangeOverflow",
-        "rangeUnderflow",
-        "stepMismatch",
-        "tooLong",
-        "tooShort",
-        "typeMismatch",
-        "valueMissing",
-      ]),
+      /* platform.js's, which its ValidityState reads too. */
+      validityKeys = domShared.validityKeys,
       definitionForInternals = (element) => {
         const definition = definitionFor(element);
         return definition?.localName === definition?.name ? definition : null;
@@ -693,21 +683,12 @@
         this.__states = new CustomStateSet(internalsByElement, {
           names: new Set(),
         });
-        const validityState = {};
-        for (const name of validityKeys)
-          Object.defineProperty(validityState, name, {
-            enumerable: true,
-            get: () => !!this.__validity[name],
-          });
-        Object.defineProperty(validityState, "valid", {
-          enumerable: true,
-          get: () => {
-            for (const name of validityKeys)
-              if (this.__validity[name]) return false;
-            return true;
-          },
+        this.__validityState = domShared.validityState((name) => {
+          if (name !== "valid") return !!this.__validity[name];
+          for (const key of validityKeys)
+            if (this.__validity[key]) return false;
+          return true;
         });
-        this.__validityState = Object.freeze(validityState);
       }
       get shadowRoot() {
         return globalThis.__tilefinchShadowRootForHost?.(this.__target) || null;

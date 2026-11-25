@@ -323,7 +323,9 @@ static uint64_t navigation_stylesheet_user_css_hash(
    prefix. `document` supplies both the inputs and the Content-Security-Policy
    that admits them: at commit the parser's document has already been moved
    into the page, so the stream's own copy is empty. `require_inline` limits
-   the suffix to <style> elements, whose append needs no stream fetch state. */
+   the suffix to <style> elements, whose append needs no stream fetch state.
+   A suffix of more than NAVIGATION_STYLESHEET_SUFFIX_LIMIT inputs is left to
+   a rebuild. */
 static bool navigation_stream_continue_stylesheet_suffix(
     NavigationDocumentStream *stream, PocDocument *document,
     uint64_t fingerprint, bool require_inline)
@@ -391,8 +393,12 @@ static bool navigation_stream_continue_stylesheet_suffix(
         budget_free(stream->session->budget, current);
         return false;
     }
-    lxb_dom_node_t *suffix[NAVIGATION_STYLESHEET_INPUT_LIMIT];
     size_t suffix_count = current_count - stream->stylesheet_input_count;
+    if (suffix_count > NAVIGATION_STYLESHEET_SUFFIX_LIMIT) {
+        budget_free(stream->session->budget, current);
+        return false;
+    }
+    lxb_dom_node_t *suffix[NAVIGATION_STYLESHEET_SUFFIX_LIMIT];
     for (size_t i = 0; i < suffix_count; i++) {
         suffix[i] =
             current[stream->stylesheet_input_count + i].node;

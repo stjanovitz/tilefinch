@@ -91,21 +91,16 @@ static uint64_t runtime_lazy_memory_failures(const ScriptRuntime *runtime)
     return stats.memory_failures;
 }
 
-static bool runtime_job_exception_is_fatal(const ScriptRuntime *runtime,
-                                           size_t failures_before,
-                                           size_t heap_rejections_before)
+static bool runtime_job_exception_is_fatal(const ScriptRuntime *runtime)
 {
     if (runtime == NULL) return true;
     /* Error text is author-controlled and result.interrupted describes the
-       previous completed slice until js_rt_runtime_update_result() runs.  Only a
-       failure observed while executing this job can make it fatal. A QuickJS
-       pool refusal is separate from the outer Budget counter. Pair it with the
-       propagated exception here: bounded allocation fallbacks that return
-       successfully remain nonfatal, while an uncaught inner-heap exhaustion
-       cannot be misreported as an ordinary author exception. */
-    return runtime->watchdog.interrupted
-        || runtime->budget->failure_count != failures_before
-        || script_runtime_heap_rejections(runtime) != heap_rejections_before;
+       previous completed slice until js_rt_runtime_update_result() runs.  Only
+       the watchdog stopping this job makes it fatal. An allocation refusal is
+       an ordinary author exception here, as in a timer or a listener: the
+       host judges the realm's memory at the task boundary
+       (navigation_assess_script_memory), however the refusal surfaced. */
+    return runtime->watchdog.interrupted;
 }
 
 static void runtime_record_author_job_exception(ScriptRuntime *runtime)
@@ -212,9 +207,6 @@ static bool runtime_run_jobs_checkpoint(ScriptRuntime *runtime)
             runtime->checkpoint_continuation_head = (uint8_t) (
                 (slot + 1u) % SCRIPT_CHECKPOINT_CONTINUATION_LIMIT);
             runtime->checkpoint_continuation_count--;
-            size_t failures_before = runtime->budget->failure_count;
-            size_t heap_rejections_before =
-                script_runtime_heap_rejections(runtime);
             uint64_t lazy_memory_failures_before =
                 runtime_lazy_memory_failures(runtime);
             BudgetAllocationOwner previous_owner =
@@ -242,8 +234,7 @@ static bool runtime_run_jobs_checkpoint(ScriptRuntime *runtime)
             if (JS_IsException(value)) {
                 JS_FreeValue(runtime->context, value);
                 js_rt_record_exception(runtime->context, &runtime->result);
-                bool fatal = runtime_job_exception_is_fatal(
-                    runtime, failures_before, heap_rejections_before);
+                bool fatal = runtime_job_exception_is_fatal(runtime);
                 uint64_t recovery_started_ns = trace_steps
                     ? js_rt_monotonic_time_ns() : 0;
                 js_lazy_webpack_recover_failure(runtime);
@@ -287,9 +278,6 @@ static bool runtime_run_jobs_checkpoint(ScriptRuntime *runtime)
         JSContext *job_context = NULL;
         uint64_t started_ns = js_rt_monotonic_time_ns();
         size_t polls_before = runtime->watchdog.polls;
-        size_t failures_before = runtime->budget->failure_count;
-        size_t heap_rejections_before =
-            script_runtime_heap_rejections(runtime);
         uint64_t lazy_memory_failures_before =
             runtime_lazy_memory_failures(runtime);
         BudgetAllocationOwner previous_owner =
@@ -347,8 +335,7 @@ static bool runtime_run_jobs_checkpoint(ScriptRuntime *runtime)
             js_rt_record_exception(job_context == NULL ? runtime->context
                                                  : job_context,
                              &runtime->result);
-            bool fatal = runtime_job_exception_is_fatal(
-                runtime, failures_before, heap_rejections_before);
+            bool fatal = runtime_job_exception_is_fatal(runtime);
             uint64_t recovery_started_ns = trace_steps
                 ? js_rt_monotonic_time_ns() : 0;
             js_lazy_webpack_recover_failure(runtime);
@@ -489,6 +476,7 @@ static const char *const runtime_host_callback_names[] = {
     [SCRIPT_HOST_REFRESH_NAMED_PROPERTIES] = "__tilefinchRefreshNamedProperties",
     [SCRIPT_HOST_PARSER_MUTATION_CHECKPOINT] = "__tilefinchParserMutationCheckpoint",
     [SCRIPT_HOST_RECEIVE_MESSAGE] = "__tilefinchReceiveMessage",
+    [SCRIPT_HOST_RECEIVE_KEY_MESSAGE] = "__tilefinchReceiveKeyMessage",
     [SCRIPT_HOST_SET_FRAME_WINDOW_STATE] = "__tilefinchSetFrameWindowState",
     [SCRIPT_HOST_INTERSECTION_RECHECK] = "__tilefinchIntersectionRecheck",
     [SCRIPT_HOST_MEDIA_RECHECK] = "__tilefinchMediaRecheck",
@@ -515,12 +503,17 @@ static const char *const runtime_host_callback_names[] = {
     [SCRIPT_HOST_RETIRE_NATIVE_NODE_STATE] = "__tilefinchRetireNativeNodeState",
     [SCRIPT_HOST_HOLD_EVENT_STATE] = "__tilefinchHoldEventState",
     [SCRIPT_HOST_RELEASE_EVENT_HOLDERS] = "__tilefinchReleaseEventHolders",
-    [SCRIPT_HOST_PERMISSIONS_CHANGED] = "__tilefinchPermissionsChanged"
+    [SCRIPT_HOST_PERMISSIONS_CHANGED] = "__tilefinchPermissionsChanged",
+    [SCRIPT_HOST_POST_PARENT_MESSAGE] = "__tilefinchPostParentMessage",
+    [SCRIPT_HOST_POST_TOP_MESSAGE] = "__tilefinchPostTopMessage"
 };
 _Static_assert(sizeof(runtime_host_callback_names)
                    / sizeof(runtime_host_callback_names[0])
                == SCRIPT_HOST_CALLBACK_COUNT,
                "every ScriptHostCallback needs a global name");
+_Static_assert(SCRIPT_HOST_POST_TOP_MESSAGE == SCRIPT_HOST_POST_PARENT_MESSAGE + 1
+               && SCRIPT_HOST_POST_TOP_MESSAGE + 1 == SCRIPT_HOST_CALLBACK_COUNT,
+               "the ancestor senders close the table");
 
 static bool runtime_capture_host_callbacks(ScriptRuntime *runtime,
                                            JSValueConst global)
@@ -535,6 +528,16 @@ static bool runtime_capture_host_callbacks(ScriptRuntime *runtime,
             return false;
         }
         runtime->host_callbacks[i] = function;
+        if (i == SCRIPT_HOST_RECEIVE_KEY_MESSAGE
+            || i >= SCRIPT_HOST_POST_PARENT_MESSAGE) {
+            JSAtom atom = JS_NewAtom(
+                runtime->context, runtime_host_callback_names[i]);
+            if (atom == JS_ATOM_NULL) return false;
+            bool removed = JS_DeleteProperty(runtime->context, global,
+                                             atom, 0) > 0;
+            JS_FreeAtom(runtime->context, atom);
+            if (!removed) return false;
+        }
     }
     runtime->host_global = JS_DupValue(runtime->context, global);
     return true;
@@ -860,8 +863,19 @@ bool script_runtime_configure_messaging(
     runtime->bridge.opaque_origin = runtime->bridge.opaque_origin
                                     || child_opaque_origin;
     runtime->document_scope = SCRIPT_DOCUMENT_SCOPE_CHILD_FRAME;
+    /* Lab and validation builds record where a child frame posted a
+       {event:'reject'} message to its parent, for the frame capability
+       trace (navigation_collect_frame_capability_trace). Shipping builds
+       leave the page's message alone. */
+#if defined(TILEFINCH_NO_TRACE) && !defined(TILEFINCH_PSP_VALIDATION_LOG)
+#define CHILD_REJECT_STACK_CAPTURE ""
+#else
+#define CHILD_REJECT_STACK_CAPTURE                                           \
+    "if(data&&data.event==='reject')globalThis.__tilefinchLastRejectStack="  \
+    "String(new Error('frame reject').stack||'');"
+#endif
     static const char same_origin_child_setup[] =
-        "(()=>{globalThis.__tilefinchTaskRealm='child';const topIsParent=!!globalThis.__tilefinchTopIsParent;delete globalThis.__tilefinchTopIsParent;"
+        "(()=>{globalThis.__tilefinchTaskRealm='child';const topIsParent=!!globalThis.__tilefinchTopIsParent,postParent=__tilefinchPostParentMessage,postTop=__tilefinchPostTopMessage;delete globalThis.__tilefinchTopIsParent;"
         "const makeAncestor=(send,parentOf,topOf)=>{let windowProxy;const target={};Object.defineProperties(target,{"
         "postMessage:{enumerable:true,configurable:true,writable:true,value:send},"
         "window:{enumerable:true,configurable:true,get:()=>windowProxy},self:{enumerable:true,configurable:true,get:()=>windowProxy},"
@@ -873,14 +887,14 @@ bool script_runtime_configure_messaging(
         "close:{enumerable:true,configurable:true,writable:true,value:function close(){}}});"
         "Object.defineProperty(target,Symbol.toStringTag,{configurable:true,value:'Window'});windowProxy=target;return target};"
         "const parentSend=function postMessage(data,targetOrigin='/'){"
-        "if(data&&data.event==='reject')globalThis.__tilefinchLastRejectStack=String(new Error('Turnstile reject').stack||'');"
-        "__tilefinchPostParentMessage(data,targetOrigin)};let parentWindow,topWindow;"
+        CHILD_REJECT_STACK_CAPTURE
+        "postParent(data,targetOrigin,arguments.length)};let parentWindow,topWindow;"
         "if(topIsParent){parentWindow=makeAncestor(parentSend,()=>parentWindow,()=>parentWindow);topWindow=parentWindow}"
-        "else{topWindow=makeAncestor(function postMessage(data,targetOrigin='/'){__tilefinchPostTopMessage(data,targetOrigin)},()=>topWindow,()=>topWindow);"
+        "else{topWindow=makeAncestor(function postMessage(data,targetOrigin='/'){postTop(data,targetOrigin,arguments.length)},()=>topWindow,()=>topWindow);"
         "parentWindow=makeAncestor(parentSend,()=>topWindow,()=>topWindow)}globalThis.parent=parentWindow;globalThis.top=topWindow;Object.defineProperty(globalThis,'opener',"
         "{value:null,writable:false,configurable:false});})();";
     static const char cross_origin_child_setup[] =
-        "(()=>{globalThis.__tilefinchTaskRealm='child';const topIsParent=!!globalThis.__tilefinchTopIsParent;delete globalThis.__tilefinchTopIsParent;"
+        "(()=>{globalThis.__tilefinchTaskRealm='child';const topIsParent=!!globalThis.__tilefinchTopIsParent,postParent=__tilefinchPostParentMessage,postTop=__tilefinchPostTopMessage;delete globalThis.__tilefinchTopIsParent;"
         "const makeAncestor=(send,parentOf,topOf)=>{let windowProxy;const target={};const denied=()=>{throw new DOMException("
         "'Blocked cross-origin Window access','SecurityError')};Object.defineProperties(target,{"
         "postMessage:{enumerable:true,configurable:false,get:()=>send,set:denied},"
@@ -895,13 +909,14 @@ bool script_runtime_configure_messaging(
         "windowProxy=new Proxy(target,{get:(object,key,receiver)=>Reflect.has(object,key)?Reflect.get(object,key,receiver):denied(),"
         "set:(object,key,value,receiver)=>Reflect.has(object,key)?Reflect.set(object,key,value,receiver):denied()});return windowProxy};"
         "const send=function postMessage(data,targetOrigin='/'){"
-        "if(data&&data.event==='reject')globalThis.__tilefinchLastRejectStack=String(new Error('Turnstile reject').stack||'');"
-        "__tilefinchPostParentMessage(data,targetOrigin);};let parentWindow,topWindow;"
+        CHILD_REJECT_STACK_CAPTURE
+        "postParent(data,targetOrigin,arguments.length);};let parentWindow,topWindow;"
         "if(topIsParent){parentWindow=makeAncestor(send,()=>parentWindow,()=>parentWindow);topWindow=parentWindow}"
-        "else{topWindow=makeAncestor(function postMessage(data,targetOrigin='/'){__tilefinchPostTopMessage(data,targetOrigin)},()=>topWindow,()=>topWindow);"
+        "else{topWindow=makeAncestor(function postMessage(data,targetOrigin='/'){postTop(data,targetOrigin,arguments.length)},()=>topWindow,()=>topWindow);"
         "parentWindow=makeAncestor(send,()=>topWindow,()=>topWindow)}globalThis.parent=parentWindow;globalThis.top=topWindow;"
         "Object.defineProperty(globalThis,'opener',{value:null,writable:false,"
         "configurable:false});})();";
+#undef CHILD_REJECT_STACK_CAPTURE
     const char *child_setup = parent_same_origin
         ? same_origin_child_setup : cross_origin_child_setup;
     size_t child_setup_length = parent_same_origin
@@ -911,18 +926,41 @@ bool script_runtime_configure_messaging(
     bool top_state_ok = JS_SetPropertyStr(
         runtime->context, global, "__tilefinchTopIsParent",
         JS_NewBool(runtime->context, top_is_parent)) >= 0;
+    /* The set-up takes the parent and top senders runtime creation
+       captured (runtime_capture_host_callbacks) from their old names for
+       its own evaluation only. Only TRUE counts: a page-owned
+       non-configurable name would hand the set-up the page's value. */
+    for (int i = SCRIPT_HOST_POST_PARENT_MESSAGE;
+         top_state_ok && i <= SCRIPT_HOST_POST_TOP_MESSAGE; i++)
+        top_state_ok = JS_DefinePropertyValueStr(
+            runtime->context, global, runtime_host_callback_names[i],
+            JS_DupValue(runtime->context, runtime->host_callbacks[i]),
+            JS_PROP_CONFIGURABLE) > 0;
+    bool ok = top_state_ok;
+    if (ok) {
+        js_rt_runtime_arm_watchdog(runtime);
+        /* The messaging set-up below is the browser's code: what it
+           defines (parent, top) is the browser's binding, not a page's
+           replacement. */
+        ok = js_rt_evaluate_browser_source(
+            runtime->context, child_setup, child_setup_length,
+            "<frame-messaging>", &runtime->result);
+    }
+    for (int i = SCRIPT_HOST_POST_PARENT_MESSAGE;
+         i <= SCRIPT_HOST_POST_TOP_MESSAGE; i++) {
+        JSAtom sender = JS_NewAtom(runtime->context,
+                                   runtime_host_callback_names[i]);
+        bool removed = sender != JS_ATOM_NULL
+            && JS_DeleteProperty(runtime->context, global, sender, 0) > 0;
+        if (sender != JS_ATOM_NULL) JS_FreeAtom(runtime->context, sender);
+        ok = ok && removed;
+    }
     JS_FreeValue(runtime->context, global);
     if (!top_state_ok) {
         js_rt_record_exception(runtime->context, &runtime->result);
         runtime->result.success = false;
         return false;
     }
-    js_rt_runtime_arm_watchdog(runtime);
-    /* The messaging set-up below is the browser's code: what it defines
-       (parent, top) is the browser's binding, not a page's replacement. */
-    bool ok = js_rt_evaluate_browser_source(
-        runtime->context, child_setup, child_setup_length,
-        "<frame-messaging>", &runtime->result);
     if (ok) ok = js_rt_runtime_run_jobs(runtime);
     if (ok && child_opaque_origin) {
         static const char opaque_setup[] =
@@ -969,17 +1007,84 @@ bool script_runtime_dispatch_message(ScriptRuntime *runtime,
                                      long source_frame_handle,
                                      ScriptResult *result)
 {
+    return script_runtime_dispatch_message_with_keys(
+        runtime, json, source_origin, source_frame_handle, NULL, 0, result);
+}
+
+typedef struct {
+    size_t length;
+    uint8_t bytes[];
+} ScriptMessageKeyScratch;
+
+static void runtime_free_message_key_scratch(JSRuntime *rt, void *opaque,
+                                             void *data)
+{
+    ScriptMessageKeyScratch *scratch = opaque;
+    if (data == NULL) return;
+    tilefinch_web_crypto_zeroize(scratch->bytes, scratch->length);
+    js_free_rt(rt, scratch);
+}
+
+bool script_runtime_dispatch_message_with_keys(ScriptRuntime *runtime,
+                                               const char *json,
+                                               const char *source_origin,
+                                               long source_frame_handle,
+                                               const uint8_t *key_bytes,
+                                               size_t key_length,
+                                               ScriptResult *result)
+{
+    const size_t json_length = json == NULL ? 0 : strlen(json);
     if (runtime == NULL || json == NULL || source_origin == NULL
-        || strlen(json) > 65536 || strlen(source_origin) > 2048) return false;
+        || json_length > SCRIPT_FRAME_MESSAGE_BYTE_LIMIT
+        || key_length > SCRIPT_FRAME_MESSAGE_BYTE_LIMIT - json_length
+        || (key_length != 0 && key_bytes == NULL)
+        || strlen(source_origin) > 2048) return false;
     js_rt_runtime_arm_watchdog(runtime);
-    JSValue arguments[3] = {
-        JS_NewString(runtime->context, json),
-        JS_NewString(runtime->context, source_origin),
-        JS_NewInt64(runtime->context, source_frame_handle)
+    JSContext *context = runtime->context;
+    JSValue arguments[4] = {
+        JS_NewStringLen(context, json, json_length),
+        JS_NewString(context, source_origin),
+        JS_NewInt64(context, source_frame_handle),
+        JS_UNDEFINED
     };
-    bool ok = runtime_call_host(runtime, SCRIPT_HOST_RECEIVE_MESSAGE, 3, arguments,
-                           NULL);
-    for (size_t i = 0; i < 3; i++) JS_FreeValue(runtime->context, arguments[i]);
+    JSValue buffer = JS_UNDEFINED;
+    bool keyed = key_length != 0;
+    bool ok = !JS_IsException(arguments[0]) && !JS_IsException(arguments[1]);
+    if (ok && keyed) {
+        ScriptMessageKeyScratch *scratch =
+            js_malloc(context, sizeof(*scratch) + key_length);
+        ok = scratch != NULL;
+        if (ok) {
+            scratch->length = key_length;
+            buffer = JS_NewArrayBuffer(context, scratch->bytes, key_length,
+                                       runtime_free_message_key_scratch,
+                                       scratch, false);
+            if (JS_IsException(buffer)) {
+                js_free(context, scratch);
+                ok = false;
+            } else {
+                memcpy(scratch->bytes, key_bytes, key_length);
+                JSValueConst view[3] = {buffer, JS_UNDEFINED, JS_UNDEFINED};
+                arguments[3] = JS_NewTypedArray(
+                    context, 3, view, JS_TYPED_ARRAY_UINT8);
+                ok = !JS_IsException(arguments[3]);
+            }
+        }
+    }
+    if (ok) {
+        ok = runtime_call_host(
+            runtime, keyed ? SCRIPT_HOST_RECEIVE_KEY_MESSAGE
+                           : SCRIPT_HOST_RECEIVE_MESSAGE,
+            keyed ? 4 : 3, arguments, NULL);
+    } else {
+        js_rt_record_exception(context, &runtime->result);
+    }
+    /* The captured keyed hook synchronously hydrates the opaque key data.
+       Detach and zero its temporary input before running any queued jobs. */
+    if (!JS_IsUndefined(buffer) && !JS_IsException(buffer))
+        JS_DetachArrayBuffer(context, buffer);
+    JS_FreeValue(context, buffer);
+    for (size_t i = 0; i < 4; i++) JS_FreeValue(context, arguments[i]);
     if (ok) ok = js_rt_runtime_run_jobs(runtime);
     if (ok) ok = js_rt_runtime_refresh(runtime);
     runtime->result.success = ok;
@@ -1685,6 +1790,9 @@ static bool runtime_pump_network(ScriptRuntime *runtime,
         (void) fetch_scheduler_pump(
             bridge->fetch_scheduler, 1,
             wait_ms > 4 ? 4 : wait_ms);
+    } else if (completion_budget == 0) {
+        /* A parked response that finished still ages and is released. */
+        (void) fetch_scheduler_release_parked(bridge->fetch_scheduler, false);
     }
     if (completion_budget == 0) js_rt_cors_preflights_settle(bridge);
     size_t author_tasks = 0;
@@ -1729,8 +1837,16 @@ static bool runtime_pump_network(ScriptRuntime *runtime,
     for (size_t i = 0;
          completion_budget != 0 && i < bridge->async_fetch_count;) {
         bool success = false;
+        if (!fetch_scheduler_request_complete(bridge->fetch_scheduler,
+                                              bridge->async_fetches[i].id)) {
+            i++;
+            continue;
+        }
         FetchResult *fetched = fetch_result_create(bridge->document->budget);
-        if (fetched == NULL) return false;
+        if (fetched == NULL) {
+            js_rt_note_delivery_refusal(runtime);
+            break;
+        }
         ScriptAsyncFetch async_fetch = bridge->async_fetches[i];
         uint64_t id = async_fetch.id;
         if (!fetch_scheduler_take(bridge->fetch_scheduler, id,

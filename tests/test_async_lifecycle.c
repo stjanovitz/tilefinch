@@ -486,13 +486,14 @@ static const char file_reader_stage_pressure[] =
     "'READER-STAGE-LOST'};reader.readAsText(new Blob(['intact']));";
 
 static const char file_reader_reserved_pressure[] =
-    "pocSummary='READER-RESERVED-PENDING';const reader=new FileReader,ids=[];let errors=0,ends=0;"
+    "pocSummary='READER-RESERVED-PENDING';const reader=new FileReader,ids=[],"
+    "timers=__tilefinchTestDomShared;let errors=0,ends=0;"
     "reader.onerror=()=>{errors++;if(reader.error.name!=='QuotaExceededError'){"
-    "pocSummary='READER-WRONG-REFUSAL';return}for(const id of ids)__tilefinchCancelTimer(id);"
+    "pocSummary='READER-WRONG-REFUSAL';return}for(const id of ids)timers.cancelTimer(id);"
     "reader.readAsText(new Blob(['replacement']))};reader.onloadend=()=>{ends++;"
     "pocSummary=errors===1&&ends===1&&reader.result==='replacement'&&reader.error===null"
     "?'OK':'READER-RESERVED-CHAIN'};reader.readAsText(new Blob(['discarded']));"
-    "for(let i=0;i<256;i++){const id=__tilefinchScheduleReservedTask(()=>{},600000);"
+    "for(let i=0;i<256;i++){const id=timers.scheduleReservedTask(()=>{},600000);"
     "if(!id)break;ids.push(id)}";
 
 static const char file_reader_worker_termination[] =
@@ -504,7 +505,7 @@ static const char file_reader_worker_termination[] =
     "setTimeout(()=>{if(pocSummary==='READER-WORKER-PENDING')pocSummary='OK'},0)};";
 
 static const char event_source_reconnect_parser[] =
-    "pocSummary='SOURCE-PARSER-PENDING';const deliver=__tilefinchDeliverEventSource,"
+    "pocSummary='SOURCE-PARSER-PENDING';const deliver=(...a)=>__tilefinchDeliverEventSource(...a),"
     "encoder=new TextEncoder,seen=[];let starts=0,header=false;"
     "__tilefinchEventSourceClose=()=>true;__tilefinchEventSourceStart=(url,credentials,last)=>{"
     "const id=++starts;if(id===2)header=last==='committed';queueMicrotask(()=>{"
@@ -520,7 +521,7 @@ static const char event_source_reconnect_parser[] =
 
 static const char event_source_handler_exception[] =
     "pocSummary='SOURCE-HANDLER-PENDING';addEventListener('error',event=>event.preventDefault());"
-    "const deliver=__tilefinchDeliverEventSource;__tilefinchEventSourceClose=()=>true;"
+    "const deliver=(...a)=>__tilefinchDeliverEventSource(...a);__tilefinchEventSourceClose=()=>true;"
     "__tilefinchEventSourceStart=()=>{queueMicrotask(()=>deliver(1,'open',''));"
     "queueMicrotask(()=>deliver(1,'chunk','data:one\\n\\n'));"
     "queueMicrotask(()=>deliver(1,'chunk','data:two\\n\\n'));return 1};"
@@ -529,14 +530,14 @@ static const char event_source_handler_exception[] =
     "?'OK':'SOURCE-HANDLER-DUPLICATE'};";
 
 static const char event_source_close_error[] =
-    "pocSummary='SOURCE-CLOSE-PENDING';const deliver=__tilefinchDeliverEventSource;"
+    "pocSummary='SOURCE-CLOSE-PENDING';const deliver=(...a)=>__tilefinchDeliverEventSource(...a);"
     "__tilefinchEventSourceClose=()=>true;__tilefinchEventSourceStart=()=>{queueMicrotask(()=>{"
     "deliver(1,'finish','');pocSummary=source.readyState===EventSource.CLOSED&&"
     "__tilefinchSchedulerSnapshot()[2]===0?'OK':'SOURCE-CLOSED-TIMER'});return 1};"
     "const source=new EventSource('/feed');source.onerror=()=>source.close();";
 
 static const char event_source_reconnect_pressure[] =
-    "pocSummary='SOURCE-PRESSURE-PENDING';const ids=[],deliver=__tilefinchDeliverEventSource;"
+    "pocSummary='SOURCE-PRESSURE-PENDING';const ids=[],deliver=(...a)=>__tilefinchDeliverEventSource(...a);"
     "let starts=0;__tilefinchEventSourceClose=()=>true;__tilefinchEventSourceStart=()=>{"
     "const id=++starts;queueMicrotask(()=>{if(id===1){deliver(id,'chunk','retry:250\\n');"
     "deliver(id,'finish','')}else{source.close();pocSummary=starts===2?'OK':'SOURCE-EXTRA-RETRY'}});"
@@ -545,7 +546,7 @@ static const char event_source_reconnect_pressure[] =
     "if(!id)break;ids.push(id)}";
 
 static const char event_source_cr_delimiters[] =
-    "pocSummary='SOURCE-CR-PENDING';const deliver=__tilefinchDeliverEventSource,seen=[];"
+    "pocSummary='SOURCE-CR-PENDING';const deliver=(...a)=>__tilefinchDeliverEventSource(...a),seen=[];"
     "let immediate=false;__tilefinchEventSourceClose=()=>true;__tilefinchEventSourceStart=()=>{"
     "queueMicrotask(()=>{deliver(1,'open','');deliver(1,'chunk','data:first\\r');"
     "deliver(1,'chunk','\\r');immediate=seen.join(',')==='first';"
@@ -554,7 +555,7 @@ static const char event_source_cr_delimiters[] =
     "const source=new EventSource('/feed');source.onmessage=e=>seen.push(e.data);";
 
 static const char event_source_deferred_close[] =
-    "pocSummary='SOURCE-DEFERRED-CLOSE-PENDING';const ids=[],deliver=__tilefinchDeliverEventSource;"
+    "pocSummary='SOURCE-DEFERRED-CLOSE-PENDING';const ids=[],deliver=(...a)=>__tilefinchDeliverEventSource(...a);"
     "let starts=0;__tilefinchEventSourceClose=()=>true;__tilefinchEventSourceStart=()=>{"
     "starts++;queueMicrotask(()=>{deliver(1,'finish','');source.close();"
     "for(const id of ids)clearTimeout(id);pocSummary=source.readyState===EventSource.CLOSED&&"

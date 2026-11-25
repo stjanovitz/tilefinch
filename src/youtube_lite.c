@@ -204,7 +204,8 @@ static bool lite_path_is(const TilefinchUrl *url, const char *path)
  * The form of a YouTube link this provider works from. A link in any shape
  * YouTube serves becomes the https link the watch parser and the routes
  * below accept: http becomes https, one trailing path slash is dropped, and
- * /live/ID and /embed/ID become watch?v=ID with the link's own query kept.
+ * /live/ID and /embed/ID become watch?v=ID with the link's own query and
+ * fragment kept.
  * Any other link, or one whose canonical form does not fit, is returned
  * unchanged.
  */
@@ -231,12 +232,14 @@ static const char *lite_canonical_url(const char *url, char *output,
         ? snprintf(output, capacity, "https://%.*s%.*s%s",
                    (int) parsed.host_length, host, (int) path_length, path,
                    rest)
-        : snprintf(output, capacity, "https://%.*s/watch?v=%.*s%s%.*s",
+        : snprintf(output, capacity, "https://%.*s/watch?v=%.*s%s%.*s%s",
                    (int) parsed.host_length, host,
                    (int) (path_length - prefix), path + prefix,
                    parsed.has_query ? "&" : "",
                    (int) parsed.query_length,
-                   parsed.value + parsed.query_offset);
+                   parsed.value + parsed.query_offset,
+                   parsed.has_fragment
+                       ? parsed.value + parsed.fragment_offset - 1u : "");
     return written > 0 && (size_t) written < capacity ? output : url;
 }
 
@@ -254,6 +257,26 @@ bool youtube_lite_watch_video_id(const char *url,
     char canonical[TILEFINCH_URL_SERIALIZED_LIMIT];
     return youtube_watch_url_video_id(
         lite_canonical_url(url, canonical, sizeof(canonical)), output);
+}
+
+bool youtube_lite_watch_playback_url(const char *entry_url, char *output,
+                                     size_t capacity)
+{
+    if (output == NULL || capacity == 0) return false;
+    char canonical[TILEFINCH_URL_SERIALIZED_LIMIT];
+    const char *watch = lite_canonical_url(entry_url, canonical, sizeof(canonical));
+    char id[YOUTUBE_VIDEO_ID_CAPACITY];
+    if (!youtube_watch_url_video_id(watch, id)) return false;
+    unsigned seconds = (unsigned) (youtube_watch_url_start_time_us(watch) / UINT64_C(1000000));
+    char target[sizeof("https://www.youtube.com/watch?v=&t=4294967295")
+        + YOUTUBE_VIDEO_ID_CAPACITY - 1u];
+    int length = seconds == 0u
+        ? snprintf(target, sizeof(target), "https://www.youtube.com/watch?v=%s", id)
+        : snprintf(target, sizeof(target), "https://www.youtube.com/watch?v=%s&t=%u", id, seconds);
+    if (length <= 0 || (size_t) length >= sizeof(target)
+        || (size_t) length >= capacity) return false;
+    memcpy(output, target, (size_t) length + 1u);
+    return true;
 }
 
 YoutubeLiteRoute youtube_lite_route(const char *url)
@@ -299,8 +322,23 @@ static const char *lite_find_bytes(const char *start, const char *end,
     size_t length = strlen(needle);
     if (length == 0) return start;
     if ((size_t) (end - start) < length) return NULL;
-    for (const char *at = start; at <= end - (ptrdiff_t) length; at++) {
+    /* Camel-case keys normally have a much rarer interior capital than
+       their first letter. Search for that byte, then verify the full key. */
+    size_t anchor = 0;
+    for (size_t i = 1; i < length; i++) {
+        if (needle[i] >= 'A' && needle[i] <= 'Z') {
+            anchor = i;
+            break;
+        }
+    }
+    const char *stop = end - (length - anchor - 1u);
+    const char *scan = start + anchor;
+    while (scan < stop) {
+        const char *hit = memchr(scan, needle[anchor], (size_t)(stop - scan));
+        if (hit == NULL) break;
+        const char *at = hit - anchor;
         if (*at == *needle && memcmp(at, needle, length) == 0) return at;
+        scan = hit + 1;
     }
     return NULL;
 }
@@ -1127,29 +1165,39 @@ static const char *lite_next_key(const YoutubeLiteSpan *scope, const char *at,
     const YoutubeLiteRendererKey *keys, size_t key_count, size_t *kind,
     const char **value)
 {
-    while (at < scope->end) {
-        const char *quote = memchr(at, '"', (size_t) (scope->end - at));
-        if (quote == NULL) return NULL;
-        size_t slashes = 0;
-        for (const char *back = quote;
-             back > scope->start && back[-1] == '\\'; back--) slashes++;
-        for (size_t candidate = 0; (slashes & 1u) == 0
-             && candidate < key_count; candidate++) {
-            size_t key_length = keys[candidate].length;
-            const char *key_start = quote + 1;
-            if ((size_t) (scope->end - key_start) <= key_length
-                || *key_start != keys[candidate].name[0]
-                || key_start[key_length] != '"'
-                || memcmp(key_start, keys[candidate].name, key_length) != 0)
-                continue;
-            const char *colon = lite_json_space(key_start + key_length + 1, scope->end);
-            if (colon < scope->end && *colon == ':') {
-                *kind = candidate;
-                *value = lite_json_space(colon + 1, scope->end);
-                return quote;
-            }
+    size_t longest = 0;
+    uint32_t endings = 0;
+    for (size_t i = 0; i < key_count; i++) {
+        size_t len = keys[i].length;
+        if (len > longest) longest = len;
+        endings |= UINT32_C(1) << ((unsigned char) keys[i].name[len - 1u] & 31u);
+    }
+    /* Only a closing key quote followed by a colon can introduce a
+       renderer. Most quotes are in values. The suffix filter can only
+       admit extra candidates; the length and bytes must still match. */
+    const char *scan = at;
+    while (scan < scope->end) {
+        const char *colon = memchr(scan, ':', (size_t)(scope->end - scan));
+        if (!colon) break;
+        scan = colon + 1;
+        const char *end = colon;
+        while (end > at && (end[-1] == ' ' || end[-1] == '\t'
+                            || end[-1] == '\r' || end[-1] == '\n')) end--;
+        if (end - at < 3 || *--end != '"'
+            || !(endings & (UINT32_C(1) << ((unsigned char)end[-1] & 31u)))) continue;
+        const char *first = end;
+        while (first > at && first[-1] != '"' && (size_t)(end - first) < longest) first--;
+        if (first == at || first[-1] != '"') continue;
+        size_t length = (size_t)(end - first);
+        for (size_t i = 0; i < key_count; i++) {
+            if (length != keys[i].length || memcmp(first, keys[i].name, length)) continue;
+            const char *quote = first - 1, *back = quote;
+            while (back > scope->start && back[-1] == '\\') back--;
+            if ((quote - back) & 1) break;
+            *kind = i;
+            *value = lite_json_space(scan, scope->end);
+            return quote;
         }
-        at = quote + 1;
     }
     return NULL;
 }
@@ -1486,21 +1534,22 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
         "header{background:#0f0f0f;border-bottom:1px solid #333;padding:8px 10px}"
         ".top{display:flex;align-items:baseline;gap:10px;margin-bottom:8px}"
         ".brand{color:#fff;text-decoration:none;font-size:19px;font-weight:bold}"
-        ".account{color:#ddd;text-decoration:none;font-size:12px;padding:5px}"
+        ".account{color:#ddd;text-decoration:none;font-size:12px;padding:5px}";
+    static const char account_header_style[] =
         ".account-menu{position:relative}.account-menu summary{list-style:none;font-weight:normal}"
         ".account-panel{position:fixed;left:10px;top:36px;width:calc(100% - 20px);max-width:460px;z-index:3;background:#222;border:1px solid #666;padding:10px}"
         ".account-panel h2{font-size:16px;line-height:20px;margin:0 0 4px}"
         ".account-panel p{font-size:12px;line-height:16px;margin:4px 0}"
-        ".account-panel a{display:inline-block;color:#ddd;font-size:13px;line-height:18px;margin:3px 10px 3px 0}"
+        ".account-panel a{display:inline-block;color:#ddd;font-size:13px;line-height:18px;margin:3px 10px 3px 0}";
+    static const char header_tail[] =
         ".feed-status{font-size:11px;white-space:nowrap;height:16px;color:#aaa}"
         ".feed-refresh{color:#ddd;font-size:12px;display:inline-block;white-space:nowrap;margin:4px 0 10px}"
         ".feed-home{position:relative}.feed-home h1{padding-right:130px}"
         ".feed-home .feed-refresh.corner{position:absolute;right:10px;top:18px;margin:0}"
         ".watch-progress{position:absolute;left:0;bottom:0;width:100%;height:3px;background:#666}"
         ".watch-progress-fill{display:block;height:3px;background:#f33}"
-        "form{display:flex;gap:6px;width:100%}"
-        ".chapters{border:1px solid #555;border-radius:6px;margin:10px 0;padding:8px}"
-        ".chapters summary{color:#fff;line-height:24px}"
+        "form{display:flex;gap:6px;width:100%}";
+    static const char filters_style[] =
         /* Filters is one short line under the heading, so the first result
            starts on the first screen; its fields open in a box beneath. */
         ".search-filters{margin:-4px 0 10px}.search-filters summary{display:inline-block;"
@@ -1512,8 +1561,8 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
         ".filter-field{flex:1;min-width:0}.filter-label{display:block;font-size:12px;line-height:18px;margin:4px 0 2px}"
         ".search-filters select{width:100%;height:30px;line-height:20px;padding:4px 8px;background:#222;color:#fff;border:1px solid #777}"
         ".search-filters button{width:auto;min-width:110px;max-width:100%;margin-top:8px}"
-        ".filter-reset{display:inline-block;margin-left:12px;padding:6px 0}"
-        ".chapter{display:block;color:#ddd;text-decoration:none;padding:6px 0;border-top:1px solid #444;line-height:20px}"
+        ".filter-reset{display:inline-block;margin-left:12px;padding:6px 0}";
+    static const char form_style[] =
         "input{flex:none;width:calc(100% - 82px);min-width:0;"
         "background:#181818;color:#fff;"
         "border:1px solid #666;border-radius:16px;height:32px;"
@@ -1530,7 +1579,7 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
         ".result-row{display:flex;gap:7px;margin:0 0 12px;min-height:90px}"
         ".card{display:flex;flex:1;min-width:0;color:#fff;text-decoration:none;"
         "gap:10px;min-height:90px}.details{display:block;position:relative;"
-        "flex:none;width:54px;color:#ddd;text-decoration:none;"
+        "flex:none;width:54px;min-width:0;color:#ddd;text-decoration:none;"
         "border:1px solid #606060;border-radius:8px;background:#202020}"
         ".details-icon{display:block;position:absolute;left:50%;top:29px;"
         "margin-left:-15px;width:30px;height:30px;border:1px solid #999;"
@@ -1547,12 +1596,15 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
            placing the gradient on <img> can therefore cover decoded pixels
            even though CSS painting order would put its background behind
            them. This parent layer needs no animation or repeated raster. */
-        ".thumb-wrap{position:relative;width:160px;height:90px;flex:none;"
+        ".thumb-wrap{position:relative;width:160px;min-width:0;height:90px;flex:none;"
         "background:#242424 linear-gradient(110deg,#242424 30%,"
         "#383838 48%,#242424 66%);border-radius:7px}"
         ".thumb{display:block;width:100%;height:100%;border-radius:7px;"
         "object-fit:cover}"
-        ".info{min-width:0}.title{display:-webkit-box;-webkit-box-orient:vertical;"
+        /* The fixed thumbnail and gap already determine the space left for
+           text. A zero flex basis avoids an intrinsic pass over every title,
+           channel and snippet just to arrive at that same column width. */
+        ".info{flex:1;min-width:0}.title{display:-webkit-box;-webkit-box-orient:vertical;"
         "-webkit-line-clamp:2;font-size:15px;line-height:1.25;"
         "font-weight:bold;margin:1px 0 5px;max-height:38px;overflow:clip}.meta{font-size:12px;"
         "display:block;line-height:1.35;margin-top:2px}.duration{position:"
@@ -1574,7 +1626,11 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
         /* The question and both answers fit the first screen in every
            interface language. */
         ".confirm{padding:12px 14px}.confirm h1{font-size:16px;line-height:1.3}"
-        ".hero .confirm-actions{margin-top:12px}.confirm-actions a{margin-right:10px}"
+        ".hero .confirm-actions{margin-top:12px}.confirm-actions a{margin-right:10px}";
+    static const char watch_style[] =
+        ".chapters{border:1px solid #555;border-radius:6px;margin:10px 0;padding:8px}"
+        ".chapters summary{color:#fff;line-height:24px}"
+        ".chapter{display:block;color:#ddd;text-decoration:none;padding:6px 0;border-top:1px solid #444;line-height:20px}"
         ".watch-hero{display:flex;gap:12px;"
         "align-items:flex-start;margin-bottom:4px}.watch-target{display:block;"
         "position:relative;overflow:hidden;background:#222;"
@@ -1608,14 +1664,16 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
         ".watch-action-row .comments-link{margin:0;white-space:nowrap}"
         ".watch-action-row .icon-action{display:block;flex:none;width:40px;height:36px;padding:7px 9px}";
     /* The account menu and the action icons, shared with channel pages. */
-    static const char action_style[] =
+    static const char account_menu_style[] =
         ".watch-account-menu{margin:0;padding:0;border:0;flex:none;width:40px}"
         ".watch-account-menu summary{list-style:none;border:1px solid #666;border-radius:16px}"
         ".watch-account-panel{position:absolute;left:0;top:44px;width:100%;padding:8px;"
-        "background:#222;border:1px solid #666;border-radius:6px;z-index:3}"
+        "background:#222;border:1px solid #666;border-radius:6px;z-index:3}";
+    static const char icon_style[] =
         ".action-icon{display:block;position:relative;width:20px;height:20px;color:#eee}"
         ".action-vector{display:block;position:absolute;left:0;top:0;width:20px;height:20px}"
-        ".action-icon i{display:block;position:absolute}"
+        ".action-icon i{display:block;position:absolute}";
+    static const char account_icon_style[] =
         ".icon-bell .a{left:4px;top:2px;width:12px;height:13px;border:2px solid #eee;border-radius:6px}"
         ".icon-bell .b{left:2px;top:14px;width:16px;height:2px;background:#eee}"
         ".icon-bell .c{left:8px;top:18px;width:4px;height:2px;background:#eee;border-radius:2px}"
@@ -1631,10 +1689,12 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
         ".icon-playlist .a{left:1px;top:3px;width:12px;height:12px;border-top:2px solid #eee;border-bottom:2px solid #eee}"
         ".icon-playlist .b{left:1px;top:8px;width:12px;height:2px;background:#eee}"
         ".icon-playlist .c{left:15px;top:14px;width:6px;height:2px;background:#eee}"
-        ".icon-playlist .d{left:17px;top:12px;width:2px;height:6px;background:#eee}"
+        ".icon-playlist .d{left:17px;top:12px;width:2px;height:6px;background:#eee}";
+    static const char download_icon_style[] =
         ".icon-download .a{left:8px;top:1px;width:3px;height:11px;background:#eee}"
         ".icon-download .b{left:5px;top:6px;width:9px;height:9px;border-right:3px solid #eee;border-bottom:3px solid #eee;transform:rotate(45deg)}"
-        ".icon-download .c{left:2px;top:16px;width:16px;height:4px;border:2px solid #eee;border-top:0}"
+        ".icon-download .c{left:2px;top:16px;width:16px;height:4px;border:2px solid #eee;border-top:0}";
+    static const char more_icon_style[] =
         ".icon-more .a,.icon-more .b,.icon-more .c{top:8px;width:4px;height:4px;border-radius:2px;background:#eee}"
         ".icon-more .a{left:1px}.icon-more .b{left:8px}.icon-more .c{left:15px}";
     static const char watch_channel_style[] =
@@ -1661,6 +1721,12 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
         "padding:10px 0;line-height:1.4}.comment-author{font-weight:bold}"
         ".comment-meta{color:#aaa;font-size:12px;margin-left:6px}"
         ".comment-text{margin:5px 0}.comment-likes{color:#aaa;font-size:12px}"
+        /* On a narrow page the six fixed-width account actions otherwise
+           squeeze the channel to its ellipsis padding. Keep the buttons
+           together, and anchor the open panel below their actual row. */
+        "@media(max-width:400px){.signed-actions{flex-wrap:wrap;position:relative}"
+        ".signed-actions .channel-link{flex:0 0 100%;max-width:none}"
+        ".signed-actions .watch-account-panel{top:100%}}"
         "@media(max-width:380px){.thumb-wrap{width:136px;height:77px}"
         ".filter-fields{display:block}"
         ".card{min-height:77px}.title{font-size:14px}"
@@ -1700,10 +1766,21 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
     return lite_html_text(html, prefix)
         && lite_html_escape(html, page_title)
         && lite_html_text(html, style)
+        && (!signed_in || lite_html_text(html, account_header_style))
+        && lite_html_text(html, header_tail)
+        && (page != LITE_PAGE_PLAIN || lite_html_text(html, filters_style))
+        && lite_html_text(html, form_style)
         && lite_html_text(html, content_style)
+        && (page != LITE_PAGE_WATCH || lite_html_text(html, watch_style))
         && lite_html_text(html, content_tail)
-        && (page != LITE_PAGE_WATCH || (lite_html_text(html, action_row_style)
-            && lite_html_text(html, action_style) && lite_html_text(html, watch_channel_style)))
+        && (page != LITE_PAGE_WATCH || lite_html_text(html, action_row_style))
+        && ((page != LITE_PAGE_WATCH && !(page == LITE_PAGE_CHANNEL && signed_in))
+            || ((!signed_in || lite_html_text(html, account_menu_style))
+                && lite_html_text(html, icon_style)
+                && (!signed_in || lite_html_text(html, account_icon_style))
+                && (page != LITE_PAGE_WATCH || lite_html_text(html, download_icon_style))
+                && (!signed_in || lite_html_text(html, more_icon_style))))
+        && (page != LITE_PAGE_WATCH || lite_html_text(html, watch_channel_style))
         && (page != LITE_PAGE_CHANNEL || lite_html_text(html,
             ".channel-banner{display:block;width:100%;height:76px;border-radius:8px;margin-bottom:8px}"
             ".channel-id{display:flex;align-items:center;gap:10px}"
@@ -1717,12 +1794,11 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
             ".channel-links a{color:#3ea6ff;text-decoration:none}"
             ".channel-tabs{margin:8px 0}.channel-tabs .on{background:#f1f1f1;color:#0f0f0f}"
             ".see-all{white-space:nowrap;overflow:clip;text-overflow:ellipsis;padding:10px 16px}"))
-        && (page != LITE_PAGE_CHANNEL || !signed_in || (lite_html_text(html, action_style)
-            && lite_html_text(html,
+        && (page != LITE_PAGE_CHANNEL || !signed_in || lite_html_text(html,
                 ".channel-actions{display:flex;flex:none;gap:6px;position:relative}"
                 ".channel-actions .icon-action{display:block;width:40px;height:36px;padding:7px 9px;margin:0}"
                 ".channel-actions .watch-account-panel{left:auto;right:0;width:200px;top:42px}"
-                ".channel-id .watch-status{font-size:12px;line-height:16px;color:#aaa;min-height:16px;margin:0}")))
+                ".channel-id .watch-status{font-size:12px;line-height:16px;color:#aaa;min-height:16px;margin:0}"))
         && (!compact_results || lite_html_text(html, compact_style))
         && (tilefinch_ui_translation_bound_language() == TILEFINCH_UI_LANGUAGE_ENGLISH
             || lite_html_text(html,
@@ -1792,7 +1868,7 @@ static bool lite_html_queue_label(YoutubeLiteHtml *html, const char *title)
 static bool lite_html_video(YoutubeLiteHtml *html,
                             const YoutubeLiteVideo *video,
                             bool autofocus, const char *search_query,
-                            size_t queue_index)
+                            size_t queue_index, bool stable_search_focus)
 {
     char encoded_query[YOUTUBE_LITE_QUERY_LIMIT * 3u] = {0};
     bool retain_query = search_query != NULL && search_query[0] != '\0';
@@ -1814,7 +1890,9 @@ static bool lite_html_video(YoutubeLiteHtml *html,
         || (queue_index != SIZE_MAX
             && (!lite_html_format(html, "&amp;tilefinch_queue=%zu\" aria-label=\"", queue_index)
                 || !lite_html_queue_label(html, video->title)))
-        || !lite_html_text(html, "\">")
+        || !lite_html_text(html, "\"")
+        || (stable_search_focus && !lite_html_format(html, " id=yt-result-card-%s", video->id))
+        || !lite_html_text(html, ">")
         || !lite_html_format(
             html, "<span class=thumb-wrap><img class=thumb "
                   "src=\"https://i.ytimg.com/vi/%s/mqdefault.jpg\" "
@@ -1838,19 +1916,16 @@ static bool lite_html_video(YoutubeLiteHtml *html,
             html, "</span><span class=info><span class=title>")
         || !lite_html_escape(html, video->title)
         || !lite_html_text(html, "</span>")) return false;
-    if (video->channel[0] != '\0'
-        && !lite_html_text(html, "<span class=meta>")) return false;
     if (video->channel[0] != '\0') {
         /* A result is one semantic link. Nesting a channel anchor inside the
            card anchor is invalid HTML; parser repair split each result into
            several focus targets and made spatial navigation and scrolling do
            redundant work. */
-        if (!lite_html_text(html, "<span class=channel>")
+        if (!lite_html_text(html, "<span class=\"meta channel\">")
             || !lite_html_escape(html, video->channel)
             || !lite_html_text(html, "</span>")) {
             return false;
         }
-        if (!lite_html_text(html, "</span>")) return false;
     }
     if (video->views[0] != '\0' || video->published[0] != '\0') {
         if (!lite_html_text(html, "<span class=meta>")
@@ -1873,8 +1948,10 @@ static bool lite_html_video(YoutubeLiteHtml *html,
         || (retain_query
             && (!lite_html_text(html, "&amp;search_query=")
                 || !lite_html_text(html, encoded_query)))
+        || !lite_html_text(html, "\"")
+        || (stable_search_focus && !lite_html_format(html, " id=yt-result-details-%s", video->id))
         || !lite_html_ui_markup(
-            html, "\" aria-label=\"{{Open video details}}\"><span class=details-icon aria-hidden=true><span class=details-i-dot></span><span class=details-i-stem></span></span></a></div>")) {
+            html, " aria-label=\"{{Open video details}}\"><span class=details-icon aria-hidden=true><span class=details-i-dot></span><span class=details-i-stem></span></span></a></div>")) {
         return false;
     }
     return true;
@@ -2304,7 +2381,7 @@ static bool lite_html_watch_intro(
 {
     bool ok = lite_html_format(
         html, "<section class=watch-hero><a class=watch-target%s "
-              "data-tilefinch-provider-media "
+              "data-tilefinch-provider-media data-tilefinch-youtube-watch-play "
               "href=\"https://www.youtube.com/watch?v=%s",
         autofocus ? " autofocus" : "", watch->video.id)
         && (resume_seconds == 0u || lite_html_format(html, "&amp;t=%u", resume_seconds))
@@ -2331,7 +2408,8 @@ static bool lite_html_watch_intro(
     if (ok && watch->published[0] != '\0')
         ok = lite_html_ui_markup(html, "<br>{{Published}} ")
             && lite_html_escape(html, watch->published);
-    ok = ok && lite_html_text(html, "</p></div></section><section id=yt-watch-actions class=watch-actions><div class=watch-action-row>")
+    ok = ok && lite_html_text(html, "</p></div></section><section id=yt-watch-actions class=watch-actions>")
+        && lite_html_text(html, signed_in ? "<div class=\"watch-action-row signed-actions\">" : "<div class=watch-action-row>")
         && lite_html_watch_channel(html, watch);
     if (ok && signed_in) {
         ok = (watch->channel_id[0] == '\0'
@@ -2519,7 +2597,7 @@ static bool lite_build_document_with_comments_decoded(
             ok = lite_html_video(
                 &html, &videos[i],
                 route == YOUTUBE_LITE_ROUTE_SEARCH && i == 0,
-                query, SIZE_MAX);
+                query, SIZE_MAX, route == YOUTUBE_LITE_ROUTE_SEARCH);
     }
     if (ok && route == YOUTUBE_LITE_ROUTE_SEARCH
         && next_continuation[0] != '\0') {
@@ -3640,7 +3718,7 @@ static void lite_build_work_pump(YoutubeLiteBuildWork *work)
                     recent->resume_seconds / 60u, recent->resume_seconds % 60u);
             else if (ok && recent->has_progress)
                 ok = lite_html_ui_format(&work->html, "<p class=hint>%u%% {{watched}}</p>", recent->progress_percent);
-            ok = ok && lite_html_video(&work->html, recent, false, NULL, SIZE_MAX)
+            ok = ok && lite_html_video(&work->html, recent, false, NULL, SIZE_MAX, false)
                 && lite_html_ui_markup(&work->html, "</section><h2>{{Suggestions}}</h2>");
         }
         work->phase = YOUTUBE_LITE_BUILD_EMIT_DESCRIPTION;
@@ -3699,7 +3777,8 @@ static void lite_build_work_pump(YoutubeLiteBuildWork *work)
                 ok = video->unplayable ? lite_html_unplayable_row(&work->html, video)
                     : lite_html_video(&work->html, video,
                     work->route == YOUTUBE_LITE_ROUTE_SEARCH && emit_index == 0, work->query,
-                    work->route == YOUTUBE_LITE_ROUTE_PLAYLIST ? queue_index : SIZE_MAX);
+                    work->route == YOUTUBE_LITE_ROUTE_PLAYLIST ? queue_index : SIZE_MAX,
+                    work->route == YOUTUBE_LITE_ROUTE_SEARCH);
                 if (ok && work->route == YOUTUBE_LITE_ROUTE_PLAYLIST && work->playlist_editable)
                     ok = lite_html_text(&work->html, "<p>")
                         && lite_html_account_action(&work->html, YOUTUBE_LITE_ACTION_PLAYLIST_REMOVE,

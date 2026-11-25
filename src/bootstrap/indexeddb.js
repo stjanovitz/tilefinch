@@ -8,8 +8,17 @@
     apply: intrinsicApply } = globalThis.__tilefinchEventInterfaces;
   /* This module's hook publisher, claimed first (hardening.js); a realm
      without reserved hooks takes plain globals. */
-  const publish = claimHooks?.()
-    || ((name, value) => { globalThis[name] = value; });
+  const privatePublish = claimHooks?.(),
+    publish = privatePublish || ((name, value) => { globalThis[name] = value; });
+  let cryptoKeySize, cloneForStorage, workerFactory;
+  /* platform.js keeps what this returns in its private share, where the
+     Worker module finds a worker's factory (IDBFactory's workerFactory). */
+  privatePublish?.("__tilefinchIndexedDBKeySizeReader",
+    (read, cloneBounded) => {
+      cryptoKeySize = read;
+      cloneForStorage = cloneBounded;
+      return (reader, release) => workerFactory(reader, release);
+    });
   if (globalThis.indexedDB !== undefined) return;
   /* Dispatch passes Event's phase numbers (1 capturing, 2 at target,
      3 bubbling) as literals instead of reading them from the global Event,
@@ -46,6 +55,16 @@
     trustedScheduleTask = globalThis.__tilefinchScheduleTask,
     trustedQueueCheckpointContinuation =
       globalThis.__tilefinchQueueCheckpointContinuation;
+  const { arrayBufferByteLength, bufferSourceBacking, dateTime, isView,
+    objectTag, prototypeOf } = globalThis.__tilefinchWorkerCloneIntrinsics;
+  /* A live worker realm's constructors (workerFactory), by its
+     Function.prototype: IDBKeyRange's statics called on a worker's
+     IDBKeyRange find them. The constructors reach the key, and QuickJS
+     marks weak-map values strongly, so the worker's termination removes
+     its entry, or the realm would stay for the page's life. */
+  const realmReaders = globalThis.__tilefinchCreatePrivateWeakMap(),
+    realmReader = (realm) => typeof realm === "function"
+      && realmReaders.get(prototypeOf(realm)) || trustedCloneIntrinsics;
   delete globalThis.__tilefinchQueueCheckpointContinuation;
   let activityCloses = [];
   let activityCloseScheduled = false;
@@ -116,10 +135,14 @@
   globalThis.__tilefinchHostChannel.indexedDBStats = stats;
 
   const fail = (message, name) => new DOMException(message, name);
-  const clone = (value) => {
+  /* A read through transaction builds values and keys with its
+     connection's constructors: a worker's own (IDBFactory). */
+  const readerOf = (transaction) =>
+    transaction && idbReader(transaction.db) || trustedCloneIntrinsics;
+  const clone = (value, transaction) => {
     try {
       return intrinsicApply(trustedStructuredClone, globalThis, [
-        value, trustedCloneIntrinsics,
+        value, readerOf(transaction),
       ]);
     } catch (_) {
       throw fail("The value could not be cloned", "DataCloneError");
@@ -134,16 +157,17 @@
       typeof value === "number" || typeof value === "boolean" ||
       typeof value === "bigint"
     ) return 16;
+    /* Test the private CryptoKey brand before the prototype-based checks:
+       a key with an altered prototype still retains its native secret. */
+    const keySize = cryptoKeySize?.(value);
+    if (keySize !== undefined) {
+      if (seen.has(value)) return 8;
+      seen.add(value);
+      return keySize;
+    }
     if (value instanceof Date) return 24;
     if (value instanceof RegExp)
       return 32 + value.source.length * 2 + value.flags.length * 2;
-    if (value instanceof Blob)
-      return 48 + value.size + value.type.length * 2 +
-        (typeof File !== "undefined" && value instanceof File
-          ? value.name.length * 2 + 16
-          : 0);
-    if (value instanceof ArrayBuffer) return 32 + value.byteLength;
-    if (ArrayBuffer.isView(value)) return 48 + value.byteLength;
     if (typeof value !== "object")
       throw fail("The value could not be cloned", "DataCloneError");
     /* Structured serialization preserves aliases and cycles. Count a bounded
@@ -152,6 +176,20 @@
        aliases are not charged as duplicate retained payloads. */
     if (seen.has(value)) return 8;
     seen.add(value);
+    if (value instanceof Blob)
+      return 48 + value.size + value.type.length * 2 +
+        (typeof File !== "undefined" && value instanceof File
+          ? value.name.length * 2 + 16
+          : 0);
+    const backing = bufferSourceBacking(value);
+    if (backing === value) return 32 + arrayBufferByteLength(backing);
+    if (backing !== undefined) {
+      // Structured clone copies the entire backing buffer, not the view's
+      // slice. Count it once, even if the record also holds the buffer itself.
+      if (seen.has(backing)) return 48 + 8;
+      seen.add(backing);
+      return 48 + 32 + arrayBufferByteLength(backing);
+    }
     let total = 32;
     if (value instanceof Map) {
       if (value.size > 1024)
@@ -228,12 +266,39 @@
     }
     return boundedName(value, 256, "Key path");
   };
-  const binaryKeyBytes = (key) => {
-    if (key instanceof ArrayBuffer) return new Uint8Array(key);
-    if (ArrayBuffer.isView(key))
-      return new Uint8Array(key.buffer, key.byteOffset, key.byteLength);
-    return null;
+  /* Key types by rank: 0 number, 1 date, 2 string, 3 binary, 4 array, -1
+     none. A worker's keys are objects of its own realm, so the checks are
+     brands, not instanceof: the captured getters throw for anything but a
+     real Date or ArrayBuffer. instanceof and the class tag only choose
+     which to try, so the browser's own copies take the shortest path and
+     no real key makes a getter throw. A Date's time is left in keyTime. */
+  let keyTime;
+  const keyTypeRank = (key) => {
+    if (typeof key === "number") return 0;
+    if (typeof key === "string") return 2;
+    if (typeof key !== "object" || key === null) return -1;
+    if (!(key instanceof Date)) {
+      if (Array.isArray(key)) return 4;
+      if (isView(key)) return 3;
+      if (key instanceof ArrayBuffer || objectTag(key) !== "[object Date]")
+        try {
+          arrayBufferByteLength(key);
+          return 3;
+        } catch (_) {
+          return -1;
+        }
+    }
+    try {
+      keyTime = dateTime(key);
+      return 1;
+    } catch (_) {
+      return -1;
+    }
   };
+  /* The bytes of a binary key (rank 3). */
+  const binaryKeyBytes = (key) => isView(key)
+    ? new Uint8Array(bufferSourceBacking(key), key.byteOffset, key.byteLength)
+    : new Uint8Array(key);
   const keyTokenValue = (key) => {
     if (typeof key === "string") return ["string", key];
     if (typeof key === "number")
@@ -245,13 +310,13 @@
             ? "-infinity"
             : key === 0 ? 0 : key,
       ];
-    if (key instanceof Date) return ["date", key.getTime()];
-    const bytes = binaryKeyBytes(key);
-    if (bytes !== null)
-      return ["binary", intrinsicApply(arrayJoin, bytes, [","])];
-    if (Array.isArray(key)) {
+    const rank = keyTypeRank(key);
+    if (rank === 1) return ["date", keyTime];
+    if (rank === 3)
+      return ["binary", intrinsicApply(arrayJoin, binaryKeyBytes(key), [","])];
+    if (rank === 4) {
       const parts = [];
-      for (const item of key) parts.push(keyTokenValue(item));
+      for (let at = 0; at < key.length; at++) parts[at] = keyTokenValue(key[at]);
       return ["array", parts];
     }
     /* validateKey runs before every caller reaches keyToken. Keep this
@@ -262,40 +327,32 @@
   const validateKey = (key, depth = 0) => {
     if (typeof key === "string") return key;
     if (typeof key === "number" && !Number.isNaN(key)) return key;
-    if (key instanceof Date && Number.isFinite(key.getTime())) return key;
-    const bytes = binaryKeyBytes(key);
-    if (bytes !== null && bytes.byteLength <= KEY_BINARY_BYTE_LIMIT) return key;
-    if (Array.isArray(key) && depth < 8 && key.length <= 16) {
-      for (const item of key) validateKey(item, depth + 1);
+    const rank = keyTypeRank(key);
+    if (rank === 1 && Number.isFinite(keyTime)) return key;
+    if (rank === 3 && binaryKeyBytes(key).byteLength <= KEY_BINARY_BYTE_LIMIT)
+      return key;
+    if (rank === 4 && depth < 8 && key.length <= 16) {
+      for (let at = 0; at < key.length; at++) validateKey(key[at], depth + 1);
       return key;
     }
     throw fail("The key is not a supported IndexedDB key", "DataError");
   };
-  const cloneKey = (key) => {
-    if (key instanceof Date) return new Date(key.getTime());
-    const bytes = binaryKeyBytes(key);
-    if (bytes !== null) {
-      const copy = new Uint8Array(bytes.byteLength);
-      copy.set(bytes);
-      return copy.buffer;
-    }
-    if (Array.isArray(key)) {
-      const copy = [];
-      for (const item of key) copy.push(cloneKey(item));
+  /* A copy of a valid key built with realm's constructors: the browser's
+     own for what it stores, the reader's for what a read returns. */
+  const cloneKey = (key, realm = trustedCloneIntrinsics) => {
+    const rank = keyTypeRank(key);
+    if (rank === 1) return new realm.Date(keyTime);
+    if (rank === 3)
+      return bufferSourceBacking(new realm.Uint8Array(binaryKeyBytes(key)));
+    if (rank === 4) {
+      const copy = new realm.Array();
+      for (let at = 0; at < key.length; at++) copy[at] = cloneKey(key[at], realm);
       return copy;
     }
     return key;
   };
-  const keyTypeRank = (key) => {
-    if (typeof key === "number") return 0;
-    if (key instanceof Date) return 1;
-    if (typeof key === "string") return 2;
-    if (binaryKeyBytes(key) !== null) return 3;
-    if (Array.isArray(key)) return 4;
-    return -1;
-  };
   const compareKeys = (left, right) => {
-    const leftRank = keyTypeRank(left),
+    const leftRank = keyTypeRank(left), leftTime = keyTime,
       rightRank = keyTypeRank(right);
     if (leftRank < 0 || rightRank < 0)
       throw fail("The key is not a supported IndexedDB key", "DataError");
@@ -325,8 +382,8 @@
         : leftBytes.byteLength < rightBytes.byteLength ? -1 : 1;
     }
     if (leftRank === 1) {
-      left = left.getTime();
-      right = right.getTime();
+      left = leftTime;
+      right = keyTime;
     }
     if (left === right) return 0;
     return left < right ? -1 : 1;
@@ -452,7 +509,35 @@
     return { records, bytes };
   };
 
-  let idbHandlerState, idbRequestState;
+  const IDB_EVENT_CANCELED = 1, IDB_EVENT_HANDLER_THREW = 2;
+  const dispatchIDBEvent = (target, event, author = false) => {
+    const parents = [];
+    if (target instanceof IDBRequest && target.transaction) {
+      parents.push(target.transaction);
+      if (target.transaction.db) parents.push(target.transaction.db);
+    } else if (target instanceof IDBTransaction && target.db) {
+      parents.push(target.db);
+    }
+    globalThis.__tilefinchPrepareEvent(event, target, [target, ...parents], author);
+    /* Keep the exception flag on this delivery's stack. Neither `throw null`
+       nor a nested dispatch on the same request can erase it. */
+    let outcome = 0;
+    const observeError = () => { outcome |= IDB_EVENT_HANDLER_THREW; };
+    const invoke = globalThis.__tilefinchInvokeEventTarget;
+    try {
+      for (let i = parents.length - 1; i >= 0 && !event.__stopped; i--)
+        invoke(parents[i], event, true, 1, observeError);
+      if (!event.__stopped) invoke(target, event, true, 2, observeError);
+      if (!event.__stopped) invoke(target, event, false, 2, observeError);
+      if (event.bubbles)
+        for (let i = 0; i < parents.length && !event.__stopped; i++)
+          invoke(parents[i], event, false, 3, observeError);
+      return outcome | (event.defaultPrevented ? IDB_EVENT_CANCELED : 0);
+    } finally {
+      globalThis.__tilefinchFinishEventDispatch(event);
+    }
+  };
+  let idbHandlerState, idbRequestState, idbReader;
   class TilefinchIDBEventTarget extends EventTarget {
     #handlers = new Map();
     static {
@@ -460,48 +545,16 @@
         (typeof target === "object" || typeof target === "function") &&
         #handlers in target ? target.#handlers : undefined;
     }
-    constructor() {
-      super();
-      this._lastDispatchError = null;
-    }
     dispatchEvent(event) {
-      const type = String((event && event.type) || "");
-      if (!type) throw new TypeError("Event type is required");
-      this._lastDispatchError = null;
-      const parents = [];
-      if (event.bubbles && this instanceof IDBRequest && this.transaction) {
-        parents.push(this.transaction);
-        if (this.transaction.db) parents.push(this.transaction.db);
-      } else if (event.bubbles && this instanceof IDBTransaction && this.db) {
-        parents.push(this.db);
-      }
-      globalThis.__tilefinchPrepareEvent(event, this, [this, ...parents]);
-      const observeError = (error) => {
-        if (this._lastDispatchError === null) this._lastDispatchError = error;
-      };
-      if (!event.__stopped) {
-        globalThis.__tilefinchInvokeEventTarget(
-          this, event, true, 2, observeError);
-        if (!event.__stopped)
-          globalThis.__tilefinchInvokeEventTarget(
-            this, event, false, 2, observeError);
-      }
-      if (event.bubbles && !event.__stopped)
-        for (const parent of parents) {
-          globalThis.__tilefinchInvokeEventTarget(
-            parent, event, false, 3, observeError);
-          if (event.__stopped) break;
-        }
-      globalThis.__tilefinchFinishEventDispatch(event);
-      return !event.defaultPrevented;
+      return !(dispatchIDBEvent(this, event, true) & IDB_EVENT_CANCELED);
     }
     _dispatch(type, init = {}) {
       const event = createEvent(type, {
-        bubbles: type === "error",
+        bubbles: type === "error" || type === "abort",
         cancelable: type === "error",
       });
       Object.assign(event, init);
-      return this.dispatchEvent(event);
+      return dispatchIDBEvent(this, event);
     }
   }
   for (const type of [
@@ -551,16 +604,15 @@
   };
   const succeedIDBRequest = (request, result, redispatch = false, init) => {
     const state = idbRequestState(request);
-    if (state.readyState === "done" && !redispatch) return null;
+    if (state.readyState === "done" && !redispatch) return false;
     state.result = result;
     state.error = null;
     state.readyState = "done";
-    request._dispatch("success", init);
-    return request._lastDispatchError;
+    return (request._dispatch("success", init) & IDB_EVENT_HANDLER_THREW) !== 0;
   };
   const failIDBRequest = (request, error) => {
     const state = idbRequestState(request);
-    if (state.readyState === "done") return true;
+    if (state.readyState === "done") return 0;
     state.result = undefined;
     state.error =
       error instanceof DOMException
@@ -568,6 +620,13 @@
         : fail(String(error), "UnknownError");
     state.readyState = "done";
     return request._dispatch("error");
+  };
+  const abortOnIDBRequestError = (transaction, request, error) => {
+    const outcome = failIDBRequest(request, error);
+    // A thrown handler aborts even when a listener canceled the error event.
+    if (outcome & IDB_EVENT_HANDLER_THREW)
+      transaction._abort(fail("A request error handler threw an exception", "AbortError"));
+    else if (!(outcome & IDB_EVENT_CANCELED)) transaction._abort(request.error);
   };
   class IDBRequest extends TilefinchIDBEventTarget {
     #state;
@@ -631,8 +690,11 @@
 
   class IDBKeyRange {
     #lower; #upper; #lowerOpen; #upperOpen;
-    #lowerValue; #upperValue;
-    constructor(lower, upper, lowerOpen, upperOpen) {
+    #lowerValue; #upperValue; #realm;
+    /* realm: the IDBKeyRange a static was called on, whose realm reads
+       the bounds back (realmReader). */
+    constructor(lower, upper, lowerOpen, upperOpen, realm) {
+      this.#realm = realm;
       this.#lower = lower === undefined
         ? undefined
         : cloneKey(validateKey(lower));
@@ -642,8 +704,12 @@
       this.#lowerOpen = !!lowerOpen;
       this.#upperOpen = !!upperOpen;
     }
-    get lower() { return this.#lowerValue ??= cloneKey(this.#lower); }
-    get upper() { return this.#upperValue ??= cloneKey(this.#upper); }
+    get lower() {
+      return this.#lowerValue ??= cloneKey(this.#lower, realmReader(this.#realm));
+    }
+    get upper() {
+      return this.#upperValue ??= cloneKey(this.#upper, realmReader(this.#realm));
+    }
     get lowerOpen() { return this.#lowerOpen; }
     get upperOpen() { return this.#upperOpen; }
     includes(key) {
@@ -660,15 +726,15 @@
     }
     static only(value) {
       value = validateKey(value);
-      return new IDBKeyRange(value, value, false, false);
+      return new IDBKeyRange(value, value, false, false, this);
     }
     static lowerBound(value, open = false) {
       value = validateKey(value);
-      return new IDBKeyRange(value, undefined, open, false);
+      return new IDBKeyRange(value, undefined, open, false, this);
     }
     static upperBound(value, open = false) {
       value = validateKey(value);
-      return new IDBKeyRange(undefined, value, false, open);
+      return new IDBKeyRange(undefined, value, false, open, this);
     }
     static bound(lower, upper, lowerOpen = false, upperOpen = false) {
       lower = validateKey(lower);
@@ -676,7 +742,7 @@
       const compared = compareKeys(lower, upper);
       if (compared > 0 || (compared === 0 && (lowerOpen || upperOpen)))
         throw fail("Lower bound exceeds upper bound", "DataError");
-      return new IDBKeyRange(lower, upper, lowerOpen, upperOpen);
+      return new IDBKeyRange(lower, upper, lowerOpen, upperOpen, this);
     }
   }
   const keyRangeIncludes = IDBKeyRange.prototype.includes,
@@ -716,6 +782,70 @@
     if (source.transaction.db._state.stores.get(store.name) !== store ||
         (schema && store.indexes.get(schema.name) !== schema))
       throw fail("The store or index has been deleted", "InvalidStateError");
+  };
+  /* The four read bindings differ in their result, not in when their
+     arguments are converted or their source and transaction are checked.
+     Keep the store's direct-key lookup; an index uses its own key order. */
+  const readResult = (record, keys, tx) => keys
+    ? cloneKey(record.key, readerOf(tx)) : clone(record.value, tx);
+  const readQuery = (source, query, optional) => {
+    if (typeof query === "string" || (typeof query === "number" && query === query)
+        || (optional && query == null)) return query;
+    assertSource(source);
+    source.transaction._checkRequestState(false);
+    return optional ? snapshotQuery(query) : requiredQuery(query, 1);
+  };
+  const readRecords = (source, query, count, many, keys, indexed) => {
+    if (many) count = boundedCount(count);
+    else if (!count) throw new TypeError("A key or key range is required");
+    const tx = source.transaction;
+    /* Numbers and strings are already immutable keys. Other inputs can
+       fail conversion or run page code; check state before snapshotting
+       them. _request checks again before it publishes a request. */
+    query = readQuery(source, query, many);
+    return tx._request(source, () => {
+      if (!many && !indexed && !(query instanceof IDBKeyRange)) {
+        const record = source._store.records.get(keyToken(query));
+        return record ? readResult(record, keys, tx) : undefined;
+      }
+      const entries = source._entries(query, many ? count : 1);
+      if (many) return entries.map(entry =>
+        readResult(indexed ? entry.record : entry, keys, tx));
+      return entries.length
+        ? readResult(indexed ? entries[0].record : entries[0], keys, tx) : undefined;
+    });
+  };
+  /* Convert Web IDL arguments first; key snapshotting follows the deleted
+     and inactive checks. Enqueue checks state again after author getters. */
+  const iterateRecords = (source, query, direction, withValue, indexed) => {
+    if (withValue !== undefined) {
+      if (typeof direction !== "string") direction = `${direction}`;
+      if (direction !== "next" && direction !== "prev" &&
+          direction !== "nextunique" && direction !== "prevunique")
+        throw new TypeError("Invalid cursor direction");
+    }
+    query = readQuery(source, query, true);
+    if (withValue === undefined) return source.transaction._request(source, () => {
+      if (indexed) return source._entries(query).length;
+      const records = source._store.records;
+      if (query == null) return records.size;
+      if (!(query instanceof IDBKeyRange)) return +records.has(keyToken(query));
+      let count = 0;
+      for (const record of records.values()) if (rangeIncludes(query, record.key)) count++;
+      return count;
+    });
+    return source.transaction._openCursor(source, () => {
+      const entries = source._entries(query);
+      if (indexed && (direction === "nextunique" || direction === "prevunique")) {
+        let kept = 0;
+        for (const entry of entries)
+          if (!kept || compareKeys(entries[kept - 1].indexKey, entry.indexKey))
+            entries[kept++] = entry;
+        entries.length = kept;
+      }
+      if (direction === "prev" || direction === "prevunique") entries.reverse();
+      return entries;
+    }, withValue, direction);
   };
   const matchesQuery = (key, query) =>
     query === undefined ||
@@ -953,7 +1083,8 @@
       this._abort(null);
     }
     commit() {
-      if (this._state !== "active" && this._state !== "pending")
+      if ((this._state !== "active" && this._state !== "pending") ||
+          this._commitRequested || !this._acceptingRequests)
         throw fail("Transaction is inactive", "InvalidStateError");
       this._commitRequested = true;
       if (this._state === "active") this._state = "committing";
@@ -972,16 +1103,37 @@
         nextKey: store.nextKey,
       });
     }
-    _request(source, operation, write = false) {
-      assertSource(source);
+    _checkRequestState(write) {
       if (this._state === "finished" || this._state === "committing"
           || this._commitRequested || !this._acceptingRequests)
         throw fail("Transaction is inactive", "TransactionInactiveError");
-      if (this._pending >= REQUEST_LIMIT)
-        throw fail("Transaction request quota exceeded", "QuotaExceededError");
       if (write && this.mode === "readonly")
         throw fail("Transaction is read only", "ReadOnlyError");
+    }
+    _requestAbortedDuringClone(source) {
+      if (this._pending >= REQUEST_LIMIT)
+        throw fail("Transaction request quota exceeded", "QuotaExceededError");
       const request = new IDBRequest(source, this);
+      const deliver = () => {
+        failIDBRequest(request, fail("Transaction aborted", "AbortError"));
+        this._pending--;
+      };
+      /* A pending transaction may already have a FIFO drain for its older
+         requests. Otherwise join the ordinary task queue before the abort
+         event; this path never schedules the write itself or revives locks. */
+      if (this._abortSequence) this._abortSequence.operations.push(deliver);
+      else if (!this._scheduleOperation(deliver))
+        throw fail("Database task quota exceeded", "QuotaExceededError");
+      this._pending++;
+      stats.requests++;
+      return request;
+    }
+    _request(source, operation, write = false, cursor = null) {
+      assertSource(source);
+      this._checkRequestState(write);
+      if (this._pending >= REQUEST_LIMIT)
+        throw fail("Transaction request quota exceeded", "QuotaExceededError");
+      const request = new IDBRequest(cursor || source, this);
       if (
         this._state === "pending" &&
         this.db._state.pendingRequests >= PENDING_REQUEST_LIMIT
@@ -999,8 +1151,7 @@
           return;
         }
         try {
-          const dispatchError = succeedIDBRequest(request, operation());
-          if (dispatchError !== null) {
+          if (succeedIDBRequest(request, operation())) {
             this._pending--;
             this._abort(fail(
               "A request success handler threw an exception",
@@ -1009,8 +1160,7 @@
             return;
           }
         } catch (error) {
-          const mayAbort = failIDBRequest(request, error);
-          if (mayAbort) this._abort(request.error);
+          abortOnIDBRequestError(this, request, error);
         }
         this._pending--;
         this._maybeComplete();
@@ -1027,9 +1177,7 @@
     }
     _openCursor(source, entriesFactory, withValue, direction) {
       assertSource(source);
-      if (this._state === "finished" || this._state === "committing"
-          || this._commitRequested || !this._acceptingRequests)
-        throw fail("Transaction is inactive", "TransactionInactiveError");
+      this._checkRequestState(false);
       if (this._pending >= REQUEST_LIMIT)
         throw fail("Transaction request quota exceeded", "QuotaExceededError");
       const request = new IDBRequest(source, this);
@@ -1053,13 +1201,13 @@
         try {
           entries = entriesFactory();
         } catch (error) {
-          const mayAbort = failIDBRequest(request, error);
-          if (mayAbort) this._abort(request.error);
+          abortOnIDBRequestError(this, request, error);
           this._finishCursor();
           return;
         }
         if (!entries.length) {
-          succeedIDBRequest(request, null);
+          if (succeedIDBRequest(request, null))
+            this._abort(fail("A cursor success handler threw an exception", "AbortError"));
           this._finishCursor();
           return;
         }
@@ -1293,98 +1441,97 @@
         if (!previous) stats.records++;
         stats.peakBytes = Math.max(stats.peakBytes, stats.bytes);
       }
-      return cloneKey(key);
+      return cloneKey(key, readerOf(this.transaction));
     }
-    _preparedWrite(value, key, overwrite, cursor = false) {
+    _preparedWrite(value, key, overwrite, cursor = null) {
       assertSource(this);
+      const tx = this.transaction;
+      tx._checkRequestState(true);
       if (!cursor && this._store.keyPath !== null && key !== undefined)
         throw fail("Inline keys cannot be supplied separately", "DataError");
-      /* Refuse an obviously over-bound BufferSource in the queued request
-         without first allocating a second multi-megabyte copy. This keeps a
-         normal quota refusal recoverable under the PSP heap while ordinary
-         values are still cloned synchronously at the API boundary. */
-      const directBytes = value instanceof ArrayBuffer
-          ? value.byteLength
-          : ArrayBuffer.isView(value) ? value.byteLength : 0,
-        copiedKey = key === undefined ? undefined : cloneKey(validateKey(key));
-      if (directBytes > RECORD_BYTE_LIMIT - 128)
+      const copiedKey = key === undefined ? undefined : cloneKey(validateKey(key));
+      /* Enforce the backing-buffer cap while cloning so accessors are only
+         visited once and over-quota bytes need not be copied first. Author
+         getters run while this transaction is inactive, and can abort it. */
+      let storageCopy;
+      tx._acceptingRequests = false;
+      /* Hold the transaction's abort notification until a successful clone
+         that itself aborted has queued its request's async error. */
+      tx._operationTasks++;
+      try {
+        storageCopy = cloneForStorage
+          ? cloneForStorage(value, RECORD_BYTE_LIMIT - 128)
+          : { __proto__: null, value: intrinsicApply(
+              trustedStructuredClone, globalThis, [value, trustedCloneIntrinsics]) };
+        if (tx._state === "finished")
+          return tx._requestAbortedDuringClone(cursor || this);
+      } finally {
+        tx._operationTasks--;
+        tx._queueAbortEvent();
+        if ((tx._state === "active" || tx._state === "pending") &&
+            !tx._commitRequested)
+          tx._acceptingRequests = true;
+      }
+      tx._checkRequestState(true);
+      if (storageCopy === undefined)
         return this.transaction._request(
-          this,
+          cursor ? cursor.source : this,
           () => {
             stats.quotaErrors++;
             throw fail("IndexedDB storage quota exceeded", "QuotaExceededError");
           },
           true,
+          cursor,
         );
-      const copied = clone(value);
+      const copied = storageCopy.value;
       if (!cursor && Array.isArray(this._store.keyPath))
         validateKey(keyAtPath(copied, this._store.keyPath));
       if (cursor && this._store.keyPath !== null &&
           compareKeys(validateKey(keyAtPath(copied, this._store.keyPath)), copiedKey) !== 0)
         throw fail("The cursor key cannot change", "DataError");
       return this.transaction._request(
-        this,
+        cursor ? cursor.source : this,
         () => this._storeValue(copied, copiedKey, overwrite),
         true,
+        cursor,
       );
     }
     put(value, key) {
+      if (!arguments.length) throw new TypeError("A value is required");
       return this._preparedWrite(value, key, true);
     }
     add(value, key) {
+      if (!arguments.length) throw new TypeError("A value is required");
       return this._preparedWrite(value, key, false);
     }
+    #read(query, count, many, keys) {
+      return readRecords(this, query, count, many, keys, false);
+    }
     get(query) {
-      query = requiredQuery(query, arguments.length);
-      return this.transaction._request(this, () => {
-        const record =
-          query instanceof IDBKeyRange
-            ? this._entries(query, 1)[0]
-            : this._store.records.get(keyToken(validateKey(query)));
-        return record ? clone(record.value) : undefined;
-      });
+      return this.#read(query, arguments.length, false, false);
     }
     getKey(query) {
-      query = requiredQuery(query, arguments.length);
-      return this.transaction._request(this, () => {
-        const record =
-          query instanceof IDBKeyRange
-            ? this._entries(query, 1)[0]
-            : this._store.records.get(keyToken(validateKey(query)));
-        return record ? cloneKey(record.key) : undefined;
-      });
+      return this.#read(query, arguments.length, false, true);
     }
-    getAll(query, count) {
-      query = snapshotQuery(query);
-      count = boundedCount(count);
-      return this.transaction._request(this, () =>
-        this._entries(query, count).map((record) => clone(record.value)),
-      );
+    getAll(query = undefined, count) {
+      return this.#read(query, count, true, false);
     }
-    getAllKeys(query, count) {
-      query = snapshotQuery(query);
-      count = boundedCount(count);
-      return this.transaction._request(this, () =>
-        this._entries(query, count).map((record) => cloneKey(record.key)),
-      );
+    getAllKeys(query = undefined, count) {
+      return this.#read(query, count, true, true);
     }
-    count(query) {
-      query = snapshotQuery(query);
-      return this.transaction._request(this, () => {
-        if (query === undefined || query === null)
-          return this._store.records.size;
-        if (!(query instanceof IDBKeyRange))
-          return this._store.records.has(keyToken(validateKey(query))) ? 1 : 0;
-        let count = 0;
-        for (const record of this._store.records.values())
-          if (rangeIncludes(query, record.key)) count++;
-        return count;
-      });
+    count(query = undefined) {
+      return this.#iterate(query);
     }
     delete(query) {
-      query = snapshotQuery(query);
+      if (!arguments.length) throw new TypeError("A key or key range is required");
+      assertSource(this);
+      this.transaction._checkRequestState(true);
+      query = requiredQuery(query, arguments.length);
+      return this._deleteRecords(query);
+    }
+    _deleteRecords(query, cursor = null) {
       return this.transaction._request(
-        this,
+        cursor ? cursor.source : this,
         () => {
           this.transaction._snapshot(this._store);
           const records =
@@ -1407,6 +1554,7 @@
           return undefined;
         },
         true,
+        cursor,
       );
     }
     clear() {
@@ -1503,25 +1651,14 @@
         throw fail("Index does not exist", "NotFoundError");
       this._refreshIndexNames();
     }
-    openCursor(query, direction = "next") {
-      return this._cursorRequest(query, direction, true);
+    openCursor(query = undefined, direction = "next") {
+      return this.#iterate(query, direction, true);
     }
-    openKeyCursor(query, direction = "next") {
-      return this._cursorRequest(query, direction, false);
+    openKeyCursor(query = undefined, direction = "next") {
+      return this.#iterate(query, direction, false);
     }
-    _cursorRequest(query, direction, withValue) {
-      query = snapshotQuery(query);
-      direction = String(direction);
-      return this.transaction._openCursor(
-        this,
-        () => {
-          const entries = this._entries(query);
-          if (direction.startsWith("prev")) entries.reverse();
-          return entries;
-        },
-        withValue,
-        direction,
-      );
+    #iterate(query, direction, withValue) {
+      return iterateRecords(this, query, direction, withValue, false);
     }
   }
 
@@ -1572,65 +1709,32 @@
         Number(count) > 0 ? Math.floor(Number(count)) : output.length;
       return output.slice(0, maximum);
     }
+    #read(query, count, many, keys) {
+      return readRecords(this, query, count, many, keys, true);
+    }
     get(query) {
-      query = requiredQuery(query, arguments.length);
-      return this.transaction._request(this, () => {
-        const entry = this._entries(query, 1)[0];
-        return entry ? clone(entry.record.value) : undefined;
-      });
+      return this.#read(query, arguments.length, false, false);
     }
     getKey(query) {
-      query = requiredQuery(query, arguments.length);
-      return this.transaction._request(this, () => {
-        const entry = this._entries(query, 1)[0];
-        return entry ? cloneKey(entry.record.key) : undefined;
-      });
+      return this.#read(query, arguments.length, false, true);
     }
-    getAll(query, count) {
-      query = snapshotQuery(query);
-      count = boundedCount(count);
-      return this.transaction._request(this, () =>
-        this._entries(query, count).map((entry) => clone(entry.record.value)),
-      );
+    getAll(query = undefined, count) {
+      return this.#read(query, count, true, false);
     }
-    getAllKeys(query, count) {
-      query = snapshotQuery(query);
-      count = boundedCount(count);
-      return this.transaction._request(this, () =>
-        this._entries(query, count).map((entry) => cloneKey(entry.record.key)),
-      );
+    getAllKeys(query = undefined, count) {
+      return this.#read(query, count, true, true);
     }
-    count(query) {
-      query = snapshotQuery(query);
-      return this.transaction._request(this, () => this._entries(query).length);
+    count(query = undefined) {
+      return this.#iterate(query);
     }
-    openCursor(query, direction = "next") {
-      return this._cursorRequest(query, direction, true);
+    openCursor(query = undefined, direction = "next") {
+      return this.#iterate(query, direction, true);
     }
-    openKeyCursor(query, direction = "next") {
-      return this._cursorRequest(query, direction, false);
+    openKeyCursor(query = undefined, direction = "next") {
+      return this.#iterate(query, direction, false);
     }
-    _cursorRequest(query, direction, withValue) {
-      query = snapshotQuery(query);
-      direction = String(direction);
-      return this.transaction._openCursor(
-        this,
-        () => {
-          const entries = this._entries(query);
-          /* Both unique directions choose the lowest primary key. */
-          if (direction.endsWith("unique")) {
-            let kept = 0;
-            for (const entry of entries)
-              if (!kept || compareKeys(entries[kept - 1].indexKey, entry.indexKey))
-                entries[kept++] = entry;
-            entries.length = kept;
-          }
-          if (direction.startsWith("prev")) entries.reverse();
-          return entries;
-        },
-        withValue,
-        direction,
-      );
+    #iterate(query, direction, withValue) {
+      return iterateRecords(this, query, direction, withValue, true);
     }
   }
 
@@ -1654,12 +1758,14 @@
     _sync() {
       const entry = this._entries[this._position];
       const record = entry && (entry.record || entry);
+      const realm = readerOf(this._transaction);
       this.key = entry
-        ? cloneKey(entry.indexKey === undefined ? record.key : entry.indexKey)
+        ? cloneKey(entry.indexKey === undefined ? record.key : entry.indexKey,
+          realm)
         : undefined;
-      this.primaryKey = record ? cloneKey(record.key) : undefined;
+      this.primaryKey = record ? cloneKey(record.key, realm) : undefined;
       if (this._withValue)
-        this.value = record ? clone(record.value) : undefined;
+        this.value = record ? clone(record.value, this._transaction) : undefined;
     }
     _finish() {
       if (this._finished) return;
@@ -1671,7 +1777,7 @@
       this._continued = false;
       resetIDBRequest(this.request);
       if (this._position >= this._entries.length) {
-        if (succeedIDBRequest(this.request, null) !== null)
+        if (succeedIDBRequest(this.request, null))
           this._transaction._abort(fail(
             "A cursor success handler threw an exception",
             "AbortError",
@@ -1680,7 +1786,7 @@
         return;
       }
       this._sync();
-      if (succeedIDBRequest(this.request, this) !== null) {
+      if (succeedIDBRequest(this.request, this)) {
         this._transaction._abort(fail(
           "A cursor success handler threw an exception",
           "AbortError",
@@ -1694,15 +1800,16 @@
       })) this._finish();
     }
     _checkMove() {
-      if (this._finished || this._transaction._state !== "active"
-          || !this._transaction._acceptingRequests)
-        throw fail("Transaction is inactive", "TransactionInactiveError");
-      if (this._continued)
-        throw fail("Cursor is already iterating", "InvalidStateError");
+      this._transaction._checkRequestState(false);
       assertSource(this.source);
+      if (this._continued || !this._entries[this._position])
+        throw fail("Cursor is not positioned on a record", "InvalidStateError");
     }
     _move(count, target, primary) {
       this._checkMove();
+      const tx = this._transaction, reacquire = this._finished;
+      if (reacquire && tx._pending >= REQUEST_LIMIT)
+        throw fail("Transaction request quota exceeded", "QuotaExceededError");
       const revision = this._storeRevision, store = storeFor(this.source),
         old = this._entries[this._position], record = old.record || old,
         indexed = old.record !== undefined,
@@ -1716,7 +1823,7 @@
         (tie === undefined ? 0 : compareKeys(entry.record.key, tie)));
       const strictlyAfter = target === undefined;
       this._continued = true;
-      if (!this._transaction._scheduleOperation(() => {
+      if (!tx._scheduleOperation(() => {
         if (this._transaction._state === "finished") {
           failIDBRequest(this.request, fail("Transaction aborted", "AbortError"));
           this._finish();
@@ -1745,8 +1852,7 @@
           }
         } catch (error) {
           resetIDBRequest(this.request);
-          if (failIDBRequest(this.request, error))
-            this._transaction._abort(this.request.error);
+          abortOnIDBRequestError(this._transaction, this.request, error);
           this._finish();
           return;
         }
@@ -1754,6 +1860,12 @@
       })) {
         this._continued = false;
         throw fail("Database task quota exceeded", "QuotaExceededError");
+      }
+      // A later request can reactivate a transaction after this positioned
+      // cursor released its reservation. Hold it again for the new movement.
+      if (reacquire) {
+        this._finished = false;
+        tx._pending++;
       }
       resetIDBRequest(this.request);
     }
@@ -1787,26 +1899,33 @@
       this._move(1, key, primaryKey);
     }
     advance(count) {
-      count = Number(count);
-      if (!Number.isInteger(count) || count <= 0)
-        throw new TypeError("Count must be positive");
+      count = boundedCount(count);
+      if (!count) throw new TypeError("Count must be positive");
       this._move(count);
     }
-    update(value) {
-      this._checkMove();
+    _writeKey() {
+      this._transaction._checkRequestState(true);
+      assertSource(this.source);
+      // Retiring the cursor's keep-alive task does not clear its position.
+      // Another request can still reactivate the same transaction.
+      const entry = this._entries[this._position];
+      if (this._continued || !entry)
+        throw fail("Cursor is not positioned on a record", "InvalidStateError");
       if (!this._withValue) throw fail("Key-only cursor", "InvalidStateError");
+      return (entry.record || entry).key;
+    }
+    update(value) {
+      if (!arguments.length) throw new TypeError("A value is required");
+      const key = this._writeKey();
       const store =
         this.source instanceof IDBIndex ? this.source.objectStore : this.source;
-      const entry = this._entries[this._position];
-      return store._preparedWrite(value, (entry.record || entry).key, true, true);
+      return store._preparedWrite(value, key, true, this);
     }
     delete() {
-      this._checkMove();
-      if (!this._withValue) throw fail("Key-only cursor", "InvalidStateError");
+      const key = this._writeKey();
       const store =
         this.source instanceof IDBIndex ? this.source.objectStore : this.source;
-      const entry = this._entries[this._position];
-      return store.delete((entry.record || entry).key);
+      return store._deleteRecords(key, this);
     }
   }
   class IDBCursorWithValue extends IDBCursor {}
@@ -1841,8 +1960,11 @@
       throw fail("Transaction is inactive", "TransactionInactiveError");
   };
   class IDBDatabase extends TilefinchIDBEventTarget {
-    constructor(state) {
+    #reader;
+    static { idbReader = (database) => database.#reader; }
+    constructor(state, reader) {
       super();
+      this.#reader = reader;
       this._state = state;
       this.name = state.name;
       this.version = state.version;
@@ -1989,7 +2111,28 @@
   };
 
   class IDBFactory {
+    #reader;
+    /* A worker's factory builds the values and keys its connections read
+       with the worker realm's constructors (clone, cloneKey). Only the
+       Worker module makes one, with the constructors it captured
+       (reader); release, at the worker's termination, forgets them. The
+       constructor takes no reader, so a page's cannot run in the
+       browser's requests. */
+    static {
+      workerFactory = (reader, release) => {
+        if (!reader) return;
+        const realm = prototypeOf(reader.Array);
+        if (!release) {
+          realmReaders.set(realm, reader);
+          const factory = new IDBFactory();
+          factory.#reader = reader;
+          return factory;
+        }
+        if (realmReaders.get(realm) === reader) realmReaders.delete(realm);
+      };
+    }
     open(name, version) {
+      const reader = #reader in this ? this.#reader : undefined;
       name = boundedName(name, 256, "Database name");
       const requestedVersion = version === undefined ? undefined : Number(version);
       if (requestedVersion !== undefined &&
@@ -2034,7 +2177,7 @@
           return;
         }
         const performOpen = () => {
-          const connection = new IDBDatabase(state);
+          const connection = new IDBDatabase(state, reader);
           if (requested > state.version) {
             const oldVersion = state.version;
             let transaction;
@@ -2077,11 +2220,11 @@
               failIDBRequest(request, fail("Upgrade aborted", "AbortError"));
               finishOpen(oldVersion === 0);
             });
-            request._dispatch("upgradeneeded", {
+            const upgradeOutcome = request._dispatch("upgradeneeded", {
               oldVersion,
               newVersion: requested,
             });
-            if (request._lastDispatchError !== null) {
+            if (upgradeOutcome & IDB_EVENT_HANDLER_THREW) {
               transaction._abort(
                 fail("Upgrade handler threw an exception", "AbortError"),
               );

@@ -515,6 +515,42 @@ static size_t lane_stream(const char *url, unsigned char *copy,
    it all first at enqueue), through a read-ahead slice: the bytes arrive
    intact, a corrupt body fails before its last bytes are handed out, and a
    stored file longer than its record is refused at once. */
+static bool cancel_second_verify_chunk(void *opaque, const char *phase, size_t bytes)
+{
+    if (strcmp(phase, "fetch-replay-verify") || bytes == 0) return true;
+    *(bool *)opaque = true;
+    return false;
+}
+
+static void test_cancel_buffered_verify(Budget *budget)
+{
+    bool interrupted = false;
+    TilefinchPlatformServices services = {
+        .context = &interrupted, .cooperate = cancel_second_verify_chunk
+    };
+    FetchRequest request = {.method = "GET", .allow_http_errors = true};
+    FetchResult result = {0};
+    FetchTraceReplayStats before = {0}, after = {0};
+    fetch_trace_replay_stats(&before);
+    tilefinch_platform_set_services(&services);
+    bool ok = fetch_request_cancelable(budget, HASHED_GOOD, &request,
+        HASHED_BYTES, 30000, NULL, NULL, &result);
+    tilefinch_platform_set_services(NULL);
+    CHECK(!ok && interrupted && result.length == 0 && strstr(result.error, "cancel"));
+    fetch_result_destroy(&result);
+    fetch_trace_replay_stats(&after);
+    CHECK(before.served_request_count == after.served_request_count
+          && before.matched_request_count == after.matched_request_count
+          && before.invalid_route_request_count == after.invalid_route_request_count);
+    CHECK(fetch_request_cancelable(budget, HASHED_GOOD, &request,
+        HASHED_BYTES, 30000, NULL, NULL, &result)
+        && result.length == HASHED_BYTES && !memcmp(result.data, hashed_body, HASHED_BYTES));
+    fetch_result_destroy(&result);
+    CHECK(!fetch_request_cancelable(budget, HASHED_BAD, &request,
+        HASHED_BYTES, 30000, NULL, NULL, &result) && !result.length);
+    fetch_result_destroy(&result);
+}
+
 static void test_lane_hash_on_delivery(Budget *budget)
 {
     static unsigned char copy[HASHED_BYTES + 188u];
@@ -1229,6 +1265,7 @@ int main(int argc, char **argv)
 
     test_lane_ranges(mp4, mp4_length);
     test_lane_hash_on_delivery(&budget);
+    test_cancel_buffered_verify(&budget);
     test_release_redirect_chain(&budget);
     test_worker_attach_is_retried(&budget);
     test_blocking_request_beside_page_hops(&budget);

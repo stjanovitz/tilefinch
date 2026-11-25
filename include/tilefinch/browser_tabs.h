@@ -25,10 +25,14 @@ typedef struct {
     uint64_t focus_identity;
 } BrowserTabHistoryEntry;
 
+typedef struct BrowserTabControls BrowserTabControls;
+
 typedef struct {
     BrowserTabHistoryEntry history[BROWSER_TAB_HISTORY_LIMIT];
     size_t history_count;
     size_t history_index;
+    /* Optional budgeted, RAM-only form history. */
+    BrowserTabControls *controls;
 } BrowserTabSnapshot;
 
 typedef struct BrowserTabs BrowserTabs;
@@ -76,10 +80,17 @@ bool browser_tabs_rehydrate(
    transactionally on controlled persistence points and never read unless the
    user's existing restore-last-page option is enabled. A temporarily refused
    restore prevents saving over that unread session until a later restore
-   succeeds or establishes that no readable session exists. */
+   succeeds or establishes that no readable session exists. Each refused
+   save reads the unread files again: absent or invalid ones stop blocking;
+   one that reads intact keeps saves refused for the run (the next boot
+   restores it). */
 bool browser_tabs_save_session(
-    const BrowserTabs *tabs, const char *path, const char *hibernation_path);
+    BrowserTabs *tabs, const char *path, const char *hibernation_path);
 bool browser_tabs_restore_session(BrowserTabs *tabs, const char *path);
+/* Remove the session and its save/recovery sidecars, not live tabs or the
+   active hibernation file. tabs may be NULL. Missing files are success. */
+bool browser_tabs_clear_session(BrowserTabs *tabs, const char *path);
+bool browser_tabs_session_save_blocked(const BrowserTabs *tabs);
 size_t browser_tabs_resident_bytes(const BrowserTabs *tabs);
 
 bool browser_tab_history_records(

@@ -1408,15 +1408,18 @@ static bool fetch_request_internal(Budget *budget, const char *url,
         || curl_easy_setopt(easy, CURLOPT_NOSIGNAL, 1L) != CURLE_OK
         || curl_easy_setopt(
                easy, CURLOPT_FAILONERROR,
-               request != NULL && request->allow_http_errors
-                   ? 0L : 1L) != CURLE_OK
+               fetch_curl_fail_on_error(
+                   &context, request != NULL && request->allow_http_errors))
+               != CURLE_OK
         || curl_easy_setopt(
                easy, CURLOPT_ERRORBUFFER, curl_error) != CURLE_OK
         || curl_easy_setopt(
-               easy, CURLOPT_WRITEFUNCTION, receive_data) != CURLE_OK
+               easy, CURLOPT_WRITEFUNCTION,
+               fetch_curl_receive_data) != CURLE_OK
         || curl_easy_setopt(easy, CURLOPT_WRITEDATA, &context) != CURLE_OK
         || curl_easy_setopt(
-               easy, CURLOPT_HEADERFUNCTION, receive_header) != CURLE_OK
+               easy, CURLOPT_HEADERFUNCTION,
+               fetch_curl_receive_header) != CURLE_OK
         || curl_easy_setopt(easy, CURLOPT_HEADERDATA, &context) != CURLE_OK
         || curl_easy_setopt(
                easy, CURLOPT_XFERINFOFUNCTION,
@@ -1501,7 +1504,9 @@ static bool fetch_request_internal(Budget *budget, const char *url,
     }
     for (;;) {
         curl_error[0] = '\0';
-        code = curl_easy_perform(easy);
+        code = fetch_settle_deferred_abort(
+            &context, curl_easy_perform(easy), curl_error,
+            sizeof(curl_error));
         if (!hop->private_network.blocked
             && code == CURLE_SSL_CONNECT_ERROR
             && !context.headers_delivered
@@ -1880,6 +1885,10 @@ typedef struct {
     bool blocking_slot;
     bool tls12_retry_attempted;
     CURLcode transport_result;
+    /* fetch_scheduler_park: nonzero while the request runs on for an owner
+       to adopt it by this key, and the pump generation it was parked at. */
+    uint64_t park_key;
+    size_t park_generation;
 } ScheduledFetch;
 
 struct FetchSchedulerDomain {

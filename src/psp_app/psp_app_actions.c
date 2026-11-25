@@ -425,9 +425,11 @@ static bool psp_history_open_internal(
     /* The caller already classified history_url; only the scroll is needed,
        which keeps the URL copy off this page-loading stack. */
     int restored_scroll = 0;
+    unsigned before_draft = psp_draft_stays();
     if (!browser_engine_history_step(
             engine, forward, NULL, &restored_scroll)) {
-        psp_ui_show_status(&app->process->presentation.ui, "HISTORY COULD NOT OPEN", 180);
+        psp_ui_show_status(&app->process->presentation.ui,
+            psp_draft_stays() != before_draft ? "CANCELLED" : "HISTORY COULD NOT OPEN", 180);
         return true;
     }
     bool opened = true;
@@ -690,9 +692,14 @@ static void psp_app_history_step(
     }
     if (history_open == PSP_LOCAL_OPEN_OFFLINE) {
         BrowserHistoryEntryText moved_entry;
+        unsigned before_draft = psp_draft_stays();
         int restored_scroll = 0;
         bool moved = browser_engine_history_step(
             engine, forward, &moved_entry, &restored_scroll);
+        if (!moved && psp_draft_stays() != before_draft) {
+            psp_ui_show_status(&app->process->presentation.ui, "CANCELLED", 180);
+            return;
+        }
         PspOfflineRouteResult result = moved
             ? psp_offline_store_handle_url(
                   &app->browser->offline_store, engine, profile,
@@ -771,6 +778,7 @@ static void psp_app_history_step(
     bool javascript_ready = history_url != NULL
         && psp_navigation_begin_javascript(engine, profile, history_url,
                                            "GET");
+    unsigned before_draft = psp_draft_stays();
     bool started = javascript_ready
         && browser_engine_begin_navigation_history(
             engine, forward, PSP_NAVIGATION_DOCUMENT_BYTES, PSP_NAVIGATION_TIMEOUT_MS);
@@ -785,7 +793,8 @@ static void psp_app_history_step(
             "interactive-history-start-failed");
         psp_ui_set_loading(&app->process->presentation.ui, false, 0);
         psp_ui_show_status(
-            &app->process->presentation.ui, forward ? "NO FORWARD PAGE" : "NO BACK PAGE",
+            &app->process->presentation.ui, psp_draft_stays() != before_draft
+                ? "CANCELLED" : forward ? "NO FORWARD PAGE" : "NO BACK PAGE",
             120);
     }
 }
@@ -1246,7 +1255,7 @@ static void psp_app_dispatch_heavy_action(
                                     PSP_UI_COLLECTION_SAVED);
             for (size_t row = 0; id != 0 && row < surface->view.count;
                  row++) {
-                if (surface->id[row] != id) continue;
+                if (surface->view.rows[row].offline_id != id) continue;
                 ui->collections_selection = (uint8_t) row;
                 PspUiIntent open = {
                     .action = PSP_UI_ACTION_COLLECTION_ACTIVATE,
@@ -1652,21 +1661,19 @@ static void psp_app_dispatch_heavy_action(
             PspUiCollectionSection section =
                 (PspUiCollectionSection) app->process->presentation.ui.collections_section;
             bool removed = false;
+            bool history_unsaved = false;
             bool uninstalling = false;
             if (section == PSP_UI_COLLECTION_SAVED
                 || section == PSP_UI_COLLECTION_DOWNLOADS) {
+                uint32_t id =
+                    app->process->presentation.collections_surface.view.rows[
+                        intent->list_index].offline_id;
                 const OfflineLibraryItem *selected = offline_library_find(
-                    &app->browser->offline_store.library,
-                    app->process->presentation.collections_surface.id[
-                        intent->list_index]);
+                    &app->browser->offline_store.library, id);
                 uninstalling = selected != NULL
                     && selected->type == OFFLINE_ITEM_WEB_APP;
-                removed = offline_library_remove(
-                    &app->browser->offline_store.library,
-                    app->process->presentation.collections_surface.id[intent->list_index]);
-                if (removed)
-                    (void) offline_library_save(
-                        &app->browser->offline_store.library);
+                removed = psp_offline_store_remove_item(
+                    &app->browser->offline_store, id);
             } else if (section == PSP_UI_COLLECTION_HISTORY) {
                 const char *url = psp_collections_row_url(
                     &app->process->presentation.collections_surface, intent->list_index);
@@ -1674,18 +1681,17 @@ static void psp_app_dispatch_heavy_action(
                 removed = url != NULL
                     && browser_profile_forget_history(profile, url);
                 psp_presentation_fence_release(held);
-                if (removed) {
-                    psp_profile_store_mark_dirty(
+                if (removed)
+                    history_unsaved = !psp_profile_store_commit_edit(
                         &app->browser->profile_store, frame->ui_sample_us);
-                    (void) psp_profile_store_flush(&app->browser->profile_store);
-                }
             }
             psp_collections_sync_ui(
                 &app->process->presentation.ui, &app->process->presentation.collections_surface, profile,
                 &app->browser->offline_store, section);
             psp_ui_show_status(
                 &app->process->presentation.ui,
-                removed ? (uninstalling ? "OFFLINE APP UNINSTALLED"
+                history_unsaved ? "REMOVED FOR NOW - HISTORY NOT SAVED"
+                    : removed ? (uninstalling ? "OFFLINE APP UNINSTALLED"
                                          : "DELETED")
                         : (uninstalling ? "APP COULD NOT BE UNINSTALLED"
                                         : "COULD NOT DELETE"),

@@ -843,9 +843,6 @@ typedef struct {
 
 typedef struct {
     PspUiCollectionsView view;
-    /* Offline rows carry a library id; bookmark and history rows are read
-       back by their position, which is what the accessors take. */
-    uint32_t id[PSP_UI_COLLECTIONS_ROW_LIMIT];
     /* Only the bounded download section needs synthesized status strings;
        every other row continues borrowing profile/library storage. */
     char download_detail[OFFLINE_LIBRARY_ITEM_LIMIT][96];
@@ -1107,12 +1104,10 @@ typedef struct {
     size_t pumps;
     size_t bytes_budgeted;
     bool cache_enabled;
-    /* Navigation may discard an uncommitted cache restore. Until a later boot
-       reads that snapshot, exit must not rotate it behind an empty live cache. */
+    /* Cache restore was skipped, canceled or could not verify the snapshot.
+       Exit may write a fresh file, but cannot rotate an existing generation. */
     bool cache_restore_cancelled_unread;
-    /* The localStorage snapshot could not be read (I/O error, memory or
-       limit refusal, or the load could not start). The live store is then
-       not what the card holds, so exit must not rotate it over the file. */
+    /* Same protection for localStorage, including boot with site data off. */
     bool storage_restore_unread;
 } PspSiteDataRestore;
 
@@ -1254,6 +1249,9 @@ void psp_page_dialog_bind(PspUiState *ui, PspEngineViews *views,
                           PspInteractiveState *interactive,
                           Budget *budget, const char *argv0);
 /* The platform page_dialog service (tilefinch/platform.h). */
+bool psp_confirm_draft_loss(void *context);
+/* Sample around a single start: Stay is not a transport failure to log. */
+unsigned psp_draft_stays(void);
 bool psp_page_dialog_show(void *context,
                           const TilefinchPageDialogRequest *request,
                           TilefinchPageDialogResponse *response);
@@ -1386,7 +1384,7 @@ bool psp_captive_portal_destroy(PspApp *app);
 bool psp_captive_portal_active(const PspInteractiveState *interactive);
 
 /* src/psp_app/psp_app_youtube.c */
-void psp_app_youtube_login_boot(PspProcessResources *, PspBrowserResources *);
+const char *psp_app_youtube_login_boot(PspProcessResources *, PspBrowserResources *);
 bool psp_app_youtube_login_poll(PspApp *app);
 void psp_app_youtube_login_action(PspApp *, PspAppFrameState *, const PspUiIntent *);
 void psp_app_youtube_login_setting(PspApp *, PspAppFrameState *, unsigned policy);

@@ -2,7 +2,8 @@
 
 This page is for engineers changing how page scripts are admitted, compiled,
 and kept in memory: the admission rules and the parser-stage circuit breaker,
-compiled-script reuse, lazy webpack bundles, and the function-source store.
+when a realm that runs out of memory is stopped, compiled-script reuse, lazy
+webpack bundles, and the function-source store.
 The rules are summarized in
 [Architecture](../ARCHITECTURE.md#script-admission); this page holds the
 mechanism. The memory profiles and the realm's heap are in
@@ -64,6 +65,25 @@ rather than by its size (`include/tilefinch/script_admission.h`).
   `document_parser_set_inline_script_admit_callback`) and drops the text of a
   script once it is too large to admit, since more text only needs more; the
   element is then empty and the refusal is reported as pressure.
+- **An inserted script keeps the stop rule's headroom.** When the compile
+  unit of a script a page inserts is at least 256 KiB
+  (`SCRIPT_HEAVY_UNIT_BYTES`), the script is compiled only when the heap the
+  realm can obtain (`script_runtime_heap_obtainable`) would still be 2 MiB
+  after that compile (`SCRIPT_ADMISSION_MEMORY_STOP_HEADROOM_BYTES`, the
+  threshold of [Exhaustion](#exhaustion)); otherwise it fails with an `error`
+  event before compiling. Admitted into less, any refusal in its first run
+  would stop the realm and every script the page already runs. The unit is
+  the compile being admitted: the whole script, a lazy webpack bundle's
+  largest factory, or a resource-loader aggregate's current statement. A lazy
+  bundle's other factories compile at first call under their own admission,
+  so a large bundle of small factories is not held to the headroom. Before
+  refusing, the realm is collected unless it has allocated nothing since its
+  last collection, and the session's cached responses give up the page Budget
+  still short, only when more Budget would raise what the realm obtains and
+  the cache could cover it (`js_rt_reclaim_cached_responses_for_heap`).
+  Smaller units keep the reserve that scales with their source, and a
+  continued classic script (one registration of a split aggregate) keeps
+  only the work floor.
 - **A large unit needs room for the expensive case.** Only the source size is
   known before a compile, and units of 1 MiB or more compile either near their
   source size or at several times it. Such a unit is compiled only when the
@@ -129,6 +149,69 @@ realm is left to observe one). The validation log and the host's
 `TILEFINCH_TRACE_SCRIPT_FAILURES` trace print a `tilefinch-script-breaker`
 line with the reason; the lab's parser-checkpoint line counts the author
 exceptions the breaker left uncounted (`author-exceptions=`).
+
+## Exhaustion
+
+A realm whose allocation was refused is judged by the heap it can still
+obtain, never by how the refusal reached the page
+(`navigation_assess_script_memory`, `src/navigation/page_lifecycle.inc`).
+
+- **The error is not evidence.** QuickJS throws a catchable
+  `InternalError: out of memory` at the first refused allocation and does not
+  collect and retry. Whether that becomes a caught exception, a promise
+  rejection, a listener's reported error, a failed timer or a failed host
+  call depends on which operation needed the next 4 KB arena, and any byte of
+  heap in front of it moves that. A page can also throw the text itself.
+- **When.** At each author-task boundary after a refusal: the document's
+  scripts at commit, each runtime turn (before page script runs and after),
+  input dispatch, stylesheet and frame events, and cross-frame message
+  delivery. A refusal counts whether the realm's heap limit or the page
+  Budget refused (`script_runtime_allocation_refusals`). So does the page
+  Budget refusing the host envelope the realm needs to take a completed
+  response (an inserted script's, a `fetch()`'s or an event stream's): the
+  response stays queued for a later turn, and the turn itself succeeds.
+- **Measure.** The realm is collected and trimmed. When it can obtain less
+  than it needs to be kept, optional page memory is reclaimed only if freeing
+  it could meet that threshold without exceeding the heap ceiling. This includes
+  optional caches, compiled scripts' bodies, unconsumed preloads, and stored
+  function text (`script_runtime_reclaim_for_admission`), then the session's
+  other cached responses (`script_runtime_reclaim_heap_headroom`). The failed
+  task's own memory is already free: its body goes with its task or with the
+  cached script bodies, its garbage with the collection. What it can obtain
+  is `script_runtime_heap_obtainable`: headroom under its limit only as far as
+  the Budget backs it, plus the growth the growth hook would still grant.
+- **Stop under 2 MiB.** If the page discarded its readable body after
+  the refusal, restore the saved body when a useful snapshot is available,
+  even if the script caught the exception. Otherwise keep the live body.
+  The realm stops,
+  the summary reads "JavaScript stopped at its memory limit", the
+  static-content cascade applies, the page qualifies for
+  [Basic view](../BASIC_VIEW.md#automatic-fallback), and the site is
+  noted for opening in Basic view next time.
+- **Keep otherwise.** The realm runs on and the exception is an ordinary
+  author error; a turn that failed only because of it counts as a completed
+  turn. A turn the watchdog stopped for time is still a failure.
+- **Guard.** A realm kept three times with under 4 MiB to obtain stops at the
+  third: it is living at its limit.
+- **Child frames** are judged the same way on their own counts; stopping one
+  leaves the page and its other frames running.
+- **A challenge frame goes first.** While a frame of a managed challenge
+  runs (the frame `navigation_script_heap_limit` raises) and under a quarter
+  of the page Budget is free, each other realm of the page whose heap has
+  grown an amortized step since its last collection is collected before the
+  frame's turn and returns its cached pool blocks
+  (`navigation_collect_for_challenge_frame`). An idle parent's own pacing
+  can leave its garbage in place for megabytes.
+
+A layout or style rebuild the Budget refuses stops the page's realms to give
+their memory to the page; that is the page's need, not this rule. A page
+with a few hundred bytes to spare still depends on whether it is ever
+refused, and a stop costs one static relayout.
+
+The validation log and the host's `TILEFINCH_TRACE_SCRIPT_FAILURES` trace
+print a `tilefinch-script-memory-assess` line for each assessment: where it
+ran, the verdict, the new refusals, and the obtainable, available and used
+heap.
 
 ## Compiled-script reuse
 
@@ -235,6 +318,9 @@ text itself is never dropped, so a factory's `toString()` never falls back to
   a promise reaction the checkpoint ends at that job and the rest of the queue
   runs on a later turn. Code that catches the out-of-memory error and retries
   is stopped once one entry into JavaScript has had 256 allocations refused.
+  Both stops stay uncatchable when the error's stack text cannot be
+  allocated: the error keeps a null `stack` (QuickJS layer
+  `backtrace-pending-exception`).
 - **The bytecode cache stores offsets, not text.** A restore names the script
   text (its digest is the cache key) and the store copies it only if restored
   functions refer to it, before the script runs. Bytecode whose lazy functions

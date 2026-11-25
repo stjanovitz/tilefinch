@@ -2257,7 +2257,8 @@ static int test_web_runtime(void)
         "<center id=legacy-center>"
         "<table id=legacy-table bgcolor='#ff6600' width='85%' cellpadding=2>"
         "<tr id=legacy-row height=7><td id=legacy-cell width=12 align=right>"
-        "LEGACY</td></tr><tr><td>SECOND</td></tr></table></center></body>";
+        "LEGACY</td></tr><tr><td>SECOND</td><td class=plain>THIRD</td></tr>"
+        "</table></center></body>";
     PocDocument legacy_document;
     Stylesheet legacy_sheet;
     LayoutDocument legacy_layout;
@@ -2287,6 +2288,16 @@ static int test_web_runtime(void)
         &legacy_sheet, legacy_row, &legacy_table_style);
     ComputedStyle legacy_cell_style = style_for_node(
         &legacy_sheet, legacy_cell, &legacy_row_style);
+    /* Both cells lack local presentation hints, but their table still
+       supplies padding. Do not skip it for empty or class-only cells. */
+    CHECK(legacy_row->next && legacy_row->next->first_child
+          && legacy_row->next->first_child->next);
+    for (lxb_dom_node_t *cell = legacy_row->next->first_child;
+         cell; cell = cell->next) {
+        ComputedStyle plain = style_for_node(&legacy_sheet, cell, &legacy_row_style);
+        CHECK(plain.display == DISPLAY_TABLE_CELL
+              && plain.padding.left == 2 && plain.padding.top == 2);
+    }
     CHECK(legacy_body_style.has_background
           && legacy_body_style.background == 0xf6f6ef
           && legacy_body_style.color == 0x010203

@@ -27,6 +27,7 @@
 #include "tilefinch/site_adapter.h"
 #include "tilefinch/youtube_lite.h"
 #include "tilefinch/url.h"
+#include "tilefinch/web_crypto.h"
 #include "tilefinch/work_vector.h"
 #include "tilefinch/work_ledger.h"
 
@@ -113,6 +114,7 @@ static void navigation_note_layout_failure(
 #include "navigation/style_sources.inc"
 #include "navigation/layout_reuse.inc"
 #include "navigation/relayout.inc"
+#include "navigation/geometry_proof.inc"
 #include "navigation/deferred_images.inc"
 #include "navigation/runtime_advance.inc"
 #include "navigation/events.inc"

@@ -27,6 +27,17 @@ void layout_validation_set_reference(const LayoutDocument *layout);
 void layout_validation_forget(const LayoutDocument *layout);
 /* One tilefinch-layout-diff line for a completed build. */
 void layout_validation_report_build(const LayoutDocument *fresh);
+/* Every box (geometry, client, content and scroll extents) and every draw
+   command of two layouts of one document, in order; `detail` names the
+   first difference. For TILEFINCH_VERIFY_GEOMETRY_PROOF. */
+typedef enum {
+    LAYOUT_VALIDATION_SAME,
+    LAYOUT_VALIDATION_COMMANDS_DIFFER,
+    LAYOUT_VALIDATION_BOXES_DIFFER
+} LayoutValidationCompare;
+LayoutValidationCompare layout_validation_compare(
+    const LayoutDocument *expected, const LayoutDocument *actual,
+    char *detail, size_t detail_size);
 /* Free text appended to the next report line (adoption reasons). */
 void layout_validation_note(const char *note);
 

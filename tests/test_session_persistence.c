@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #define CHECK(condition) do {                                                \
     if (!(condition)) {                                                      \
@@ -197,6 +198,29 @@ static int test_replace_file_on_fat(void)
     CHECK(write_text(temporary, "three")
           && tilefinch_platform_replace_file(temporary, path, backup)
           && file_contains(path, "three") && file_contains(backup, "two"));
+    /* No staged generation: neither the live file nor its verified backup
+       is expendable. This applies to FAT and to replacing rename. */
+    for (unsigned fat = 0; fat <= 1; fat++) {
+        faults->replace_file_no_replace = fat != 0;
+        CHECK(!tilefinch_platform_replace_file(temporary, path, backup)
+              && file_contains(path, "three") && file_contains(backup, "two"));
+    }
+    for (unsigned keep = 0; keep <= 1; keep++) {
+        faults->replace_file_rename_io_error = true;
+        CHECK(write_text(temporary, "staged")
+              && !tilefinch_platform_replace_file(temporary, path, keep ? backup : NULL)
+              && file_contains(path, "three") && file_contains(backup, "two")
+              && file_contains(temporary, "staged"));
+    }
+    FILE *incomplete = fopen(temporary, "wb");
+    CHECK(incomplete != NULL && fputs("prefix", incomplete) >= 0);
+    CHECK(!tilefinch_platform_finish_file(incomplete, false, temporary, path, backup)
+          && !exists(temporary) && file_contains(path, "three") && file_contains(backup, "two"));
+    CHECK(write_text(temporary, "partial"));
+    FILE *failed = fopen(temporary, "rb");
+    CHECK(failed != NULL && fputc('!', failed) == EOF && ferror(failed));
+    CHECK(!tilefinch_platform_finish_file(failed, true, temporary, path, backup)
+          && !exists(temporary) && file_contains(path, "three") && file_contains(backup, "two"));
     /* A failed install moves the previous file back. */
     faults->replace_file_fail_install = true;
     CHECK(write_text(temporary, "four")
@@ -1069,7 +1093,7 @@ static bool newer_write(const char *path, const unsigned char *data,
 static bool newer_same(const char *path, const unsigned char *data,
                        size_t length)
 {
-    static unsigned char current[8192];
+    static unsigned char current[16384];
     size_t current_length = 0;
     return newer_read(path, current, sizeof(current), &current_length)
         && current_length == length && memcmp(current, data, length) == 0;
@@ -1086,7 +1110,7 @@ static int test_newer_format_is_left_alone(void)
     snprintf(backup, sizeof(backup), "%s.bak", refusal_path);
     Budget budget;
     budget_init(&budget, 2u * 1024u * 1024u);
-    for (unsigned newer_backup = 0; newer_backup < 3; newer_backup++) {
+    for (unsigned newer_backup = 0; newer_backup < 5; newer_backup++) {
         BrowserSession source;
         CHECK(browser_session_init(&source, &budget, 64u * 1024u)
             && browser_session_storage_set(
@@ -1109,14 +1133,16 @@ static int test_newer_format_is_left_alone(void)
         unsigned char *newer = primary;
         size_t newer_length = primary_length;
         if (newer_backup != 0) {
-            /* The newer generation is .bak; the primary is gone (1) or
-               damaged (2). */
+            /* The newer generation is .bak: the primary is gone (1), has a
+               damaged header (2), has a damaged payload (3), or is intact (4). */
             newer_path = backup;
             newer = older;
             newer_length = older_length;
             if (newer_backup == 1) CHECK(remove(refusal_path) == 0);
-            else CHECK(newer_write(refusal_path,
-                                   (const unsigned char *) "broken", 6));
+            else if (newer_backup == 2)
+                CHECK(newer_write(refusal_path, (const unsigned char *) "broken", 6));
+            else if (newer_backup == 3)
+                CHECK(flip_file_byte(refusal_path, primary_length - 1u));
         }
         newer[8] = 3u; /* format version: the payload hash does not cover it */
         CHECK(newer_write(newer_path, newer, newer_length));
@@ -1127,7 +1153,13 @@ static int test_newer_format_is_left_alone(void)
             browser_session_persistence_load(
                 &target, refusal_path, BROWSER_SESSION_PERSIST_LOCAL_STORAGE,
                 NULL);
-        CHECK(status == BROWSER_SESSION_PERSISTENCE_NEWER_FORMAT
+        if (newer_backup == 4) {
+            const char *token;
+            size_t length;
+            CHECK(status == BROWSER_SESSION_PERSISTENCE_OK
+                  && browser_session_storage_get(&target, origin, true, "token", &token, &length)
+                  && length == 3u && !memcmp(token, "new", length));
+        } else CHECK(status == BROWSER_SESSION_PERSISTENCE_NEWER_FORMAT
               && browser_session_persistence_load_left_unread(status)
               && strcmp(browser_session_persistence_status_name(status),
                         "newer-format") == 0
@@ -1149,6 +1181,50 @@ static int test_newer_format_is_left_alone(void)
               == BROWSER_SESSION_PERSISTENCE_OK);
     }
     CHECK(budget.current == 0u);
+    return 0;
+}
+
+static int test_unreadable_snapshot_is_not_rotated(void)
+{
+    const char url[] = "https://unreadable.test/";
+    char backup[256];
+    snprintf(backup, sizeof(backup), "%s.bak", refusal_path);
+    Budget budget;
+    budget_init(&budget, 2u * 1024u * 1024u);
+    BrowserSession session;
+    CHECK(browser_session_init(&session, &budget, 65536));
+    CHECK(browser_session_persistence_remove(refusal_path) == BROWSER_SESSION_PERSISTENCE_OK);
+    CHECK(browser_session_storage_set(&session, url, true, "token", "one", 3u)
+          && browser_session_persistence_save(&session, refusal_path,
+                  BROWSER_SESSION_PERSIST_LOCAL_STORAGE, NULL) == BROWSER_SESSION_PERSISTENCE_OK
+          && browser_session_storage_set(&session, url, true, "token", "two", 3u)
+          && browser_session_persistence_save(&session, refusal_path,
+                  BROWSER_SESSION_PERSIST_LOCAL_STORAGE, NULL) == BROWSER_SESSION_PERSISTENCE_OK);
+    unsigned char primary[8192], older[8192];
+    size_t primary_length, older_length;
+    CHECK(newer_read(refusal_path, primary, sizeof(primary), &primary_length)
+          && newer_read(backup, older, sizeof(older), &older_length));
+    CHECK(browser_session_storage_set(&session, url, true, "token", "three", 5u));
+    for (unsigned blocked = 0; blocked < 2; blocked++) {
+        const char *unreadable = blocked ? backup : refusal_path;
+        CHECK(chmod(unreadable, 0000) == 0);
+        FILE *can_read = fopen(unreadable, "rb");
+        if (can_read != NULL) {
+            /* Administrator/root runs may bypass the mode bits. */
+            fclose(can_read);
+            CHECK(chmod(unreadable, 0600) == 0);
+            continue;
+        }
+        BrowserSessionPersistenceStatus status = browser_session_persistence_save(
+            &session, refusal_path, BROWSER_SESSION_PERSIST_LOCAL_STORAGE, NULL);
+        CHECK(chmod(unreadable, 0600) == 0);
+        CHECK(status == BROWSER_SESSION_PERSISTENCE_IO_ERROR
+              && newer_same(refusal_path, primary, primary_length)
+              && newer_same(backup, older, older_length));
+    }
+    browser_session_destroy(&session);
+    CHECK(browser_session_persistence_remove(refusal_path) == BROWSER_SESSION_PERSISTENCE_OK
+          && !budget.current);
     return 0;
 }
 
@@ -1188,10 +1264,134 @@ static int test_planned_bytes_match_save(void)
     return 0;
 }
 
-int main(void)
+/* A separate writer and reader for the real short-write/restart journey. */
+static int session_generation(const char *path, const char *step, const char *generation)
 {
+    Budget budget; budget_init(&budget, 4u*1024u*1024u);
+    BrowserSession session; CHECK(browser_session_init(&session,&budget,65536));
+    BrowserSessionPersistenceLimits limits; browser_session_persistence_limits_default(&limits);
+    const char url[] = "https://notes.test/page";
+    unsigned char bytes[9000]; memset(bytes,*generation,sizeof(bytes));
+    if (!strcmp(step,"read")) {
+        const unsigned char *body; const char *value; size_t len;
+        CHECK(browser_session_persistence_load(&session,path,BROWSER_SESSION_PERSIST_ALL,&limits)
+              == BROWSER_SESSION_PERSISTENCE_OK
+              && browser_session_cache_get(&session,url,&body,&len) && len == sizeof(bytes)
+              && !memcmp(body,bytes,len) && browser_session_storage_get(&session,url,true,"draft",&value,&len)
+              && len == strlen(generation) && !memcmp(value,generation,len));
+    } else {
+        CHECK(browser_session_storage_set(&session,url,true,"draft",generation,strlen(generation))
+              && browser_session_cache_put(&session,url,bytes,sizeof(bytes)));
+        BrowserSessionPersistenceStatus result =
+            browser_session_persistence_save(&session,path,BROWSER_SESSION_PERSIST_ALL,&limits);
+        CHECK(result == (!strcmp(step,"refuse") ? BROWSER_SESSION_PERSISTENCE_IO_ERROR
+                                               : BROWSER_SESSION_PERSISTENCE_OK));
+    }
+    browser_session_destroy(&session); CHECK(!budget.current);
+    return 0;
+}
+
+static int test_unrestored_exit_preserves_previous_snapshot(void)
+{
+    const char *path = refusal_path;
+    char backup[256];
+    snprintf(backup, sizeof(backup), "%s.bak", path);
+    CHECK(browser_session_persistence_remove(path) == BROWSER_SESSION_PERSISTENCE_OK
+          && session_generation(path, "save", "good") == 0
+          && session_generation(path, "save", "damaged") == 0
+          && flip_file_byte(path, 36u));
+    unsigned char original[16384];
+    size_t length;
+    CHECK(newer_read(backup, original, sizeof(original), &length));
+
+    /* The browser booted with site data disabled and then enabled it. An
+       unhydrated exit must not let a failed rotation consume the only good
+       generation. Arm the real replacement failure if a save is attempted. */
+    TilefinchTestFaults *faults = tilefinch_test_faults();
+    faults->replace_file_fail_install = true;
+    bool attempted = browser_session_persistence_can_save(path, true);
+    if (attempted) CHECK(session_generation(path, "refuse", "new") == 0);
+    bool install_untouched = faults->replace_file_fail_install;
+    faults->replace_file_fail_install = false;
+    CHECK(!attempted && install_untouched && newer_same(backup, original, length));
+    CHECK(session_generation(path, "read", "good") == 0);
+    CHECK(!exists(path) && !browser_session_persistence_can_save(path, true)
+          && browser_session_persistence_can_save(path, false));
+    CHECK(browser_session_persistence_remove(path) == BROWSER_SESSION_PERSISTENCE_OK
+          && browser_session_persistence_can_save(path, true)
+          && session_generation(path, "save", "new") == 0
+          && session_generation(path, "read", "new") == 0
+          && browser_session_persistence_remove(path) == BROWSER_SESSION_PERSISTENCE_OK);
+    return 0;
+}
+
+static int test_restore_keeps_primary_published_between_pumps(void)
+{
+    unsigned lost = 0;
+    for (unsigned corrupt = 0; corrupt < 2; corrupt++) {
+        (void) browser_session_persistence_remove(persistence_path);
+        CHECK(session_generation(persistence_path, "save", "backup") == 0
+              && session_generation(persistence_path, "save", "old") == 0);
+        CHECK(corrupt ? flip_file_byte(persistence_path, 0u)
+                      : remove(persistence_path) == 0);
+        Budget budget;
+        budget_init(&budget, 4u * 1024u * 1024u);
+        BrowserSession reader;
+        CHECK(browser_session_init(&reader, &budget, 65536));
+        BrowserSessionPersistenceLoad *load = browser_session_persistence_load_begin(
+            &reader, persistence_path, BROWSER_SESSION_PERSIST_ALL, NULL);
+        CHECK(load != NULL);
+        BrowserSessionPersistenceStatus status;
+        /* This consumes the corrupt header, if any, and leaves the old
+           backup open partway through parsing its 9000-byte response. */
+        CHECK(browser_session_persistence_load_pump(load, 256u, &status)
+              == BROWSER_SESSION_PERSISTENCE_LOAD_PENDING
+              && status == BROWSER_SESSION_PERSISTENCE_OK);
+        CHECK(session_generation(persistence_path, "save", "new") == 0);
+        CHECK(pump_load(load, 4096u, NULL) == BROWSER_SESSION_PERSISTENCE_OK);
+        browser_session_persistence_load_destroy(load);
+        const char *draft;
+        size_t length;
+        CHECK(browser_session_storage_get(&reader, "https://notes.test/page",
+                  true, "draft", &draft, &length)
+              && length == sizeof("backup") - 1u
+              && !memcmp(draft, "backup", length));
+        browser_session_destroy(&reader);
+        CHECK(!budget.current);
+        if (session_generation(persistence_path, "read", "new") != 0) {
+            fprintf(stderr, "%s primary: lost publication during restore\n",
+                    corrupt ? "Corrupt" : "Missing");
+            lost++;
+        }
+    }
+    CHECK(browser_session_persistence_remove(persistence_path)
+          == BROWSER_SESSION_PERSISTENCE_OK);
+    CHECK(!lost);
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc == 7 && !strcmp(argv[1], "--generation")) {
+        TilefinchTestFaults *faults = tilefinch_test_faults();
+        CHECK(!strcmp(argv[5], "native") || !strcmp(argv[5], "fat"));
+        faults->replace_file_no_replace = !strcmp(argv[5], "fat");
+        static const char *const cuts[] = {
+            "none", "before-rotation", "after-retiring-backup",
+            "after-rotation", "after-install"
+        };
+        size_t cut = 0;
+        while (cut < sizeof(cuts) / sizeof(*cuts) && strcmp(argv[6], cuts[cut]))
+            cut++;
+        CHECK(cut < sizeof(cuts) / sizeof(*cuts));
+        faults->replace_file_process_cut = (TilefinchReplaceProcessCut) cut;
+        return session_generation(argv[2], argv[3], argv[4]);
+    }
+    if (argc == 5 && !strcmp(argv[1],"--generation"))
+        return session_generation(argv[2],argv[3],argv[4]);
     CHECK(test_restore_pauses_across_portal_partition() == 0);
     (void) browser_session_persistence_remove(persistence_path);
+    (void) browser_session_persistence_remove(refusal_path);
     CHECK(test_replace_file_on_fat() == 0);
     CHECK(test_round_trip_and_clear() == 0);
     CHECK(test_transaction_limits_and_backup() == 0);
@@ -1200,7 +1400,10 @@ int main(void)
     CHECK(test_storage_load_budget_refusal_preserves_target() == 0);
     CHECK(test_unread_restore_is_reported() == 0);
     CHECK(test_newer_format_is_left_alone() == 0);
+    CHECK(test_unreadable_snapshot_is_not_rotated() == 0);
     CHECK(test_planned_bytes_match_save() == 0);
+    CHECK(test_restore_keeps_primary_published_between_pumps() == 0);
+    CHECK(test_unrestored_exit_preserves_previous_snapshot() == 0);
     puts("session persistence: bounded transactional round-trip passed");
     return 0;
 }

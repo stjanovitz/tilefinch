@@ -24,14 +24,33 @@ third-party data: the corpus lives outside the repository (by default
 
 Every page is loaded by `psp-browser-interactive-lab` with the shipping
 defaults: Tilefinch's honest default UA, `--psp-profile realistic` (the PSP
-app's memory, script and document caps), basic content blocking, cookie
-notices hidden (never clicked), 480x272, a seeded clock and random source
-(`--deterministic-replay-seed 1`). By default the lab applies the
-cookie-notice sheet after the load, which costs a whole-sheet rebuild the
-PSP never does; `replay --user-css-before-load` sets it before the load, as
-the PSP app sets its presentation CSS before each navigation (same frames,
-one full rebuild fewer). Use it for timing, and compare runs only within
-one mode. The command script runs the page for 150 frames of 33 ms,
+app's memory, script and document caps), basic content blocking, page ads
+and cookie notices hidden (the PSP app's built-in **Hide page ads** and
+cookie-notice sheets; nothing is clicked), 480x272, a seeded clock and
+random source (`--deterministic-replay-seed 1`). Those sheets are set
+before the load (lab `--user-css-before-load`), as the PSP app sets its
+presentation CSS before each navigation.
+
+Runs from 2026-11-19 on set the sheets before the load (`run.json` records
+`user_css_before_load`; each page's `meta.json` mode ends in
+`+user-css-before-load`). Before, the lab applied them after the load,
+which costs a whole-sheet rebuild the PSP never does (on a large news page
+about half a second of relayout time). The frames are the same, but the
+timings are not, so the first run made this way is a new timing baseline:
+compare it only with runs made the same way. `capture` and `replay` take
+`--user-css-after-load` for the older order, for comparison with older
+runs; `replay` still accepts `--user-css-before-load`, now the default.
+
+Runs from 2026-11-19 on hide page ads (lab `--hide-page-ads`; `run.json`
+records `hide_page_ads`). Earlier runs show reserved ad slots a PSP hides,
+such as an empty black or grey band, so the first run made this way is a
+new baseline: compare it only with runs made the same way. `capture` and
+`replay` take `--show-page-ads` to leave the sheet out, for a lab built
+before the option existed (it rejects `--hide-page-ads`) or for comparison
+with older runs; each page's `meta.json` mode then ends in
+`+show-page-ads`.
+
+The command script runs the page for 150 frames of 33 ms,
 renders the top and two scrolled screens, runs the `census` lab command
 (first-paint timebase, off-screen layout share, decoded vs. painted size of
 every image, Reader analysis), records a few page facts and prints the
@@ -164,7 +183,8 @@ and below-the-fold bytes), `styles`, `scripts` (loader counters),
 whether it started before first paint, category), `js` (totals, pre-paint
 and non-essential pre-paint time, cacheable compile time, heap peak), `errors`,
 `limits` (document cap, script quota, memory pressure, stylesheet cap, DOM
-handles, watchdog, compile cap, JS heap), `fallback` (Reader kind and
+handles, watchdog, compile cap, `js-heap` for a JS heap refusal and
+`js-heap-stop` when it stopped the page's scripts), `fallback` (Reader kind and
 confidence, extraction size, Basic view nodes, visible text and truncation,
 whether the page is blank), `work` (the deterministic `tilefinch-work` vector),
 `api_probe` (probe runs) and `outcome_auto` (a first-pass outcome; the report
@@ -189,6 +209,33 @@ python3 tools/site-census/census.py capture --retry news       # by tag
 One capture per page, at most one retry. Never solve challenges or log in: a
 challenge or block is a finding, recorded as the page's outcome. The trace
 lands in `CENSUS/corpus/NAME/capture`.
+
+A capture runs the same command script as a replay: 150 frames, then the
+screens. A page requests nothing after that, so a replay that runs longer
+(`--idle`, `--settle-pumps`) or a lab that gets further than the capturing
+one meets responses the trace lacks. `capture --settle-pumps N` adds N
+loop frames of 33 ms after the 150 (the page's timers, async scripts and
+their fetches keep running) and `capture --idle N` up to N owner idle turns
+after those (background images, fonts). `replay --settle-pumps N` runs the
+same extra frames. A lab experiment such as a raised page budget goes in
+`CENSUS_LAB_ARGS` (for example `--limit-mb 64`); the capture's `meta.json`
+records the extra turns and those arguments.
+
+A capture's frames run far faster than a live network answers, so requests
+are still on the wire when the command script ends, and quitting cancels
+them: their trace records say so (`image pipeline aborted`, for example),
+and no replay of the trace gets those responses. So a capture drains before
+it quits (lab `drain-fetches`, last in the script, after every frame and
+page fact): the page admits no new request, and loop turns that do not move
+the page clock run until nothing is in flight or `--drain-ms` of wall time
+has passed (default 10000; 0 for no drain). In flight means admitted and
+not complete: the page's resource requests (images, stylesheets, fonts) and
+the native requests behind its realms' fetch queues. `meta.json` records
+the drain (`drain`: `reason` `idle` or `cap`, the requests in flight at its
+start and at its end, the drain time, and `pending_urls`, the resource
+requests still in flight at the cap), and the capture prints it per page.
+Replays run no drain: they render every frame before quitting, and a
+replay's quit writes nothing.
 
 `meta.json` records `final_url`, the page URL the lab reported last (after
 redirects; a native route such as YouTube's keeps the page URL). When its

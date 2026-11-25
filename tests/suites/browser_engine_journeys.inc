@@ -473,10 +473,7 @@ int test_deferred_image_publication_survives_rebuild(void)
     return 0;
 }
 
-/* A page whose layout cost more than the publication limit keeps its
-   deferred images unloaded: the queue finishes without a batch job and
-   without a relayout, and the page stays usable. */
-int test_deferred_images_skip_oversized_pages(void)
+static BrowserEngine *oversized_image_page(const char *fixture)
 {
     BrowserDeviceProfile profile;
     browser_device_profile_psp3000(&profile);
@@ -486,32 +483,92 @@ int test_deferred_images_skip_oversized_pages(void)
     config.javascript.enabled = true;
     config.javascript.document_scripts_enabled = true;
     config.resources.enabled = true;
+    config.resources.web_fonts_enabled = false;
     config.resources.maximum_images = 12;
     config.resources.maximum_publication_work_units = 1u;
     char error[256] = {0};
     BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
-    CHECK(engine != NULL && fetch_trace_replay_begin(
-        TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-interactive-images",
-        error, sizeof(error)));
-    CHECK(browser_engine_load_url(engine, "https://interactive-images.test/page", true));
+    if (engine == NULL || !fetch_trace_replay_begin(fixture, error, sizeof(error))) {
+        fprintf(stderr, "oversized image page: %s\n", error);
+        browser_engine_destroy(engine);
+        return NULL;
+    }
+    if (!browser_engine_load_url(engine, "https://interactive-images.test/page", true)) {
+        fetch_trace_end();
+        browser_engine_destroy(engine);
+        return NULL;
+    }
+    return engine;
+}
+
+static void oversized_image_page_drain(BrowserEngine *engine)
+{
     NavigationSession *nav = browser_engine_navigation(engine);
-    CHECK(nav->page.loaded && nav->page.image_continuation_pending
+    for (unsigned pump = 0; nav->page.image_continuation_pending && pump < 1024;
+         pump++) {
+        bool changed = false;
+        (void) browser_engine_run_deferred_image_work(engine, &changed);
+    }
+}
+
+/* A page whose layout cost more than the publication limit cannot afford a
+   flow per pair of images. Images whose boxes do not depend on them are
+   still loaded and painted into those boxes, with no flow at all, as on any
+   other page. An image that would need a flow waits for the page's next
+   one, and the queue ends there; the page stays usable either way. */
+int test_deferred_images_paint_on_oversized_pages(void)
+{
+    BrowserEngine *engine = oversized_image_page(
+        TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-interactive-images");
+    CHECK(engine != NULL);
+    NavigationSession *nav = browser_engine_navigation(engine);
+    lxb_dom_node_t *root = lxb_dom_interface_node(nav->page.document.html);
+    lxb_dom_node_t *hero = test_reader_find_id(root, "hero");
+    lxb_dom_node_t *last = test_reader_find_id(root, "last");
+    CHECK(hero != NULL && last != NULL && nav->page.loaded
+        && nav->page.image_continuation_pending
         && nav->page.deferred_image_count == 3u
         && nav->page.layout.layout_work_units > 1u
         && browser_engine_render_frame(engine, NULL));
     size_t relayouts = nav->performance.background_image_relayouts;
-    bool changed = false;
-    CHECK(!browser_engine_run_deferred_image_work(engine, &changed) && !changed);
+    size_t publications = nav->incremental_relayouts;
+    oversized_image_page_drain(engine);
     CHECK(!nav->page.image_continuation_pending
         && nav->page.deferred_image_job == NULL
         && nav->performance.background_image_relayouts == relayouts
+        && nav->incremental_relayouts > publications
         && nav->performance.background_image_failures == 0
-        && nav->page.images.stats.loaded == 1
+        && nav->performance.background_images_loaded == 3u
+        && image_resource_available(images_find_node(&nav->page.images, hero))
+        && image_resource_available(images_find_node(&nav->page.images, last))
         && browser_engine_last_error(engine)[0] == '\0'
         && browser_engine_render_frame(engine, NULL));
     fetch_trace_end();
     CHECK(browser_engine_shutdown(engine));
     BrowserEngineMetrics metrics = {0};
+    CHECK(browser_engine_metrics(engine, &metrics)
+        && metrics.budget_current == 0 && metrics.budget_active_allocations == 0);
+    browser_engine_destroy(engine);
+
+    engine = oversized_image_page(
+        TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-interactive-image-unsized");
+    CHECK(engine != NULL);
+    nav = browser_engine_navigation(engine);
+    root = lxb_dom_interface_node(nav->page.document.html);
+    lxb_dom_node_t *far = test_reader_find_id(root, "far");
+    CHECK(far != NULL && nav->page.loaded && nav->page.image_continuation_pending
+        && browser_engine_render_frame(engine, NULL));
+    relayouts = nav->performance.background_image_relayouts;
+    oversized_image_page_drain(engine);
+    CHECK(!nav->page.image_continuation_pending
+        && nav->page.deferred_image_job == NULL
+        && nav->page.deferred_image_targets == NULL
+        && nav->performance.background_image_relayouts == relayouts
+        && images_find_node(&nav->page.images, far) == NULL
+        && browser_engine_last_error(engine)[0] == '\0'
+        && browser_engine_render_frame(engine, NULL));
+    fetch_trace_end();
+    CHECK(browser_engine_shutdown(engine));
     CHECK(browser_engine_metrics(engine, &metrics)
         && metrics.budget_current == 0 && metrics.budget_active_allocations == 0);
     browser_engine_destroy(engine);
@@ -1469,16 +1526,67 @@ int test_native_form_submission_sends_script_entries(void)
     static const char cancelled[] =
         "<!doctype html><form id=f method=post action='/step'>"
         "<input name=a value=b><button id=next>Next</button></form>"
+        "<form id=other method=post action='/other'><input name=x value=stale></form>"
         "<script>document.addEventListener('submit',function(e){"
-        "e.preventDefault()});</script>";
+        "document.getElementById('other').submit();e.preventDefault()});"
+        "document.getElementById('other').addEventListener('formdata',e=>"
+        "e.formData.set('x','cancel edit'));</script>";
     engine = form_test_engine(true, cancelled, sizeof(cancelled) - 1u);
     CHECK(engine != NULL);
+    browser_engine_set_defer_script_navigation(engine, true);
     memset(&action, 0, sizeof(action));
     CHECK(browser_engine_focus_node(engine, form_test_node(engine, "next"))
         && browser_engine_activate(engine, &action)
         && action.type != CONTROLLER_ACTION_FORM_SUBMIT
         && action.activation_outcome == CONTROLLER_ACTIVATION_CANCELLED
         && action.body_length == 0);
+    CHECK(browser_engine_take_script_form_submission(engine, &action)
+        && strcmp(action.url, "https://form.test/other") == 0
+        && strcmp(controller_action_body(&action), "x=cancel+edit") == 0);
+    browser_engine_destroy(engine);
+
+    /* The navigation handoff, not just Fetch, must preserve file bytes and
+       the entry list after formdata handlers have run. */
+    static const char multipart[] =
+        "<form id=f method=post action='/upload' enctype='multipart/form-data'>"
+        "<input name=obsolete value=field><button id=next>Upload</button></form>"
+        "<form id=other method=post action='/other'><input name=x value=stale></form>"
+        "<script>document.getElementById('f').addEventListener('formdata',e=>{"
+        "e.formData.delete('obsolete');"
+        "e.formData.append('meta\\rfirst\\nnext\\r\\nlast','value\\nnext\\rlast');"
+        "e.formData.append('sample',new File([new Uint8Array([65,0,255,66])],"
+        "'a\\rb\\nc\".bin'));document.getElementById('other').submit()});"
+        "document.getElementById('other').addEventListener('formdata',e=>"
+        "e.formData.set('x','queued edit'));</script>";
+    engine = form_test_engine(true, multipart, sizeof(multipart) - 1u);
+    CHECK(engine != NULL);
+    browser_engine_set_defer_script_navigation(engine, true);
+    memset(&action, 0, sizeof(action));
+    CHECK(browser_engine_focus_node(engine, form_test_node(engine, "next"))
+        && browser_engine_activate(engine, &action)
+        && action.type == CONTROLLER_ACTION_FORM_SUBMIT
+        && strcmp(action.url, "https://form.test/upload") == 0);
+    static const char type[] = "multipart/form-data; boundary=";
+    CHECK(strncmp(action.content_type, type, sizeof(type) - 1u) == 0);
+    const char *boundary = action.content_type + sizeof(type) - 1u;
+    CHECK(strlen(boundary) == 32u);
+    char expected[384];
+    int prefix = snprintf(expected, sizeof(expected),
+        "--%s\r\nContent-Disposition: form-data; "
+        "name=\"meta%%0D%%0Afirst%%0D%%0Anext%%0D%%0Alast\"\r\n\r\nvalue\r\nnext\r\nlast\r\n"
+        "--%s\r\nContent-Disposition: form-data; name=\"sample\"; filename=\"a%%0Db%%0Ac%%22.bin\""
+        "\r\nContent-Type: application/octet-stream\r\n\r\n", boundary, boundary);
+    CHECK(prefix > 0 && (size_t)prefix + 40u < sizeof(expected));
+    static const unsigned char raw[] = {'A', 0, 255, 'B'};
+    memcpy(expected + prefix, raw, sizeof(raw));
+    size_t pos = (size_t)prefix + sizeof(raw);
+    int suffix = snprintf(expected + pos, sizeof(expected) - pos, "\r\n--%s--\r\n", boundary);
+    CHECK(suffix > 0 && action.body_length == pos + (size_t)suffix
+        && memcmp(controller_action_body(&action), expected, action.body_length) == 0);
+    CHECK(browser_engine_take_script_form_submission(engine, &action)
+        && strcmp(action.url, "https://form.test/other") == 0
+        && strcmp(controller_action_body(&action), "x=queued+edit") == 0);
+    CHECK(!browser_engine_take_script_form_submission(engine, &action));
     browser_engine_destroy(engine);
     return 0;
 }
@@ -1521,6 +1629,15 @@ int test_native_form_submission_large_bodies(void)
                the fixture matches only the exact body's hash. */
             char error[256] = {0};
             NavigationSession *navigation = browser_engine_navigation(engine);
+            ControllerAction refused = {0};
+            lxb_dom_node_t *submitter = form_test_node(engine, "go");
+            budget_inject_failure_after(navigation->budget, 0u);
+            bool built = controller_build_form_action(
+                browser_engine_controller(engine), submitter->parent,
+                submitter, true, &refused);
+            budget_clear_failure_injection(navigation->budget);
+            CHECK(!built && refused.type == CONTROLLER_ACTION_NONE
+                && refused.form_not_sent && refused.body_length == 0);
             CHECK(fetch_trace_replay_begin_response_keyed(
                 TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-form-large",
                 error, sizeof(error)));
@@ -1553,6 +1670,46 @@ int test_native_form_submission_large_bodies(void)
         browser_engine_destroy(engine);
     }
     free(page);
+
+    /* Without an authored value, option text uses the DOM text arena.
+       Substitute a populated small arena during serialization so the
+       temporary copy reliably needs a new Budget allocation, even if the
+       real arena happens to have space or a suitable cached block. */
+    static const char option_page[] =
+        "<!doctype html><form method=post action='/step'>"
+        "<select name=pick><option selected>"
+        "abcdefghijklmnopqrstuvwxabcdefghijklmnopqrstuvwxyz"
+        "abcdefghijklmnopqrstuvwxyz</select>"
+        "<button id=go name=go value=Go>Go</button></form>";
+    BrowserEngine *engine = form_test_engine(
+        false, option_page, sizeof(option_page) - 1u);
+    CHECK(engine != NULL);
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    lxb_dom_node_t *submitter = form_test_node(engine, "go");
+    CHECK(submitter != NULL);
+    lexbor_mraw_t scratch = {0};
+    CHECK(lexbor_mraw_init(&scratch, 32u) == LXB_STATUS_OK
+        && lexbor_mraw_alloc(&scratch, 16u) != NULL);
+    lxb_dom_document_t *dom = submitter->owner_document;
+    lexbor_mraw_t *text_arena = dom->text;
+    dom->text = &scratch;
+    size_t injected_before = navigation->budget->injected_failure_count;
+    budget_inject_failure_after(navigation->budget, 0u);
+    ControllerAction action = {0};
+    bool built = controller_build_form_action(browser_engine_controller(engine),
+        submitter->parent, submitter, true, &action);
+    budget_clear_failure_injection(navigation->budget);
+    dom->text = text_arena;
+    lexbor_mraw_destroy(&scratch, false);
+    CHECK(navigation->budget->injected_failure_count == injected_before + 1u);
+    CHECK(!built && action.type == CONTROLLER_ACTION_NONE
+        && action.form_not_sent && action.body_length == 0);
+    CHECK(controller_build_form_action(browser_engine_controller(engine),
+        submitter->parent, submitter, true, &action)
+        && strcmp(controller_action_body(&action),
+            "pick=abcdefghijklmnopqrstuvwxabcdefghijklmnopqrstuvwxyz"
+            "abcdefghijklmnopqrstuvwxyz&go=Go") == 0);
+    browser_engine_destroy(engine);
     return 0;
 }
 
@@ -1563,7 +1720,8 @@ int test_form_submitter_overrides(void)
         "<!doctype html><form id=f method=post action='/form'>"
         "<input name=a value=1>"
         "<button id=other formaction='/other'>O</button>"
-        "<button id=get formaction='/got' formmethod=get>G</button></form>"
+        "<button id=get formaction='/got?stale=1#done' formmethod=get "
+        "formenctype='multipart/form-data'>G</button></form>"
         "<form method=get action='/q'><input name=a value=1>"
         "<button id=post formmethod=post>P</button></form>";
     for (unsigned script = 0; script < 2; script++) {
@@ -1577,13 +1735,65 @@ int test_form_submitter_overrides(void)
             && strcmp(action.method, "POST") == 0);
         CHECK(browser_engine_focus_node(engine, form_test_node(engine, "get"))
             && browser_engine_activate(engine, &action)
-            && strcmp(action.url, "https://form.test/got?a=1") == 0
+            && strcmp(action.url, "https://form.test/got?a=1#done") == 0
             && strcmp(action.method, "GET") == 0);
         CHECK(browser_engine_focus_node(engine, form_test_node(engine, "post"))
             && browser_engine_activate(engine, &action)
             && strcmp(action.url, "https://form.test/q") == 0
             && strcmp(action.method, "POST") == 0
             && strcmp(controller_action_body(&action), "a=1") == 0);
+        browser_engine_destroy(engine);
+    }
+    static const char ownership[] =
+        "<!doctype html><input form=f name=before value=outside>"
+        "<form id=f method=post action='/send'>"
+        "<input id=inside name=inside value='a*b~'>"
+        "<input form=other name=skip value=wrong>"
+        "<select multiple name=pick><option selected value=one>One"
+        "<optgroup disabled><option selected value=bad>Bad</optgroup>"
+        "<option selected>two</select>"
+        "<select multiple name=empty><option>unselected</select></form>"
+        "<form id=other></form>"
+        "<button id=external form=f name=submit value=external>Go</button>";
+    BrowserEngine *engine = form_test_engine(false, ownership,
+                                               sizeof(ownership) - 1u);
+    CHECK(engine != NULL);
+    ControllerAction action = {0};
+    CHECK(browser_engine_focus_node(engine, form_test_node(engine, "inside"))
+        && browser_engine_activate(engine, &action)
+        && strcmp(controller_action_body(&action),
+                  "before=outside&inside=a*b%7E&pick=one&pick=two"
+                  "&submit=external") == 0);
+    browser_engine_destroy(engine);
+
+    static const char encodings[] =
+        "<!doctype html><form id=f method=post action='/send'>"
+        "<textarea name=a>x\ny</textarea>"
+        "<button id=plain formenctype='text/plain'>Plain</button>"
+        "<button id=multipart formenctype='multipart/form-data'>Multi</button>"
+        "</form><script>document.getElementById('f').addEventListener("
+        "'formdata',e=>e.formData.set('a','changed\\nline'))</script>";
+    for (unsigned script = 0; script < 2; script++) {
+        engine = form_test_engine(script != 0, encodings, sizeof(encodings) - 1u);
+        CHECK(engine != NULL);
+        CHECK(browser_engine_focus_node(engine, form_test_node(engine, "plain"))
+            && browser_engine_activate(engine, &action)
+            && strcmp(action.content_type, "text/plain") == 0
+            && strcmp(controller_action_body(&action),
+                      script ? "a=changed\r\nline\r\n" : "a=x\r\ny\r\n") == 0);
+        CHECK(browser_engine_focus_node(engine, form_test_node(engine, "multipart"))
+            && browser_engine_activate(engine, &action));
+        static const char mime[] = "multipart/form-data; boundary=";
+        CHECK(strncmp(action.content_type, mime, sizeof(mime) - 1u) == 0);
+        char expected[192];
+        const char *boundary = action.content_type + sizeof(mime) - 1u;
+        int expected_length = snprintf(expected, sizeof(expected),
+            "--%s\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n"
+            "%s\r\n--%s--\r\n", boundary,
+            script ? "changed\r\nline" : "x\r\ny", boundary);
+        CHECK(expected_length > 0
+            && (size_t) expected_length == action.body_length
+            && memcmp(controller_action_body(&action), expected, action.body_length) == 0);
         browser_engine_destroy(engine);
     }
     return 0;
@@ -2499,9 +2709,15 @@ int test_given_up_deferred_batch_keeps_script_images(void)
     lxb_dom_node_t *late = test_reader_find_id(root, "late");
     CHECK(late != NULL && image_resource_available(
         images_find_node(&nav->page.images, late)));
-    /* The earlier script image and its accounting survive the give-up. */
+    /* The earlier script image and its accounting survive the give-up. The
+       given-up batch returns the attempts of its unpublished requests (its
+       targets are charged again when they are admitted again), so the late
+       image's attempt can stand in for one of them; the late icon is an
+       exempt attempt, which the batch's photographs are not, so the exempt
+       count shows it was charged. */
     CHECK(image_resource_available(images_find_node(&nav->page.images, early)));
-    CHECK(nav->page.images.stats.attempted > with_early.attempted
+    CHECK(nav->page.images.stats.count_exempt > with_early.count_exempt);
+    CHECK(nav->page.images.stats.attempted >= with_early.attempted
         && nav->page.images.stats.loaded > with_early.loaded
         && nav->page.images.stats.decoded_bytes > with_early.decoded_bytes);
     /* And the batch still loads afterwards. */
@@ -2566,6 +2782,66 @@ int test_filtered_page_fixed_images_publish_by_paint(void)
     CHECK(!nav->page.image_continuation_pending
         && nav->performance.background_images_loaded == 2u
         && nav->performance.background_image_failures == 0);
+    CHECK(nav->performance.background_image_relayouts == flows
+        && nav->incremental_relayouts > publications);
+    CHECK(browser_engine_render_frame(engine, NULL));
+    size_t count = 0;
+    const uint16_t *pixels = browser_engine_framebuffer(engine, &count);
+    CHECK(pixels != NULL && count != 0);
+    uint64_t painted = frame_checksum(pixels, count);
+    CHECK(navigation_relayout(nav) && browser_engine_render_frame(engine, NULL));
+    size_t reference_count = 0;
+    const uint16_t *reference = browser_engine_framebuffer(engine, &reference_count);
+    CHECK(reference_count == count
+        && frame_checksum(reference, reference_count) == painted);
+    fetch_trace_end();
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* A card photo positioned to fill a placeholder its container sizes (width
+   and height 100% of its containing block) has a box that does not depend
+   on the photo. It is painted into that box when it arrives, without a flow,
+   and the frame matches what a full relayout draws. */
+int test_positioned_card_images_publish_by_paint(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = true;
+    config.resources.web_fonts_enabled = false;
+    config.resources.maximum_images = 12;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL && fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-positioned-image-slots",
+        error, sizeof(error)));
+    CHECK(browser_engine_load_url(engine, "https://positioned-images.test/page", true));
+    NavigationSession *nav = browser_engine_navigation(engine);
+    lxb_dom_node_t *root = lxb_dom_interface_node(nav->page.document.html);
+    lxb_dom_node_t *first = test_reader_find_id(root, "first");
+    lxb_dom_node_t *second = test_reader_find_id(root, "second");
+    CHECK(first != NULL && second != NULL && nav->page.loaded
+        && nav->page.image_continuation_pending
+        && nav->page.deferred_image_count == 2u
+        && browser_engine_render_frame(engine, NULL));
+    size_t flows = nav->performance.background_image_relayouts;
+    size_t publications = nav->incremental_relayouts;
+    for (unsigned pump = 0; nav->page.image_continuation_pending && pump < 1024;
+         pump++) {
+        bool changed = false;
+        (void) browser_engine_run_deferred_image_work(engine, &changed);
+    }
+    CHECK(!nav->page.image_continuation_pending
+        && nav->performance.background_images_loaded == 2u
+        && nav->performance.background_image_failures == 0
+        && image_resource_available(images_find_node(&nav->page.images, first))
+        && image_resource_available(images_find_node(&nav->page.images, second)));
     CHECK(nav->performance.background_image_relayouts == flows
         && nav->incremental_relayouts > publications);
     CHECK(browser_engine_render_frame(engine, NULL));

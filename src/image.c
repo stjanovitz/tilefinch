@@ -107,9 +107,9 @@ typedef struct {
     uint64_t source_hash;
     uint16_t display_width;
     uint16_t display_height;
-    /* CSS background only (image_note_background_area): the painting area
-       in the page's last layout, zero when unknown, and its
-       background-size. */
+    /* CSS background (image_note_background_area) or mask
+       (image_note_mask_area): the painting area, zero when unknown, and
+       its background-size or mask-size. */
     uint16_t background_area_width;
     uint16_t background_area_height;
     uint16_t background_size_width;
@@ -126,6 +126,7 @@ typedef struct {
     uint64_t url_hash;
     char *url;
     size_t reserved_bytes;
+    size_t admission_free_bytes;
     size_t last_received_bytes;
     long last_status_code;
     unsigned last_replay_delay_pumps;
@@ -133,6 +134,8 @@ typedef struct {
     double last_progress_ms;
     bool no_progress_cancelled;
     bool from_resource_cache;
+    /* A short data: URL, which spends no slot of the image count. */
+    bool count_exempt;
     bool resource_grant_valid;
     TilefinchResourceGrant resource_grant;
     /* A scheduler completion whose metadata probe encountered the decode
@@ -140,6 +143,9 @@ typedef struct {
     FetchResult *retained_result;
     bool retained_success;
     bool response_side_effects_applied;
+    /* Its attempt is in the job's last commit (images_priority_load_commit_
+       progress), so a rollback does not return it. */
+    bool charge_committed;
     PendingImageTarget *targets;
     size_t target_count;
     size_t target_capacity;
@@ -306,7 +312,9 @@ static TilefinchRequestContext image_request_context(
     return (TilefinchRequestContext) {
         .target_url = url,
         .initiator_url = context == NULL ? NULL : context->document_url,
-        .top_level_url = context == NULL ? NULL : context->document_url,
+        .top_level_url = context == NULL ? NULL
+            : context->images != NULL && context->images->top_level_url != NULL
+            ? context->images->top_level_url : context->document_url,
         .method = "GET",
         .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
         .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
@@ -749,24 +757,31 @@ static uint64_t image_hash_bytes(const char *data, size_t length)
     return fnv1a64(UINT64_C(1469598103934665603), data, length);
 }
 
+static bool image_noscript_placeholder_empty(const lxb_dom_node_t *node);
+
 /* Records that `node`'s source `source_hash` failed for good, for its
-   error event (ImageResources.failures); only an <img> element has one. A
-   full list, or a Budget without room, drops the record, and the image
-   then never reports the failure, as one past the table never loads. */
+   error event (ImageResources.failures); only an <img> element has one,
+   and an empty <noscript> placeholder (image_noscript_placeholder_source),
+   so that its fallback is not requested again. A full list, or a Budget
+   without room, drops the record, and the image then never reports the
+   failure, as one past the table never loads. */
 static void image_note_failure(ImageResources *images, Budget *budget,
                                lxb_dom_node_t *node, uint64_t source_hash,
                                bool is_mask, bool is_background,
-                               PseudoElement pseudo)
+                               PseudoElement pseudo, bool charged)
 {
     if (images == NULL || budget == NULL || node == NULL || is_mask
         || is_background || pseudo != PSEUDO_NONE
         || node->type != LXB_DOM_NODE_TYPE_ELEMENT
-        || node->ns != LXB_NS_HTML || node->local_name != LXB_TAG_IMG)
+        || node->ns != LXB_NS_HTML
+        || (node->local_name != LXB_TAG_IMG
+            && !image_noscript_placeholder_empty(node)))
         return;
     for (size_t i = 0; i < images->failure_count; i++) {
         /* Updated in place; a rollback keeps the newer failure. */
         if (images->failures[i].node != node) continue;
         images->failures[i].source_hash = source_hash;
+        images->failures[i].charged |= charged;
         return;
     }
     if (images->failure_count == images->failure_capacity) {
@@ -786,7 +801,7 @@ static void image_note_failure(ImageResources *images, Budget *budget,
     }
     images->failures[images->failure_count++] = (struct ImageFailure) {
         .node = node, .source_hash = source_hash,
-        .serial = images->failure_serial++
+        .serial = images->failure_serial++, .charged = charged
     };
 }
 
@@ -845,17 +860,146 @@ static void image_failures_rollback(ImageResources *images,
     images->failure_serial = retained_serial;
 }
 
-/* Records the failure of a request's targets (image_note_failure). */
+/* Records the failure of a request's targets (image_note_failure). The
+   request's slot of the image count is its first target's, unless it was
+   `exempt`. */
 static void image_note_targets_failure(ImageLoadContext *context,
                                        const PendingImageTarget *targets,
-                                       size_t target_count)
+                                       size_t target_count, bool exempt)
 {
     for (size_t i = 0; i < target_count; i++) {
         const PendingImageTarget *target = &targets[i];
         image_note_failure(context->images, context->budget, target->node,
                            target->source_hash, target->is_mask,
-                           target->is_background, target->pseudo);
+                           target->is_background, target->pseudo,
+                           i == 0 && !exempt);
     }
+}
+
+/* Remembers `node` as one whose raster memory refused, until
+   `retry_free_bytes` Budget bytes are free (ImageResources.memory_refusals). */
+static void image_memory_refusal_add(ImageResources *images,
+                                     const lxb_dom_node_t *node,
+                                     size_t retry_free_bytes)
+{
+    struct ImageMemoryRefusal *slot = NULL;
+    for (size_t i = 0; i < IMAGE_MEMORY_REFUSAL_LIMIT && slot == NULL; i++)
+        if (images->memory_refusals[i].node == node)
+            slot = &images->memory_refusals[i];
+    if (slot == NULL) {
+        slot = &images->memory_refusals[images->memory_refusal_next];
+        images->memory_refusal_next = (uint8_t)
+            ((images->memory_refusal_next + 1u) % IMAGE_MEMORY_REFUSAL_LIMIT);
+    }
+    *slot = (struct ImageMemoryRefusal) {node, retry_free_bytes};
+}
+
+/* A refusal with no known Budget shortfall (e.g. worker startup failure)
+   should not spin at unchanged pressure. Don't wait a whole arena again. */
+#define IMAGE_MEMORY_RETRY_STEP (64u * 1024u)
+#define IMAGE_SVG_INTRINSIC_CSS_RECALL_KEY 1u
+
+static uint32_t image_svg_target_key(const ImageLoadContext *context,
+                                     const PendingImageTarget *target);
+static PendingImageTarget image_pending_target(
+    const ImageLoadContext *context, lxb_dom_node_t *node, uint64_t source_hash,
+    bool is_mask, bool is_background, PseudoElement pseudo);
+
+static void image_svg_limit_note(ImageLoadContext *context,
+                                const PendingImageFetch *pending,
+                                size_t decoded_room,
+                                const PendingImageTarget *limited_target,
+                                bool intrinsic_css,
+                                ImageSvgLimit limit)
+{
+    ImageResources *images = context->images;
+    uint32_t key = intrinsic_css ? IMAGE_SVG_INTRINSIC_CSS_RECALL_KEY
+        : limited_target != NULL
+        ? image_svg_target_key(context, limited_target) : 0;
+    struct ImageSvgLimitRecall *slot = NULL;
+    for (size_t i = 0; i < IMAGE_SVG_LIMIT_RECALL && slot == NULL; i++)
+        if (images->svg_limit_recalls[i].url_hash == pending->url_hash
+            && images->svg_limit_recalls[i].target_key == key)
+            slot = &images->svg_limit_recalls[i];
+    if (slot == NULL) {
+        slot = &images->svg_limit_recalls[images->svg_limit_recall_next];
+        images->svg_limit_recall_next = (uint8_t)
+            ((images->svg_limit_recall_next + 1u) % IMAGE_SVG_LIMIT_RECALL);
+    }
+    size_t retry_room = limit.reason == IMAGE_SVG_LIMIT_SIZE
+        && decoded_room < SIZE_MAX ? decoded_room + 1u : SIZE_MAX;
+    bool budget_limited = limit.reason == IMAGE_SVG_LIMIT_BUDGET;
+    if (budget_limited) {
+        size_t needed = limit.budget_shortfall != 0
+            ? limit.budget_shortfall : IMAGE_MEMORY_RETRY_STEP;
+        size_t admission_free = pending->admission_free_bytes;
+        if (needed <= SIZE_MAX - admission_free)
+            retry_room = admission_free + needed;
+    }
+    *slot = (struct ImageSvgLimitRecall) {
+        pending->url_hash, retry_room, key, budget_limited
+    };
+}
+
+/* Remember the resource that actually blocked decode. Decoded bytes held
+   alone cannot describe a changed quota, Budget, or requested paint size. */
+static bool image_svg_limit_waits(ImageLoadContext *context, uint64_t url_hash,
+                                   lxb_dom_node_t *node, bool is_mask,
+                                   bool is_background, PseudoElement pseudo)
+{
+    ImageResources *images = context->images;
+    uint32_t target_key = 0;
+    for (size_t i = 0; i < IMAGE_SVG_LIMIT_RECALL; i++) {
+        struct ImageSvgLimitRecall *recall = &images->svg_limit_recalls[i];
+        if (recall->url_hash != url_hash || url_hash == 0) continue;
+        if (recall->target_key == IMAGE_SVG_INTRINSIC_CSS_RECALL_KEY) {
+            if (!is_mask && !is_background) continue;
+        } else if (recall->target_key != 0) {
+            if (target_key == 0) {
+                PendingImageTarget target = image_pending_target(
+                    context, node, 0, is_mask, is_background, pseudo);
+                target_key = image_svg_target_key(context, &target);
+            }
+            if (target_key != recall->target_key) continue;
+        }
+        size_t room = recall->budget_limited ? budget_remaining(context->budget)
+            : context->maximum_decoded_bytes > images->stats.decoded_bytes
+            ? context->maximum_decoded_bytes - images->stats.decoded_bytes : 0;
+        if (room < recall->retry_room) return true;
+        recall->url_hash = 0;
+    }
+    return false;
+}
+
+static void image_note_memory_refusal(ImageLoadContext *context,
+                                      const ImagePendingRasterDecode *pending,
+                                      size_t free_at_refusal,
+                                      size_t refused_charge)
+{
+    /* At the next look, the transaction's own staging will be gone.
+       Only wait for the shortfall that remained with the request in hand. */
+    size_t needed = refused_charge > free_at_refusal
+        ? refused_charge - free_at_refusal : IMAGE_MEMORY_RETRY_STEP;
+    size_t free = budget_remaining(context->budget);
+    if (pending->targets != NULL)
+        free += budget_malloc_charge(budget_usable_size(pending->targets));
+    if (pending->url != NULL)
+        free += budget_malloc_charge(budget_usable_size(pending->url));
+    size_t retry = needed <= SIZE_MAX - free ? free + needed : SIZE_MAX;
+    for (size_t i = 0; i < pending->target_count; i++)
+        image_memory_refusal_add(context->images, pending->targets[i].node,
+                                 retry);
+    const char *url = pending->url == NULL ? "" : pending->url;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    char message[256];
+    snprintf(message, sizeof(message),
+             "tilefinch-image-memory-refused: free=%zu required=%zu "
+             "targets=%zu url=%.160s", free_at_refusal, refused_charge,
+             pending->target_count, url);
+    tilefinch_platform_log_message(message);
+#else
+    image_trace("decode-memory-refused", url, strlen(url));
+#endif
 }
 
 /* Records a failed fetch's targets. */
@@ -863,7 +1007,7 @@ static void image_note_pending_failure(ImageLoadContext *context,
                                        const PendingImageFetch *pending)
 {
     image_note_targets_failure(context, pending->targets,
-                               pending->target_count);
+                               pending->target_count, pending->count_exempt);
 }
 
 static bool image_add(ImageResources *images, ImageResource resource)
@@ -1817,7 +1961,7 @@ static int image_refresh_borrow(ImageLoadContext *context,
     borrowed.owns_pixels = false;
     borrowed.owns_encoded = false;
     borrowed.borrows_previous = true;
-    if (!lender_retained) borrowed.reused_raster_count_exempt = true;
+    if (!lender_retained) borrowed.count_exempt_surface = true;
     if (!image_add(images, borrowed)) return -1;
     image_trace(lender_retained ? "svg-refresh-alias" : "svg-refresh-adopt",
                 "", 0);
@@ -2408,9 +2552,76 @@ static const char *image_lazy_source(lxb_dom_node_t *node, size_t *length)
     return NULL;
 }
 
-static const char *image_select_source_for_width(
+/* `node`'s <noscript> fallback source (see image_noscript_arm) once the
+   document is armed: what its <noscript> sibling's <img> would load. */
+static const char *image_noscript_source(const Stylesheet *stylesheet,
+                                         lxb_dom_node_t *node,
+                                         size_t *length)
+{
+    *length = 0;
+    if (stylesheet == NULL || stylesheet->noscript_images == NULL)
+        return NULL;
+    const char *source = image_noscript_markup_source(
+        stylesheet->noscript_images, node, length);
+    if (source != NULL && image_lazy_source_is_url(source, *length))
+        return source;
+    *length = 0;
+    return NULL;
+}
+
+/* Elements that never paint a background image as an empty placeholder:
+   replaced content, form controls, and what renders nothing. */
+static bool image_noscript_placeholder_tag(const lxb_dom_node_t *node)
+{
+    switch (node->local_name) {
+    case LXB_TAG_IMG: case LXB_TAG_PICTURE: case LXB_TAG_SVG:
+    case LXB_TAG_VIDEO: case LXB_TAG_AUDIO: case LXB_TAG_CANVAS:
+    case LXB_TAG_IFRAME: case LXB_TAG_EMBED: case LXB_TAG_OBJECT:
+    case LXB_TAG_INPUT: case LXB_TAG_TEXTAREA: case LXB_TAG_SELECT:
+    case LXB_TAG_BUTTON: case LXB_TAG_SOURCE: case LXB_TAG_SCRIPT:
+    case LXB_TAG_STYLE: case LXB_TAG_TEMPLATE: case LXB_TAG_NOSCRIPT:
+    case LXB_TAG_BR: case LXB_TAG_HR: case LXB_TAG_HTML: case LXB_TAG_BODY:
+        return false;
+    default:
+        return node->ns == LXB_NS_HTML;
+    }
+}
+
+/* An element that can stand empty in place of a picture, and is: a page
+   whose own loader filled it in (an <img> child, text) shows that. */
+static bool image_noscript_placeholder_empty(const lxb_dom_node_t *node)
+{
+    if (node->type != LXB_DOM_NODE_TYPE_ELEMENT
+        || !image_noscript_placeholder_tag(node)) return false;
+    unsigned visited = 0;
+    for (lxb_dom_node_t *child = node->first_child; child != NULL;
+         child = child->next) {
+        if (++visited > 8u || child->type == LXB_DOM_NODE_TYPE_ELEMENT)
+            return false;
+        size_t text_length = 0;
+        const char *text = child->type == LXB_DOM_NODE_TYPE_TEXT
+            ? document_text_data(child, &text_length) : NULL;
+        for (size_t at = 0; text != NULL && at < text_length; at++)
+            if (!isspace((unsigned char) text[at])) return false;
+    }
+    return true;
+}
+
+const char *image_noscript_placeholder_source(const Stylesheet *stylesheet,
+                                              lxb_dom_node_t *node,
+                                              size_t *length)
+{
+    if (length == NULL) return NULL;
+    *length = 0;
+    if (stylesheet == NULL || stylesheet->noscript_images == NULL
+        || node == NULL || !image_noscript_placeholder_empty(node))
+        return NULL;
+    return image_noscript_source(stylesheet, node, length);
+}
+
+static const char *image_select_source_impl(
     const Stylesheet *stylesheet, lxb_dom_node_t *node, int layout_width,
-    size_t *length)
+    bool noscript, size_t *length)
 {
     if (length == NULL) return NULL;
     *length = 0;
@@ -2460,9 +2671,42 @@ static const char *image_select_source_for_width(
         *length = lazy_length;
         return lazy;
     }
+    size_t fallback_length = 0;
+    const char *fallback = noscript && node->local_name == LXB_TAG_IMG
+        ? image_noscript_source(stylesheet, node, &fallback_length) : NULL;
+    if (fallback != NULL) {
+        *length = fallback_length;
+        return fallback;
+    }
     if (selected != NULL) return selected;
     *length = source_length;
     return source;
+}
+
+static const char *image_select_source_for_width(
+    const Stylesheet *stylesheet, lxb_dom_node_t *node, int layout_width,
+    size_t *length)
+{
+    return image_select_source_impl(stylesheet, node, layout_width, true,
+                                    length);
+}
+
+const char *image_select_author_source(const Stylesheet *stylesheet,
+                                       lxb_dom_node_t *node, size_t *length)
+{
+    return image_select_source_impl(stylesheet, node, 0, false, length);
+}
+
+bool image_noscript_fallback_shown(const Stylesheet *stylesheet,
+                                   lxb_dom_node_t *node)
+{
+    size_t length = 0, author_length = 0;
+    if (stylesheet == NULL || stylesheet->noscript_images == NULL
+        || node == NULL || node->local_name != LXB_TAG_IMG) return false;
+    const char *source = image_select_source(stylesheet, node, &length);
+    const char *author = image_select_author_source(stylesheet, node,
+                                                    &author_length);
+    return source != NULL && source != author;
 }
 
 uint64_t image_source_hash(const char *source, size_t length)
@@ -2504,6 +2748,55 @@ static bool svg_response(const FetchResult *fetched)
     return svg_markup(fetched->content_type, fetched->data, fetched->length);
 }
 
+static PendingImageTarget image_pending_target(
+    const ImageLoadContext *context, lxb_dom_node_t *node, uint64_t source_hash,
+    bool is_mask, bool is_background, PseudoElement pseudo)
+{
+    return (PendingImageTarget) {
+        .node = node,
+        .source_hash = source_hash,
+        .display_width = context->current_display_width,
+        .display_height = context->current_display_height,
+        .background_area_width = is_background || is_mask
+            ? context->current_background_area_width : 0,
+        .background_area_height = is_background || is_mask
+            ? context->current_background_area_height : 0,
+        .background_size_width = context->current_background_size_width,
+        .background_size_height = context->current_background_size_height,
+        .background_size_flags = context->current_background_size_flags,
+        .background_fit = context->current_background_fit,
+        .is_mask = is_mask,
+        .is_background = is_background,
+        .pseudo = pseudo
+    };
+}
+
+static uint32_t image_svg_target_key(const ImageLoadContext *context,
+                                     const PendingImageTarget *target)
+{
+    const ImageLayoutBoxes *boxes = context->layout_boxes;
+    /* No node identity: multiple same-sized uses of one source must all
+       observe the same refusal. Dimensions and CSS sizing affect admission. */
+    bool css = target->is_mask || target->is_background;
+    uint32_t values[] = {
+        css ? target->background_area_width : target->display_width,
+        css ? target->background_area_height : target->display_height,
+        css ? target->background_size_width : 0,
+        css ? target->background_size_height : 0,
+        css ? target->background_size_flags : 0,
+        css ? target->background_fit : 0,
+        target->is_mask, target->is_background, (uint32_t) target->pseudo,
+        (uint32_t) context->viewport_width,
+        boxes == NULL ? 1u : (uint32_t) boxes->scale_numerator,
+        boxes == NULL ? 1u : (uint32_t) boxes->scale_denominator,
+        target->is_background && boxes != NULL && boxes->decode_after_layout
+    };
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < sizeof(values) / sizeof(*values); i++)
+        hash = (hash ^ values[i]) * 16777619u;
+    return hash > IMAGE_SVG_INTRINSIC_CSS_RECALL_KEY ? hash : 2u;
+}
+
 static bool pending_add_target(ImageLoadContext *context,
                                PendingImageFetch *pending,
                                lxb_dom_node_t *node, uint64_t source_hash,
@@ -2526,23 +2819,8 @@ static bool pending_add_target(ImageLoadContext *context,
         pending->targets = targets;
         pending->target_capacity = capacity;
     }
-    pending->targets[pending->target_count++] = (PendingImageTarget) {
-        .node = node,
-        .source_hash = source_hash,
-        .display_width = context->current_display_width,
-        .display_height = context->current_display_height,
-        .background_area_width = is_background && !is_mask
-            ? context->current_background_area_width : 0,
-        .background_area_height = is_background && !is_mask
-            ? context->current_background_area_height : 0,
-        .background_size_width = context->current_background_size_width,
-        .background_size_height = context->current_background_size_height,
-        .background_size_flags = context->current_background_size_flags,
-        .background_fit = context->current_background_fit,
-        .is_mask = is_mask,
-        .is_background = is_background,
-        .pseudo = pseudo
-    };
+    pending->targets[pending->target_count++] = image_pending_target(
+        context, node, source_hash, is_mask, is_background, pseudo);
     return true;
 }
 
@@ -2646,20 +2924,87 @@ static bool image_background_decode_target(
 
 typedef struct {
     const PendingImageFetch *pending;
+    const ImageLayoutBoxes *boxes;
     int viewport_width;
     size_t decoded_limit;
+    /* Set by the decoder's painted call: the document has no natural
+       size. */
+    bool no_natural_size;
+    /* A mixed pending group may fail on just one target. Remember the
+       geometry that actually requires the raster, not whichever use
+       happened to start the request. */
+    const PendingImageTarget *limit_target;
 } ImageSvgOversizeContext;
 
-static bool image_svg_oversize_target(void *opaque, int source_width,
-                                      int source_height, int *width,
-                                      int *height)
+/* The device-pixel raster an SVG with no natural size paints at in every
+   use waiting for it, when each is a mask or a background whose area is
+   known (pending_add_target) and that sizes it by contain, cover or auto
+   (which contains its ratio, layout_image_auto_size), never by an authored
+   mask-size or background-size that may address part of a sprite sheet:
+   the largest tile among them. */
+static bool image_svg_painted_target(ImageSvgOversizeContext *context,
+                                     int source_width, int source_height,
+                                     int *width, int *height)
 {
-    const ImageSvgOversizeContext *context = opaque;
+    const PendingImageFetch *pending = context->pending;
+    int numerator = context->boxes != NULL
+        ? context->boxes->scale_numerator : 1;
+    int denominator = context->boxes != NULL
+        ? context->boxes->scale_denominator : 1;
+    int painted_width = 0, painted_height = 0;
+    for (size_t i = 0; i < pending->target_count; i++) {
+        const PendingImageTarget *target = &pending->targets[i];
+        uint8_t fit = target->background_fit == LAYOUT_IMAGE_FIT_STRETCH
+            ? LAYOUT_IMAGE_FIT_CONTAIN : target->background_fit;
+        int tile_width = 0, tile_height = 0;
+        if ((!target->is_mask && !target->is_background)
+            || target->background_area_width == 0
+            || target->background_area_height == 0
+            || (target->background_size_flags
+                & STYLE_BACKGROUND_SIZE_EXPLICIT) != 0
+            || (fit != LAYOUT_IMAGE_FIT_CONTAIN
+                && fit != LAYOUT_IMAGE_FIT_COVER)
+            || !layout_background_raster_size(
+                   fit, 0, 0, 0, target->background_area_width,
+                   target->background_area_height, numerator, denominator,
+                   source_width, source_height, &tile_width, &tile_height)
+            || tile_width <= 0 || tile_height <= 0
+            || (size_t) tile_width
+                   > context->decoded_limit / 4u / (size_t) tile_height) {
+            context->limit_target = target;
+            return false;
+        }
+        if (tile_width > painted_width || tile_height > painted_height)
+            context->limit_target = target;
+        if (tile_width > painted_width) painted_width = tile_width;
+        if (tile_height > painted_height) painted_height = tile_height;
+    }
+    if (painted_width <= 0 || painted_height <= 0
+        || (size_t) painted_width * (size_t) painted_height
+               > context->decoded_limit / 4u) return false;
+    *width = painted_width;
+    *height = painted_height;
+    return true;
+}
+
+static bool image_svg_oversize_target(void *opaque, int source_width,
+                                      int source_height, bool painted,
+                                      int *width, int *height)
+{
+    ImageSvgOversizeContext *context = opaque;
+    if (painted) {
+        context->no_natural_size = true;
+        return image_svg_painted_target(context, source_width,
+                                        source_height, width, height);
+    }
     /* Backgrounds and masks can address a sprite subrectangle; shrinking
        those before layout would change their coordinate system. */
     for (size_t i = 0; i < context->pending->target_count; i++) {
         const PendingImageTarget *target = &context->pending->targets[i];
-        if (target->is_mask || target->is_background) return false;
+        if (target->is_mask || target->is_background) {
+            if (!context->no_natural_size) context->limit_target = target;
+            return false;
+        }
     }
     if (!image_layout_decode_target(context->pending, source_width,
                                    source_height, width, height)) {
@@ -2794,6 +3139,7 @@ static ImageDecodedCacheResult image_adopt_decoded_cache(
         .source_height = decoded.source_height,
         .width = decoded.width,
         .height = decoded.height,
+        .no_natural_size = decoded.no_natural_size,
         .cross_origin = image_response_cross_origin(
             context->document_url,
             browser_cache_entry_response_url(cached)),
@@ -2891,10 +3237,12 @@ static PendingImageFetch *pending_find_free(ImageLoadContext *context)
     return NULL;
 }
 
-static void image_pending_raster_release(ImageLoadContext *context)
+static void image_pending_raster_finish(ImageLoadContext *context,
+                                        bool refused, size_t refused_charge)
 {
     if (context == NULL || !context->raster_decode.active) return;
     ImagePendingRasterDecode *pending = &context->raster_decode;
+    size_t free_at_refusal = refused ? budget_remaining(context->budget) : 0;
     image_decode_worker_abandon(pending->token);
     image_resource_release_owned_pixels(context->budget, &pending->resource);
     if (pending->resource.owns_encoded) {
@@ -2904,9 +3252,17 @@ static void image_pending_raster_release(ImageLoadContext *context)
             budget_free(context->budget, pending->resource.encoded);
         }
     }
+    if (refused)
+        image_note_memory_refusal(context, pending, free_at_refusal,
+                                  refused_charge);
     budget_free(context->budget, pending->targets);
     budget_free(context->budget, pending->url);
     memset(pending, 0, sizeof(*pending));
+}
+
+static void image_pending_raster_release(ImageLoadContext *context)
+{
+    image_pending_raster_finish(context, false, 0);
 }
 
 static bool image_pending_raster_publish(
@@ -2927,12 +3283,14 @@ static bool image_pending_raster_publish(
            worker's arena or gate) stays a limit skip. */
         if (decoded->status == IMAGE_DECODE_DETERMINISTIC_FAILURE) {
             images->stats.unsupported++;
-            image_note_targets_failure(context, pending->targets,
-                                       pending->target_count);
+            image_note_targets_failure(
+                context, pending->targets, pending->target_count,
+                pending->resource.count_exempt_surface);
+            image_pending_raster_release(context);
         } else {
             images->stats.skipped_limit++;
+            image_pending_raster_finish(context, true, 0);
         }
-        image_pending_raster_release(context);
         return true;
     }
     resource->pixels = decoded->pixels;
@@ -2948,7 +3306,7 @@ static bool image_pending_raster_publish(
                 context->session, pending->url, &request_context,
                 resource->encoded, resource->encoded_length, pixel_body,
                 resource->source_width, resource->source_height,
-                resource->width, resource->height);
+                resource->width, resource->height, false);
         }
     }
     /* The encoded bytes stay with the resource (usually a lease on the HTTP
@@ -3015,8 +3373,31 @@ static ImagePriorityLoadStatus image_pending_raster_pump(
     ImagePendingRasterDecode *pending = &context->raster_decode;
     if (!pending->active) return IMAGE_PRIORITY_LOAD_COMPLETE;
     if (pending->token == 0) {
+        size_t refused_charge = 0;
         ImageDecodeSubmitResult submit = image_decode_worker_submit(
-            &pending->resource, context->budget, &pending->token);
+            &pending->resource, context->budget, &pending->token,
+            &refused_charge);
+        int width = pending->resource.width;
+        int height = pending->resource.height;
+        size_t needed = 0;
+        if (submit == IMAGE_DECODE_SUBMIT_REJECTED && refused_charge != 0
+            && pending->resource.full_width == 0
+            && image_decode_reduced_fallback(&pending->resource,
+                   context->budget, true, SIZE_MAX, &width, &height,
+                   &needed)) {
+            /* A full-scale decode the Budget refused decodes at half or a
+               quarter of the source instead and is painted larger; its
+               decoded bytes are what it holds. Display retargeting grows it
+               to the size asked for once that fits. */
+            pending->resource.full_width = pending->resource.width;
+            pending->resource.full_height = pending->resource.height;
+            pending->resource.width = width;
+            pending->resource.height = height;
+            pending->decoded_bytes = (size_t) width * (size_t) height * 4u;
+            submit = image_decode_worker_submit(
+                &pending->resource, context->budget, &pending->token,
+                &refused_charge);
+        }
         if (submit == IMAGE_DECODE_SUBMIT_ACCEPTED) {
             return IMAGE_PRIORITY_LOAD_PENDING;
         }
@@ -3026,7 +3407,8 @@ static ImagePriorityLoadStatus image_pending_raster_pump(
             return IMAGE_PRIORITY_LOAD_PENDING;
         }
         context->images->stats.skipped_limit++;
-        image_pending_raster_release(context);
+        image_pending_raster_finish(context,
+            submit == IMAGE_DECODE_SUBMIT_REJECTED, refused_charge);
         return IMAGE_PRIORITY_LOAD_COMPLETE;
     }
     ImageDecodeWorkerResult decoded = {0};
@@ -3196,13 +3578,19 @@ static bool finish_image_fetch(ImageLoadContext *context,
                                - images->stats.decoded_bytes;
     unsigned char *pixels = NULL;
     bool svg_limited = false;
+    ImageSvgLimit svg_limit = {0};
     bool svg_deferred = false, svg_far = false;
+    bool svg_no_natural_size = false;
+    const PendingImageTarget *svg_limit_target = NULL;
     /* The parse of a large SVG background left for the layout that follows,
        kept so that layout's raster does not parse it again. */
     ImageSvgParse *svg_parse = NULL;
     if (is_svg && (!external_use || external_symbol.data != NULL)) {
         ImageSvgOversizeContext oversize = {
-            pending, context->viewport_width, decoded_remaining
+            .pending = pending,
+            .boxes = context->layout_boxes,
+            .viewport_width = context->viewport_width,
+            .decoded_limit = decoded_remaining
         };
         ImageSvgDeferContext defer = {decode_length, decoded_remaining};
         bool deferrable = !external_use
@@ -3215,7 +3603,10 @@ static bool finish_image_fetch(ImageLoadContext *context,
             external_use ? NULL : image_svg_oversize_target, &oversize,
             deferrable ? image_svg_defer_background : NULL, &defer,
             &svg_source_width, &svg_source_height, &svg_limited,
-            &svg_deferred, keep_limit, keep_limit != 0 ? &svg_parse : NULL);
+            &svg_deferred, keep_limit, keep_limit != 0 ? &svg_parse : NULL,
+            &svg_limit);
+        svg_no_natural_size = oversize.no_natural_size;
+        svg_limit_target = oversize.limit_target;
         /* The decoder reclaims its own scratch, including what NanoSVG
            leaks on malformed input, through its allocation owner. Anything
            else allocated meanwhile (by a cooperation hook) is not ours. */
@@ -3239,6 +3630,21 @@ static bool finish_image_fetch(ImageLoadContext *context,
        decoder takes failed for good. */
     if (pixels == NULL && svg_limited) {
         images->stats.skipped_limit++;
+        if (svg_limit.reason != IMAGE_SVG_LIMIT_TRANSIENT) {
+            bool intrinsic_css = false;
+            if (svg_limit.reason == IMAGE_SVG_LIMIT_OTHER)
+                svg_limit_target = NULL;
+            else if (svg_limit_target != NULL && !svg_no_natural_size
+                     && (svg_limit_target->is_mask
+                         || svg_limit_target->is_background))
+                intrinsic_css = true;
+            else if (svg_limit_target == NULL
+                     && !external_use && !primary.is_mask
+                     && !primary.is_background)
+                svg_limit_target = pending->targets;
+            image_svg_limit_note(context, pending, decoded_remaining,
+                                 svg_limit_target, intrinsic_css, svg_limit);
+        }
         image_trace("svg-decode-limit", fetched->effective_url,
                     strlen(fetched->effective_url));
         fetch_result_destroy(fetched);
@@ -3354,7 +3760,10 @@ static bool finish_image_fetch(ImageLoadContext *context,
                                   fetched->effective_url),
                               .is_mask = primary.is_mask,
                               .is_background = primary.is_background,
+                              .no_natural_size = is_svg
+                                  && svg_no_natural_size,
                               .pseudo = primary.pseudo,
+                              .count_exempt_surface = pending->count_exempt,
                               .owns_pixels = is_svg};
     if (background_sized) {
         /* Display retargeting decodes it again at source size if a later
@@ -3385,7 +3794,8 @@ static bool finish_image_fetch(ImageLoadContext *context,
                 (void) browser_session_decoded_image_put(
                     context->session, pending->url, &request_context,
                     (const unsigned char *) fetched->data, fetched->length,
-                    pixel_body, source_width, source_height, width, height);
+                    pixel_body, source_width, source_height, width, height,
+                    resource.no_natural_size);
             }
         }
     }
@@ -3452,6 +3862,24 @@ static bool finish_image_fetch(ImageLoadContext *context,
            from repeatedly attempting an impossible late decode after the
            rest of the page has consumed the budget. */
         if ((context->eager_decode_rasters || is_webp) && !await_layout) {
+            /* A full-scale JPEG decode its frame header says the Budget
+               cannot hold decodes at half or a quarter of its source
+               instead, painted larger, rather than running into the limit. */
+            int fit_width = width, fit_height = height;
+            size_t needed = 0, full_decoded = decoded;
+            bool reduced = resource.full_width == 0
+                && image_decode_reduced_fallback(&resource, context->budget,
+                       false, SIZE_MAX, &fit_width, &fit_height, &needed)
+                && budget_pressure_required(context->budget, needed, 0);
+            if (reduced) {
+                /* Display retargeting grows it to this size once that
+                   fits. */
+                resource.full_width = width;
+                resource.full_height = height;
+                resource.width = width = fit_width;
+                resource.height = height = fit_height;
+                decoded = (size_t) width * (size_t) height * 4u;
+            }
             unsigned char *decoded_pixels = NULL;
             ImageDecodeStatus decode_status = image_resource_decode_checked(
                 &resource, context->budget, &decoded_pixels);
@@ -3472,11 +3900,19 @@ static bool finish_image_fetch(ImageLoadContext *context,
                             context->session, pending->url,
                             &request_context, resource.encoded,
                             resource.encoded_length, pixel_body,
-                            source_width, source_height, width, height);
+                            source_width, source_height, width, height,
+                            false);
                     }
                 }
                 /* Keep the encoded bytes (usually a lease on the HTTP
                    cache's copy) for display retargeting. */
+            } else if (reduced) {
+                /* Held encoded at the size asked for, as any refused
+                   decode is. */
+                resource.width = width = resource.full_width;
+                resource.height = height = resource.full_height;
+                resource.full_width = resource.full_height = 0;
+                decoded = full_decoded;
             } else if (is_webp) {
                 /* WebP is always attempted in the cooperative resource
                    continuation. If that bounded attempt cannot be admitted,
@@ -3716,13 +4152,21 @@ static bool finish_one_pending(ImageLoadContext *context, bool wait)
     }
 }
 
-static void cancel_pending(ImageLoadContext *context)
+/* Ends the in-flight requests. `park`: a released job's requests run on in
+   the scheduler for the next admission of the same request to adopt
+   (fetch_scheduler_park) instead of starting it again. */
+static void cancel_pending(ImageLoadContext *context, bool park)
 {
     for (size_t i = 0; i < IMAGE_FETCH_CONCURRENCY; i++) {
         PendingImageFetch *pending = &context->pending[i];
         if (pending->retained_result != NULL) {
             fetch_result_destroy(pending->retained_result);
             fetch_result_free(pending->retained_result);
+        } else if (park && fetch_scheduler_park(
+                       context->scheduler, pending->request_id,
+                       pending->url_hash)) {
+            image_trace("park", pending->url,
+                        pending->url == NULL ? 0 : strlen(pending->url));
         } else if (pending->request_id != 0) {
             (void) fetch_scheduler_cancel(context->scheduler,
                                           pending->request_id,
@@ -3923,7 +4367,7 @@ static bool load_image_node_with_provenance_impl(
         images->stats.failed++;
         if (source_base_url != NULL && referrer_source != NULL)
             image_note_failure(images, context->budget, node, source_hash,
-                               is_mask, is_background, pseudo);
+                               is_mask, is_background, pseudo, false);
         image_trace("invalid-source", source, source_length);
         return true;
     }
@@ -3946,7 +4390,7 @@ static bool load_image_node_with_provenance_impl(
                 TILEFINCH_DESTINATION_IMAGE, "data:")) {
             images->stats.failed++;
             image_note_failure(images, context->budget, node, source_hash,
-                               is_mask, is_background, pseudo);
+                               is_mask, is_background, pseudo, false);
             return true;
         }
         bool count_exempt = source_length <= IMAGE_COUNT_EXEMPT_DATA_URL_BYTES;
@@ -3977,6 +4421,7 @@ static bool load_image_node_with_provenance_impl(
                 .retarget_flags = duplicate->retarget_flags,
                 .full_width = duplicate->full_width,
                 .full_height = duplicate->full_height,
+                .no_natural_size = duplicate->no_natural_size,
                 .is_mask = is_mask,
                 .is_background = is_background,
                 .pseudo = pseudo,
@@ -4004,6 +4449,7 @@ static bool load_image_node_with_provenance_impl(
             &body_length, media_type, sizeof(media_type));
         images->stats.attempted++;
         if (count_exempt) images->stats.count_exempt++;
+        else images->stats.work++;
         if (decoded != DATA_URL_DECODED) {
             if (decoded == DATA_URL_TOO_LARGE) {
                 images->stats.skipped_limit++;
@@ -4013,14 +4459,14 @@ static bool load_image_node_with_provenance_impl(
                 images->stats.unsupported++;
                 image_note_failure(images, context->budget, node,
                                    source_hash, is_mask, is_background,
-                                   pseudo);
+                                   pseudo, !count_exempt);
             }
             budget_free(context->budget, body);
             image_trace("data-uri-invalid", source, 40);
             return true;
         }
         PendingImageFetch pending = {
-            .url_hash = hash
+            .url_hash = hash, .count_exempt = count_exempt
         };
         /* finish_image_fetch may transfer this target into the asynchronous
            JPEG worker.  Use the same budget-owned target storage as network
@@ -4081,7 +4527,7 @@ static bool load_image_node_with_provenance_impl(
                TILEFINCH_DESTINATION_IMAGE, resolved)) {
         images->stats.failed++;
         image_note_failure(images, context->budget, node, source_hash,
-                           is_mask, is_background, pseudo);
+                           is_mask, is_background, pseudo, false);
         return true;
     }
     uint64_t hash = image_hash_request(
@@ -4106,6 +4552,7 @@ static bool load_image_node_with_provenance_impl(
                                .retarget_flags = duplicate->retarget_flags,
                                .full_width = duplicate->full_width,
                                .full_height = duplicate->full_height,
+                               .no_natural_size = duplicate->no_natural_size,
                                .is_mask = is_mask,
                                .is_background = is_background,
                                .pseudo = pseudo,
@@ -4120,6 +4567,15 @@ static bool load_image_node_with_provenance_impl(
     };
     int borrowed = image_refresh_borrow(context, &role, hash);
     if (borrowed != 0) return borrowed > 0;
+    /* A remembered oversized use must not rejoin this URL's in-flight
+       request and keep blocking a different, affordable use. An already
+       decoded duplicate can still share its surface above. */
+    if (image_svg_limit_waits(context, hash, node, is_mask, is_background,
+                               pseudo)) {
+        images->stats.skipped_limit++;
+        image_trace("svg-limit-waits", resolved, strlen(resolved));
+        return true;
+    }
     PendingImageFetch *same = pending_find_hash(context, hash);
     if (same != NULL) {
         return pending_add_target(context, same, node, source_hash, is_mask,
@@ -4194,6 +4650,7 @@ static bool load_image_node_with_provenance_impl(
     }
     PendingImageFetch *pending = pending_find_free(context);
     if (pending == NULL) return false;
+    size_t admission_free = budget_remaining(context->budget);
     if (!pending_add_target(context, pending, node, source_hash, is_mask,
                             is_background, pseudo)) return false;
     size_t resolved_length = strlen(resolved);
@@ -4206,6 +4663,7 @@ static bool load_image_node_with_provenance_impl(
     memcpy(pending->url, resolved, resolved_length + 1);
     pending->url_hash = hash;
     pending->reserved_bytes = maximum;
+    pending->admission_free_bytes = admission_free;
     images->stats.attempted++;
     uint64_t cache_started = image_profile_enabled()
         ? image_profile_now_us() : 0;
@@ -4242,6 +4700,7 @@ static bool load_image_node_with_provenance_impl(
             memset(pending, 0, sizeof(*pending));
             return decoded_cache == IMAGE_DECODED_CACHE_USED;
         }
+        images->stats.work++;
         pending->from_resource_cache = true;
         pending->resource_grant_valid = cached->resource_grant_valid;
         pending->resource_grant = cached->resource_grant;
@@ -4303,6 +4762,7 @@ static bool load_image_node_with_provenance_impl(
         memset(pending, 0, sizeof(*pending));
         return finished;
     }
+    images->stats.work++;
     uint64_t context_started = image_profile_enabled()
         ? image_profile_now_us() : 0;
     FetchRequest transport = {
@@ -4333,11 +4793,20 @@ static bool load_image_node_with_provenance_impl(
         images->stats.admission_context_us +=
             image_profile_now_us() - context_started;
     }
-    image_trace("enqueue", resolved, strlen(resolved));
     uint64_t enqueue_started = image_profile_enabled()
         ? image_profile_now_us() : 0;
-    pending->request_id = fetch_scheduler_enqueue(
-        context->scheduler, resolved, request, maximum, context->timeout_ms);
+    /* The request a released job parked runs on: no new fetch. */
+    pending->request_id = fetch_scheduler_adopt(context->scheduler, hash,
+                                                resolved, request, maximum);
+    if (pending->request_id != 0) {
+        images->stats.work--;
+        image_trace("adopt", resolved, strlen(resolved));
+    } else {
+        image_trace("enqueue", resolved, strlen(resolved));
+        pending->request_id = fetch_scheduler_enqueue(
+            context->scheduler, resolved, request, maximum,
+            context->timeout_ms);
+    }
     if (enqueue_started != 0) {
         images->stats.admission_enqueue_us +=
             image_profile_now_us() - enqueue_started;
@@ -4520,6 +4989,39 @@ static void image_note_background_area(ImageLoadContext *context,
     context->current_background_fit = fit;
 }
 
+/* The area of `node`'s single-layer mask (of its `pseudo` element, or the
+   element itself) and its mask-size, for pending_add_target: the
+   element's border box in the borrowed layout boxes or, for a
+   pseudo-element or a box layout has not placed (a masked box waiting for
+   its mask is not laid out), its declared pixel width and height. */
+static void image_note_mask_area(ImageLoadContext *context,
+                                 const lxb_dom_node_t *node,
+                                 PseudoElement pseudo,
+                                 const ComputedStyle *style,
+                                 const StylePaintStack *paint)
+{
+    context->current_background_area_width = 0;
+    context->current_background_area_height = 0;
+    if (paint == NULL || paint->mask_count != 1) return;
+    int width = 0, height = 0;
+    if (pseudo != PSEUDO_NONE
+        || !layout_image_box_size(context->layout_boxes, node,
+                                  &width, &height)) {
+        if (!layout_declared_box_size(context->stylesheet, style,
+                                      context->viewport_width,
+                                      &width, &height)) return;
+    }
+    const StylePaintLayer *layer = &paint->masks[0];
+    context->current_background_area_width =
+        width > UINT16_MAX ? UINT16_MAX : (uint16_t) width;
+    context->current_background_area_height =
+        height > UINT16_MAX ? UINT16_MAX : (uint16_t) height;
+    context->current_background_size_width = layer->width;
+    context->current_background_size_height = layer->height;
+    context->current_background_size_flags = layer->flags;
+    context->current_background_fit = layer->fit;
+}
+
 static bool image_process_node(
     ImageLoadContext *context, lxb_dom_node_t *node,
     const ComputedStyle *parent, ComputedStyle *style, bool *traverse)
@@ -4648,6 +5150,7 @@ static bool image_process_node(
         if (!loaded) return false;
     }
     if (*traverse && layered_mask) {
+        image_note_mask_area(context, node, PSEUDO_NONE, style, paint);
         for (size_t i = 0; i < paint->mask_count; i++) {
             const StylePaintLayer *layer = &paint->masks[i];
             if (layer->kind == STYLE_PAINT_IMAGE_URL
@@ -4656,6 +5159,8 @@ static bool image_process_node(
                        context, node, layer->image, strlen(layer->image),
                        true, false, PSEUDO_NONE)) return false;
         }
+        context->current_background_area_width = 0;
+        context->current_background_area_height = 0;
     } else if (*traverse && style->mask_image != NULL
                && style->mask_image[0] != '\0'
                && !load_stylesheet_image_node(
@@ -4729,6 +5234,8 @@ static bool image_process_node(
                           strlen(generated.background_image), false,
                           true, pseudo)) return false;
         if (generated.generated_content && generated_layered_mask) {
+            image_note_mask_area(context, node, pseudo, &generated,
+                                 generated_paint);
             for (size_t i = 0; i < generated_paint->mask_count; i++) {
                 const StylePaintLayer *layer = &generated_paint->masks[i];
                 if (layer->kind == STYLE_PAINT_IMAGE_URL
@@ -4739,6 +5246,8 @@ static bool image_process_node(
                     return false;
                 }
             }
+            context->current_background_area_width = 0;
+            context->current_background_area_height = 0;
         } else if (generated.generated_content
                    && generated.mask_image != NULL
                    && generated.mask_image[0] != '\0'
@@ -4774,7 +5283,14 @@ static bool image_process_priority_node(
         return image_process_refresh_node(context, node);
     }
     if (!document_node_is_tag(node, LXB_TAG_IMG) && !document_node_is_tag(node, LXB_TAG_VIDEO)) {
-        return true;
+        /* An empty placeholder's <noscript> image: a document image keyed
+           to the element, which paints it as a cover background. */
+        size_t fallback_length = 0;
+        const char *fallback = image_noscript_placeholder_source(
+            context->stylesheet, node, &fallback_length);
+        return fallback == NULL || load_document_image_node(
+            context, node, fallback, fallback_length, false, false,
+            PSEUDO_NONE);
     }
     size_t source_length = 0;
     const char *source = document_node_is_tag(node, LXB_TAG_VIDEO)
@@ -4966,8 +5482,8 @@ static bool image_process_priority_target(
        background, so an eager decode takes the tile it paints (a cover
        background in a short, wide box needs more than the viewport width)
        without resolving the element's style again. */
-    if (is_background && target->background_sized
-        && target->pseudo == (uint8_t) PSEUDO_NONE) {
+    if (target->background_sized
+        && (is_mask || target->pseudo == (uint8_t) PSEUDO_NONE)) {
         context->current_background_area_width = target->display_width;
         context->current_background_area_height = target->display_height;
         context->current_background_size_width =
@@ -5285,7 +5801,7 @@ static bool images_load_external_impl(
     }
     if (style_selector_cooperation_cancelled(stylesheet)) traversed = false;
     if (!traversed) {
-        cancel_pending(&context);
+        cancel_pending(&context, false);
         if (retained_count != 0) {
             images_rollback_optional_suffix(
                 images, retained_count, &retained_stats,
@@ -5306,7 +5822,7 @@ static bool images_load_external_impl(
         ? image_profile_now_us() : 0;
     while (context.pending_count != 0) {
         if (!finish_one_pending(&context, true)) {
-            cancel_pending(&context);
+            cancel_pending(&context, false);
             if (retained_count != 0) {
                 images_rollback_optional_suffix(
                     images, retained_count, &retained_stats,
@@ -5527,6 +6043,12 @@ void images_retire_subtree(ImageResources *images,
         if (at == NULL) images->failures[kept++] = images->failures[i];
     }
     images->failure_count = kept;
+    for (size_t i = 0; i < IMAGE_MEMORY_REFUSAL_LIMIT; i++) {
+        size_t depth = 0;
+        const lxb_dom_node_t *at = images->memory_refusals[i].node;
+        while (at != NULL && at != root && ++depth < 4096u) at = at->parent;
+        if (at != NULL) images->memory_refusals[i].node = NULL;
+    }
     for (size_t i = 0; i < 2u; i++) {
         size_t depth = 0;
         for (const lxb_dom_node_t *at = images->canvas_depth[i].node;
@@ -5710,20 +6232,55 @@ static size_t image_refresh_owned_decoded_bytes(
     return bytes;
 }
 
-/* Each inline-SVG raster owner consumed one attempt from the page's image
-   count when it was rasterized (or adopted by a refresh). Retiring it
-   returns that attempt as its decoded bytes are returned; otherwise every
-   refresh of an unchanged icon would ratchet the count until later
-   refreshes skip the icons outright. */
-static size_t image_refresh_owned_svg_attempts(
-    const ImageResources *images, lxb_dom_node_t *const *nodes,
-    size_t node_count, size_t *exempt)
+/* An SVG raster an element's own source fetched (an <img>, not an inline
+   <svg>): its admission spent the count as any fetched raster's did. */
+static bool image_svg_from_source(const ImageResource *item)
 {
-    size_t attempts = 0;
-    *exempt = 0;
+    return item->source_hash != 0 && !item->is_mask && !item->is_background
+        && item->pseudo == PSEUDO_NONE && item->node != NULL
+        && !document_node_is_tag(item->node, LXB_TAG_SVG);
+}
+
+/* Whether showing this entry's surface spends the image count: the same test
+   its admission made, from what the entry retains. Only an inline SVG's
+   raster is exempt by its size. */
+static bool image_surface_count_exempt(const ImageResource *item)
+{
+    return item->count_exempt_surface
+        || (image_refresh_svg_lendable(item) && !image_svg_from_source(item)
+            && image_svg_first_raster_bytes(item)
+                   <= IMAGE_COUNT_EXEMPT_DECODED_BYTES);
+}
+
+static bool image_can_return_counted_slots(const ExternalImageStats *stats,
+                                           size_t maximum_count)
+{
+    if (maximum_count > MAX_IMAGE_FETCH_ATTEMPTS)
+        maximum_count = MAX_IMAGE_FETCH_ATTEMPTS;
+    return stats->work < maximum_count * IMAGE_SWAP_WORK_FACTOR;
+}
+
+/* Each surface an entry owns took one attempt from the image count when it
+   was admitted, and so did each charged failure. Retiring the entries and
+   failures of `nodes` returns those attempts as their bytes are returned:
+   otherwise every refresh of an unchanged icon would ratchet the count
+   until later refreshes skip the icons outright, and every source swap
+   would spend a slot for good. A surface a retained entry still shows
+   stays charged to it. An SVG raster a refresh against `sheet` takes over
+   again rather than rasterizing it (an inline SVG's, or one whose element
+   still names the same source) always returns its attempt, and so does a
+   surface admitted exempt, as it holds no slot. Any other slot, a replaced
+   SVG source's included, comes back only while the table's work is under
+   its limit (IMAGE_SWAP_WORK_FACTOR). */
+static void image_return_retired_slots(
+    const ImageResources *images, ExternalImageStats *stats,
+    lxb_dom_node_t *const *nodes, size_t node_count, size_t maximum_count,
+    const Stylesheet *sheet)
+{
+    size_t attempts = 0, exempt = 0, counted = 0;
     for (size_t i = 0; i < images->count; i++) {
         const ImageResource *item = &images->items[i];
-        if (!image_owns_surface(item) || !image_refresh_svg_lendable(item)
+        if (!image_owns_surface(item)
             || !image_node_in_refresh_set(item->node, nodes, node_count)) {
             continue;
         }
@@ -5740,13 +6297,25 @@ static size_t image_refresh_owned_svg_attempts(
             }
         }
         if (retained_alias) continue;
-        attempts++;
-        if (item->reused_raster_count_exempt || image_svg_first_raster_bytes(item)
-                <= IMAGE_COUNT_EXEMPT_DECODED_BYTES) {
-            (*exempt)++;
-        }
+        bool exempt_surface = image_surface_count_exempt(item);
+        bool retaken = image_refresh_svg_lendable(item)
+            && (!image_svg_from_source(item)
+                || (sheet != NULL
+                    && image_resource_source_current(sheet, item)));
+        if (exempt_surface || retaken) attempts++;
+        else counted++;
+        if (exempt_surface) exempt++;
     }
-    return attempts;
+    for (size_t i = 0; i < images->failure_count; i++)
+        if (images->failures[i].charged
+            && image_node_in_refresh_set(images->failures[i].node, nodes,
+                                         node_count)) counted++;
+    if (image_can_return_counted_slots(stats, maximum_count))
+        attempts += counted;
+    stats->attempted = attempts <= stats->attempted
+        ? stats->attempted - attempts : 0;
+    stats->count_exempt = exempt <= stats->count_exempt
+        ? stats->count_exempt - exempt : 0;
 }
 
 static void image_refresh_transfer_old_ownership(
@@ -5838,8 +6407,28 @@ static void image_failures_forget_nodes(
     images->failure_count = kept;
 }
 
+void images_discard_stale_failures(
+    ImageResources *images, const Stylesheet *sheet, size_t maximum_count)
+{
+    if (images == NULL) return;
+    bool refund = image_can_return_counted_slots(&images->stats,
+                                                 maximum_count);
+    size_t kept = 0;
+    for (size_t i = 0; i < images->failure_count; i++) {
+        struct ImageFailure failure = images->failures[i];
+        if (failure.source_hash == image_current_source_hash(
+                sheet, failure.node)) {
+            images->failures[kept++] = failure;
+        } else if (refund && failure.charged && images->stats.attempted > 0) {
+            images->stats.attempted--;
+        }
+    }
+    images->failure_count = kept;
+}
+
 void images_discard_nodes(
-    ImageResources *images, lxb_dom_node_t *const *nodes, size_t node_count)
+    ImageResources *images, lxb_dom_node_t *const *nodes, size_t node_count,
+    size_t maximum_count)
 {
     if (images == NULL || images->budget == NULL || nodes == NULL
         || node_count == 0u) return;
@@ -5847,6 +6436,9 @@ void images_discard_nodes(
         images, nodes, node_count);
     size_t retired_decoded = image_refresh_owned_decoded_bytes(
         images, nodes, node_count);
+    if (maximum_count != 0)
+        image_return_retired_slots(images, &images->stats, nodes, node_count,
+                                   maximum_count, NULL);
     for (size_t i = 0; i < images->count; i++) {
         if (image_node_in_refresh_set(
                 images->items[i].node, nodes, node_count)) {
@@ -6002,21 +6594,6 @@ static size_t images_mark_far_surfaces(
     return removed;
 }
 
-/* Whether showing this entry's surface spends the image count: the same test
-   its admission made, from what the entry retains. */
-static bool image_surface_count_exempt(const ImageResource *item)
-{
-    if (image_refresh_svg_lendable(item))
-        return item->reused_raster_count_exempt
-            || image_svg_first_raster_bytes(item)
-                   <= IMAGE_COUNT_EXEMPT_DECODED_BYTES;
-    size_t length = 0;
-    const char *source = item->node == NULL ? NULL
-        : document_attribute(item->node, "src", &length);
-    return source != NULL && length > 5u && length <= IMAGE_COUNT_EXEMPT_DATA_URL_BYTES
-        && strncasecmp(source, "data:", 5) == 0;
-}
-
 size_t images_evict_farthest(
     ImageResources *images, const uint32_t *distances, size_t slots,
     size_t maximum_total_encoded_bytes, size_t maximum_decoded_bytes,
@@ -6133,26 +6710,22 @@ bool images_refresh_external_nodes_reusing_layout_styles(
         images, nodes, node_count);
     size_t retired_decoded = image_refresh_owned_decoded_bytes(
         images, nodes, node_count);
-    size_t retired_exempt = 0;
-    size_t retired_attempts = image_refresh_owned_svg_attempts(
-        images, nodes, node_count, &retired_exempt);
     ImageResources replacement = {
         .budget = budget,
         .stats = images->stats,
         .priority_staged = true
     };
+    memcpy(replacement.svg_limit_recalls, images->svg_limit_recalls,
+           sizeof(replacement.svg_limit_recalls));
+    replacement.svg_limit_recall_next = images->svg_limit_recall_next;
     replacement.stats.encoded_bytes =
         retired_encoded <= replacement.stats.encoded_bytes
         ? replacement.stats.encoded_bytes - retired_encoded : 0;
     replacement.stats.decoded_bytes =
         retired_decoded <= replacement.stats.decoded_bytes
         ? replacement.stats.decoded_bytes - retired_decoded : 0;
-    replacement.stats.attempted =
-        retired_attempts <= replacement.stats.attempted
-        ? replacement.stats.attempted - retired_attempts : 0;
-    replacement.stats.count_exempt =
-        retired_exempt <= replacement.stats.count_exempt
-        ? replacement.stats.count_exempt - retired_exempt : 0;
+    image_return_retired_slots(images, &replacement.stats, nodes, node_count,
+                               maximum_count, stylesheet);
     const ImageResources *lenders = images;
 #ifndef TILEFINCH_NO_TRACE
     if (getenv("TILEFINCH_DISABLE_SVG_REFRESH_REUSE") != NULL) lenders = NULL;
@@ -6236,12 +6809,27 @@ bool images_refresh_external_nodes_reusing_layout_styles(
     images->count = write;
     images->stats = replacement.stats;
     images->priority_staged = false;
-    /* The refreshed nodes' failures are the replacement's now. */
+    /* The refreshed nodes' failures and memory refusals are the
+       replacement's now. */
     image_failures_forget_nodes(images, nodes, node_count);
+    for (size_t i = 0; i < IMAGE_MEMORY_REFUSAL_LIMIT; i++) {
+        struct ImageMemoryRefusal *refusal = &images->memory_refusals[i];
+        if (image_node_in_refresh_set(refusal->node, nodes, node_count))
+            refusal->node = NULL;
+    }
+    /* The replacement began with this table's SVG limit records. */
+    memcpy(images->svg_limit_recalls, replacement.svg_limit_recalls,
+           sizeof(images->svg_limit_recalls));
+    images->svg_limit_recall_next = replacement.svg_limit_recall_next;
+    for (size_t i = 0; i < IMAGE_MEMORY_REFUSAL_LIMIT; i++)
+        if (replacement.memory_refusals[i].node != NULL)
+            image_memory_refusal_add(images,
+                replacement.memory_refusals[i].node,
+                replacement.memory_refusals[i].retry_free_bytes);
     for (size_t i = 0; i < replacement.failure_count; i++)
         image_note_failure(images, budget, replacement.failures[i].node,
                            replacement.failures[i].source_hash, false, false,
-                           PSEUDO_NONE);
+                           PSEUDO_NONE, replacement.failures[i].charged);
     budget_free(budget, replacement.failures);
     replacement.failures = NULL;
     replacement.failure_count = replacement.failure_capacity = 0;
@@ -6359,16 +6947,38 @@ bool images_load_external_priority_targets(
     return loaded;
 }
 
+/* `park`: the job is given up, not failed (images_priority_load_destroy). */
 static ImagePriorityLoadStatus image_priority_load_fail(
-    ImagePriorityLoadJob *job)
+    ImagePriorityLoadJob *job, bool park)
 {
     if (job == NULL) return IMAGE_PRIORITY_LOAD_FAILED;
-    cancel_pending(&job->context);
+    /* A request given up (not failed) before it published holds no slot of
+       the count: a commit kept its attempt, which the rollback would
+       otherwise keep too, and the target's next admission (adopting it or
+       starting it again) is charged in its place. The work limit bounds the
+       return, as for a replaced image (image_can_return_counted_slots). A
+       failed job (timeout, memory) keeps its committed attempts. */
+    size_t refund = 0, refund_exempt = 0;
+    for (size_t i = 0; park && i < IMAGE_FETCH_CONCURRENCY; i++) {
+        const PendingImageFetch *pending = &job->context.pending[i];
+        if (!pending->charge_committed) continue;
+        refund++;
+        if (pending->count_exempt) refund_exempt++;
+    }
+    cancel_pending(&job->context, park);
     if (!job->rolled_back) {
+        ExternalImageStats *stats = &job->context.images->stats;
         images_rollback_optional_suffix(
             job->context.images, job->retained_count,
             &job->retained_stats, job->retained_priority_staged,
             job->retained_failure_serial);
+        if (image_can_return_counted_slots(stats,
+                                           job->context.maximum_count)) {
+            stats->attempted -= refund <= stats->attempted
+                ? refund : stats->attempted;
+            stats->count_exempt -= refund_exempt <= stats->count_exempt
+                ? refund_exempt : stats->count_exempt;
+        }
         job->rolled_back = true;
     }
     job->terminal = true;
@@ -6512,7 +7122,7 @@ ImagePriorityLoadStatus images_priority_load_pump(
                 context->maximum_single_encoded_bytes)) {
             if (image_now_ms() - job->started_ms
                 >= (double) context->timeout_ms) {
-                return image_priority_load_fail(job);
+                return image_priority_load_fail(job, false);
             }
             image_finish_slice(context);
             return IMAGE_PRIORITY_LOAD_PENDING;
@@ -6541,7 +7151,7 @@ ImagePriorityLoadStatus images_priority_load_pump(
                             "deferred-image-admission")
                 || !image_process_priority_target(
                        context, &job->targets[at])) {
-                return image_priority_load_fail(job);
+                return image_priority_load_fail(job, false);
             }
         }
         if (context->pending_count == 0
@@ -6563,7 +7173,7 @@ ImagePriorityLoadStatus images_priority_load_pump(
             image_pending_raster_pump(context);
         image_finish_slice(context);
         if (decode_status == IMAGE_PRIORITY_LOAD_FAILED)
-            return image_priority_load_fail(job);
+            return image_priority_load_fail(job, false);
         if (decode_status == IMAGE_PRIORITY_LOAD_PENDING
             || context->pending_count != 0) {
             return IMAGE_PRIORITY_LOAD_PENDING;
@@ -6589,7 +7199,7 @@ ImagePriorityLoadStatus images_priority_load_pump(
            Always give the ordered consumer one nonblocking retry. */
         size_t pending_before = context->pending_count;
         if (!finish_one_pending(context, false)) {
-            return image_priority_load_fail(job);
+            return image_priority_load_fail(job, false);
         }
         job->progressed = context->pending_count < pending_at_pump
             || context->raster_decode.active;
@@ -6598,7 +7208,7 @@ ImagePriorityLoadStatus images_priority_load_pump(
             return IMAGE_PRIORITY_LOAD_PENDING;
         }
     } else if (!finish_one_pending(context, false)) {
-        return image_priority_load_fail(job);
+        return image_priority_load_fail(job, false);
     }
     job->progressed = context->pending_count < pending_at_pump
         || context->raster_decode.active;
@@ -6633,6 +7243,10 @@ void images_priority_load_commit_progress(ImagePriorityLoadJob *job)
     job->retained_failure_serial = job->context.images->failure_serial;
     job->retained_priority_staged =
         job->context.images->priority_staged;
+    for (size_t i = 0; i < IMAGE_FETCH_CONCURRENCY; i++)
+        job->context.pending[i].charge_committed =
+            job->context.pending[i].request_id != 0
+            || job->context.pending[i].retained_result != NULL;
 }
 
 bool images_priority_load_progressed(const ImagePriorityLoadJob *job)
@@ -6664,7 +7278,7 @@ bool images_priority_load_holds_decoder(const ImagePriorityLoadJob *job)
 void images_priority_load_destroy(ImagePriorityLoadJob *job)
 {
     if (job == NULL) return;
-    if (!job->terminal) (void) image_priority_load_fail(job);
+    if (!job->terminal) (void) image_priority_load_fail(job, true);
     budget_free(job->context.budget, job->context.request_scratch);
     budget_free(job->context.budget, job);
 }
@@ -6674,6 +7288,30 @@ bool image_resource_available(const ImageResource *image)
     return image != NULL && (image->pixels != NULL
                              || (image->encoded != NULL
                                  && image->encoded_length != 0));
+}
+
+uint32_t images_layout_fingerprint(const ImageResources *images)
+{
+    /* No table lays out as an empty one. */
+    size_t count = images == NULL ? 0 : images->count;
+    uint64_t hash = UINT64_C(1469598103934665603) ^ count;
+    for (size_t i = 0; i < count; i++) {
+        const ImageResource *image = &images->items[i];
+        uint64_t words[4] = {
+            (uint64_t) (uintptr_t) image->node ^ image->source_hash,
+            (uint64_t) (uint32_t) image->width << 32
+                | (uint32_t) image->height,
+            (uint64_t) (uint32_t) image->source_width << 32
+                | (uint32_t) image->source_height,
+            (uint64_t) image_resource_available(image)
+                | (uint64_t) image->is_background << 1
+                | (uint64_t) image->is_mask << 2
+                | (uint64_t) image->is_canvas << 3
+        };
+        for (size_t w = 0; w < 4; w++)
+            hash = (hash ^ words[w]) * UINT64_C(1099511628211);
+    }
+    return (uint32_t) (hash ^ (hash >> 32)) | 1u;
 }
 
 const void *image_resource_backing_identity(const ImageResource *image)
@@ -6700,6 +7338,29 @@ bool images_node_failed(const ImageResources *images,
     if (images == NULL || node == NULL) return false;
     for (size_t i = 0; i < images->failure_count; i++)
         if (images->failures[i].node == node) return true;
+    return false;
+}
+
+bool images_node_source_failed(const ImageResources *images,
+                               const lxb_dom_node_t *node,
+                               const char *source, size_t length)
+{
+    if (images == NULL || node == NULL) return false;
+    uint64_t source_hash = image_source_hash(source, length);
+    for (size_t i = 0; i < images->failure_count; i++)
+        if (images->failures[i].node == node)
+            return images->failures[i].source_hash == source_hash;
+    return false;
+}
+
+bool images_node_memory_refused(const ImageResources *images,
+                                const lxb_dom_node_t *node,
+                                size_t free_bytes)
+{
+    if (images == NULL || node == NULL) return false;
+    for (size_t i = 0; i < IMAGE_MEMORY_REFUSAL_LIMIT; i++)
+        if (images->memory_refusals[i].node == node)
+            return free_bytes < images->memory_refusals[i].retry_free_bytes;
     return false;
 }
 

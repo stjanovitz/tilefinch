@@ -124,6 +124,236 @@ static bool cache_test_cooperate(void *opaque, lxb_dom_node_t *node, size_t visi
     return true;
 }
 
+/* What a rule keeps about its selector text (style_rule_selector_facts)
+   answers what the whole-sheet scans read the text for: it moves with the
+   rule when added CSS re-sorts the sheet, and the :has() rule index built
+   from it holds exactly the selectors spelling ":has(". */
+static uint8_t selector_facts_expected(const char *selector)
+{
+    static const struct {
+        const char *selector;
+        uint8_t facts;
+    } table[] = {
+        {".card:has(> img)", STYLE_SELECTOR_FACTS_HAS
+            | STYLE_SELECTOR_FACTS_HAS_ANY_CASE},
+        {".card:HAS(.x)", STYLE_SELECTOR_FACTS_HAS_ANY_CASE},
+        {"li:last-child", STYLE_SELECTOR_FACTS_TRAILING
+            | STYLE_SELECTOR_FACTS_STRUCTURAL},
+        {"li:NTH-LAST-CHILD(2)", STYLE_SELECTOR_FACTS_TRAILING
+            | STYLE_SELECTOR_FACTS_STRUCTURAL},
+        {"p:only-of-type .x", STYLE_SELECTOR_FACTS_TRAILING
+            | STYLE_SELECTOR_FACTS_STRUCTURAL},
+        {"form:focus-within", STYLE_SELECTOR_FACTS_FOCUS_WITHIN},
+        {"nav:has(a:focus-within)", STYLE_SELECTOR_FACTS_HAS
+            | STYLE_SELECTOR_FACTS_HAS_ANY_CASE
+            | STYLE_SELECTOR_FACTS_FOCUS_WITHIN},
+        {"h1 + p", STYLE_SELECTOR_FACTS_STRUCTURAL},
+        {"div:empty", STYLE_SELECTOR_FACTS_STRUCTURAL},
+        {"a:hover", 0},
+        {".plain", 0},
+    };
+    for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++)
+        if (strcmp(table[i].selector, selector) == 0)
+            /* The structural bit is a custom-property rule's only. */
+            return (uint8_t) (STYLE_SELECTOR_FACTS_KNOWN
+                              | (table[i].facts
+                                 & ~STYLE_SELECTOR_FACTS_STRUCTURAL));
+    return 0;
+}
+
+static int test_rule_selector_facts(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    static const char html[] = "<div id=root><p>t</p></div>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    Stylesheet sheet = {0};
+    CHECK(stylesheet_build(&sheet, &budget, &document, 480));
+    static const char first[] = ".plain{color:#111111}"
+        ".card:has(> img){color:#222222}li:last-child{color:#333333}"
+        "form:focus-within{color:#444444}h1 + p{color:#555555}";
+    static const char second[] = "a:hover{color:#666666}"
+        ".card:HAS(.x){color:#777777}li:NTH-LAST-CHILD(2){color:#888888}"
+        "p:only-of-type .x{color:#999999}"
+        "nav:has(a:focus-within){color:#aaaaaa}div:empty{color:#bbbbbb}"
+        "#root .plain{--tone:1}li + li:first-child{--tone:2;--hue:3}";
+    CHECK(stylesheet_add_css(&sheet, first, sizeof(first) - 1u));
+    CHECK(stylesheet_prepare_has_rule_index(&sheet));
+    CHECK(stylesheet_add_css(&sheet, second, sizeof(second) - 1u));
+    CHECK(stylesheet_prepare_has_rule_index(&sheet));
+    size_t has = 0, checked = 0;
+    for (size_t i = 0; i < sheet.count; i++) {
+        uint8_t expected = selector_facts_expected(sheet.rules[i].selector);
+        if (expected == 0) continue;
+        checked++;
+        CHECK(style_rule_selector_facts(&sheet.rules[i]) == expected);
+        if (strstr(sheet.rules[i].selector, ":has(") == NULL) continue;
+        bool indexed = false;
+        for (size_t k = 0; k < sheet.has_rule_count; k++)
+            indexed = indexed || sheet.has_rule_indices[k] == i;
+        CHECK(indexed);
+        has++;
+    }
+    CHECK(checked == 11 && has == 2 && sheet.has_rule_count == has);
+    size_t custom = 0;
+    for (size_t i = 0; i < sheet.custom_rule_count; i++) {
+        const char *selector = sheet.custom_rules[i].selector;
+        StyleCustomRule *rule = &sheet.custom_rules[i];
+        uint8_t facts = style_custom_rule_selector_facts(rule);
+        /* The text facts leave the structural bit unfilled. */
+        CHECK((rule->selector_facts
+               & STYLE_SELECTOR_FACTS_STRUCTURAL_KNOWN) == 0);
+        bool structural = style_custom_rule_structural(rule);
+        CHECK(style_custom_rule_selector_facts(rule) == facts);
+        if (strcmp(selector, "#root .plain") == 0) {
+            CHECK(facts == STYLE_SELECTOR_FACTS_KNOWN && !structural);
+            custom++;
+        } else if (strcmp(selector, "li + li:first-child") == 0) {
+            CHECK(facts == STYLE_SELECTOR_FACTS_KNOWN && structural);
+            custom++;
+        }
+    }
+    CHECK(custom == 3);
+    /* A declaration of the same block takes the facts of the one before. */
+    for (size_t i = 1; i < sheet.custom_rule_count; i++) {
+        StyleCustomRule *rule = &sheet.custom_rules[i];
+        if (strcmp(rule->name, "--hue") != 0) continue;
+        rule->selector_facts = 0;
+        style_custom_rule_facts_from(rule, rule - 1);
+        CHECK(rule->selector_facts
+              == (STYLE_SELECTOR_FACTS_KNOWN | STYLE_SELECTOR_FACTS_STRUCTURAL
+                  | STYLE_SELECTOR_FACTS_STRUCTURAL_KNOWN));
+    }
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* The sibling or positional test of a custom-property rule, in one pass:
+   sibling combinators and :nth-* outside strings and escapes, the other
+   positional names as written anywhere. */
+static int test_selector_structural_text(void)
+{
+    static const struct {
+        const char *selector;
+        bool structural;
+    } cases[] = {
+        {".plain", false}, {"a[title=\"x:first-child\"]", true},
+        {"a[title=\"x+y\"]", false}, {".a\\+b", false},
+        {".a\\:first-x", true}, {"li:NTH-child(2)", true},
+        {"li:FIRST-child", false}, {".x ~ .y", true}, {"div:empty", true},
+        {"p:only-of-type", true}, {"a[title='q\\'+']", false},
+        {".e\\", false}, {"h1+p", true}, {":root", false},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+        CHECK(style_selector_structural_text(cases[i].selector)
+              == cases[i].structural);
+    return 0;
+}
+
+/* The trailing-test reach splits into the sibling's own keys and those
+   of its parent or above, each element's keys read once. */
+static int test_trailing_keys_reach_halves(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    static const char html[] = "<div class=list><section class=card>"
+        "<ul id=u data-x=1><li class=item id=a></li><li id=b></li></ul>"
+        "</section></div>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *list = find_id(root, "u");
+    lxb_dom_node_t *a = find_id(root, "a"), *b = find_id(root, "b");
+    CHECK(list != NULL && a != NULL && b != NULL);
+    static const struct {
+        const char *selector;
+        bool sibling_a, sibling_b, parent;
+    } cases[] = {
+        {".item:last-child", true, false, false},
+        {"li:only-child", true, true, false},
+        {"#u > :last-child", false, false, true},
+        {"[data-x] > :nth-last-child(2)", false, false, true},
+        {".card > :last-child", false, false, false},
+        {".list > * > * > :last-child", false, false, true},
+        {".list :last-child", false, false, true},
+        {".missing :last-child", false, false, false},
+        {"a:hover", false, false, false},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        StyleTrailingKeys keys = {0};
+        style_selector_trailing_keys(cases[i].selector,
+                                     strlen(cases[i].selector), &keys);
+        CHECK(!keys.any);
+        CHECK(style_trailing_keys_reach_sibling(&keys, a)
+              == cases[i].sibling_a);
+        CHECK(style_trailing_keys_reach_sibling(&keys, b)
+              == cases[i].sibling_b);
+        CHECK(style_trailing_keys_reach_parent(&keys, list)
+              == cases[i].parent);
+    }
+    StyleTrailingKeys any = {.any = true};
+    CHECK(style_trailing_keys_reach_sibling(&any, b)
+          && style_trailing_keys_reach_parent(&any, list)
+          && style_trailing_keys_reach_sibling(NULL, b)
+          && style_trailing_keys_reach_parent(NULL, list));
+    document_destroy(&document);
+    CHECK(budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* What a :has() argument can see of a new subtree: plain arguments by
+   their first and last keys (one pass over each element's keys), others
+   by their anchors only. */
+static int test_has_argument_keys_reach(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    static const char html[] = "<div class=card id=card><p class=a id=pa>"
+        "<i class=x id=ax></i></p><p class=b id=pb><i class=x id=bx></i>"
+        "<i class=y id=by></i></p></div><section id=s><b class=card></b>"
+        "<p id=ps><i class=x id=sx></i></p></section>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *pa = find_id(root, "pa"), *pb = find_id(root, "pb");
+    lxb_dom_node_t *ps = find_id(root, "ps"), *ax = find_id(root, "ax");
+    lxb_dom_node_t *bx = find_id(root, "bx"), *by = find_id(root, "by");
+    lxb_dom_node_t *sx = find_id(root, "sx");
+    CHECK(pa && pb && ps && ax && bx && by && sx);
+    static const struct {
+        const char *selector;
+        bool ax, bx, by, sx;
+    } cases[] = {
+        {".card:has(.x)", true, true, false, true},
+        {".card:has(.a .x)", true, false, false, false},
+        /* Sibling arguments: only an anchor before the subtree's parent
+           or one of its ancestors can see it (the <div> before <section>,
+           the <b class=card> before <p id=ps>). */
+        {"div:has(+ section)", false, false, false, true},
+        {".card:has(~ p)", false, false, false, true},
+        {".card:has(> .x)", true, true, false, true},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        StyleHasArgumentKeys keys = {0};
+        style_selector_has_argument_keys(cases[i].selector,
+                                         strlen(cases[i].selector), &keys);
+        CHECK(!keys.any);
+        CHECK(style_has_argument_keys_reach(&keys, ax, pa) == cases[i].ax);
+        CHECK(style_has_argument_keys_reach(&keys, bx, pb) == cases[i].bx);
+        CHECK(style_has_argument_keys_reach(&keys, by, pb) == cases[i].by);
+        CHECK(style_has_argument_keys_reach(&keys, sx, ps) == cases[i].sx);
+    }
+    document_destroy(&document);
+    CHECK(budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 static int test_ancestor_filter_canonical_tokens(void)
 {
     Budget budget;
@@ -1478,12 +1708,15 @@ static int test_head_script_dependency_cache(void)
     CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
     Stylesheet sheet = {0};
     CHECK(stylesheet_build(&sheet, &budget, &document, 480));
-    /* Keyed anchors nothing in the head's path carries, an unkeyed anchor
-       that needs an ancestor <html> lacks, and an escaped selector without
-       :has() (which the old lexical scan refused outright). */
+    /* Keyed anchors nothing in the head's path carries (one keyed by the
+       options of :is(), in a rule the walk does not place: its subject
+       sits beside it and carries a key), an unkeyed anchor that needs an
+       ancestor <html> lacks, and an escaped selector without :has() (which
+       the old lexical scan refused outright). */
     static const char css[] =
         ".observer:has(script) p{color:red}"
-        ".wrap :is(.a,.b):has(+:not(.c)){color:red}"
+        ":is(.top,.watcher):has(script) ~ body{color:red}"
+        ".wrap :is(.a,:first-child):has(+:not(.c)){color:red}"
         ".esc\\:wide{width:1px}";
     CHECK(stylesheet_add_css(&sheet, css, sizeof(css) - 1u));
     lxb_dom_node_t *head = lxb_dom_interface_node(
@@ -1496,11 +1729,20 @@ static int test_head_script_dependency_cache(void)
         (const lxb_char_t *) "class", 5,
         (const lxb_char_t *) "observer", 8) != NULL);
     CHECK(stylesheet_head_scripts_affect_ancestors(&sheet, head, NULL));
+    /* Each key of the :is() anchor is, not only the first. */
+    static const char *const options[] = {"top", "watcher"};
+    for (size_t i = 0; i < 2; i++) {
+        CHECK(lxb_dom_element_set_attribute(lxb_dom_interface_element(head),
+            (const lxb_char_t *) "class", 5,
+            (const lxb_char_t *) options[i], strlen(options[i])) != NULL);
+        CHECK(stylesheet_head_scripts_affect_ancestors(&sheet, head, NULL));
+    }
     CHECK(lxb_dom_element_remove_attribute(lxb_dom_interface_element(head),
         (const lxb_char_t *) "class", 5) == LXB_STATUS_OK);
     CHECK(!stylesheet_head_scripts_affect_ancestors(&sheet, head, NULL));
-    /* So is the unkeyed one: <html> class=a matches `:is(.a,.b)` but not
-       `.wrap :is(.a,.b)`; the head under a .wrap <html> does. */
+    /* So is the unkeyed one: <html> class=a matches `:is(.a,:first-child)`
+       but not `.wrap :is(.a,:first-child)`; the head under a .wrap <html>
+       does. */
     lxb_dom_node_t *root = head->parent;
     CHECK(lxb_dom_element_set_attribute(lxb_dom_interface_element(root),
         (const lxb_char_t *) "class", 5, (const lxb_char_t *) "a", 1) != NULL);
@@ -3755,6 +3997,161 @@ static int test_retained_container_selectors(void)
     return 0;
 }
 
+/* Resolves every node under `node` (elements and text) depth-first from
+   `parent`, adding the retained-property lookups it made to *lookups and
+   failing when `compare` is set and a node's style differs from a
+   resolution without the retained table. */
+static bool modern_walk(Stylesheet *sheet, lxb_dom_node_t *node,
+                        const ComputedStyle *parent, StyleRetainedMatches *table,
+                        bool compare, uint64_t *lookups)
+{
+    for (lxb_dom_node_t *child = node->first_child; child != NULL;
+         child = child->next) {
+        if (child->type != LXB_DOM_NODE_TYPE_ELEMENT
+            && child->type != LXB_DOM_NODE_TYPE_TEXT) continue;
+        uint64_t before = sheet->retained_lookup_calls;
+        ComputedStyle style = style_for_node(sheet, child, parent);
+        *lookups += sheet->retained_lookup_calls - before;
+        if (compare) {
+            (void) style_retained_matches_attach(sheet, NULL);
+            ComputedStyle fresh = style_for_node(sheet, child, parent);
+            (void) style_retained_matches_attach(sheet, table);
+            if (!computed_style_same(sheet, &style, &fresh)) {
+                fprintf(stderr, "modern lookups: style differs at <%s>\n",
+                        child->type == LXB_DOM_NODE_TYPE_TEXT ? "#text"
+                        : (const char *) lxb_dom_element_local_name(
+                              lxb_dom_interface_element(child), NULL));
+                return false;
+            }
+        }
+        if (child->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && !modern_walk(sheet, child, &style, table, compare, lookups))
+            return false;
+    }
+    return true;
+}
+
+static ComputedStyle modern_style_of(Stylesheet *sheet, lxb_dom_node_t *root,
+                                     const char *id)
+{
+    lxb_dom_node_t *node = find_id(root, id);
+    ComputedStyle parent = style_for_node(sheet, node->parent, NULL);
+    return style_for_node(sheet, node, &parent);
+}
+
+/* The modern-properties pass (user-select, hyphens, resize, text-wrap...)
+   looked each property up on every node it resolved: on a large page a
+   third of style resolution, a third of that on text nodes, and none of it
+   helped by retained match lists. No rule selects a text node, and an
+   element carrying no key of any such rule (by the retained gate) can find
+   only its style attribute's declarations. */
+static int test_modern_properties_skip_impossible_lookups(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+#define MODERN_SHEET "<style>.u{user-select:none}p{hyphens:none}" \
+    "[data-r]{resize:both}.w{text-wrap:balance}.on .y{user-select:all}" \
+    "b{color:#123456}</style>"
+#define MODERN_KEYED "<p id=p>para <i>it</i></p>" \
+    "<span id=u class=u>sel</span><div id=r data-r=1>res</div>" \
+    "<div id=w class=w>wrap <em id=we>inner</em> text</div>" \
+    "<div id=anc><span id=y class=y>Y</span></div>"
+#define MODERN_PLAIN "<div><b>bold</b> plain <i>it</i></div>"
+#define MODERN_PLAIN4 MODERN_PLAIN MODERN_PLAIN MODERN_PLAIN MODERN_PLAIN
+    static const char keyed_page[] =
+        "<!doctype html>" MODERN_SHEET "<body>" MODERN_KEYED;
+    static const char plain_page[] =
+        "<!doctype html>" MODERN_SHEET "<body>" MODERN_KEYED
+        MODERN_PLAIN4 MODERN_PLAIN4 MODERN_PLAIN4 MODERN_PLAIN4
+        "<b id=late>late</b><b id=inline>inline</b>";
+    uint64_t lookups[2] = {0, 0};
+    const char *pages[2] = {keyed_page, plain_page};
+    size_t lengths[2] = {sizeof(keyed_page) - 1u, sizeof(plain_page) - 1u};
+    for (size_t at = 0; at < 2; at++) {
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        CHECK(document_parse(&document, &budget, pages[at], lengths[at], 17)
+              && stylesheet_build(&sheet, &budget, &document, 480));
+        lxb_dom_node_t *html = lxb_dom_interface_node(document.html);
+        ComputedStyle root = style_for_node(&sheet, html, NULL);
+        CHECK(modern_walk(&sheet, html, &root, NULL, false, &lookups[at]));
+        /* The skipped lookups found nothing; the keyed ones still apply,
+           and inherited text-wrap reaches text and plain descendants. */
+        ComputedStyle u = modern_style_of(&sheet, html, "u");
+        ComputedStyle p = modern_style_of(&sheet, html, "p");
+        ComputedStyle r = modern_style_of(&sheet, html, "r");
+        ComputedStyle we = modern_style_of(&sheet, html, "we");
+        ComputedStyle text = style_for_node(
+            &sheet, find_id(html, "we")->first_child, &we);
+        CHECK(computed_style_user_select(&u) == STYLE_USER_SELECT_NONE
+              && (p.word_break_mode & STYLE_HYPHENS_NONE) != 0
+              && r.resize_mode == STYLE_RESIZE_BOTH
+              && computed_style_text_wrap(&we) == STYLE_TEXT_WRAP_BALANCE
+              && computed_style_text_wrap(&text) == STYLE_TEXT_WRAP_BALANCE
+              && computed_style_user_select(&we) == STYLE_USER_SELECT_AUTO);
+        if (at == 0) {
+            CHECK(lookups[0] != 0);
+            stylesheet_destroy(&sheet);
+            document_destroy(&document);
+            continue;
+        }
+        /* Sixteen plain blocks and two plain elements (about a hundred
+           nodes) add no lookup. */
+        if (lookups[1] != lookups[0]) {
+            fprintf(stderr, "modern lookups: %llu with plain content, %llu "
+                    "without\n", (unsigned long long) lookups[1],
+                    (unsigned long long) lookups[0]);
+            return 1;
+        }
+
+        /* Replayed retained lists give the same styles. */
+        StyleRetainedMatches *table = style_retained_matches_create(&budget);
+        CHECK(table != NULL);
+        (void) style_retained_matches_attach(&sheet, table);
+        uint64_t ignored = 0;
+        size_t hits = table->hits;
+        CHECK(modern_walk(&sheet, html, &root, table, true, &ignored)
+              && modern_walk(&sheet, html, &root, table, true, &ignored)
+              && table->hits > hits);
+        lxb_dom_node_t *late = find_id(html, "late");
+        lxb_dom_node_t *inline_node = find_id(html, "inline");
+        lxb_dom_node_t *anc = find_id(html, "anc");
+        /* A style attribute keeps the element's list (layout_reuse_cache_
+           invalidate_inline_style) and is read whatever the gate says. */
+        CHECK(lxb_dom_element_set_attribute(
+                  lxb_dom_interface_element(inline_node),
+                  (const lxb_char_t *) "style", 5,
+                  (const lxb_char_t *) "user-select:text", 16) != NULL);
+        ComputedStyle styled = modern_style_of(&sheet, html, "inline");
+        CHECK(computed_style_user_select(&styled) == STYLE_USER_SELECT_TEXT);
+        /* An ancestor's class reaches .y through a rule keyed on .y. */
+        CHECK(lxb_dom_element_set_attribute(
+                  lxb_dom_interface_element(anc),
+                  (const lxb_char_t *) "class", 5,
+                  (const lxb_char_t *) "on", 2) != NULL);
+        style_retained_matches_forget_node(table, anc);
+        ComputedStyle y = modern_style_of(&sheet, html, "y");
+        CHECK(computed_style_user_select(&y) == STYLE_USER_SELECT_ALL);
+        /* A later sheet rebuilds the gate. */
+        static const char more[] = "b{resize:vertical}";
+        CHECK(stylesheet_add_css(&sheet, more, sizeof(more) - 1u));
+        ComputedStyle late_style = modern_style_of(&sheet, html, "late");
+        CHECK(late_style.resize_mode == STYLE_RESIZE_VERTICAL);
+        CHECK(modern_walk(&sheet, html, &root, table, true, &ignored));
+        (void) style_retained_matches_attach(&sheet, NULL);
+        style_retained_matches_destroy(table);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+    }
+#undef MODERN_PLAIN4
+#undef MODERN_PLAIN
+#undef MODERN_KEYED
+#undef MODERN_SHEET
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 static int test_retained_range_cache_handoff(void)
 {
     Budget budget;
@@ -4190,6 +4587,55 @@ static int test_has_attribute_readers_agree(void)
         CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
     }
     return failed ? 1 : 0;
+}
+
+static int test_has_argument_anchor_regions(void)
+{
+    Budget budget;
+    budget_init(&budget, 4 * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    char html[8192] = "<!doctype html><section id=parent class=ancestor>"
+                      "<i class=watch></i>";
+    size_t length = strlen(html);
+    const char row[] = "<i class=row></i>";
+    for (size_t i = 0; i < 270; i++) {
+        memcpy(html + length, row, sizeof(row) - 1);
+        length += sizeof(row) - 1;
+    }
+    const char tail[] = "<i id=added class=target></i></section>";
+    memcpy(html + length, tail, sizeof(tail));
+    length += sizeof(tail) - 1;
+    CHECK(document_parse(&document, &budget, html, length, 17));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *parent = find_id(root, "parent");
+    lxb_dom_node_t *added = find_id(root, "added");
+    CHECK(parent != NULL && added != NULL);
+
+    /* A broad trailing edge is not a reason to give up when this rule
+       reads only its descendants and none of their ancestors is .watch. */
+    StyleHasArgumentKeys keys = {0};
+    const char descendants[] = ".watch:has(:empty)";
+    style_selector_has_argument_keys(descendants, sizeof(descendants) - 1,
+                                     &keys);
+    CHECK(!style_has_argument_keys_reach(&keys, added, parent));
+    const char ancestor[] = ".ancestor:has(:empty)";
+    style_selector_has_argument_keys(ancestor, sizeof(ancestor) - 1, &keys);
+    CHECK(style_has_argument_keys_reach(&keys, added, parent));
+
+    /* The same anchor key can occur in both regions. Include an actual
+       earlier anchor to check that adding its sibling rule keeps that walk. */
+    memset(&keys, 0, sizeof(keys));
+    style_selector_has_argument_keys(descendants, sizeof(descendants) - 1,
+                                     &keys);
+    const char siblings[] = ".watch:has(+ .row)";
+    style_selector_has_argument_keys(siblings, sizeof(siblings) - 1, &keys);
+    CHECK(parent->first_child != NULL && parent->first_child->next != NULL);
+    CHECK(style_has_argument_keys_reach(&keys, parent->first_child->next,
+                                        parent));
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
 }
 
 /* A class write asks whether any :has() rule mentions a changed token
@@ -4863,6 +5309,51 @@ static bool element_has_key(lxb_dom_node_t *node, const StyleRule *rule)
     const char *tag = document_element_name(node, &length);
     return tag != NULL && length == key_length
         && memcmp(tag, key, key_length) == 0;
+}
+
+static int test_attribute_candidates(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument doc = {0};
+    static const char html[] =
+        "<section data-parent><p id=one></p><b id=two aria-label=VISIBLE></b>"
+        "<i id=three aa ab ac ad ae af ag ah ai aj ak al am an ao ap data-last></i>"
+        "</section>";
+    CHECK(document_parse(&doc, &budget, html, sizeof(html) - 1, 17));
+    Stylesheet sheet = {0};
+    CHECK(stylesheet_build(&sheet, &budget, &doc, 480));
+    static const char css[] =
+        "[data-unused]{color:red}[aria-other]{color:red}"
+        ":is([data-test='foo,]bar'], [aria-label=visible i]){color:blue}"
+        "[data-parent] p{color:green}:not([data-absent]){width:42px}"
+        ":is([data-parent] > b,[aria-other]){height:33px}"
+        "[data-last]{display:none}";
+    CHECK(stylesheet_add_css(&sheet, css, sizeof(css) - 1));
+    uint64_t saved = 0;
+    const char *ids[] = {"one", "two", "three"};
+    for (size_t i = 0; i < 3; i++) {
+        lxb_dom_node_t *node = find_id(lxb_dom_interface_node(doc.html), ids[i]);
+        CHECK(node != NULL);
+        uint64_t before = sheet.selector_match_calls;
+        ComputedStyle fast = style_for_node(&sheet, node, NULL);
+        uint64_t calls = sheet.selector_match_calls - before;
+        StyleRuleFilter *filters = sheet.rule_filters;
+        sheet.rule_filters = NULL;
+        before = sheet.selector_match_calls;
+        ComputedStyle plain = style_for_node(&sheet, node, NULL);
+        sheet.rule_filters = filters;
+        CHECK(equivalent(&sheet, &fast, &sheet, &plain)
+              && fast.width == plain.width && fast.height == plain.height);
+        if (i == 0 && sheet.selector_match_calls - before > calls)
+            saved = sheet.selector_match_calls - before - calls;
+    }
+    CHECK(saved >= 3);
+    stylesheet_destroy(&sheet);
+    document_destroy(&doc);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
 }
 
 static int test_functional_selector_keys(void)
@@ -5625,6 +6116,119 @@ static size_t escaped_utility_class_list(uint32_t *state, char *out,
         used += (size_t) written;
     }
     return used;
+}
+
+/* A rule whose subject compound is an :is()/:where() of options that each
+   end on a class or id is filed under each option's key instead of being
+   a candidate for every element (the rule index's universal range): a
+   news page's 77 focus-ring rules used to be matched against all of its
+   4,000 elements. A list with one keyless option stays universal. The
+   index gives the styles a linear scan gives. */
+static int test_logical_subject_index_keys(void)
+{
+    Budget budget;
+    budget_init(&budget, 32u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    static const char rules[] =
+        ":is(.a,.b:hover,#c){color:#100001}"
+        ":where(.d .e,.f>.g){padding-top:3px}"
+        ".x :is(.h,.i).j{margin-left:2px}"
+        ":is(.a,.a:focus,.m){letter-spacing:1px}"
+        ":is(.p,.q)::before{content:'x';color:#100002}"
+        ":is(.k,:first-child){word-spacing:5px}"
+        ":is(.o1,.o2,.o3,.o4,.o5,.o6,.o7,.o8,.o9,.o10,.o11,.o12,.o13,.o14,"
+        ".o15,.o16,.o17){padding-top:4px}";
+    static char html[16384];
+    int written = snprintf(html, sizeof(html),
+        "<!doctype html><style>%s</style><body>"
+        "<div class=a>1</div><div class=b>2</div><div id=c>3</div>"
+        "<div class=d><span class=e>4</span></div>"
+        "<div class=f><span class=g>5</span></div><span class=g>6</span>"
+        "<div class=x><p class='h j'>7</p><p class=i>8</p></div>"
+        "<p class=j>9</p><div class=k>10</div><p class=m>11</p>"
+        "<p class=p>12</p><p class=q>13</p><p class=o17>14</p>", rules);
+    CHECK(written > 0);
+    size_t length = (size_t) written;
+    for (unsigned i = 0; i < 200; i++) {
+        written = snprintf(html + length, sizeof(html) - length,
+                           "<p class=z>filler %u</p>", i);
+        CHECK(written > 0 && (size_t) written < sizeof(html) - length);
+        length += (size_t) written;
+    }
+    PocDocument document = {0}, bare = {0};
+    CHECK(document_parse(&document, &budget, html, length, 19));
+    static const char empty[] = "<!doctype html><body><p>x</p>";
+    CHECK(document_parse(&bare, &budget, empty, sizeof(empty) - 1u, 19));
+    Stylesheet indexed = {0}, linear = {0}, base = {0};
+    CHECK(stylesheet_build(&indexed, &budget, &document, 480));
+    CHECK(stylesheet_build(&base, &budget, &bare, 480));
+    CHECK(setenv("TILEFINCH_DISABLE_STYLE_INDEX", "1", 1) == 0);
+    bool linear_built = stylesheet_build(&linear, &budget, &document, 480);
+    CHECK(unsetenv("TILEFINCH_DISABLE_STYLE_INDEX") == 0);
+    CHECK(linear_built);
+    linear.class_tokens_refused = true;
+    lxb_dom_node_t *body = document_body_node(&document);
+    lxb_dom_node_t *elements[256];
+    size_t count = utility_elements(body, elements, 256);
+    CHECK(count > 200);
+    /* Only the rule with the keyless option and the one past the
+       16-option cap join the universal range. */
+    stylesheet_prepare_rule_index(&indexed);
+    stylesheet_prepare_rule_index(&base);
+    CHECK(indexed.rule_index_ready);
+    size_t page_free = base.rule_index_ready
+        ? base.rule_index_universal_count : 0u;
+    if (indexed.rule_index_universal_count != page_free + 2u) {
+        printf("logical subjects: universal %zu, page-free %zu\n",
+               indexed.rule_index_universal_count, page_free);
+        CHECK(false);
+    }
+    uint64_t candidates = indexed.rule_index_candidates;
+    size_t fillers = 0, colored = 0;
+    for (size_t i = 0; i < count; i++) {
+        ComputedStyle fast = style_for_node(&indexed, elements[i], NULL);
+        ComputedStyle slow = style_for_node(&linear, elements[i], NULL);
+        bool same = utility_styles_equal(&fast, &slow)
+            && fast.padding.top == slow.padding.top;
+        for (PseudoElement pseudo = PSEUDO_BEFORE; same
+             && pseudo <= PSEUDO_AFTER; pseudo++) {
+            ComputedStyle fast_pseudo = style_for_pseudo(
+                &indexed, elements[i], pseudo, &fast);
+            ComputedStyle slow_pseudo = style_for_pseudo(
+                &linear, elements[i], pseudo, &slow);
+            same = utility_styles_equal(&fast_pseudo, &slow_pseudo);
+        }
+        if (!same) {
+            printf("logical subjects: element %zu diverged\n", i);
+            CHECK(false);
+        }
+        if (fast.color == 0x100001) colored++;
+        size_t class_length = 0;
+        const lxb_char_t *classes = lxb_dom_element_get_attribute(
+            lxb_dom_interface_element(elements[i]),
+            (const lxb_char_t *) "class", 5, &class_length);
+        if (classes != NULL && class_length == 1 && classes[0] == 'z')
+            fillers++;
+    }
+    /* The rules styled what they select (.a and #c), through the index. */
+    CHECK(colored == 2);
+    /* The fillers carry no option key: each is a candidate for the one
+       universal page rules, beside the page-free ones, not for all. */
+    uint64_t per_element = (indexed.rule_index_candidates - candidates)
+        / (uint64_t) count;
+    CHECK(fillers == 200);
+    if (per_element > page_free + 4u) {
+        printf("logical subjects: %llu candidates per element\n",
+               (unsigned long long) per_element);
+        CHECK(false);
+    }
+    stylesheet_destroy(&indexed);
+    stylesheet_destroy(&linear);
+    stylesheet_destroy(&base);
+    document_destroy(&document);
+    document_destroy(&bare);
+    CHECK(budget.current == 0);
+    return 0;
 }
 
 static int test_escaped_utility_classes_indexed(void)
@@ -6952,6 +7556,274 @@ static int test_shadow_carrier_scan_memo(void)
     return 0;
 }
 
+/* A component without adopted sheets keeps a <style> in each instance's
+   shadow root, so each custom property it declares is a rule once per
+   instance. Only the trees an element is inside, hosts, or is slotted
+   into can admit such a rule, so a lookup's scan is bounded by those trees
+   rather than the instance count (it scanned every instance's copy). The
+   values must equal the full scan's (the unindexed path), across
+   inheritance into and through the trees, :host, ::slotted(), nested
+   trees, !important, fallbacks, cycles, @property, and mutation. */
+enum { SHADOW_VARIABLE_INSTANCES = 48 };
+
+static const char *const shadow_variable_names[] = {
+    "--tone", "--edge", "--fixed", "--a", "--b", "--reg"
+};
+
+/* Every probed element's value of every probed name, joined. */
+static bool shadow_variable_snapshot(const Stylesheet *sheet,
+                                     lxb_dom_node_t *const *nodes,
+                                     size_t count, char *out, size_t size)
+{
+    size_t used = 0;
+    out[0] = '\0';
+    for (size_t i = 0; i < count; i++) {
+        for (size_t n = 0; n < sizeof(shadow_variable_names)
+                               / sizeof(shadow_variable_names[0]); n++) {
+            char value[64];
+            custom_property_text(sheet, nodes[i], shadow_variable_names[n],
+                                 value, sizeof(value));
+            ComputedStyle style = n == 0
+                ? style_for_node(sheet, nodes[i], NULL) : (ComputedStyle) {0};
+            int written = snprintf(out + used, size - used, "%s=%s%s%06x",
+                                   shadow_variable_names[n], value,
+                                   n == 0 ? "/" : "",
+                                   n == 0 ? (unsigned) style.color : 0u);
+            if (written < 0 || (size_t) written >= size - used) return false;
+            used += (size_t) written;
+        }
+        if (used + 1u >= size) return false;
+        out[used++] = ';';
+        out[used] = '\0';
+    }
+    return true;
+}
+
+static int test_shadow_style_variable_scan_bounded(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    enum { HTML_CAPACITY = 64 * 1024 };
+    char *html = malloc(HTML_CAPACITY);
+    CHECK(html != NULL);
+    size_t used = (size_t) snprintf(html, HTML_CAPACITY,
+        "<style>@property --reg{syntax:'<length>';inherits:false;"
+        "initial-value:2px}"
+        ":root{--tone:#00ff00;--edge:1px}"
+        "x-host{--tone:#ff0000;--fixed:#111111!important}"
+        ".plain{color:var(--tone)}"
+        "x-host.hot{--tone:#330000}</style>"
+        "<body><p class=plain id=plain>outside</p>");
+    for (int i = 0; i < SHADOW_VARIABLE_INSTANCES; i++) {
+        used += (size_t) snprintf(html + used, HTML_CAPACITY - used,
+            "<x-host id=h%d><span id=l%d>light</span><div id=c%d><style>"
+            ":host{--edge:%dpx;--reg:9px;--tone:#7f7f7f;"
+            "--fixed:#222222!important}"
+            ".t{--tone:#0000%02x;color:var(--tone)}"
+            ".u{color:var(--tone)}"
+            "::slotted(span){--tone:#01%02x01}"
+            ".f{color:var(--missing,#123456)}"
+            ".cyc{--a:var(--b);--b:var(--a)}"
+            ".imp{--fixed:#333333!important}.f.imp{--fixed:#444444}"
+            "</style><slot></slot><p class=t id=t%d>t</p>"
+            "<p class=u id=u%d>u<b class=w id=b%d>b</b></p>"
+            "<p class='f cyc imp' id=f%d>f</p>",
+            i, i, i, i + 2, i + 1, i + 1, i, i, i, i);
+        /* The probed instance has a second <style>: two scopes, one tree
+           group. */
+        if (i == SHADOW_VARIABLE_INSTANCES / 2)
+            used += (size_t) snprintf(html + used, HTML_CAPACITY - used,
+                "<style>.w{--edge:13px}</style>");
+        /* The first instance nests a component without its own <style>:
+           the outer tree's rules do not reach into it. */
+        if (i == 0)
+            used += (size_t) snprintf(html + used, HTML_CAPACITY - used,
+                "<x-host id=nh><div id=nc><p class=t id=np>n</p></div>"
+                "</x-host>");
+        used += (size_t) snprintf(html + used, HTML_CAPACITY - used,
+                                  "</div></x-host>");
+        CHECK(used < HTML_CAPACITY);
+    }
+    used += (size_t) snprintf(html + used, HTML_CAPACITY - used, "</body>");
+    CHECK(used < HTML_CAPACITY);
+    PocDocument document = {0};
+    CHECK(document_parse(&document, &budget, html, used, 17));
+    free(html);
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    char id[16];
+    for (int i = 0; i < SHADOW_VARIABLE_INSTANCES; i++) {
+        snprintf(id, sizeof(id), "c%d", i);
+        CHECK(document_mark_shadow_carrier(find_id(root, id)));
+    }
+    CHECK(document_mark_shadow_carrier(find_id(root, "nc")));
+    const int probe = SHADOW_VARIABLE_INSTANCES / 2;
+    const char *const probe_ids[] = {"plain", "h", "l", "t", "u", "b", "f"};
+    enum { PROBES = 7 + 2 };
+    lxb_dom_node_t *nodes[PROBES];
+    for (size_t i = 0; i < 7; i++) {
+        if (i == 0) snprintf(id, sizeof(id), "%s", probe_ids[i]);
+        else snprintf(id, sizeof(id), "%s%d", probe_ids[i], probe);
+        nodes[i] = find_id(root, id);
+        CHECK(nodes[i] != NULL);
+    }
+    nodes[7] = find_id(root, "nh");
+    nodes[8] = find_id(root, "np");
+    CHECK(nodes[7] != NULL && nodes[8] != NULL);
+    lxb_dom_node_t *host = nodes[1], *light = nodes[2], *inside = nodes[3];
+    lxb_dom_node_t *plain_inside = nodes[4], *nested = nodes[8];
+
+    Stylesheet sheet = {0};
+    CHECK(stylesheet_build(&sheet, &budget, &document, 480));
+    CHECK(sheet.scopes.shadow_scope_count == SHADOW_VARIABLE_INSTANCES + 1);
+    stylesheet_prepare_rule_index(&sheet);
+    CHECK(sheet.custom_rule_index_ready
+          && sheet.custom_rule_index_carrier_count
+                 == SHADOW_VARIABLE_INSTANCES);
+
+    /* The cascade itself. */
+    char value[64];
+    CHECK(custom_property_text(&sheet, nodes[0], "--tone", value,
+                               sizeof(value)) != 0
+          && strcmp(value, "#00ff00") == 0);
+    snprintf(id, sizeof(id), "#0000%02x", probe + 1);
+    CHECK(custom_property_text(&sheet, inside, "--tone", value,
+                               sizeof(value)) != 0 && strcmp(value, id) == 0);
+    /* Inherited from the host's document rule through the carrier. */
+    CHECK(custom_property_text(&sheet, plain_inside, "--tone", value,
+                               sizeof(value)) != 0
+          && strcmp(value, "#ff0000") == 0);
+    snprintf(id, sizeof(id), "%dpx", probe + 2);
+    CHECK(custom_property_text(&sheet, host, "--edge", value,
+                               sizeof(value)) != 0 && strcmp(value, id) == 0);
+    CHECK(custom_property_text(&sheet, plain_inside, "--edge", value,
+                               sizeof(value)) != 0 && strcmp(value, id) == 0);
+    /* The tree's second <style>. */
+    CHECK(custom_property_text(&sheet, nodes[5], "--edge", value,
+                               sizeof(value)) != 0
+          && strcmp(value, "13px") == 0);
+    snprintf(id, sizeof(id), "#01%02x01", probe + 1);
+    CHECK(custom_property_text(&sheet, light, "--tone", value,
+                               sizeof(value)) != 0 && strcmp(value, id) == 0);
+    /* A non-inheriting registration: the host's own value, the initial
+       value below it. */
+    CHECK(custom_property_text(&sheet, host, "--reg", value, sizeof(value))
+          != 0 && strcmp(value, "9px") == 0);
+    CHECK(custom_property_text(&sheet, plain_inside, "--reg", value,
+                               sizeof(value)) != 0
+          && strcmp(value, "2px") == 0);
+    lxb_dom_node_t *mixed = nodes[6];
+    /* On the host a normal document declaration beats :host and an
+       important :host one beats the document's; inside, importance beats
+       specificity. Both properties of the cycle are guaranteed-invalid. */
+    CHECK(custom_property_text(&sheet, host, "--tone", value, sizeof(value))
+          != 0 && strcmp(value, "#ff0000") == 0);
+    CHECK(custom_property_text(&sheet, host, "--fixed", value,
+                               sizeof(value)) != 0
+          && strcmp(value, "#222222") == 0);
+    CHECK(custom_property_text(&sheet, mixed, "--fixed", value,
+                               sizeof(value)) != 0
+          && strcmp(value, "#333333") == 0);
+    CHECK(custom_property_text(&sheet, mixed, "--a", value, sizeof(value))
+          == 0);
+    CHECK(custom_property_text(&sheet, mixed, "--b", value, sizeof(value))
+          == 0);
+    CHECK(style_for_node(&sheet, mixed, NULL).color == 0x123456u);
+    /* The nested tree sees neither the outer tree's .t rule nor its value. */
+    CHECK(custom_property_text(&sheet, nested, "--tone", value,
+                               sizeof(value)) != 0
+          && strcmp(value, "#ff0000") == 0);
+
+    /* Bounded work: one element's lookup scans its own tree's copies and
+       the document's rules, whatever the instance count. */
+    uint64_t candidates = sheet.variable_rule_candidates;
+    uint64_t lookups = sheet.variable_lookup_calls;
+    ComputedStyle inside_style = style_for_node(&sheet, inside, NULL);
+    CHECK(inside_style.color == (uint32_t) (probe + 1));
+    uint64_t scanned = sheet.variable_rule_candidates - candidates;
+    printf("shadow <style> variable lookup: lookups=%llu candidates=%llu "
+           "instances=%d\n",
+           (unsigned long long) (sheet.variable_lookup_calls - lookups),
+           (unsigned long long) scanned, SHADOW_VARIABLE_INSTANCES);
+    CHECK(sheet.variable_lookup_calls - lookups != 0);
+    CHECK(scanned <= 8u * (sheet.variable_lookup_calls - lookups));
+    CHECK(scanned < SHADOW_VARIABLE_INSTANCES);
+
+    /* The same answers as the full scan, before and after mutations. */
+    enum { SNAPSHOT = 8192 };
+    char *grouped = malloc(SNAPSHOT), *full = malloc(SNAPSHOT);
+    CHECK(grouped != NULL && full != NULL);
+    for (int step = 0; step < 3; step++) {
+        if (step == 1) {
+            /* Class changes on a host and inside its tree. */
+            CHECK(lxb_dom_element_set_attribute(
+                lxb_dom_interface_element(host),
+                (const lxb_char_t *) "class", 5,
+                (const lxb_char_t *) "hot", 3) != NULL);
+            CHECK(lxb_dom_element_set_attribute(
+                lxb_dom_interface_element(plain_inside),
+                (const lxb_char_t *) "class", 5,
+                (const lxb_char_t *) "t", 1) != NULL);
+        } else if (step == 2) {
+            /* A rule inserted after the index was built. */
+            static const char added[] =
+                "x-host.hot{--edge:7px!important}.plain{--tone:#00007f}";
+            CHECK(stylesheet_add_css(&sheet, added, sizeof(added) - 1u));
+        }
+        stylesheet_prepare_rule_index(&sheet);
+        CHECK(sheet.custom_rule_index_ready
+              && sheet.custom_rule_index_carrier_count
+                     == SHADOW_VARIABLE_INSTANCES);
+        CHECK(shadow_variable_snapshot(&sheet, nodes, PROBES, grouped,
+                                       SNAPSHOT));
+        /* The unindexed path scans every custom rule. */
+        sheet.custom_rule_index_ready = false;
+        CHECK(shadow_variable_snapshot(&sheet, nodes, PROBES, full,
+                                       SNAPSHOT));
+        sheet.custom_rule_index_ready = true;
+        if (strcmp(grouped, full) != 0)
+            fprintf(stderr, "step %d\n grouped=%s\n full=%s\n", step,
+                    grouped, full);
+        CHECK(strcmp(grouped, full) == 0);
+    }
+    snprintf(id, sizeof(id), "#0000%02x", probe + 1);
+    CHECK(custom_property_text(&sheet, plain_inside, "--tone", value,
+                               sizeof(value)) != 0 && strcmp(value, id) == 0);
+    CHECK(custom_property_text(&sheet, plain_inside, "--edge", value,
+                               sizeof(value)) != 0
+          && strcmp(value, "7px") == 0);
+    CHECK(custom_property_text(&sheet, nodes[0], "--tone", value,
+                               sizeof(value)) != 0
+          && strcmp(value, "#00007f") == 0);
+    /* Each allocation of the index refused in turn: without the carrier
+       table every rule stays in group 0 and the full scan's answers hold;
+       a refused index or gate leaves the unindexed or ungated path. */
+    bool degraded = false;
+    for (size_t failure_at = 0; failure_at < 8u; failure_at++) {
+        stylesheet_drop_custom_rule_index(&sheet);
+        size_t before = budget.injected_failure_count;
+        budget_inject_failure_after(&budget, failure_at);
+        stylesheet_prepare_rule_index(&sheet);
+        budget_clear_failure_injection(&budget);
+        if (sheet.custom_rule_index_ready
+            && sheet.custom_rule_index_carrier_count == 0
+            && before != budget.injected_failure_count) degraded = true;
+        CHECK(shadow_variable_snapshot(&sheet, nodes, PROBES, grouped,
+                                       SNAPSHOT));
+        if (strcmp(grouped, full) != 0)
+            fprintf(stderr, "refusal %zu\n grouped=%s\n full=%s\n",
+                    failure_at, grouped, full);
+        CHECK(strcmp(grouped, full) == 0);
+    }
+    CHECK(degraded);
+    free(grouped);
+    free(full);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 static int test_shadow_scope_allocation_refusal(void)
 {
     Budget budget;
@@ -7958,6 +8830,10 @@ static int test_focus_has_anchor_scope(void)
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--attribute-candidates-only") == 0)
+        return test_attribute_candidates();
+    if (argc == 2 && strcmp(argv[1], "--modern-lookups-only") == 0)
+        return test_modern_properties_skip_impossible_lookups();
     if (argc == 2 && strcmp(argv[1], "--letter-spacing-only") == 0)
         return test_long_math_letter_spacing();
     if (argc == 2 && strcmp(argv[1], "--angle-grammar-only") == 0)
@@ -8088,6 +8964,8 @@ int main(int argc, char **argv)
         return test_has_attribute_readers_agree();
     if (argc == 2 && strcmp(argv[1], "--has-class-positions-only") == 0)
         return test_has_class_positions();
+    if (argc == 2 && strcmp(argv[1], "--has-argument-regions-only") == 0)
+        return test_has_argument_anchor_regions();
     if (argc == 2 && strcmp(argv[1], "--declaration-footprint-only") == 0)
         return test_unmatched_declaration_footprint();
     if (argc == 2 && strcmp(argv[1], "--custom-footprint-only") == 0)
@@ -8106,6 +8984,8 @@ int main(int argc, char **argv)
         return test_selector_attribute_names();
     if (argc == 2 && strcmp(argv[1], "--shadow-scope-refusal-only") == 0)
         return test_shadow_scope_allocation_refusal();
+    if (argc == 2 && strcmp(argv[1], "--shadow-style-variables-only") == 0)
+        return test_shadow_style_variable_scan_bounded();
     if (argc == 2 && strcmp(argv[1], "--shadow-carrier-scan-only") == 0)
         return test_shadow_carrier_scan_memo();
     if (argc == 2 && strcmp(argv[1], "--document-attribute-only") == 0)
@@ -8125,6 +9005,7 @@ int main(int argc, char **argv)
     CHECK(test_transition_candidate_rejection() == 0);
     CHECK(test_selector_attribute_names() == 0);
     CHECK(test_shadow_scope_allocation_refusal() == 0);
+    CHECK(test_shadow_style_variable_scan_bounded() == 0);
     CHECK(test_shadow_carrier_scan_memo() == 0);
     CHECK(test_shadow_carrier_is_the_marker() == 0);
     CHECK(test_manual_slot_assignment() == 0);
@@ -8142,14 +9023,17 @@ int main(int argc, char **argv)
     CHECK(test_unrelated_container_custom_rules() == 0);
     CHECK(test_retained_dense_storage() == 0);
     CHECK(test_retained_range_cache_handoff() == 0);
+    CHECK(test_modern_properties_skip_impossible_lookups() == 0);
     CHECK(test_class_token_byte_boundaries() == 0);
     CHECK(test_retained_properties_share_class_tokens() == 0);
     CHECK(test_utility_class_candidates_match_linear() == 0);
+    CHECK(test_logical_subject_index_keys() == 0);
     CHECK(test_escaped_utility_classes_indexed() == 0);
     CHECK(test_query_attribute_keys_match_direct() == 0);
     CHECK(test_query_deeply_nested_is_prepares_flat() == 0);
     CHECK(test_full_selector_class_token_reuse() == 0);
     CHECK(test_functional_selector_keys() == 0);
+    CHECK(test_attribute_candidates() == 0);
     CHECK(test_deferred_font_basis() == 0);
     CHECK(test_retained_retirement_probe_holes() == 0);
     CHECK(test_retained_mixed_importance_append() == 0);
@@ -8159,6 +9043,7 @@ int main(int argc, char **argv)
     CHECK(test_retained_focus_descendants() == 0);
     CHECK(test_has_attribute_readers_agree() == 0);
     CHECK(test_has_class_positions() == 0);
+    CHECK(test_has_argument_anchor_regions() == 0);
     if (argc == 2 && strcmp(argv[1], "--bounded-out-focus-only") == 0)
         return test_bounded_out_sheet_keeps_focus_fast_path();
     CHECK(test_bounded_out_sheet_keeps_focus_fast_path() == 0);
@@ -8173,6 +9058,10 @@ int main(int argc, char **argv)
     CHECK(test_retained_keyless_lost_match() == 0);
     CHECK(test_retained_scoped_invalidation() == 0);
     CHECK(test_ancestor_filter_canonical_tokens() == 0);
+    CHECK(test_rule_selector_facts() == 0);
+    CHECK(test_selector_structural_text() == 0);
+    CHECK(test_trailing_keys_reach_halves() == 0);
+    CHECK(test_has_argument_keys_reach() == 0);
     CHECK(test_compiled_attribute_and_pseudo_instructions() == 0);
     CHECK(test_quoted_declaration_boundaries() == 0);
     CHECK(test_pseudo_state_work() == 0);

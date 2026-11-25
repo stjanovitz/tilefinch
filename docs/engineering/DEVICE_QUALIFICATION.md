@@ -123,7 +123,7 @@ and captures loading, immediate acknowledgement, and settled cancellation.
 
 ```sh
 scripts/run-ppsspp-input-script.sh \
-  --script navigation-cancel-live --runs 2
+  --script navigation-cancel-live --runs 2 --allow-network
 ```
 
 Temporal snapshots first enter a bounded RAM ring and are written after the

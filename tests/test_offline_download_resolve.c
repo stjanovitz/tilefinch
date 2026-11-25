@@ -55,20 +55,24 @@ static bool write_replay(char directory[128], const ReplayRecord *records,
         snprintf(path, sizeof(path), "%s/%04zu.body", directory, i);
         FILE *body = fopen(path, "wb");
         ok = body != NULL
-            && fwrite(records[i].body, 1, records[i].body_length, body)
-                   == records[i].body_length;
+            && (records[i].body == NULL
+                || fwrite(records[i].body, 1, records[i].body_length, body)
+                       == records[i].body_length);
         if (body != NULL && fclose(body) != 0) ok = false;
         snprintf(path, sizeof(path), "%s/%04zu.meta", directory, i);
         FILE *meta = ok ? fopen(path, "wb") : NULL;
         ok = meta != NULL && fprintf(
             meta,
             "psp-http-trace=1\nmethod=%s\nurl=%s\n"
-            "success=1\nasync-delay-pumps=0\nexternal-cancel=0\n"
-            "transport-timeout=0\nerror=\nstatus=200\nlength=%zu\n"
+            "success=%d\nasync-delay-pumps=0\nexternal-cancel=0\n"
+            "transport-timeout=0\nerror=%s\nstatus=200\nlength=%zu\n"
             "effective-url=%s\ncontent-type=%s\netag=\nlast-modified=\n"
             "cf-mitigated=\naccept-ch=\ncritical-ch=\n"
             "server=fixture-youtube\ncf-ray=\nset-cookie-count=0\n",
-            records[i].method, records[i].url, records[i].body_length,
+            records[i].method, records[i].url, records[i].body != NULL,
+            records[i].body != NULL ? ""
+                : "failed while fetching https://media.example/?token=not-for-storage",
+            records[i].body_length,
             records[i].url, records[i].content_type) > 0;
         if (meta != NULL && fclose(meta) != 0) ok = false;
     }
@@ -441,8 +445,7 @@ static int test_cancel_during_resolve(void)
     return fixture_close(&fixture);
 }
 
-/* A failed resolve keeps the resolver's message as the item's failure
-   reason, as before. */
+/* Raw transport diagnostics may contain a signed URL; never persist them. */
 static int test_failed_resolve_message(void)
 {
     ReplayRecord records[] = {
@@ -452,7 +455,7 @@ static int test_failed_resolve_message(void)
         {"GET",
          "https://www.youtube.com/watch?v=TFTEST00005"
          "&bpctr=9999999999&has_verified=1",
-         "text/html; charset=utf-8", "<html></html>", 13u}
+         "text/html; charset=utf-8", NULL, 0u}
     };
     Fixture fixture;
     if (fixture_open(&fixture, "TFTEST00005", records, 2) != 0) return 1;
@@ -463,16 +466,41 @@ static int test_failed_resolve_message(void)
     const OfflineLibraryItem *item =
         offline_library_find(&fixture.library, fixture.id);
     CHECK(item != NULL);
-    if (strstr(item->failure_reason,
-               "watch: page omitted bounded player configuration"
-               " after 3 client attempts") == NULL)
-        fprintf(stderr, "failed resolve: state %d, error \"%s\"\n",
-                (int) item->state, item->failure_reason);
     CHECK(!offline_download_manager_active(download, NULL)
           && item->state == OFFLINE_ITEM_FAILED && most <= 1u
-          && strstr(item->failure_reason,
-                    "watch: page omitted bounded player configuration"
-                    " after 3 client attempts") != NULL);
+          && strcmp(item->failure_reason,
+                    "YouTube video could not be resolved") == 0
+          && strcmp(download->error, item->failure_reason) == 0);
+    OfflineLibrary saved;
+    offline_library_init(&saved, &fixture.budget, fixture.root);
+    CHECK(offline_library_load(&saved));
+    item = offline_library_find(&saved, fixture.id);
+    CHECK(item != NULL && strcmp(item->failure_reason, download->error) == 0);
+    return fixture_close(&fixture);
+}
+
+static int test_failed_media_message(void)
+{
+    static const char url[] =
+        "https://rr2.googlevideo.com/videoplayback?id=v&token=not-for-storage";
+    ReplayRecord records[] = {{"GET", url, "video/mp4", NULL, 0u}};
+    Fixture fixture;
+    if (fixture_open(&fixture, "TFTEST00013", records, 1) != 0) return 1;
+    YoutubeStream stream = {
+        .video_id = "TFTEST00013", .content_length = 2000, .itag = 18,
+    };
+    snprintf(stream.media_url, sizeof(stream.media_url), "%s", url);
+    OfflineDownloadManager *download = &fixture.download;
+    CHECK(offline_download_manager_start(download, fixture.id)
+          && offline_download_manager_adopt_resolved(download, &stream));
+    for (unsigned i = 0; i < 32 && offline_download_manager_active(download, NULL); i++)
+        (void) offline_download_manager_pump(download);
+    const OfflineLibraryItem *item =
+        offline_library_find(&fixture.library, fixture.id);
+    CHECK(!offline_download_manager_active(download, NULL)
+          && item != NULL && item->state == OFFLINE_ITEM_PAUSED
+          && strstr(item->failure_reason, "not-for-storage") == NULL
+          && strcmp(download->error, item->failure_reason) == 0);
     return fixture_close(&fixture);
 }
 
@@ -542,6 +570,81 @@ static off_t file_length(const char *path)
 {
     struct stat status;
     return stat(path, &status) == 0 ? status.st_size : -1;
+}
+
+static int test_unreadable_receipt_keeps_partial(void)
+{
+    Fixture fixture;
+    ReplayRecord records[] = {
+        {"GET", "https://www.youtube.com/watch?v=TFTEST00006",
+         "text/html", watch_page, sizeof(watch_page) - 1u},
+    };
+    if (fixture_open(&fixture, "TFTEST00006", records, 1) != 0) return 1;
+    OfflineDownloadManager *download = &fixture.download;
+    YoutubeStream stream = {
+        .video_id = "TFTEST00006", .content_length = 2000, .itag = 18,
+        .media_url = "https://rr2.googlevideo.com/videoplayback?id=asset&lmt=1",
+    };
+    char receipt[384], part[384], held[400];
+    CHECK(item_file(&fixture, ".video.identity", receipt, sizeof(receipt))
+          && item_file(&fixture, ".video.part", part, sizeof(part)));
+    snprintf(held, sizeof(held), "%s.held", receipt);
+    CHECK(offline_download_manager_start(download, fixture.id)
+          && offline_download_manager_adopt_resolved(download, &stream)
+          && fputs("old prefix", download->output) >= 0
+          && offline_download_manager_pause(download, fixture.id)
+          && rename(receipt, held) == 0 && mkdir(receipt, 0700) == 0);
+    /* A directory can open for input, but cannot supply receipt bytes. */
+    CHECK(offline_download_manager_start(download, fixture.id)
+          && !offline_download_manager_adopt_resolved(download, &stream));
+    const OfflineLibraryItem *item = offline_library_find(&fixture.library, fixture.id);
+    CHECK(item->state == OFFLINE_ITEM_PAUSED
+          && strstr(item->failure_reason, "metadata could not be read") != NULL
+          && file_length(part) == (off_t) strlen("old prefix"));
+    CHECK(rmdir(receipt) == 0 && rename(held, receipt) == 0
+          && offline_download_manager_start(download, fixture.id)
+          && offline_download_manager_adopt_resolved(download, &stream)
+          && download->part_offset == strlen("old prefix")
+          && offline_download_manager_pause(download, fixture.id));
+    return fixture_close(&fixture);
+}
+
+static int test_unavailable_video_payload_keeps_partial(void)
+{
+    Fixture fixture;
+    ReplayRecord records[] = {
+        {"GET", "https://www.youtube.com/watch?v=TFTEST00006",
+         "text/html", watch_page, sizeof(watch_page) - 1u},
+    };
+    if (fixture_open(&fixture, "TFTEST00006", records, 1) != 0) return 1;
+    OfflineDownloadManager *download = &fixture.download;
+    YoutubeStream stream = {
+        .video_id = "TFTEST00006", .content_length = 2000, .itag = 18,
+        .media_url = "https://rr2.googlevideo.com/videoplayback?id=asset&lmt=1",
+    };
+    char part[384], audio[384];
+    CHECK(item_file(&fixture, ".video.part", part, sizeof(part))
+          && item_file(&fixture, ".audio.mp4", audio, sizeof(audio))
+          && offline_download_manager_start(download, fixture.id)
+          && offline_download_manager_adopt_resolved(download, &stream)
+          && fputs("old prefix", download->output) >= 0
+          && offline_download_manager_pause(download, fixture.id)
+          && symlink(audio, audio) == 0);
+    char *revision = strstr(stream.media_url, "lmt=1");
+    CHECK(revision != NULL);
+    revision[4] = '2';
+    CHECK(offline_download_manager_start(download, fixture.id)
+          && !offline_download_manager_adopt_resolved(download, &stream));
+    const OfflineLibraryItem *item = offline_library_find(&fixture.library, fixture.id);
+    CHECK(item->state == OFFLINE_ITEM_PAUSED
+          && strstr(item->failure_reason, "files could not be checked") != NULL
+          && file_length(part) == (off_t) strlen("old prefix"));
+    revision[4] = '1';
+    CHECK(unlink(audio) == 0 && offline_download_manager_start(download, fixture.id)
+          && offline_download_manager_adopt_resolved(download, &stream)
+          && download->part_offset == strlen("old prefix")
+          && offline_download_manager_pause(download, fixture.id));
+    return fixture_close(&fixture);
 }
 
 /* A brand-new download takes the reset branch with none of its files on
@@ -714,6 +817,59 @@ static int test_oversized_part_restarts(void)
     return fixture_close(&fixture);
 }
 
+static int test_final_close_failure(bool audio, bool pause)
+{
+    Fixture fixture;
+    ReplayRecord records[] = {
+        {"GET", "https://www.youtube.com/watch?v=TFTEST00011",
+         "text/html", watch_page, sizeof(watch_page) - 1u},
+    };
+    if (fixture_open(&fixture, "TFTEST00011", records, 1) != 0) return 1;
+    YoutubeStream stream = {
+        .video_id = "TFTEST00011", .content_length = 2000, .itag = 135,
+        .audio_content_length = 1000, .audio_itag = 140,
+        .split_streams = true,
+        .media_url = "https://rr2.googlevideo.com/videoplayback?id=v",
+        .audio_url = "https://rr2.googlevideo.com/videoplayback?id=a",
+    };
+    OfflineDownloadManager *download = &fixture.download;
+    CHECK(offline_download_manager_start(download, fixture.id)
+          && offline_download_manager_adopt_resolved(download, &stream)
+          && offline_download_manager_pause(download, fixture.id));
+    char part[384], final[384], video[384];
+    CHECK(item_file(&fixture, ".video.mp4", video, sizeof(video))
+          && item_file(&fixture, audio ? ".audio.part" : ".video.part",
+                       part, sizeof(part))
+          && item_file(&fixture, audio ? ".audio.mp4" : ".video.mp4",
+                       final, sizeof(final))
+          && (!audio || write_bytes(video, 2000))
+          && write_bytes(part, audio ? 1000 : 2000));
+    CHECK(offline_download_manager_start(download, fixture.id)
+          && offline_download_manager_adopt_resolved(download, &stream)
+          && download->phase == (audio ? OFFLINE_DOWNLOAD_AUDIO
+                                      : OFFLINE_DOWNLOAD_VIDEO)
+          && download->part_offset == download->part_total);
+    /* The length looks complete, but the underlying writer fails at close.
+       Leave pending data in the pause case to fault the flush as well. */
+    if (pause) CHECK(fputc('x', download->output) != EOF);
+    CHECK(close(fileno(download->output)) == 0);
+    if (pause) CHECK(offline_download_manager_pause(download, fixture.id));
+    else (void) offline_download_manager_pump(download);
+    const OfflineLibraryItem *item =
+        offline_library_find(&fixture.library, fixture.id);
+    CHECK(!offline_download_manager_active(download, NULL)
+          && item != NULL && item->state == OFFLINE_ITEM_PAUSED
+          && strstr(item->failure_reason, "could not be finalized") != NULL
+          && item->downloaded_bytes == (audio ? 2000u : 0u)
+          && access(final, F_OK) != 0 && access(part, F_OK) != 0
+          && (!audio || file_length(video) == 2000));
+    CHECK(offline_download_manager_start(download, fixture.id)
+          && offline_download_manager_adopt_resolved(download, &stream)
+          && download->part_offset == 0
+          && offline_download_manager_pause(download, fixture.id));
+    return fixture_close(&fixture);
+}
+
 int main(void)
 {
     if (test_resolve_spans_pumps() != 0
@@ -721,11 +877,18 @@ int main(void)
         || test_pause_during_resolve() != 0
         || test_cancel_during_resolve() != 0
         || test_failed_resolve_message() != 0
+        || test_failed_media_message() != 0
         || test_resume_representation() != 0
+        || test_unreadable_receipt_keeps_partial() != 0
+        || test_unavailable_video_payload_keeps_partial() != 0
         || test_new_download_resets_without_files() != 0
         || test_unreceipted_download_resumes() != 0
         || test_unreceipted_mismatch_resets() != 0
-        || test_oversized_part_restarts() != 0)
+        || test_oversized_part_restarts() != 0
+        || test_final_close_failure(false, false) != 0
+        || test_final_close_failure(true, false) != 0
+        || test_final_close_failure(false, true) != 0
+        || test_final_close_failure(true, true) != 0)
         return 1;
     printf("offline download resolve tests passed\n");
     return 0;

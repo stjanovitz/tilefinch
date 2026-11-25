@@ -41,6 +41,7 @@ set(TILEFINCH_CORE_SOURCES
     src/glyph_pack_offer.c
     src/ui_language.c
     src/image.c
+    src/image_noscript.c
     src/image_decode.c
     src/image_retarget.c
     src/image_svg_decode.c
@@ -119,6 +120,7 @@ set(TILEFINCH_CORE_SOURCES
     src/resources.c
     src/resources_fonts.c
     src/sha256.c
+    src/web_crypto.c
     src/script_admission.c
     src/script_lazy.c
     src/script_loader.c

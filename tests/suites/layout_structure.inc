@@ -1241,6 +1241,107 @@ static int test_directional_logical_properties(Budget *budget)
     return 0;
 }
 
+static bool bidi_cancel_prepare(void *unused, const char *phase, size_t work)
+{
+    (void) unused;
+    (void) work;
+    return strcmp(phase, "layout-prepare") != 0;
+}
+
+static int test_bidi_provisional_absence(Budget *budget)
+{
+    size_t baseline = budget->current;
+    static const char html[] = "<style>.absent:focus-within span{direction:rtl}"
+        "</style><p id=a>abc</p><p id=b>\xd7\x90 world</p>";
+    PocDocument doc = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    LayoutReuseCache *reuse = layout_reuse_cache_create(budget);
+    LayoutContext *ctx = budget_calloc(budget, 1, sizeof(*ctx));
+    CHECK(reuse && ctx && document_parse(&doc, budget, html, sizeof(html)-1, 19)
+          && stylesheet_build(&sheet, budget, &doc, 480));
+    ctx->document = &doc; ctx->sheet = &sheet; ctx->reuse = reuse;
+    ctx->layout = &layout; ctx->preview_y_limit = 800;
+    ctx->document_bidi_text_present = true;
+    layout_bidi_prepare(ctx, budget);
+    CHECK(ctx->bidi_prepared && reuse->bidi_absence == NULL);
+    layout_bidi_release(ctx, budget);
+    layout_reuse_cache_set_extending(reuse, true);
+    lxb_dom_node_t *a = find_id(lxb_dom_interface_node(doc.html), "a");
+    CHECK(a != NULL);
+    /* Refusing the optional memo must not disable this pass's real summary. */
+    budget_inject_failure_after(budget, 1);
+    layout_bidi_prepare(ctx, budget);
+    budget_clear_failure_injection(budget);
+    CHECK(ctx->bidi_prepared && reuse->bidi_absence == NULL);
+    layout_bidi_release(ctx, budget);
+    layout_bidi_prepare(ctx, budget);
+    CHECK(ctx->bidi_prepared && reuse->bidi_absence != NULL);
+    size_t count = ctx->bidi_rtl_ancestor_count;
+    CHECK(count > 0 && count <= 32);
+    lxb_dom_node_t *expected[32];
+    memcpy(expected, ctx->bidi_rtl_ancestors, count * sizeof(*expected));
+    layout_bidi_release(ctx, budget);
+    budget_inject_failure_after(budget, 0);
+    layout_bidi_prepare(ctx, budget);
+    budget_clear_failure_injection(budget);
+    CHECK(!ctx->bidi_prepared && ctx->bidi_rtl_ancestors == NULL);
+    uint32_t visits = layout.performance.bidi_prepare_nodes;
+    CHECK(visits > 0);
+    layout_bidi_prepare(ctx, budget);
+    CHECK(ctx->bidi_prepared && ctx->bidi_rtl_ancestor_count == count
+          && layout.performance.bidi_prepare_nodes == visits);
+    CHECK(layout_bidi_forget_absence(reuse) > 0
+          && memcmp(expected, ctx->bidi_rtl_ancestors, count * sizeof(*expected)) == 0);
+    layout_bidi_release(ctx, budget);
+    layout_bidi_prepare(ctx, budget);
+    layout_bidi_release(ctx, budget);
+    /* A text mutation increases the RTL ancestor set; a required class
+       appearing disallows reuse even when focus currently doesn't match. */
+    CHECK(document_set_element_inner_html(&doc, a, "\xd7\x90", 2));
+    layout_bidi_prepare(ctx, budget);
+    CHECK(ctx->bidi_prepared && ctx->bidi_rtl_ancestor_count > count);
+    layout_bidi_release(ctx, budget);
+    /* Live script bypasses an existing memo. */
+    visits = layout.performance.bidi_prepare_nodes;
+    doc.script_realm_bound = true;
+    layout_bidi_prepare(ctx, budget);
+    CHECK(ctx->bidi_prepared && layout.performance.bidi_prepare_nodes > visits);
+    layout_bidi_release(ctx, budget);
+    doc.script_realm_bound = false;
+    CHECK(lxb_dom_element_set_attribute(lxb_dom_interface_element(a),
+        (const lxb_char_t *)"class",5,(const lxb_char_t *)"absent",6) != NULL);
+    layout_bidi_prepare(ctx, budget);
+    CHECK(ctx->bidi_prepared && !reuse->bidi_absence);
+    layout_bidi_release(ctx, budget);
+    CHECK(lxb_dom_element_set_attribute(lxb_dom_interface_element(a),
+        (const lxb_char_t *)"class",5,(const lxb_char_t *)"plain",5) != NULL);
+    layout_bidi_prepare(ctx, budget);
+    CHECK(ctx->bidi_prepared && reuse->bidi_absence != NULL);
+    layout_bidi_release(ctx, budget);
+    static const char direction[] = "#a{direction:rtl}";
+    CHECK(stylesheet_add_css(&sheet, direction, sizeof(direction)-1));
+    layout_bidi_prepare(ctx, budget);
+    CHECK(ctx->bidi_prepared && ctx->bidi_direction_change_possible
+          && reuse->bidi_absence == NULL);
+    layout_bidi_release(ctx, budget);
+    char children[80 * 8];
+    for (size_t i = 0; i < 80; i++) memcpy(children + 8*i, "<i>x</i>", 8);
+    CHECK(document_set_element_inner_html(&doc, a, children, sizeof(children)));
+    TilefinchPlatformServices services = {.cooperate = bidi_cancel_prepare};
+    ctx->slice_started_ns = 0;
+    tilefinch_platform_set_services(&services);
+    layout_bidi_prepare(ctx, budget);
+    tilefinch_platform_set_services(NULL);
+    CHECK(ctx->cancelled && !ctx->bidi_prepared && !reuse->bidi_absence);
+    budget_free(budget, ctx);
+    layout_reuse_cache_destroy(reuse);
+    stylesheet_destroy(&sheet);
+    document_destroy(&doc);
+    CHECK(budget->current == baseline);
+    return 0;
+}
+
 /* Every right-to-left paragraph of a long page is reordered. The
    retained glyph and command caps were 4,096 and 1,024 for the whole
    document, so after a few paragraphs every later line fell back to
@@ -1248,6 +1349,7 @@ static int test_directional_logical_properties(Budget *budget)
    10,240 glyphs and at least 2,560 mapped commands. */
 static int test_bidi_long_document(Budget *budget)
 {
+    CHECK(test_bidi_provisional_absence(budget) == 0);
     enum { PARAGRAPHS = 64, WORDS = 40 };
     static char page[PARAGRAPHS * (WORDS * 9 + 32) + 128];
     size_t used = (size_t) snprintf(page, sizeof(page),
@@ -1655,6 +1757,129 @@ static int test_international_line_flow(Budget *budget)
     layout_destroy(&layout);
     stylesheet_destroy(&sheet);
     document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+/* Only a direction or bidi override that can reorder LTR text sends a
+   page's paragraphs through the bidi scan. A var()-deferred declaration
+   block that declares `direction:ltr`, or a style attribute naming
+   `flex-direction`, had marked every paragraph of a page with one RTL word
+   for the scan, which resolved the style of each inline descendant. */
+static size_t bidi_page_scans(Budget *budget, const char *page,
+                              unsigned seed, size_t *paragraphs)
+{
+    PocDocument document;
+    Stylesheet sheet;
+    LayoutDocument layout;
+    size_t scans = SIZE_MAX;
+    if (document_parse(&document, budget, page, strlen(page), seed)) {
+        if (stylesheet_build(&sheet, budget, &document, 480)) {
+            if (layout_build(&layout, budget, &document, &sheet, NULL, NULL,
+                             480)) {
+                scans = layout.performance.bidi_subtree_scans;
+                if (paragraphs != NULL)
+                    *paragraphs = layout.performance.bidi_paragraphs;
+                layout_destroy(&layout);
+            }
+            stylesheet_destroy(&sheet);
+        }
+        document_destroy(&document);
+    }
+    return scans;
+}
+
+static int test_bidi_direction_change_values(Budget *budget)
+{
+    static const struct {
+        const char *text;
+        bool changes;
+    } declarations[] = {
+        { "direction:ltr", false },
+        { "color:var(--c); direction : LTR !important", false },
+        { "direction:inherit;unicode-bidi:isolate", false },
+        { "{unicode-bidi:plaintext}", false },
+        { "display:flex;flex-direction:row-reverse", false },
+        { "--direction:rtl", false },
+        { "direction:rtl", true },
+        { "direction:ltr;direction:rtl", true },
+        { "direction:var(--dir)", true },
+        { "direction:/**/ltr", true },
+        { "unicode-bidi:bidi-override", true },
+        { "unicode-bidi: isolate-override !important", true },
+        { "unicode-bidi:var(--u, normal)", true },
+        { "& .x{direction:rtl}", true },
+    };
+    for (size_t i = 0; i < sizeof(declarations) / sizeof(declarations[0]);
+         i++) {
+        const char *text = declarations[i].text;
+        if (style_declarations_may_change_direction(text, strlen(text))
+            != declarations[i].changes) {
+            fprintf(stderr, "direction change misread: %s\n", text);
+            return 1;
+        }
+    }
+
+
+    /* One RTL word puts its own formatting contexts through the scan. The
+       LTR-only pages below must not add any. */
+#define BIDI_RTL_PARAGRAPH "<p>\xd7\xa9\xd7\x9c\xd7\x95\xd7\x9d world</p>"
+#define BIDI_LTR_BLOCKS "<p>left one</p><p>left <b>two</b></p>" \
+    "<p>left three</p></div>"
+    static const char control[] =
+        "<!doctype html><body>" BIDI_RTL_PARAGRAPH
+        "<div class=d>" BIDI_LTR_BLOCKS;
+    size_t control_scans = bidi_page_scans(budget, control, 460, NULL);
+    CHECK(control_scans != SIZE_MAX && control_scans != 0);
+    static const char *const inert_pages[] = {
+        "<!doctype html><style>.d{color:var(--c,#111);direction:ltr}"
+        "</style><body>" BIDI_RTL_PARAGRAPH "<div class=d>" BIDI_LTR_BLOCKS,
+        "<!doctype html><style>.d{margin:var(--m,0);unicode-bidi:isolate}"
+        "</style><body>" BIDI_RTL_PARAGRAPH "<div class=d>" BIDI_LTR_BLOCKS,
+        "<!doctype html><body>" BIDI_RTL_PARAGRAPH
+        "<div class=d style='display:flex;flex-direction:column'>"
+        BIDI_LTR_BLOCKS,
+        "<!doctype html><body>" BIDI_RTL_PARAGRAPH
+        "<div class=d style='direction:ltr'>" BIDI_LTR_BLOCKS,
+    };
+    int failures = 0;
+    for (size_t i = 0; i < sizeof(inert_pages) / sizeof(inert_pages[0]);
+         i++) {
+        size_t scans = bidi_page_scans(budget, inert_pages[i],
+                                       461u + (unsigned) i, NULL);
+        if (scans != control_scans) {
+            fprintf(stderr, "inert direction page %zu: %zu scans, %zu "
+                    "expected\n", i, scans, control_scans);
+            failures++;
+        }
+    }
+    CHECK(failures == 0);
+
+    /* A deferred or inline RTL direction still reaches the paragraph it
+       reorders, as does a var() whose value is unknown until resolution. */
+    static const char *const rtl_pages[] = {
+        "<!doctype html><style>.r{color:var(--c,#111);direction:rtl;"
+        "unicode-bidi:isolate}</style><body>" BIDI_RTL_PARAGRAPH
+        "<p>left <span class=r>ABC 12</span> right</p>",
+        "<!doctype html><style>.r{--d:rtl;direction:var(--d);"
+        "unicode-bidi:isolate}</style><body>" BIDI_RTL_PARAGRAPH
+        "<p>left <span class=r>ABC 12</span> right</p>",
+        "<!doctype html><body>" BIDI_RTL_PARAGRAPH
+        "<p>left <span style='direction:rtl;unicode-bidi:isolate'>ABC 12"
+        "</span> right</p>",
+    };
+    for (size_t i = 0; i < sizeof(rtl_pages) / sizeof(rtl_pages[0]); i++) {
+        size_t paragraphs = 0;
+        size_t scans = bidi_page_scans(budget, rtl_pages[i],
+                                       470u + (unsigned) i, &paragraphs);
+        if (scans == SIZE_MAX || paragraphs != 2) {
+            fprintf(stderr, "rtl direction page %zu: %zu paragraphs\n", i,
+                    paragraphs);
+            return 1;
+        }
+    }
+#undef BIDI_LTR_BLOCKS
+#undef BIDI_RTL_PARAGRAPH
     CHECK(budget->current == 0);
     return 0;
 }

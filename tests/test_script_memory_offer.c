@@ -51,7 +51,7 @@ static const char plain_script[] =
     "<p>Its script is tiny.</p></main>"
     "<script>document.title='Small page';</script>";
 
-static BrowserEngine *create_engine(void)
+static BrowserEngine *create_engine_with_heap(size_t heap_limit)
 {
     BrowserDeviceProfile profile;
     browser_device_profile_psp3000(&profile);
@@ -61,7 +61,7 @@ static BrowserEngine *create_engine(void)
     config.tile_capacity = 4u;
     config.javascript.enabled = true;
     config.javascript.document_scripts_enabled = true;
-    config.javascript.heap_limit = 3u * MIB;
+    config.javascript.heap_limit = heap_limit;
     char error[128] = {0};
     BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
     if (engine == NULL) {
@@ -71,6 +71,11 @@ static BrowserEngine *create_engine(void)
     navigation_set_fixed_script_memory_limits(
         browser_engine_navigation(engine), true);
     return engine;
+}
+
+static BrowserEngine *create_engine(void)
+{
+    return create_engine_with_heap(3u * MIB);
 }
 
 static int test_engine_stop_reason(void)
@@ -114,8 +119,9 @@ static int test_engine_stop_reason(void)
    (script_heavy_state_low_on_memory, src/psp_app/psp_app_heavy.c) needs a
    refusal. A page that leaves little heap but got everything it asked for
    (a bbc.co.uk article on a PSP: all 65 scripts loaded, 0.8 MB of
-   admission headroom) is not warned; a page whose allocation the heap
-   refused, or whose script was skipped for memory, is. The memory-stop
+   admission headroom) is not warned, nor is a page refused one allocation
+   with room left; a page whose script was skipped for memory is. The
+   memory-stop
    note behind the "Load without scripts?" offer is separate and still
    follows a real stop (test_engine_stop_reason). */
 static int test_low_memory_needs_a_refusal(void)
@@ -143,20 +149,30 @@ static int test_low_memory_needs_a_refusal(void)
     CHECK(state.memory_refusals == 0);
     CHECK(!script_heavy_state_low_on_memory(&state));
 
-    /* An allocation the heap refused (caught by the page). */
+    /* An allocation the heap refused (caught by the page) and the room to
+       go on: a realm the memory rule keeps has at least 2 MiB to obtain
+       (docs/engineering/SCRIPT_MEMORY.md, "Exhaustion"), so the refusal
+       alone is not low memory. In the 3 MiB heap the realm would have been
+       stopped instead. */
     static const char refused[] =
         "<!doctype html><title>Refused</title><main><h1>Refused</h1>"
         "<p>Its script asks for more than the heap has.</p></main>"
         "<script>try{globalThis.big=new ArrayBuffer(16*1024*1024)}"
         "catch(e){globalThis.big=null}</script>";
-    CHECK(browser_engine_commit_html(engine, NEXT_URL, refused,
+    browser_engine_destroy(engine);
+    BrowserEngine *roomy = create_engine_with_heap(8u * MIB);
+    CHECK(roomy != NULL);
+    CHECK(browser_engine_commit_html(roomy, NEXT_URL, refused,
                                      sizeof(refused) - 1u, true));
-    CHECK(browser_engine_heavy_page(engine, &state));
+    CHECK(browser_engine_heavy_page(roomy, &state));
     if (state.memory_refusals == 0)
         fprintf(stderr, "refused: free=%zu refusals=%zu\n",
                 state.memory_free, state.memory_refusals);
     CHECK(state.memory_refusals != 0);
-    CHECK(script_heavy_state_low_on_memory(&state));
+    CHECK(!script_heavy_state_low_on_memory(&state));
+    browser_engine_destroy(roomy);
+    engine = create_engine();
+    CHECK(engine != NULL);
 
     /* A script skipped because its compile could not fit. */
     static const char head[] =

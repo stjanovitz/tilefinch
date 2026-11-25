@@ -461,10 +461,12 @@ static bool tests(const char *root)
     zip_install_cancel(install); CHECK(zip_install_pump(install) == ZIP_INSTALL_CANCELLED);
     zip_install_destroy(install); CHECK(!budget.current && access(final, F_OK) && access(stage, F_OK));
     CHECK(!mkdir(stage, 0700));
+    char spare[620]; snprintf(spare, sizeof(spare), "%s-retry", stage);
+    CHECK(!mkdir(spare, 0700));
     install = zip_install_prepare(&budget, archive, games, "Test.zip", 1, error, sizeof(error));
     CHECK(install && !zip_install_begin(install));
     zip_install_destroy(install); CHECK(!budget.current && !access(stage, F_OK));
-    CHECK(!rmdir(stage)); /* Never delete another run's staging folder. */
+    CHECK(!rmdir(stage) && !rmdir(spare)); /* Neither occupied folder was touched. */
     CHECK(!symlink("missing-target", final));
     CHECK(!zip_install_prepare(&budget, archive, games, "Test.zip", 1, error, sizeof(error)));
     CHECK(!budget.current && !unlink(final));
@@ -527,8 +529,77 @@ static bool tests(const char *root)
     return true;
 }
 
+typedef struct { uint64_t first, last; unsigned turns; bool cancel; } InstallInput;
+
+static bool install_input(void *ctx, const char *phase, size_t work)
+{
+    (void)work;
+    InstallInput *input = ctx;
+    if (strcmp(phase,"zip-install")) return true;
+    input->last = tilefinch_platform_monotonic_time_us();
+    if (++input->turns == 1) input->first = input->last;
+    return !input->cancel || input->turns < 2;
+}
+
+/* Use the real modal path. A press queued just after the first input poll
+   is consumed on the next; the final status must make it onto the frame. */
+static bool install_feedback(ZipInstall *job, bool cancel)
+{
+    PspOfflineStore store = {.zip_install = job};
+    InstallInput input = {.cancel = cancel};
+    TilefinchPlatformServices services = {.context = &input, .cooperate = install_input};
+    PspUiState ui; psp_ui_init(&ui);
+    static uint16_t before[480*272], after[480*272];
+    psp_ui_show_status(&ui, "INSTALLING HOMEBREW  O CANCEL", 600);
+    psp_ui_composite(&ui,before,480,272,480);
+    tilefinch_platform_set_services(&services);
+    bool done = psp_offline_store_install_prepared_zip(&store);
+    tilefinch_platform_set_services(NULL);
+    CHECK(done == !cancel && !store.zip_install && input.turns >= 2);
+    CHECK(strstr(psp_offline_store_status(&store),cancel ? "CANCELLED" : "INSTALLED TO"));
+    psp_ui_show_status(&ui,psp_offline_store_status(&store),300);
+    psp_ui_composite(&ui,after,480,272,480);
+    uint64_t ready = tilefinch_platform_monotonic_time_us();
+    CHECK(memcmp(before,after,sizeof(before)) != 0);
+    printf("ZIP %s to status frame ready: %lluus (%u input polls)\n",
+        cancel ? "queued Cancel" : "last poll before completion",
+        (unsigned long long)(ready-(cancel ? input.first : input.last)),input.turns);
+    return true;
+}
+
+/* Each call starts with only the saved library and filesystem. The simulated
+   interruption deliberately bypasses destructors, just like losing power. */
+static bool restart_step(const char *step, const char *root, const char *games)
+{
+    Budget budget; budget_init(&budget, 4u * 1024u * 1024u);
+    OfflineLibrary library; offline_library_init(&library, &budget, root);
+    CHECK(offline_library_load(&library) && library.count == 1
+          && library.items[0].state == OFFLINE_ITEM_READY);
+    const OfflineLibraryItem *item = &library.items[0];
+    char archive[512], error[128] = {0};
+    CHECK(file_download_path(&library,item->id,archive,sizeof(archive)));
+    bool removing = strstr(step, "remove") != NULL;
+    ZipInstall *job = removing ? zip_install_prepare_removal(&budget,games,"Test",error,sizeof(error))
+        : zip_install_prepare(&budget,archive,games,item->title,item->id,error,sizeof(error));
+    if (!strcmp(step,"refuse-existing"))
+        return job == NULL && strstr(error,"already exists") != NULL && !budget.current;
+    CHECK(job);
+    if (!strcmp(step,"cancel-install") || !strcmp(step,"install"))
+        return install_feedback(job,!strcmp(step,"cancel-install")) && !budget.current;
+    CHECK(zip_install_begin(job));
+    if (!strncmp(step, "interrupt-", 10)) {
+        CHECK(zip_install_pump(job) == ZIP_INSTALL_PENDING);
+        _exit(0);
+    }
+    CHECK(!strcmp(step,"remove") && finish(job) == ZIP_INSTALL_DONE);
+    zip_install_destroy(job);
+    return budget.current == 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 5 && !strcmp(argv[1],"--restart-step"))
+        return restart_step(argv[2],argv[3],argv[4]) ? 0 : 1;
     if (argc == 3 && (!strcmp(argv[1], "--qualify-archive") || !strcmp(argv[1], "--profile-archive"))) {
         char root[] = "/tmp/tilefinch-zip-qualification-XXXXXX", error[128] = {0};
         if (!mkdtemp(root)) return 1;

@@ -386,16 +386,16 @@ static int test_provisional_preview_empty_backoff(void)
 /* A large script-free page commits with only its top screens laid out
    (no whole-document layout or image walk before commit); page idle work
    then completes the layout, identical to a synchronous build. */
-static bool provisional_commit_has_text(const LayoutDocument *layout,
-                                        const char *text)
+static const DrawCommand *provisional_commit_text(const LayoutDocument *layout,
+                                                   const char *text)
 {
     size_t length = strlen(text);
     for (size_t i = 0; i < layout->count; i++) {
         const DrawCommand *command = &layout->commands[i];
         if (command->type == DRAW_TEXT && command->text_length == length
-            && memcmp(command->text, text, length) == 0) return true;
+            && memcmp(command->text, text, length) == 0) return command;
     }
-    return false;
+    return NULL;
 }
 
 typedef struct {
@@ -822,8 +822,8 @@ static int test_large_static_page_commits_provisionally(void)
     int limit = navigation->page.layout.content_limit_y;
     CHECK(navigation->page.layout_provisional
           && limit > 0 && navigation->page.layout.height > limit
-          && provisional_commit_has_text(&navigation->page.layout, "para")
-          && !provisional_commit_has_text(&navigation->page.layout, "899")
+          && provisional_commit_text(&navigation->page.layout, "para")
+          && !provisional_commit_text(&navigation->page.layout, "899")
           && navigation->performance.provisional_relayouts == 1);
     /* A reader at the bottom of the provisional extent waits for the next
        screens: that step runs under its own phase, which a frontend does
@@ -889,7 +889,7 @@ static int test_large_static_page_commits_provisionally(void)
           && navigation->relayout_damage_top >= limit_before_adoption - 64);
     CHECK(!navigation->page.layout_provisional
           && navigation->page.layout.content_limit_y == 0
-          && provisional_commit_has_text(&navigation->page.layout, "899")
+          && provisional_commit_text(&navigation->page.layout, "899")
           && navigation->performance.provisional_completions == 1);
     /* A provisional relayout of the completed page (an image batch's
        publication) is built beside it: a press pages the committed page at
@@ -938,6 +938,400 @@ static int test_large_static_page_commits_provisionally(void)
     return 0;
 }
 
+/* A streamed article becomes interactive once its first screens commit.
+   Refusing the idle completion must leave those screens and the live form
+   intact, not substitute a blank page or the original markup value. */
+static int test_article_initial_stream_layout_pressure(void)
+{
+    static const char url[] = "https://article.test/story";
+    static const char head[] =
+        "<!doctype html><html><head><meta name=viewport "
+        "content='width=device-width'><title>Field notes</title></head>"
+        "<body style='margin:0'><h1 style='height:40px;margin:0'>Field notes</h1>"
+        "<div style='height:120px'>Welcome</div>"
+        "<form method=post action='/notes'>"
+        "<input id=q name=note aria-label='Note' "
+        "style='display:block;width:200px;height:24px;margin:0'>"
+        "<p><button id=send>Send</button></p></form>"
+        "<p><a id=next href='/next'>Next chapter</a></p><article>";
+    static const char paragraph[] =
+        "<p>River observations and a line of field notes.</p>";
+    static const char tail[] =
+        "<p>End of field notes.</p></article></body></html>";
+    enum { PARAGRAPHS = 1600 };
+    size_t length = sizeof(head) - 1u + PARAGRAPHS * (sizeof(paragraph) - 1u)
+        + sizeof(tail) - 1u;
+    char *html = malloc(length + 1u);
+    CHECK(html != NULL);
+    memcpy(html, head, sizeof(head) - 1u);
+    size_t offset = sizeof(head) - 1u;
+    for (size_t i = 0; i < PARAGRAPHS; i++) {
+        memcpy(html + offset, paragraph, sizeof(paragraph) - 1u);
+        offset += sizeof(paragraph) - 1u;
+    }
+    memcpy(html + offset, tail, sizeof(tail));
+    char directory[128], error[256] = {0};
+    bool replay_written = write_document_replay(
+        directory, url, html, length, 200, "");
+    free(html);
+    CHECK(replay_written);
+
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.maximum_document_bytes = 256u * 1024u;
+    config.resources.enabled = true;
+    config.javascript.enabled = false;
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+    ProvisionalPresentProbe article_present = {0};
+    TilefinchPlatformServices article_services = {
+        .context = &article_present, .present_rgb565 = capture_provisional_present
+    };
+    tilefinch_platform_set_services(&article_services);
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    navigation_set_stream_delivery(navigation, 512, 0, 0, 0, 0, 0);
+    BrowserNavigationJobQuota quota = {
+        .load = {
+            .fetch = { .maximum_body_bytes = 512,
+                       .maximum_body_callbacks = 1,
+                       .maximum_time_us = 10000 },
+            .maximum_parser_body_bytes = 512,
+            .maximum_parser_time_us = 10000,
+            .maximum_finalize_work_units = 8,
+            .maximum_finalize_time_us = 1000
+        }
+    };
+    CHECK(fetch_trace_replay_begin(directory, error, sizeof(error))
+          && browser_engine_begin_navigation_url(
+                 engine, url, 256u * 1024u, 1000, true));
+    BrowserNavigationJobStatus status = BROWSER_NAVIGATION_JOB_PENDING;
+    bool focused_early = false;
+    ControllerAction action = {0};
+    for (size_t pumps = 0;
+         pumps < 8192 && status == BROWSER_NAVIGATION_JOB_PENDING; pumps++) {
+        status = browser_engine_pump_navigation(engine, &quota);
+        BrowserProvisionalViewport viewport = {0};
+        BrowserNavigationJobMetrics metrics = {0};
+        if (!focused_early && status == BROWSER_NAVIGATION_JOB_PENDING
+            && browser_engine_provisional_viewport(engine, &viewport)
+            && viewport.complete
+            && browser_engine_navigation_job_metrics(engine, &metrics)
+            && !metrics.load.response_received
+            && metrics.load.body_bytes < length) {
+            CHECK(browser_engine_scroll_provisional_by(engine, 30)
+                  && browser_engine_provisional_activate(
+                         engine, true, 20, 140, &action)
+                         == BROWSER_PREVIEW_ACTIVATION_DEFERRED
+                  && action.type == CONTROLLER_ACTION_NONE
+                  && !browser_engine_take_deferred_activation(engine)
+                  && !browser_engine_insert_text(engine, "early", 5));
+            focused_early = true;
+        }
+    }
+    fetch_trace_end();
+    remove_large_youtube_replay(directory);
+    bool activation = browser_engine_take_deferred_activation(engine);
+    BrowserNavigationJobMetrics job = {0};
+    (void) browser_engine_navigation_job_metrics(engine, &job);
+    if (!focused_early || !activation || !navigation->page.layout_provisional)
+        fprintf(stderr, "article preview early=%d activation=%d provisional=%d paints=%zu checks=%zu "
+                "attempts=%zu pressure=%zu loaded=%zu/%zu\n",
+                focused_early, activation, navigation->page.layout_provisional,
+                job.provisional_paints,
+                navigation->performance.streaming_preview_checks,
+                navigation->performance.streaming_preview_attempts,
+                navigation->performance.streaming_preview_pressure_skips,
+                job.load.body_bytes, length);
+    CHECK(focused_early && status == BROWSER_NAVIGATION_JOB_SUCCEEDED);
+    lxb_dom_node_t *root =
+        lxb_dom_interface_node(navigation->page.document.html);
+    lxb_dom_node_t *field = test_reader_find_id(root, "q");
+    CHECK(field != NULL
+          && navigation->page.layout_provisional
+          && activation
+          && controller_focused_node(browser_engine_controller(engine)) == field);
+    CHECK(navigation_current(navigation)->scroll_y == 30);
+    CHECK(browser_engine_insert_text(engine, "river", 5)
+          && browser_engine_scroll_by(engine, 90)
+          && browser_engine_render_frame(engine, NULL)
+          && navigation->page.layout_provisional);
+    int scroll = navigation_current(navigation)->scroll_y;
+    size_t pixels = 0;
+    const uint16_t *frame = browser_engine_framebuffer(engine, &pixels);
+    CHECK(scroll > 0 && frame != NULL && pixels > 0);
+    uint64_t before = frame_checksum(frame, pixels);
+    int limit_y = navigation->page.layout.content_limit_y;
+
+    Budget *budget = navigation->budget;
+    size_t original_limit = budget->limit;
+    size_t failures_before = budget->failure_count;
+    budget->limit = budget->current;
+    bool visual_changed = false;
+    bool idle_ok = browser_engine_run_idle_work(engine, &visual_changed);
+    budget->limit = original_limit;
+    CHECK(idle_ok && !visual_changed && budget->failure_count > failures_before
+          && navigation->page.layout_completion_failures == 1
+          && navigation->page.layout_provisional
+          && navigation->page.layout.content_limit_y == limit_y
+          && navigation_current(navigation)->scroll_y == scroll
+          && strcmp(navigation->page.document_url, url) == 0
+          && controller_focused_node(browser_engine_controller(engine)) == field
+          && !browser_engine_take_deferred_activation(engine)
+          && browser_engine_render_frame(engine, NULL));
+    frame = browser_engine_framebuffer(engine, &pixels);
+    CHECK(frame != NULL && frame_checksum(frame, pixels) == before);
+
+    char value[32];
+    CHECK(browser_engine_text_value(engine, value, sizeof(value), NULL)
+          && strcmp(value, "river") == 0
+          && browser_engine_insert_text(engine, " bank", 5)
+          && browser_engine_text_value(engine, value, sizeof(value), NULL)
+          && strcmp(value, "river bank") == 0
+          && browser_engine_focus_node(engine, test_reader_find_id(root, "send"))
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_FORM_SUBMIT
+          && strcmp(action.method, "POST") == 0
+          && strcmp(action.url, "https://article.test/notes") == 0
+          && strcmp(controller_action_body(&action), "note=river+bank") == 0
+          && browser_engine_focus_node(engine, test_reader_find_id(root, "next"))
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_NAVIGATE
+          && strcmp(action.url, "https://article.test/next") == 0);
+    static const char next[] = "<!doctype html><title>Next chapter</title>"
+                               "<h1>River mouth</h1>";
+    CHECK(write_document_replay(directory, action.url, next,
+                                sizeof(next) - 1u, 200, "")
+          && fetch_trace_replay_begin(directory, error, sizeof(error))
+          && browser_engine_execute_action(engine, &action, 4096, 1000));
+    fetch_trace_end();
+    remove_large_youtube_replay(directory);
+    CHECK(strcmp(navigation->page.document.title, "Next chapter") == 0);
+    CHECK(browser_engine_shutdown(engine));
+    tilefinch_platform_set_services(NULL);
+    BrowserEngineMetrics metrics = {0};
+    CHECK(browser_engine_metrics(engine, &metrics)
+          && metrics.budget_current == 0
+          && metrics.budget_active_allocations == 0);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+typedef struct {
+    NavigationSession *navigation;
+    size_t original_limit;
+    size_t retries;
+    size_t retirements;
+    bool refuse_retry;
+    bool clamped;
+    bool retry_clamped;
+    bool released;
+} ArticleSectionPressure;
+
+static bool article_section_pressure_checkpoint(void *context,
+                                               const char *phase,
+                                               size_t work)
+{
+    (void) work;
+    ArticleSectionPressure *pressure = context;
+    NavigationSession *nav = pressure->navigation;
+    if (pressure->clamped
+        && ((!pressure->refuse_retry
+             && nav->performance.mutation_layout_pressure_retries > pressure->retries)
+            || nav->performance.mutation_layout_script_retirements > pressure->retirements)) {
+        nav->budget->limit = pressure->original_limit;
+        pressure->released = true;
+    } else if (pressure->refuse_retry && !pressure->retry_clamped
+               && nav->performance.mutation_layout_pressure_retries > pressure->retries
+               && strcmp(phase, "layout") == 0) {
+        nav->budget->limit = nav->budget->current;
+        pressure->retry_clamped = true;
+    } else if (!pressure->clamped && strcmp(phase, "layout") == 0) {
+        nav->budget->limit = nav->budget->current;
+        pressure->clamped = true;
+    }
+    return true;
+}
+
+static bool article_section_delay_replay(const char *directory)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "%s/0000.meta", directory);
+    char *meta = read_test_file(path, NULL);
+    const char *line = meta == NULL ? NULL : strstr(meta, "async-delay-pumps=0\n");
+    FILE *file = line == NULL ? NULL : fopen(path, "wb");
+    bool ok = file != NULL
+        && fwrite(meta, 1, (size_t) (line - meta), file) == (size_t) (line - meta)
+        && fputs("async-delay-pumps=24\n", file) >= 0
+        && fputs(line + sizeof("async-delay-pumps=0\n") - 1u, file) >= 0
+        && fputs("redirect-origin-tainted=0\n", file) >= 0;
+    if (file != NULL && fclose(file) != 0) ok = false;
+    free(meta);
+    return ok;
+}
+
+/* Unlike the inert main-resource preview, this page already owns its form
+   when its script requests a later section. The section arrives after the
+   reader types; its first replacement layout must fail, and the ordinary
+   pressure retry must leave both article and draft usable. */
+static int test_article_async_section_layout_pressure(bool refuse_retry)
+{
+    static const char base[] = "https://article.test/story";
+    static const char section_url[] = "https://article.test/section";
+    static const char section[] = "Estuary field observations";
+    static const char head[] =
+        "<!doctype html><meta name=viewport content='width=device-width'>"
+        "<title>River journal</title><h1>River journal</h1>"
+        "<div style='height:120px'>Introduction</div>"
+        "<form method=post action='/notes'>"
+        "<input id=q name=note aria-label='Note'><button id=send>Send</button>"
+        "</form><p><a id=next href='/next'>Next chapter</a></p><article>";
+    static const char row[] = "<p>Existing article paragraph.</p>";
+    static const char tail[] = "</article><section id=later></section>";
+    enum { ROWS = 220 };
+    char html[sizeof(head) + ROWS * (sizeof(row) - 1u) + sizeof(tail)];
+    memcpy(html, head, sizeof(head) - 1u);
+    size_t end = sizeof(head) - 1u;
+    for (size_t i = 0; i < ROWS; i++, end += sizeof(row) - 1u)
+        memcpy(html + end, row, sizeof(row) - 1u);
+    memcpy(html + end, tail, sizeof(tail));
+    char directory[128], error[256] = {0};
+    CHECK(write_document_replay(directory, section_url, section,
+                                sizeof(section) - 1u, 200, "")
+          && article_section_delay_replay(directory)
+          && fetch_trace_replay_begin_response_keyed(directory, error,
+                                                      sizeof(error)));
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.resources.enabled = true;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.relayout_preview_threshold_us = UINT64_MAX;
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL && browser_engine_commit_html(
+              engine, base, html, end + sizeof(tail) - 1u, true));
+    NavigationSession *nav = browser_engine_navigation(engine);
+    ScriptRuntime *runtime = nav->page.runtime;
+    lxb_dom_node_t *root = lxb_dom_interface_node(nav->page.document.html);
+    lxb_dom_node_t *field = test_reader_find_id(root, "q");
+    CHECK(runtime != NULL && browser_engine_focus_node(engine, field)
+          && script_runtime_evaluate_diagnostic(runtime,
+                 "globalThis.pocSummary='section-pending';"
+                 "fetch('/section').then(r=>r.text()).then(s=>{"
+                 "document.getElementById('later').textContent=s;"
+                 "globalThis.pocSummary='section-ready'})"
+                 ".catch(e=>{globalThis.pocSummary='section-error:'+e})",
+                 "<request-article-section>", &nav->page.script_result));
+    ScriptRunnableState runnable = {0};
+    for (size_t i = 0; i < 8 && runnable.requests_in_flight == 0; i++)
+        CHECK(browser_engine_advance_runtime(engine, 16, 8, NULL)
+              && script_runtime_runnable_state(runtime, &runnable));
+    if (runnable.requests_in_flight != 1u)
+        fprintf(stderr, "article request did not wait: pending=%zu ready=%zu %s\n",
+                runnable.requests_in_flight, runnable.responses_ready,
+                nav->page.script_result.summary);
+    CHECK(runnable.requests_in_flight == 1u && runnable.responses_ready == 0u);
+    CHECK(browser_engine_insert_text(engine, "long", 4)
+          && browser_engine_scroll_by(engine, 90)
+          && browser_engine_render_frame(engine, NULL)
+          && script_runtime_runnable_state(runtime, &runnable)
+          && runnable.requests_in_flight == 1u && runnable.responses_ready == 0u);
+    int scroll = navigation_current(nav)->scroll_y;
+    size_t pixels = 0;
+    const uint16_t *frame = browser_engine_framebuffer(engine, &pixels);
+    CHECK(scroll > 0 && frame != NULL && pixels > 0);
+    uint64_t before = frame_checksum(frame, pixels);
+
+    size_t refusals = nav->budget->failure_count;
+    size_t recoveries = nav->performance.mutation_layout_pressure_recoveries;
+    ArticleSectionPressure pressure = {
+        .navigation = nav, .original_limit = nav->budget->limit,
+        .retries = nav->performance.mutation_layout_pressure_retries,
+        .retirements = nav->performance.mutation_layout_script_retirements,
+        .refuse_retry = refuse_retry
+    };
+    TilefinchPlatformServices services = {
+        .context = &pressure, .cooperate = article_section_pressure_checkpoint
+    };
+    tilefinch_platform_set_services(&services);
+    bool advanced = true;
+    for (size_t i = 0; i < 128 && advanced && !pressure.released; i++)
+        advanced = browser_engine_advance_runtime(engine, 16, 8, NULL);
+    tilefinch_platform_set_services(NULL);
+    nav->budget->limit = pressure.original_limit;
+    FetchTraceReplayStats replay = {0};
+    CHECK(fetch_trace_replay_stats(&replay));
+    fetch_trace_end();
+    remove_large_youtube_replay(directory);
+    if (!advanced || !pressure.released)
+        fprintf(stderr, "article section advanced=%d clamped=%d retries=%zu "
+                "recoveries=%zu matched=%zu unmatched=%zu error=%s\n",
+                advanced, pressure.clamped,
+                nav->performance.mutation_layout_pressure_retries - pressure.retries,
+                nav->performance.mutation_layout_pressure_recoveries - recoveries,
+                replay.matched_request_count, replay.unmatched_request_count,
+                browser_engine_last_error(engine));
+    CHECK(advanced && pressure.clamped && pressure.released
+          && pressure.retry_clamped == refuse_retry
+          && nav->budget->failure_count - refusals >= (refuse_retry ? 2u : 1u)
+          && nav->performance.mutation_layout_pressure_retries == pressure.retries + 1u
+          && nav->performance.mutation_layout_pressure_recoveries
+              == recoveries + (refuse_retry ? 0u : 1u)
+          && nav->performance.mutation_layout_script_retirements
+              == pressure.retirements + (refuse_retry ? 1u : 0u)
+          && replay.matched_request_count == 1u && replay.unmatched_request_count == 0u
+          && nav->page.loaded && nav->page.runtime == (refuse_retry ? NULL : runtime)
+          && provisional_commit_text(&nav->page.layout, "Estuary")
+          && navigation_current(nav)->scroll_y == scroll
+          && controller_focused_node(browser_engine_controller(engine)) == field
+          && browser_engine_render_frame(engine, NULL));
+    frame = browser_engine_framebuffer(engine, &pixels);
+    CHECK(frame != NULL && frame_checksum(frame, pixels) == before);
+
+    char value[32];
+    ControllerAction action = {0};
+    CHECK(browser_engine_text_value(engine, value, sizeof(value), NULL)
+          && strcmp(value, "long") == 0
+          && browser_engine_insert_text(engine, " river", 6)
+          && browser_engine_focus_node(engine, test_reader_find_id(root, "send"))
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_FORM_SUBMIT
+          && strcmp(action.method, "POST") == 0
+          && strcmp(action.url, "https://article.test/notes") == 0
+          && strcmp(controller_action_body(&action), "note=long+river") == 0
+          && browser_engine_focus_node(engine, test_reader_find_id(root, "next"))
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_NAVIGATE
+          && strcmp(action.url, "https://article.test/next") == 0);
+    static const char next[] = "<!doctype html><title>Next chapter</title>";
+    CHECK(write_document_replay(directory, action.url, next,
+                                sizeof(next) - 1u, 200, "")
+          && fetch_trace_replay_begin(directory, error, sizeof(error))
+          && browser_engine_execute_action(engine, &action, 4096, 1000));
+    fetch_trace_end();
+    remove_large_youtube_replay(directory);
+    CHECK(strcmp(nav->page.document.title, "Next chapter") == 0
+          && browser_engine_shutdown(engine));
+    BrowserEngineMetrics metrics = {0};
+    CHECK(browser_engine_metrics(engine, &metrics)
+          && metrics.budget_current == 0 && metrics.budget_active_allocations == 0);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+static int test_streamed_article_keeps_input_on_layout_pressure(void)
+{
+    return test_article_initial_stream_layout_pressure()
+        || test_article_async_section_layout_pressure(false)
+        || test_article_async_section_layout_pressure(true);
+}
+
 static size_t preview_checkerboard_pixels(
     const BrowserProvisionalViewport *viewport)
 {
@@ -954,7 +1348,23 @@ static size_t preview_checkerboard_pixels(
    content are missing), bounded raster steps fill the screen, the stream
    lays out a deeper preview through the reader, and the commit keeps both
    the position and content laid out through it. */
-static int test_preview_scrolls_ahead_during_load(void)
+typedef struct {
+    ProvisionalPresentProbe present;
+    bool refuse_band, armed;
+} ArticleBandProbe;
+
+static bool refuse_article_band(void *opaque, const char *phase, size_t work)
+{
+    (void) work;
+    ArticleBandProbe *probe = opaque;
+    if (probe->refuse_band && !probe->armed && strcmp(phase, "navigation-images") == 0) {
+        probe->armed = true;
+        tilefinch_test_faults()->refuse_next_layout_context = true;
+    }
+    return true;
+}
+
+static int test_preview_scrolls_ahead_during_load(bool refuse_band)
 {
     BrowserDeviceProfile profile;
     browser_device_profile_psp3000(&profile);
@@ -970,9 +1380,9 @@ static int test_preview_scrolls_ahead_during_load(void)
     BrowserEngine *engine = browser_engine_create(
         &config, error, sizeof(error));
     CHECK(engine != NULL);
-    ProvisionalPresentProbe present_probe = {0};
+    ArticleBandProbe probe = {.refuse_band = refuse_band};
     TilefinchPlatformServices present_services = {
-        .context = &present_probe,
+        .context = &probe, .cooperate = refuse_article_band,
         .present_rgb565 = capture_provisional_present
     };
     tilefinch_platform_set_services(&present_services);
@@ -1019,11 +1429,11 @@ static int test_preview_scrolls_ahead_during_load(void)
     while (viewport.scroll_y + viewport.viewport_height <= first_end
            && presses < 16) {
         int before = viewport.scroll_y;
-        size_t presents = present_probe.calls;
+        size_t presents = probe.present.calls;
         CHECK(browser_engine_scroll_provisional_page(engine, 1)
               && browser_engine_provisional_viewport(engine, &viewport)
               && viewport.scroll_y > before
-              && present_probe.calls == presents + 1);
+              && probe.present.calls == presents + 1);
         if (!viewport.complete) saw_placeholder = true;
         presses++;
     }
@@ -1056,7 +1466,7 @@ static int test_preview_scrolls_ahead_during_load(void)
           && viewport.content_end_y > first_end
           && viewport.content_end_y >= target + viewport.viewport_height
           && preview_checkerboard_pixels(&viewport) == 0
-          && present_probe.last_checksum
+          && probe.present.last_checksum
                  == frame_checksum(viewport.pixels, viewport.pixel_count)
           && browser_engine_navigation_job_metrics(engine, &job)
           && job.provisional_paints >= 2
@@ -1064,31 +1474,104 @@ static int test_preview_scrolls_ahead_during_load(void)
     /* Analog motion follows the stick at once: past the laid-out content
        it shows the checkerboard, and raster steps fill what is laid out. */
     int end = viewport.content_end_y;
-    size_t presents = present_probe.calls;
+    size_t presents = probe.present.calls;
     CHECK(browser_engine_scroll_provisional_by(
               engine, end - viewport.viewport_height / 2 - target)
           && browser_engine_provisional_viewport(engine, &viewport)
           && viewport.scroll_y == end - viewport.viewport_height / 2
-          && present_probe.calls == presents + 1
+          && probe.present.calls == presents + 1
           && preview_checkerboard_pixels(&viewport) > 0);
     while (browser_engine_provisional_raster_step(engine)) {}
     CHECK(browser_engine_provisional_viewport(engine, &viewport)
           && viewport.complete
           && preview_checkerboard_pixels(&viewport) > 0);
-    int reader_y = viewport.scroll_y;
+    /* Keep paging while the preview grows, then stop at a repeatable
+       position with a real band of text ahead (not placeholder extent). */
+    const int reading_at = 2100, screens_ahead = 6;
+    int live_end = 0;
     for (size_t pumps = 0;
          pumps < 8192 && status == BROWSER_NAVIGATION_JOB_PENDING;
          pumps++) {
+        if (browser_engine_provisional_viewport(engine, &viewport)
+            && viewport.content_end_y > 0) {
+            if (viewport.scroll_y < reading_at)
+                (void) browser_engine_scroll_provisional_by(
+                    engine, reading_at - viewport.scroll_y);
+            live_end = viewport.content_end_y;
+        }
         status = browser_engine_pump_navigation(engine, &quota);
     }
     const NavigationEntry *entry = navigation_current(navigation);
+    int useful_band = reading_at + screens_ahead * navigation->viewport.css_height;
     CHECK(status == BROWSER_NAVIGATION_JOB_SUCCEEDED && entry != NULL
-          && entry->scroll_y == reader_y
+          && entry->scroll_y == reading_at && probe.armed == refuse_band
           && navigation->page.layout_provisional
-          && navigation->page.layout.content_limit_y
-                 >= reader_y + navigation->viewport.css_height
+          && live_end >= useful_band
+          && (refuse_band ? navigation->page.layout.content_limit_y < useful_band
+                          : navigation->page.layout.content_limit_y >= useful_band)
+          && navigation->page.layout.content_limit_y >= reading_at + navigation->viewport.css_height
           && navigation->provisional_reader_y == 0
           && !browser_engine_provisional_viewport(engine, &viewport));
+    if (!refuse_band) {
+        /* Five page presses consume real text, without an idle extension.
+           The last visible line has the same position after completion. */
+        for (int i = 0; i < 5; ++i) {
+            int before = entry->scroll_y;
+            CHECK(browser_engine_scroll_page(engine, 1) && entry->scroll_y > before
+                  && entry->scroll_y + navigation->viewport.css_height
+                     <= navigation->page.layout.content_limit_y);
+        }
+        const DrawCommand *line = NULL;
+        for (size_t i = 0; i < navigation->page.layout.count; ++i) {
+            const DrawCommand *cmd = &navigation->page.layout.commands[i];
+            if (cmd->type == DRAW_TEXT && cmd->text_length && cmd->y >= entry->scroll_y
+                && cmd->y < entry->scroll_y + navigation->viewport.css_height
+                && cmd->text[0] >= '0' && cmd->text[0] <= '9') line = cmd;
+        }
+        CHECK(line && line->text_length < 16);
+        char number[16] = {0};
+        memcpy(number, line->text, line->text_length);
+        int x = line->x, y = line->y, scroll = entry->scroll_y;
+        /* Ordinary idle growth still doubles. Once deep enough it also
+           prepares a bounded reserve. Refusing the next build must not
+           withdraw that reserve or lose the reader's position. */
+        for (unsigned i = 0; i < 4 && navigation->page.layout_prefetch_start
+                 < 8 * navigation->viewport.css_height; ++i) {
+            int previous = navigation->page.layout_prefetch_start;
+            if (!previous) previous = navigation->page.layout.content_limit_y;
+            CHECK(navigation_set_scroll(navigation, previous)
+                  && browser_engine_run_idle_work(engine, NULL)
+                  && navigation->page.layout.content_limit_y >= 2 * previous);
+        }
+        int frontier = navigation->page.layout_prefetch_start;
+        int band = navigation->page.layout.content_limit_y;
+        CHECK(frontier >= 8 * navigation->viewport.css_height
+              && band >= frontier + 5 * navigation->viewport.css_height
+              && navigation_set_scroll(navigation, frontier + navigation->viewport.css_height)
+              && !navigation_layout_completion_awaited(navigation));
+        tilefinch_test_faults()->refuse_next_layout_completion = true;
+        CHECK(browser_engine_run_idle_work(engine, NULL)
+              && navigation->page.layout_completion_retry_us != 0
+              && navigation->page.layout_prefetch_start == frontier
+              && navigation->page.layout.content_limit_y == band
+              && entry->scroll_y == frontier + navigation->viewport.css_height);
+        ProvisionalPhaseRecorder during = {.page_during_completion = engine};
+        TilefinchPlatformServices paging = {
+            .context = &during, .cooperate = record_provisional_phase };
+        tilefinch_platform_set_services(&paging);
+        /* Simulate expiry of the refused pass's backoff, not a clock wait. */
+        navigation->page.layout_completion_retry_us = 0;
+        CHECK(browser_engine_run_idle_work(engine, NULL));
+        tilefinch_platform_set_services(&present_services);
+        CHECK(during.paged && during.paged_to == entry->scroll_y
+              && during.paged_to > frontier + navigation->viewport.css_height
+              && during.paged_to + navigation->viewport.css_height <= band
+              && !navigation->page.layout_prefetch_start);
+        CHECK(navigation_set_scroll(navigation, scroll)
+              && navigation_complete_layout_sync(navigation) && entry->scroll_y == scroll);
+        line = provisional_commit_text(&navigation->page.layout, number);
+        CHECK(line && line->x == x && line->y == y);
+    }
     fetch_trace_end();
     tilefinch_platform_set_services(NULL);
     CHECK(browser_engine_shutdown(engine));
@@ -1098,6 +1581,37 @@ static int test_preview_scrolls_ahead_during_load(void)
           && metrics.budget_active_allocations == 0);
     browser_engine_destroy(engine);
     return 0;
+}
+
+static bool preview_focus_queue_field(BrowserEngine *engine,
+                                      const BrowserNavigationJobQuota *quota,
+                                      const char *url)
+{
+    if (!browser_engine_begin_navigation_url(
+            engine, url, 256u * 1024u, 1000, true)) return false;
+    BrowserNavigationJobStatus status = BROWSER_NAVIGATION_JOB_PENDING;
+    BrowserProvisionalViewport viewport = {0};
+    for (size_t pumps = 0;
+         pumps < 4096 && status == BROWSER_NAVIGATION_JOB_PENDING
+             && !browser_engine_provisional_viewport(engine, &viewport);
+         pumps++) {
+        status = browser_engine_pump_navigation(engine, quota);
+    }
+    ControllerAction action = {0};
+    return status == BROWSER_NAVIGATION_JOB_PENDING
+        && browser_engine_provisional_activate(engine, true, 10, 10, &action)
+               == BROWSER_PREVIEW_ACTIVATION_DEFERRED;
+}
+
+static bool preview_focus_finish(BrowserEngine *engine,
+                                 const BrowserNavigationJobQuota *quota)
+{
+    BrowserNavigationJobStatus status = BROWSER_NAVIGATION_JOB_PENDING;
+    for (size_t pumps = 0;
+         pumps < 8192 && status == BROWSER_NAVIGATION_JOB_PENDING; pumps++) {
+        status = browser_engine_pump_navigation(engine, quota);
+    }
+    return status == BROWSER_NAVIGATION_JOB_SUCCEEDED;
 }
 
 /* The loading page is usable: D-pad focus moves over its visible links
@@ -1235,6 +1749,42 @@ static int test_preview_focus_and_activation(void)
     CHECK(status == BROWSER_NAVIGATION_JOB_SUCCEEDED
           && !browser_engine_take_deferred_activation(engine));
     fetch_trace_end();
+
+    /* A synchronous local commit can also replace a streamed page. Its
+       focused submit button must not inherit the previous field's X. */
+    static const char target[] =
+        "<!doctype html><form action=/wrong><button id=b>Submit B</button></form>";
+    const char *fixture = TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-preview-links";
+    const char *url = "https://preview-links.test/document";
+    CHECK(fetch_trace_replay_begin(fixture, error, sizeof(error))
+          && preview_focus_queue_field(engine, &quota, url)
+          && preview_focus_finish(engine, &quota));
+    fetch_trace_end();
+    CHECK(browser_engine_commit_html(engine, "https://replacement.test/b",
+                                    target, sizeof(target) - 1u, true));
+    lxb_dom_node_t *root =
+        lxb_dom_interface_node(navigation->page.document.html);
+    CHECK(browser_engine_focus_node(engine, test_reader_find_id(root, "b"))
+          && !browser_engine_take_deferred_activation(engine));
+
+    /* A later input on the same page also supersedes the deferred X. */
+    CHECK(fetch_trace_replay_begin(fixture, error, sizeof(error))
+          && preview_focus_queue_field(engine, &quota, url)
+          && preview_focus_finish(engine, &quota));
+    fetch_trace_end();
+    CHECK(browser_engine_focus_direction(engine, CONTROLLER_FOCUS_DOWN)
+          && !browser_engine_take_deferred_activation(engine));
+
+    /* Cancel before A's commit; a replacement has no deferred press. */
+    CHECK(fetch_trace_replay_begin(fixture, error, sizeof(error))
+          && preview_focus_queue_field(engine, &quota, url));
+    browser_engine_cancel_navigation(engine, "cancelled before field commit");
+    CHECK(!browser_engine_take_deferred_activation(engine));
+    fetch_trace_end();
+    CHECK(browser_engine_commit_html(engine, "https://replacement.test/b",
+                                    target, sizeof(target) - 1u, true)
+          && !browser_engine_take_deferred_activation(engine));
+
     tilefinch_platform_set_services(NULL);
     CHECK(browser_engine_shutdown(engine));
     BrowserEngineMetrics metrics = {0};
@@ -1242,6 +1792,139 @@ static int test_preview_focus_and_activation(void)
           && metrics.budget_current == 0
           && metrics.budget_active_allocations == 0);
     browser_engine_destroy(engine);
+    return 0;
+}
+
+static bool preview_links_replay_with_insertion(char directory[128],
+    const char *url, const char *before, const char *insertion)
+{
+    char *body = read_test_file(
+        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-preview-links/0000.body", NULL);
+    if (body == NULL) return false;
+    const char *at = strstr(body, before);
+    size_t length = strlen(body) + strlen(insertion);
+    char *html = at == NULL ? NULL : malloc(length + 1u);
+    bool written = false;
+    if (html != NULL) {
+        size_t prefix = (size_t) (at - body);
+        memcpy(html, body, prefix);
+        memcpy(html + prefix, insertion, strlen(insertion));
+        strcpy(html + prefix + strlen(insertion), at);
+        written = write_document_replay(directory, url, html, length, 200, "");
+    }
+    free(body);
+    free(html);
+    return written;
+}
+
+static int test_preview_author_replaces_field(void)
+{
+    static const char url[] = "https://preview-removed.test/document";
+    static const char script[] =
+        "<script>const a=document.getElementById('q');a.remove();"
+        "const b=document.createElement('button');b.id='q';"
+        "b.textContent='Made later';document.body.prepend(b)</script>";
+    char directory[128], error[256] = {0};
+    CHECK(preview_links_replay_with_insertion(directory, url, "</body>", script));
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.resources.enabled = true;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    BrowserNavigationJobQuota quota = {
+        .load = {
+            .fetch = { .maximum_body_bytes = 64, .maximum_body_callbacks = 1 },
+            .maximum_parser_body_bytes = 64,
+            .maximum_finalize_work_units = 8
+        }
+    };
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    NavigationSession *nav = browser_engine_navigation(engine);
+    navigation_set_stream_delivery(nav, 64, 0, 0, 0, 0, 0);
+    CHECK(fetch_trace_replay_begin(directory, error, sizeof(error))
+          && preview_focus_queue_field(engine, &quota, url)
+          && preview_focus_finish(engine, &quota));
+    fetch_trace_end();
+    remove_large_youtube_replay(directory);
+    lxb_dom_node_t *field = test_reader_find_id(
+        lxb_dom_interface_node(nav->page.document.html), "q");
+    size_t name_length = 0;
+    const char *name = document_element_name(field, &name_length);
+    CHECK(name != NULL && name_length == 6u && memcmp(name, "button", 6u) == 0
+          && !browser_engine_take_deferred_activation(engine));
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+static int test_preview_scroll_precedes_autofocus(void)
+{
+    static const char url[] = "https://preview-scroll.test/document";
+    char directory[128], error[256] = {0};
+    CHECK(preview_links_replay_with_insertion(directory, url, "<p id=\"p12\">",
+        "<input id=author-focus autofocus style='display:block'>"));
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.resources.enabled = true;
+    BrowserNavigationJobQuota quota = {
+        .load = {
+            .fetch = { .maximum_body_bytes = 512, .maximum_body_callbacks = 1 },
+            .maximum_parser_body_bytes = 512,
+            .maximum_finalize_work_units = 8
+        }
+    };
+    for (unsigned mode = 0; mode < 3; mode++) {
+        BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+        CHECK(engine != NULL);
+        NavigationSession *navigation = browser_engine_navigation(engine);
+        navigation_set_stream_delivery(navigation, 512, 0, 0, 0, 0, 0);
+        CHECK(fetch_trace_replay_begin(directory, error, sizeof(error))
+              && browser_engine_begin_navigation_url(engine, url,
+                                               256u * 1024u, 1000, true));
+        BrowserNavigationJobStatus status = BROWSER_NAVIGATION_JOB_PENDING;
+        BrowserProvisionalViewport preview = {0};
+        for (size_t pumps = 0;
+             pumps < 4096 && status == BROWSER_NAVIGATION_JOB_PENDING
+                 && !browser_engine_provisional_viewport(engine, &preview); pumps++) {
+            status = browser_engine_pump_navigation(engine, &quota);
+        }
+        CHECK(status == BROWSER_NAVIGATION_JOB_PENDING && preview.ready);
+        int expected = 0;
+        if (mode != 0) {
+            CHECK(browser_engine_scroll_provisional_by(engine, 100)
+                  && browser_engine_provisional_viewport(engine, &preview));
+            expected = preview.scroll_y;
+            CHECK(expected > 0);
+            if (mode == 2u) {
+                CHECK(browser_engine_scroll_provisional_by(engine, -expected));
+                expected = 0;
+            }
+        }
+        CHECK(preview_focus_finish(engine, &quota));
+        for (size_t turn = 0; turn < 64; turn++)
+            (void) browser_engine_run_idle_work(engine, NULL);
+        int actual = navigation_current(navigation)->scroll_y;
+        lxb_dom_node_t *focus =
+            controller_focused_node(browser_engine_controller(engine));
+        if (mode == 0) {
+            lxb_dom_node_t *root =
+                lxb_dom_interface_node(navigation->page.document.html);
+            CHECK(actual > 0 && focus == test_reader_find_id(root, "author-focus"));
+        } else {
+            CHECK(actual == expected && focus == NULL);
+        }
+        fetch_trace_end();
+        CHECK(browser_engine_shutdown(engine));
+        browser_engine_destroy(engine);
+    }
+    remove_large_youtube_replay(directory);
     return 0;
 }
 

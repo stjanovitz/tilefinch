@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define CHECK(value) do { \
@@ -53,7 +54,7 @@ int main(void)
           && browser_tabs_count(tabs) == 1
           && browser_tabs_active_index(tabs) == 0
           && budget.allocation_count == allocations_before_tabs + 2u
-          && browser_tabs_owned_bytes() <= 48u * 1024u);
+          && browser_tabs_owned_bytes() <= 72u * 1024u);
     const BrowserTabSnapshot *first = browser_tabs_active(tabs);
     CHECK(first != NULL
           && first->history_count == BROWSER_TAB_HISTORY_LIMIT
@@ -99,6 +100,8 @@ int main(void)
           && created == 4
           && !browser_tabs_add(
                  tabs, "https://overflow.test/", "Too many", NULL));
+    CHECK(browser_tabs_count(tabs) == BROWSER_TAB_LIMIT
+          && browser_tabs_resident_bytes(tabs) <= 48u * 1024u);
     CHECK(browser_tabs_select(tabs, 0)
           && browser_tabs_remove(tabs, 1)
           && browser_tabs_count(tabs) == 4
@@ -190,8 +193,55 @@ int main(void)
           && browser_tabs_save_session(
                  corrupt_restored, session_path, hibernation_path)
           && access(session_backup, F_OK) == 0);
+    /* A refused save reads the unread session again: unreadable or intact
+       but never restored keeps refusing; confirmed absent saves again. */
+    CHECK(chmod(session_path, 0) == 0);
+    BrowserTabs *unread = browser_tabs_create(&budget, &navigation);
+    bool unread_refused = unread != NULL
+        && !browser_tabs_restore_session(unread, session_path)
+        && browser_tabs_session_save_blocked(unread)
+        && !browser_tabs_save_session(unread, session_path, hibernation_path)
+        && browser_tabs_session_save_blocked(unread);
+    CHECK(chmod(session_path, 0600) == 0);
+    CHECK(unread_refused && unlink(session_path) == 0
+          && unlink(session_backup) == 0
+          && browser_tabs_save_session(unread, session_path, hibernation_path)
+          && !browser_tabs_session_save_blocked(unread)
+          && access(session_path, F_OK) == 0);
+    browser_tabs_destroy(unread);
+    unread = browser_tabs_create(&budget, &navigation);
+    CHECK(unread != NULL && chmod(session_path, 0) == 0);
+    unread_refused = !browser_tabs_restore_session(unread, session_path);
+    CHECK(chmod(session_path, 0600) == 0);
+    CHECK(unread_refused
+          && !browser_tabs_save_session(unread, session_path, hibernation_path)
+          && !browser_tabs_save_session(unread, session_path, hibernation_path)
+          && browser_tabs_session_save_blocked(unread)
+          && browser_tabs_restore_session(unread, session_path)
+          && !browser_tabs_session_save_blocked(unread));
+    browser_tabs_destroy(unread);
     browser_tabs_destroy(corrupt_restored);
     browser_tabs_destroy(backup_restored);
+    /* Restore Off removes the fallback and stage as well as the primary.
+       A failed deletion still attempts both other names. */
+    CHECK(browser_tabs_save_session(tabs, session_path, hibernation_path)
+          && access(session_path, F_OK) == 0 && access(session_backup, F_OK) == 0
+          && mkdir(session_temporary, 0700) == 0);
+    char session_blocker[200];
+    snprintf(session_blocker, sizeof(session_blocker), "%s/blocker", session_temporary);
+    FILE *occupied = fopen(session_blocker, "wb");
+    CHECK(occupied != NULL && fclose(occupied) == 0);
+    CHECK(!browser_tabs_clear_session(tabs, session_path)
+          && access(session_path, F_OK) != 0
+          && access(session_backup, F_OK) != 0
+          && !browser_tabs_restore_session(tabs, session_path)
+          && access(hibernation_path, F_OK) == 0);
+    CHECK(unlink(session_blocker) == 0 && rmdir(session_temporary) == 0);
+    FILE *staged = fopen(session_temporary, "wb");
+    CHECK(staged != NULL && fclose(staged) == 0
+          && browser_tabs_clear_session(tabs, session_path)
+          && access(session_temporary, F_OK) != 0
+          && browser_tabs_clear_session(tabs, session_path));
     budget_inject_failure_after(&budget, 0);
     CHECK(!browser_tabs_rehydrate(tabs, 1, hibernation_path)
           && browser_tabs_hibernated(tabs, 1));

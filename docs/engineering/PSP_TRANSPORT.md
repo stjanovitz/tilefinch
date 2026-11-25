@@ -447,6 +447,15 @@ connection cache. The following provider request can therefore reuse TCP and
 TLS rather than merely resuming a TLS session. Media bytes served by a
 different CDN origin necessarily use that origin's own connection.
 
+A recorded-trace run never preconnects. Under PPSSPP the emulated Wi-Fi
+reaches the host's real network, so an offline harness run without a trace
+turns the preconnect off with the validation-only boot key
+`validation_preconnect=0` (absent from release builds; the validation log
+then reports `tilefinch-preconnect: event=disabled source=boot-config`
+where it would have started), and the harness fails the run on any traffic
+past loopback; see
+[the PPSSPP runner](INPUT_SCRIPT_REFERENCE.md#ppsspp).
+
 ### Focused-result pre-resolution
 
 On a generated YouTube results page, a Play card held in focus for 700 ms may

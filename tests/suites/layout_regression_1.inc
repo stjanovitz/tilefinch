@@ -82,6 +82,7 @@
     puts("test: Unicode line opportunities and bounded RTL flow");
     CHECK(test_international_line_flow(&budget) == 0);
     CHECK(test_bidi_long_document(&budget) == 0);
+    CHECK(test_bidi_direction_change_values(&budget) == 0);
     CHECK(test_control_text_visual_order(&budget) == 0);
     CHECK(test_bidi_glyphs_follow_subtree_translation(&budget) == 0);
 
@@ -231,10 +232,21 @@
     CHECK(test_has_plan_classification(&budget) == 0);
     CHECK(test_has_tree_change_classification(&budget) == 0);
     CHECK(test_has_descendant_subject_and_fallback(&budget) == 0);
+    CHECK(test_has_sibling_subject_placed_by_anchor(&budget) == 0);
+    CHECK(test_has_key_set_scope(&budget) == 0);
     CHECK(test_has_scoped_invalidation_matches_fresh(&budget) == 0);
     puts("test: focus and custom-property invalidation matches a fresh build");
     CHECK(test_state_invalidation_matches_fresh(&budget) == 0);
     CHECK(test_children_invalidation_scope(&budget) == 0);
+    puts("test: class and id writes reach partial [class]/[id] tests only on a flip");
+    CHECK(test_partial_identity_tests_flip(&budget) == 0);
+    CHECK(test_identity_presence_reaches(&budget) == 0);
+    CHECK(test_partial_identity_fallbacks(&budget) == 0);
+    puts("test: attributes reach other elements only on the kinds that read them");
+    CHECK(test_attribute_reach_by_kind_narrows(&budget) == 0);
+    CHECK(test_attribute_reach_by_kind_keeps(&budget) == 0);
+    puts("test: innerHTML reaches only the :has() rules its children can match");
+    CHECK(test_inner_html_has_probe(&budget) == 0);
     CHECK(test_non_element_style_retirement(&budget) == 0);
     CHECK(test_fixed_drawer_rows(&budget) == 0);
     CHECK(test_checked_invalidation_cancel_drops_lists(&budget) == 0);
@@ -277,6 +289,9 @@
 
     puts("test: unresolved CSS masks stay transparent without layout shifts");
     CHECK(test_unresolved_mask_keeps_transparent_geometry(&budget) == 0);
+    puts("test: gradient masks without a background paint only content");
+    CHECK(test_gradient_mask_without_background_paints_nothing(&budget)
+          == 0);
 
     puts("test: linear-gradient rasterizes as an axial ramp");
     CHECK(test_linear_gradient_raster(&budget) == 0);

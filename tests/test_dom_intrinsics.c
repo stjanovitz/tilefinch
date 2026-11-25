@@ -8,6 +8,47 @@
    and another case; even failures finish the ownership teardown check. */
 static const char *selected_case;
 static bool selected_case_ran;
+
+static bool test_unrelated_namespaced_clone_handles(void)
+{
+    const char *name = "unrelated-namespaced-clone-handles";
+    if (selected_case != NULL && strcmp(name, selected_case) != 0) return true;
+    selected_case_ran = true;
+    ScriptPageFixture fixture;
+    if (!script_page_fixture_open(&fixture, "<script></script>", 0)) return false;
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &fixture.document, &fixture.budget, 12u * 1024u * 1024u, 1000,
+        "https://dom-intrinsics.test/", &fixture.options, &result);
+    bool ok = runtime != NULL && script_runtime_evaluate_diagnostic(runtime,
+        "globalThis.box=document.createElement('div');"
+        "box.innerHTML='<section><i></i><b></b></section>'.repeat(32);"
+        "globalThis.other=document.createElement('div');"
+        "other.setAttributeNS('urn:x','p:a','1');", name, &result);
+    /* Remove more mirror owners than the sparse index can hold. Empty
+       entries must not fill it and force an unrelated clone's slow path. */
+    for (unsigned batch = 0; ok && batch < 9; batch++)
+        ok = script_runtime_evaluate_diagnostic(runtime,
+            "(()=>{for(let i=0;i<16;i++){const owner=document.createElement('b');"
+            "owner.setAttributeNS('urn:x','p:a','1');"
+            "if(i%2)owner.removeAttribute('p:a');"
+            "else owner.removeAttributeNS('urn:x','a');}})()", name, &result);
+    if (ok) (void) script_runtime_collect_and_trim(runtime);
+    size_t before = result.dom_handle_slots_high_water + result.dom_handle_slot_reuses;
+    if (ok) ok = script_runtime_evaluate_diagnostic(runtime,
+        "globalThis.copy=box.cloneNode(true);", name, &result);
+    size_t after = result.dom_handle_slots_high_water + result.dom_handle_slot_reuses;
+    /* Neither source nor cloned descendants need native handles. Leave
+       modest slack for fixed runtime bookkeeping, not a second tree. */
+    ok = ok && result.success && after <= before + 4u;
+    if (!ok) fprintf(stderr, "%s: handle registrations %zu -> %zu; %s\n",
+                     name, before, after, result.error);
+    script_runtime_destroy(runtime);
+    bool zero = script_page_fixture_close(&fixture);
+    printf("%s: %s\n", name, ok && zero ? "PASS" : "FAIL");
+    return ok && zero;
+}
+
 static bool test_weak_shadow_slot_reclamation(void)
 {
     const char *name = "already-weakened-shadow-slot-reclamation";
@@ -216,6 +257,70 @@ static bool run_probe_surface_case(const char *name, bool omit_test_probes,
     return ok && zero;
 }
 
+/* The browser-only helpers that were once globals, and the two names that
+   carry dom.js's private share between modules while the bootstrap runs
+   and while motion.js loads. A page sees none of them. */
+#define HIDDEN_HELPER_NAMES                                                  \
+    "['StopCryptoScope','PostParentMessage','PostTopMessage',"               \
+    "'ScheduleReservedTask','ScheduleReservedFrame','CancelTimer',"          \
+    "'DomShared','TakeDomShared'].map(n=>'__tilefinch'+n)"
+static const char hidden_helper_probe[] =
+    "globalThis.pocSummary=" HIDDEN_HELPER_NAMES ".filter(n=>(0,eval)("
+    "'typeof '+n)!=='undefined'||n in globalThis"
+    "||Reflect.ownKeys(globalThis).includes(n)).join()||'OK'";
+
+/* Runs `steps` in order in one shipping realm. A step whose lazy flag is
+   set must load at least one more lazy module, without a failed load; any
+   other step must load none. Each step sets pocSummary to 'OK'. */
+typedef struct {
+    const char *source;
+    bool loads;
+} HiddenHelperStep;
+
+static bool run_hidden_helper_case(const char *name,
+                                   const HiddenHelperStep *steps,
+                                   size_t step_count,
+                                   size_t expected_failures)
+{
+    if (selected_case != NULL && strcmp(name, selected_case) != 0) return true;
+    selected_case_ran = true;
+    ScriptPageFixture fixture;
+    if (!script_page_fixture_open(&fixture, "<script></script>", 0)) return false;
+    ScriptRuntimeOptions options = fixture.options;
+    options.omit_test_probes = true;
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &fixture.document, &fixture.budget, 12u * 1024u * 1024u, 1000,
+        "https://dom-intrinsics.test/", &options, &result);
+    bool ok = runtime != NULL;
+    size_t loads = result.bootstrap_lazy_module_loads;
+    size_t failures = result.bootstrap_lazy_module_failures;
+    for (size_t i = 0; ok && i < step_count; i++) {
+        ok = script_runtime_evaluate_diagnostic(
+                 runtime, steps[i].source, name, &result)
+            && result.success && strcmp(result.summary, "OK") == 0;
+        bool loaded = result.bootstrap_lazy_module_loads > loads;
+        if (ok && loaded != steps[i].loads) {
+            fprintf(stderr, "%s: step %zu lazy loads %zu -> %zu\n", name, i,
+                    loads, result.bootstrap_lazy_module_loads);
+            ok = false;
+        }
+        if (!ok) fprintf(stderr, "%s: step %zu summary=%s error=%s\n", name,
+                         i, result.summary, result.error);
+        loads = result.bootstrap_lazy_module_loads;
+    }
+    failures = result.bootstrap_lazy_module_failures - failures;
+    if (ok && failures != expected_failures) {
+        fprintf(stderr, "%s: %zu lazy load failures, expected %zu\n", name,
+                failures, expected_failures);
+        ok = false;
+    }
+    script_runtime_destroy(runtime);
+    bool zero = script_page_fixture_close(&fixture);
+    printf("%s: %s\n", name, ok && zero ? "PASS" : "FAIL");
+    return ok && zero;
+}
+
 /* A page-defined __tilefinchTraceObject used to be called on every new node
    wrapper, and its return value replaced the wrapper the bootstrap cached. */
 static const char page_trace_hook_ignored[] =
@@ -256,10 +361,57 @@ static bool test_test_probe_surface(void)
         "'__tilefinchDiagnosticLookup','__tilefinchLastUncaughtTask',"
         "'__tilefinchXHRSendCalls','__tilefinchXHRLastStates',"
         "'__tilefinchXHRDiagnostics',"
-        "'__tilefinchDiagnosticMobileSafari','__tilefinchClearNodeCache']"
+        "'__tilefinchDiagnosticMobileSafari','__tilefinchClearNodeCache',"
+        "'__tilefinchTestDomShared']"
         ".filter(name=>name in globalThis);"
         "if(present.length)throw Error('test probes: '+present.join());"
         "globalThis.pocSummary='OK'})()");
+    /* The browser's reserved timers, its timer cancel, its crypto-scope
+       stop, its ancestor message senders and the carriers of dom.js's
+       share are no page globals, before and after each lazy module that
+       takes the share loads (each step must load one). */
+    {
+        static const HiddenHelperStep steps[] = {
+            {hidden_helper_probe, false},
+            {"void AnimationEvent;globalThis.pocSummary="
+             "typeof AnimationEvent==='function'?'OK':'no-motion'", true},
+            {hidden_helper_probe, false},
+            {"void Worker;globalThis.pocSummary='OK'", true},
+            {"void crypto.subtle.sign;globalThis.pocSummary='OK'", true},
+            {hidden_helper_probe, false},
+        };
+        ok &= run_hidden_helper_case("shipping-realm-hides-browser-helpers",
+            steps, sizeof(steps) / sizeof(steps[0]), 0);
+    }
+    /* motion.js's loader lends the share under __tilefinchDomShared and
+       accepts only its own definition. A page that owns the name first,
+       as a top-level var or a non-configurable accessor, fails the load
+       closed: motion stays unloaded and the page's binding never sees the
+       share, its setter never runs. */
+    {
+        static const HiddenHelperStep steps[] = {
+            {"var __tilefinchDomShared;globalThis.pocSummary='OK'", false},
+            {"try{void AnimationEvent}catch(_){}globalThis.pocSummary="
+             "__tilefinchDomShared===undefined"
+             "&&typeof __tilefinchMotionSourceBridge==='undefined'"
+             "?'OK':'share-seen:'+typeof __tilefinchDomShared", false},
+        };
+        ok &= run_hidden_helper_case("motion-share-page-var", steps,
+            sizeof(steps) / sizeof(steps[0]), 1);
+    }
+    {
+        static const HiddenHelperStep steps[] = {
+            {"globalThis.__shareReads=0;globalThis.__shareSets=[];"
+             "Object.defineProperty(globalThis,'__tilefinchDomShared',{"
+             "get(){__shareReads++},set(value){__shareSets.push(value)}});"
+             "globalThis.pocSummary='OK'", false},
+            {"try{void AnimationEvent}catch(_){}globalThis.pocSummary="
+             "__shareReads===0&&__shareSets.length===0?'OK':'share-reached:'"
+             "+__shareReads+'/'+__shareSets.length", false},
+        };
+        ok &= run_hidden_helper_case("motion-share-page-accessor", steps,
+            sizeof(steps) / sizeof(steps[0]), 1);
+    }
     /* A top-level `var` (or a non-configurable defineProperty) makes the
        flag non-configurable, so the loader cannot replace it. The lazy load
        must then fail closed rather than run with the page's value, and a
@@ -583,6 +735,7 @@ int main(int argc, char **argv)
     if (argc == 2) selected_case = argv[1];
     bool ok = true;
     ok &= test_weak_shadow_slot_reclamation();
+    ok &= test_unrelated_namespaced_clone_handles();
     ok &= test_disconnected_observer_ownership();
     ok &= test_author_sheet_owner_lifetime();
     ok &= test_test_probe_surface();

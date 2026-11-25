@@ -477,6 +477,9 @@ typedef struct {
     bool backend_stats_snapshot_valid;
     unsigned seek_completions;
     uint64_t last_resume_saved_us;
+    uint64_t resume_output_us;
+    bool resume_output_observed;
+    bool resume_output_blocked;
     char source[NAVIGATION_URL_LIMIT];
     char offline_video_path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
     char offline_audio_path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
@@ -590,6 +593,8 @@ void psp_media_shutdown(PspMediaSession *media);
  */
 void psp_media_set_refusal_reset(bool enabled);
 uint64_t psp_media_duration_us(const PspMediaSession *media);
+void psp_media_note_resume_output(PspMediaSession *media, uint64_t pts_us);
+void psp_media_clear_resume_evidence(PspMediaSession *media);
 bool psp_media_record_resume(PspMediaSession *media, bool persist);
 /*
  * Release firmware/audio/network-facing media state across PSP suspend while
@@ -763,5 +768,15 @@ size_t psp_media_feed_before_blocking(PspMediaSession *media, bool prepared_only
 /* Recheck a prepared wide picture against the actual DAC clock. Zero means
    publication is permitted under the ordinary half-frame due rule. */
 uint64_t psp_media_present_delay_us(const PspMediaSession *media);
+
+/* Before the first hardware picture there is no presentation to pace.
+   Yield briefly to the decoder, but don't poll a slow or stalled stream
+   indefinitely. A seek clears the open timestamp. */
+static inline bool psp_media_first_picture_poll(const PspMediaSession *m, uint64_t now)
+{
+    return m->first_frame_opened_us && !m->have_frame && m->ui.visible && !m->ui.failed
+        && !m->audio_only && !m->use_swdec && !m->pause_boundary_pending && m->playback
+        && m->job_phase == PSP_MEDIA_JOB_NONE && now - m->first_frame_opened_us < 250000u;
+}
 
 #endif

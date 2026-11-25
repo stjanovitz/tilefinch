@@ -786,6 +786,29 @@ static void geometry_inputs_capture(ScriptRuntime *runtime)
     runtime->geometry_container_generation = bridge->stylesheet == NULL ? 0
         : bridge->stylesheet->container_state_generation;
     runtime->geometry_font_generation = font_generation();
+    runtime->geometry_serial++;
+}
+
+/* The incumbent's input generations, while a scratch snapshot's replace
+   them: put back with the incumbent (script_runtime_keep_published_layout)
+   they say again what that layout was built from. */
+static void geometry_inputs_save(ScriptRuntime *runtime)
+{
+    runtime->geometry_incumbent_inputs[0] = runtime->geometry_content_generation;
+    runtime->geometry_incumbent_inputs[1] = runtime->geometry_style_generation;
+    runtime->geometry_incumbent_inputs[2] = runtime->geometry_sheet_generation;
+    runtime->geometry_incumbent_inputs[3] = runtime->geometry_container_generation;
+    runtime->geometry_incumbent_inputs[4] = runtime->geometry_font_generation;
+}
+
+static void geometry_inputs_restore(ScriptRuntime *runtime)
+{
+    runtime->geometry_content_generation = runtime->geometry_incumbent_inputs[0];
+    runtime->geometry_style_generation = runtime->geometry_incumbent_inputs[1];
+    runtime->geometry_sheet_generation = runtime->geometry_incumbent_inputs[2];
+    runtime->geometry_container_generation = runtime->geometry_incumbent_inputs[3];
+    runtime->geometry_font_generation = runtime->geometry_incumbent_inputs[4];
+    runtime->geometry_serial++;
 }
 
 void script_runtime_set_layout(ScriptRuntime *runtime, LayoutDocument *layout,
@@ -953,6 +976,182 @@ static bool geometry_refusal_stands(const ScriptRuntime *runtime,
             < runtime->geometry_refused_room + GEOMETRY_REFUSAL_RETRY_ROOM;
 }
 
+/* The load lifecycle's layout allowance (STYLE_INVALIDATION.md, "Reads
+   during page load"): a first build whose estimated work is at most
+   LOADING_LAYOUT_WORK_FLOOR, then builds that together do
+   LOADING_LAYOUT_SHARE_PERCENT of the first one's work, or the floor on a
+   small page. LOADING_LAYOUT_UNITS_PER_NODE is what laying out a node of
+   ordinary text content counts (15-19 measured on text pages; less where
+   a subtree is hidden). */
+enum {
+    LOADING_LAYOUT_SHARE_PERCENT = 50, LOADING_LAYOUT_WORK_FLOOR = 16384,
+    LOADING_LAYOUT_UNITS_PER_NODE = 16
+};
+
+/* A build's work, counted rather than timed so that a replay spends the
+   allowance alike every run: the selector candidates its style resolution
+   tested plus its layout work units (nodes and text laid out). On the
+   host each costs about 0.1 us, so the sum follows a build's time. */
+static uint64_t geometry_build_work(const LayoutDocument *layout)
+{
+    return layout->performance.style_rule_candidates
+        + layout->layout_work_units;
+}
+
+/* The live document's nodes and elements, counted until the nodes alone
+   would put the estimate past the floor (then it is refused whatever the
+   rest holds). The document's own totals are the parser's, refreshed only
+   between script turns, so a tree a script built before its read would
+   pass for the empty shell it replaced. The count is kept until the tree
+   changes (tree_version), so a style write and read in a loop walks it
+   once. */
+static void loading_dom_count(DomBridge *bridge, size_t *nodes,
+                              size_t *elements)
+{
+    enum { CAP = LOADING_LAYOUT_WORK_FLOOR / LOADING_LAYOUT_UNITS_PER_NODE + 1 };
+    if (!bridge->loading_count_valid
+        || bridge->loading_count_version != bridge->tree_version) {
+        size_t counted = 0, counted_elements = 0;
+        lxb_dom_node_t *root = lxb_dom_interface_node(bridge->document->html);
+        for (lxb_dom_node_t *node = root; node != NULL && counted < CAP;) {
+            counted++;
+            if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) counted_elements++;
+            if (node->first_child != NULL) {
+                node = node->first_child;
+                continue;
+            }
+            while (node != root && node->next == NULL) node = node->parent;
+            node = node == root ? NULL : node->next;
+        }
+        bridge->loading_count_nodes = counted;
+        bridge->loading_count_elements = counted_elements;
+        bridge->loading_count_version = bridge->tree_version;
+        bridge->loading_count_valid = true;
+    }
+    *nodes = bridge->loading_count_nodes;
+    *elements = bridge->loading_count_elements;
+}
+
+/* A first build's work, estimated before it runs: every element tests the
+   rules no tag, id or class selects (stylesheet_rules_tested_per_element,
+   which builds the rule index as the build would), and every node is laid
+   out. It leaves out what the keys add and how much text a node holds, so
+   it is a lower bound of what the build counts. */
+static uint64_t geometry_build_estimate(DomBridge *bridge)
+{
+    size_t nodes = 0, elements = 0;
+    loading_dom_count(bridge, &nodes, &elements);
+    uint64_t per_element = stylesheet_rules_tested_per_element(
+        (Stylesheet *) bridge->stylesheet);
+    return (uint64_t) elements * per_element
+        + (uint64_t) nodes * LOADING_LAYOUT_UNITS_PER_NODE;
+}
+
+/* Whether a build may start while the page loads: only for a read of the
+   page's own (its handler's, or browser code that handler called), never
+   for the browser's own work, and only while the work fits. A first
+   build is admitted by its estimate; a later one without the reuse cache
+   starts cold, as costly as the first, and must fit what is left; one
+   with it (often a fraction, unknown until it ran) may start while any
+   is left. */
+static bool loading_build_admitted(ScriptRuntime *runtime, bool cold)
+{
+    DomBridge *bridge = &runtime->bridge;
+    if (!JS_IsAuthorCodeRunning(runtime->context)) return false;
+    if (bridge->loading_layout_first == 0)
+        return geometry_build_estimate(bridge) <= LOADING_LAYOUT_WORK_FLOOR;
+    return bridge->loading_layout_allowance
+        >= (cold ? bridge->loading_layout_first : 1u);
+}
+
+/* Script reads the incumbent again (the layoutless estimate when there is
+   none), as it was before the snapshot. */
+static void geometry_snapshot_release(ScriptRuntime *runtime)
+{
+    if (runtime->geometry_layout == NULL) return;
+    DomBridge *bridge = &runtime->bridge;
+    layout_destroy(runtime->geometry_layout);
+    budget_free(runtime->budget, runtime->geometry_layout);
+    runtime->geometry_layout = NULL;
+    bridge->layout = runtime->geometry_incumbent;
+    runtime->geometry_incumbent = NULL;
+    runtime->geometry_paint_stale = false;
+    geometry_inputs_restore(runtime);
+    /* Element scrolls set meanwhile moved only the snapshot's boxes. */
+    for (size_t i = 0; bridge->layout != NULL
+                       && i < bridge->scroll_intent_count; i++) {
+        ElementScrollIntent *intent = &bridge->scroll_intents[i];
+        (void) layout_scroll_node(bridge->layout, intent->node,
+                                  intent->scroll_x, intent->scroll_y);
+    }
+}
+
+#ifdef TILEFINCH_LAYOUT_DIFF
+/* TILEFINCH_VERIFY_GEOMETRY_PROOF (host and validation builds): a read that
+   a proof answers without a build builds anyway, into a temporary laid out
+   from the same cache, and compares every box and command with the layout
+   the read answers from (layout_validation_compare). Command differences
+   on paint the read never adopts (`paint_stale`) are reported apart. */
+static void geometry_proof_verify(ScriptRuntime *runtime,
+                                  const ViewportContext *viewport,
+                                  LayoutReuseCache *reuse,
+                                  LayoutDocument *reading, const char *kind,
+                                  bool paint_stale)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("TILEFINCH_VERIFY_GEOMETRY_PROOF") != NULL;
+    if (!enabled || reading == NULL) return;
+    DomBridge *bridge = &runtime->bridge;
+    /* The build below moves the cache's coverage to itself: hand it back
+       to the layout read when the two are equal, never otherwise. */
+    bool covered = layout_reuse_proof_covers(reuse, reading);
+    LayoutDocument *fresh = budget_calloc_category(
+        runtime->budget, BUDGET_CATEGORY_LAYOUT, 1, sizeof(*fresh));
+    bool built = false;
+    if (fresh != NULL) {
+        layout_validation_set_cause("verify");
+        built = layout_build_context_reuse(
+            fresh, runtime->budget, bridge->document, bridge->stylesheet,
+            bridge->fonts, bridge->images, viewport, reuse);
+    }
+    char detail[160] = "";
+    const char *verdict = "refused";
+    if (built) {
+        layout_transfer_scroll_state(reading, fresh);
+        for (size_t i = 0; i < bridge->scroll_intent_count; i++) {
+            ElementScrollIntent *intent = &bridge->scroll_intents[i];
+            (void) layout_scroll_node(fresh, intent->node,
+                                      intent->scroll_x, intent->scroll_y);
+        }
+        LayoutValidationCompare same = layout_validation_compare(
+            reading, fresh, detail, sizeof(detail));
+        verdict = same == LAYOUT_VALIDATION_SAME ? "match"
+            : same == LAYOUT_VALIDATION_BOXES_DIFFER ? "mismatch"
+            : paint_stale ? "match-stale-paint" : "mismatch-commands";
+        /* The cache now vouches for the fresh build; it equals the one read. */
+        if (covered && same != LAYOUT_VALIDATION_BOXES_DIFFER
+            && fresh->reuse_serial != 0)
+            reading->reuse_serial = fresh->reuse_serial;
+    }
+    char message[320];
+    snprintf(message, sizeof(message),
+             "tilefinch-geometry-proof-verify: kind=%s result=%s boxes=%zu %s",
+             kind, verdict, reading->node_box_count, detail);
+    tilefinch_platform_log_message(message);
+    if (fresh != NULL) {
+        layout_destroy(fresh);
+        budget_free(runtime->budget, fresh);
+    }
+}
+#endif
+
+const LayoutDocument *script_runtime_geometry_reading(
+    const ScriptRuntime *runtime)
+{
+    return runtime == NULL ? NULL : runtime->bridge.layout;
+}
+
 bool script_runtime_flush_geometry_layout_reuse(
     ScriptRuntime *runtime, const ViewportContext *viewport,
     ScriptGeometryReuseCallback prepare, ScriptGeometryReuseRelease release,
@@ -968,6 +1167,20 @@ bool script_runtime_flush_geometry_layout_reuse(
         return true;
     }
     if (geometry_refusal_stands(runtime, viewport)) return false;
+    /* Loading listeners can update and then measure the document, but
+       their reads must not cost a page layouts it cannot afford before it
+       can be published, nor may the browser's own work during load. A
+       read no build is admitted for, and that cannot prove the snapshot
+       still holds, drops it: script then reads the estimate, which follows
+       its writes, never a superseded snapshot. */
+    bool loading = bridge->synchronous_layout_loading;
+    bool provable = prepare != NULL
+        && geometry_environment_current(runtime, viewport, bridge->layout)
+        && bridge->layout->content_limit_y == 0;
+    if (loading && !provable && !loading_build_admitted(runtime, false)) {
+        geometry_snapshot_release(runtime);
+        return false;
+    }
 #ifndef TILEFINCH_NO_TRACE
     bool trace_geometry = tilefinch_trace_runtime_steps();
     uint64_t trace_begin = trace_geometry
@@ -980,13 +1193,16 @@ bool script_runtime_flush_geometry_layout_reuse(
                 && (bridge->mutations->count != 0
                     || bridge->mutations->overflowed)
             ? bridge->mutations : NULL,
-            geometry_environment_current(runtime, viewport, bridge->layout)
-                && bridge->layout->content_limit_y == 0
-                ? &unchanged : NULL);
+            provable ? &unchanged : NULL);
     /* A truncated layout is never borrowed as script's geometry (see
        js_rt_bridge_layout): it is completed into the scratch below. */
     if (unchanged && bridge->layout != NULL && bridge->layout->budget != NULL
         && bridge->layout->content_limit_y == 0) {
+#ifdef TILEFINCH_LAYOUT_DIFF
+        geometry_proof_verify(runtime, viewport, reuse, bridge->layout,
+                              reuse == NULL ? "focus" : "proof",
+                              runtime->geometry_paint_stale);
+#endif
         /* Borrow only: never install this old paint as a fresh publication.
            The existing input generations cache the proof across subsequent
            reads in this turn; any new DOM/style/font/viewport input breaks it. */
@@ -999,6 +1215,10 @@ bool script_runtime_flush_geometry_layout_reuse(
 #endif
         return true;
     }
+    if (loading && !loading_build_admitted(runtime, reuse == NULL)) {
+        geometry_snapshot_release(runtime);
+        return false;
+    }
     /* A build is where a read's memory peaks, and it usually follows a
        mutation, which already emptied the geometry records: release their
        table for it (the walk after the build stores afresh). */
@@ -1009,6 +1229,7 @@ bool script_runtime_flush_geometry_layout_reuse(
             sizeof(*runtime->geometry_layout));
         if (runtime->geometry_layout == NULL) return false;
         runtime->geometry_incumbent = bridge->layout;
+        geometry_inputs_save(runtime);
     } else {
         /* The previous snapshot is no longer authoritative. Release it
            before rebuilding rather than admitting two scratch layouts. */
@@ -1071,7 +1292,7 @@ bool script_runtime_flush_geometry_layout_reuse(
         const LayoutPerformance *p = &runtime->geometry_layout->performance;
         fprintf(stderr, "geometry-snapshot prepare-us=%llu build-us=%llu "
             "flow-us=%llu style-us=%llu styles=%llu/%llu mutations=%zu "
-            "overflow=%d resource=%d commands=%zu\n",
+            "overflow=%d resource=%d commands=%zu reuse=%d work=%llu loading=%d\n",
             (unsigned long long)(trace_prepared - trace_begin),
             (unsigned long long)(tilefinch_platform_monotonic_time_us() - trace_prepared),
             (unsigned long long)p->flow_us,
@@ -1082,9 +1303,25 @@ bool script_runtime_flush_geometry_layout_reuse(
             bridge->mutations != NULL && bridge->mutations->overflowed,
             bridge->mutations != NULL
                 && bridge->mutations->resource_rebuild_required,
-            runtime->geometry_layout->count);
+            runtime->geometry_layout->count, reuse != NULL,
+            (unsigned long long) geometry_build_work(runtime->geometry_layout),
+            bridge->synchronous_layout_loading);
     }
 #endif
+    if (bridge->synchronous_layout_loading) {
+        uint64_t work = geometry_build_work(runtime->geometry_layout);
+        if (bridge->loading_layout_first == 0) {
+            uint64_t share = work / 100u * LOADING_LAYOUT_SHARE_PERCENT;
+            bridge->loading_layout_first = work != 0 ? work : 1u;
+            bridge->loading_layout_allowance =
+                share > LOADING_LAYOUT_WORK_FLOOR
+                    ? share : LOADING_LAYOUT_WORK_FLOOR;
+        } else {
+            bridge->loading_layout_allowance -=
+                work < bridge->loading_layout_allowance
+                    ? work : bridge->loading_layout_allowance;
+        }
+    }
     geometry_inputs_capture(runtime);
     runtime->geometry_paint_stale = false;
 #ifndef TILEFINCH_NO_TRACE
@@ -1099,6 +1336,18 @@ bool script_runtime_flush_geometry_layout_reuse(
     }
     bridge->layout = runtime->geometry_layout;
     return true;
+}
+
+void script_runtime_keep_published_layout(ScriptRuntime *runtime)
+{
+    if (runtime == NULL || runtime->geometry_layout == NULL) return;
+    DomBridge *bridge = &runtime->bridge;
+    /* A snapshot of this very DOM is the published layout's equal: the
+       next relayout, or an idle completion, may still adopt it. */
+    if (bridge->layout == runtime->geometry_layout && bridge->document != NULL
+        && runtime->geometry_content_generation
+            == bridge->document->content_generation) return;
+    geometry_snapshot_release(runtime);
 }
 
 bool script_runtime_flush_geometry_layout(ScriptRuntime *runtime,
@@ -1244,6 +1493,90 @@ void js_rt_geometry_attribute_write_end(DomBridge *bridge,
     }
     runtime->geometry_content_generation = bridge->document->content_generation;
     runtime->geometry_paint_stale = true;
+}
+
+/* jQuery measures an element without a box by writing position,
+   visibility and display inline, reading its size and writing the old
+   values back (jQuery.swap), element after element; carousels toggle
+   classes on items inside display:none popovers between such reads. Each
+   read rebuilt the whole page's geometry. A class or inline style write on
+   an element under a display:none ancestor keeps the current geometry:
+
+   - nothing under a display:none element has a box or counts a counter,
+     whatever its own style, and a selector reaches outside the ancestor
+     only through :has() (`relational`): a sibling or descendant combinator
+     from inside stays inside, so the ancestor's own style, and every box,
+     stay as they are;
+   - the element is not itself rendered in the current geometry (no box or
+     fragment: then no ancestor can be display:none), and every element
+     from it up to the ancestor is HTML (SVG <use> draws referenced
+     content wherever it sits);
+   - no shadow root (slots render light children elsewhere), no container
+     queries, a complete (not truncated) geometry, and a journal that still
+     audits every record.
+
+   The ancestor is found once per geometry (resolving the ancestors' styles
+   root first) and remembered: kept writes cannot change its style. The
+   DOM write and its journal record stand, and the geometry's commands are
+   never adopted as the new presentation. */
+bool js_rt_geometry_hidden_write_begin(DomBridge *bridge, lxb_dom_node_t *node,
+                                       bool relational)
+{
+    ScriptRuntime *runtime = bridge == NULL ? NULL : bridge->host;
+    if (relational || runtime == NULL || node == NULL
+        || node->type != LXB_DOM_NODE_TYPE_ELEMENT || node->ns != LXB_NS_HTML
+        || node->local_name == LXB_TAG_IFRAME
+        || node->local_name == LXB_TAG_FRAME
+        || node->local_name == LXB_TAG_OBJECT
+        || node->local_name == LXB_TAG_EMBED
+        || bridge->stylesheet == NULL || bridge->document == NULL
+        || bridge->shadow_root_count != 0 || bridge->mutations_unrecorded
+        || (bridge->mutations != NULL
+            && (bridge->mutations->overflowed
+                || bridge->mutations->resource_rebuild_required
+                || bridge->mutations->conservative_resource_scan)))
+        return false;
+    const LayoutDocument *layout = runtime->geometry_layout != NULL
+        ? runtime->geometry_layout : runtime->geometry_incumbent;
+    if (layout == NULL || layout->content_limit_y != 0
+        || !geometry_layout_current(runtime, &layout->viewport)
+        || stylesheet_has_container_queries(bridge->stylesheet)
+        || layout_box_for_node(layout, node) != NULL
+        || layout_inline_fragment_first(layout, node) != NULL)
+        return false;
+    lxb_dom_node_t *ancestors[64];
+    size_t count = 0;
+    lxb_dom_node_t *at = node->parent;
+    bool remembered = runtime->geometry_hidden_root != NULL
+        && runtime->geometry_hidden_serial == runtime->geometry_serial;
+    for (; at != NULL && at->type == LXB_DOM_NODE_TYPE_ELEMENT;
+         at = at->parent) {
+        if (at->ns != LXB_NS_HTML) return false;
+        if (remembered && at == runtime->geometry_hidden_root) return true;
+        if (count == sizeof(ancestors) / sizeof(ancestors[0])) return false;
+        ancestors[count++] = at;
+    }
+    if (at == NULL || at->type != LXB_DOM_NODE_TYPE_DOCUMENT) return false;
+    ComputedStyle parent = {0};
+    bool has_parent = false;
+    for (size_t i = count; i-- > 0;) {
+        ComputedStyle style = style_for_node(
+            bridge->stylesheet, ancestors[i], has_parent ? &parent : NULL);
+        if (style.display == DISPLAY_NONE) {
+            runtime->geometry_hidden_root = ancestors[i];
+            runtime->geometry_hidden_serial = runtime->geometry_serial;
+            return true;
+        }
+        parent = style;
+        has_parent = true;
+    }
+    return false;
+}
+
+void js_rt_geometry_hidden_write_end(DomBridge *bridge)
+{
+    const JsRtGeometryAttributeWrite write = {0};
+    js_rt_geometry_attribute_write_end(bridge, &write);
 }
 
 void script_runtime_notify_viewport_changed(ScriptRuntime *runtime)
@@ -1415,10 +1748,14 @@ static void runtime_queue_image_loads(ScriptRuntime *runtime, ImageResources *im
             : runtime_image_load_find(runtime, handle, &hint);
         if (at != runtime->image_load_state_count) {
             const ScriptImageLoadState *state = &runtime->image_load_states[at];
-            if (state->source_hash == image->source_hash
+            if (!image->request_replaced && state->source_hash == image->source_hash
                 && (state->pending || state->delivered)) continue;
         }
-        if (!image_resource_source_current(runtime->bridge.stylesheet, image)) continue;
+        /* A <noscript> fallback is the browser's: no load event for it. */
+        if (!image_resource_source_current(runtime->bridge.stylesheet, image)
+            || image_noscript_fallback_shown(runtime->bridge.stylesheet,
+                                             image->node)) continue;
+        images->items[i].request_replaced = false;
         if (at == runtime->image_load_state_count) {
             if (!runtime_image_load_reserve(runtime)) continue;
             if (handle == 0)

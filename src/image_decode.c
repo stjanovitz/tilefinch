@@ -428,8 +428,10 @@ static int image_jpeg_scale_shift(int source_width, int source_height,
    reduced size. Rows of the reduced image are then chroma-upsampled with
    stb's own kernels one at a time, and those the row sampler takes for the
    remaining factor (below two) are colour-converted into the target.
-   Progressive streams still hold their full coefficient planes until the
-   last scan. */
+   A progressive stream holds coefficients until its last scan: at a reduced
+   scale only the (8 >> shift) square of low-frequency coefficients of each
+   block, which the reduced block is then built from, and a map of which of
+   the others are nonzero (the patch's tilefinch_coeff_stride). */
 static unsigned char *image_decode_jpeg_scaled(
     const unsigned char *encoded, int encoded_length,
     int expected_width, int expected_height,
@@ -823,9 +825,9 @@ static void image_decode_worker_release_job(ImageDecodeWorker *worker)
 
 /* Worker scratch for one scaled JPEG decode, from the frame header: the
    reduced component planes (stb pads each to whole MCUs), progressive
-   coefficient planes (full size, two bytes per coefficient), one reduced
-   RGBA row, line buffers and the sampler's column table. The floor covers the
-   decoder state, Huffman tables and allocation headers. */
+   coefficients (the stb patch's tilefinch_coeff_stride shorts per block),
+   one reduced RGBA row, line buffers and the sampler's column table. The
+   floor covers the decoder state, Huffman tables and allocation headers. */
 static bool image_jpeg_worker_scratch(
     const unsigned char *encoded, size_t length, int target_width,
     int target_height, size_t *scratch_bytes)
@@ -875,7 +877,11 @@ static bool image_jpeg_worker_scratch(
             size_t plane_w = mcu_x * (size_t) h[i] * 8u;
             size_t plane_h = mcu_y * (size_t) v[i] * 8u;
             total += (plane_w >> shift) * (plane_h >> shift) + 16u;
-            if (marker == 0xc2u) total += plane_w * plane_h * 2u + 16u;
+            if (marker == 0xc2u) {
+                size_t size = 8u >> shift;
+                total += (plane_w / 8u) * (plane_h / 8u)
+                    * (shift == 0 ? 64u : size * size + 4u) * 2u + 16u;
+            }
         }
         size_t reduced_width = ((size_t) width + (1u << shift) - 1u) >> shift;
         total += reduced_width * (4u + 4u + (size_t) count)
@@ -886,9 +892,76 @@ static bool image_jpeg_worker_scratch(
     return false;
 }
 
-ImageDecodeSubmitResult image_decode_worker_submit(
-    const ImageResource *resource, Budget *budget, uint32_t *token)
+/* Budget a scaled JPEG decode at width x height takes while it runs
+   (scratch and output; a worker's arena also holds the encoded bytes) and
+   keeps afterwards (its output). */
+static bool image_jpeg_decode_charge(const ImageResource *image, int width,
+                                     int height, bool worker,
+                                     size_t *working, size_t *kept)
 {
+    size_t scratch = 0;
+    if (!image_jpeg_worker_scratch(image->encoded, image->encoded_length,
+                                   width, height, &scratch))
+        return false;
+    size_t output = (size_t) width * (size_t) height * 4u;
+    *kept = budget_malloc_charge(output);
+    /* A worker's arena aligns the output ahead of its scratch, as
+       image_decode_worker_submit sizes it. */
+    size_t align = _Alignof(max_align_t);
+    *working = budget_malloc_charge(scratch
+        + (worker ? (output + align - 1u) / align * align
+                        + image->encoded_length
+                  : output));
+    return true;
+}
+
+bool image_decode_reduced_fallback(const ImageResource *image,
+                                   const Budget *budget, bool worker,
+                                   size_t kept_limit, int *width, int *height,
+                                   size_t *needed)
+{
+    *needed = 0;
+    int source_width = image->source_width, source_height = image->source_height;
+    int target_width = *width, target_height = *height;
+    size_t working = 0, kept = 0;
+    if (image->encoded == NULL || image->encoded_length < 2u
+        || image->encoded[0] != 0xffu || image->encoded[1] != 0xd8u
+        || target_width <= 0 || target_height <= 0
+        || target_width > source_width || target_height > source_height
+        || !image_jpeg_decode_charge(image, target_width, target_height,
+                                     worker, &working, &kept))
+        return false;
+    *needed = working;
+    if (image_jpeg_scale_shift(source_width, source_height, target_width,
+                               target_height) != 0)
+        return false;
+    for (int shift = 1; shift <= 2; shift++) {
+        int reduced_width = (source_width + (1 << shift) - 1) >> shift;
+        int reduced_height = (source_height + (1 << shift) - 1) >> shift;
+        if (reduced_width > target_width) reduced_width = target_width;
+        if (reduced_height > target_height) reduced_height = target_height;
+        if (!image_jpeg_decode_charge(image, reduced_width, reduced_height,
+                                      worker, &working, &kept))
+            return false;
+        if (kept > kept_limit
+            || (worker ? budget_pressure_required(
+                             budget, working, IMAGE_DECODE_WORKER_RESERVE)
+                       : budget_pressure_required(budget, working, 0)
+                         || budget_pressure_required(
+                                budget, kept, IMAGE_DECODE_WORKER_RESERVE)))
+            continue;
+        *width = reduced_width;
+        *height = reduced_height;
+        return true;
+    }
+    return false;
+}
+
+ImageDecodeSubmitResult image_decode_worker_submit(
+    const ImageResource *resource, Budget *budget, uint32_t *token,
+    size_t *refused_charge)
+{
+    *refused_charge = 0;
     if (resource == NULL || budget == NULL || token == NULL
         || resource->encoded_body == NULL
         || resource->encoded == NULL || resource->encoded_length < 2u
@@ -948,10 +1021,27 @@ ImageDecodeSubmitResult image_decode_worker_submit(
     if (output_aligned > SIZE_MAX - scratch_bytes)
         return IMAGE_DECODE_SUBMIT_REJECTED;
     size_t arena_bytes = output_aligned + scratch_bytes;
-    unsigned char *storage = budget_malloc(budget, arena_bytes);
+    /* The arena stays charged until the result is collected, across the
+       page's script, network and layout turns. Leave them a reserve, as a
+       synchronous decode returns its scratch before they run again. */
+    size_t arena_charge = budget_malloc_charge(arena_bytes);
+    if (budget_pressure_required(budget, arena_charge,
+                                 IMAGE_DECODE_WORKER_RESERVE)) {
+        *refused_charge = arena_charge <= SIZE_MAX
+            - IMAGE_DECODE_WORKER_RESERVE
+            ? arena_charge + IMAGE_DECODE_WORKER_RESERVE : SIZE_MAX;
+        return IMAGE_DECODE_SUBMIT_REJECTED;
+    }
+    unsigned char *storage =
+#ifndef __PSP__
+        tilefinch_test_faults()->refuse_image_decode_arena ? NULL :
+#endif
+        budget_malloc(budget, arena_bytes);
     BrowserSharedBody *body = storage == NULL ? NULL
         : browser_shared_body_retain(resource->encoded_body);
     if (storage == NULL || body == NULL) {
+        if (storage == NULL)
+            *refused_charge = budget_malloc_charge(arena_bytes);
         budget_free(budget, storage);
         return IMAGE_DECODE_SUBMIT_REJECTED;
     }

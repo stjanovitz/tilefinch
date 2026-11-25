@@ -178,6 +178,20 @@ const cases = {
     });
     return !(await observe({})) && await observe({scrollMargin:'15px'});
   },
+  async observerSizelessImagesIntersectWhereTheyFlow() {
+    scrollTo(0, 0);
+    const p = await placed('<div><img alt=""><span><img alt="" loading="lazy"></span><img alt="" style="display:none"><div style="height:900px"></div><img alt=""></div>');
+    const images = [...p.querySelectorAll('img')];
+    const seen = await new Promise(resolve => {
+      const o = new IntersectionObserver(records => {
+        o.disconnect();
+        resolve(images.map(i => records.find(r => r.target === i)?.isIntersecting ? 1 : 0).join(''));
+      });
+      images.forEach(i => o.observe(i));
+    });
+    const r = images[0].getBoundingClientRect();
+    return seen === '1100' && r.width === 0 && r.height === 0;
+  },
   customShadowOptOutAppliesInConstructor() {
     let blocked;
     class X extends HTMLElement {

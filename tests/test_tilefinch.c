@@ -3,6 +3,7 @@
 #include "../src/psp_network_policy.h"
 #include "../src/psp_navigation_watchdog.h"
 #include "../src/tilefinch_test_faults.h"
+#include "../src/data_url.h"
 #include "../src/style_cache_internal.h"
 #include "../src/style_internal.h"
 #include "tilefinch/work_vector.h"
@@ -399,6 +400,647 @@ static bool test_external_scripts_refused_before_compile(Budget *main_budget)
     }
     budget_install_lexbor(main_budget);
     return all;
+}
+
+/* A page whose scripts come from the HTTP cache, committed in its own
+   32 MiB Budget (the realistic page size) with `leave_free` of it free
+   when the realm is created (TestScriptPressureSeam) and a realm heap of
+   `heap_bytes` that grows as the Budget allows, unless `fixed_heap`
+   (navigation_set_fixed_script_memory_limits). After the commit the
+   runtime advances until the page realm stops or 16 turns pass; then
+   `inspect` sees the session before it is destroyed. */
+typedef struct {
+    const char *url;
+    const char *source;
+    size_t length;
+    bool stylesheet;    /* a cached stylesheet response, not a script */
+} TestCachedScript;
+
+typedef void (*TestCachedPageInspect)(NavigationSession *navigation,
+                                      void *opaque);
+
+static bool test_commit_cached_script_page(
+    const char *html, const TestCachedScript *scripts, size_t script_count,
+    size_t leave_free, size_t heap_bytes, bool fixed_heap,
+    TestCachedPageInspect inspect, void *opaque)
+{
+    static Budget budget;
+    static NavigationSession navigation;
+    static BrowserSession browser_session;
+    budget_init(&budget, 32u * MIB);
+    budget_install_lexbor(&budget);
+    BudgetReservation reservation = {0};
+    bool session_ready = browser_session_init(&browser_session, &budget,
+                                              4u * MIB);
+    bool ok = session_ready;
+    for (size_t i = 0; ok && i < script_count; i++)
+        ok = scripts[i].source != NULL
+            && (scripts[i].stylesheet
+                ? test_cache_put_stylesheet(
+                      &browser_session, scripts[i].url,
+                      (const unsigned char *) scripts[i].source,
+                      scripts[i].length, NULL)
+                : test_cache_put_classic_script(
+                      &browser_session, "https://cached.test/",
+                      scripts[i].url,
+                      (const unsigned char *) scripts[i].source,
+                      scripts[i].length));
+    ok = ok && navigation_init(&navigation, &budget, 2);
+    if (ok) {
+        navigation_attach_browser_session(&navigation, &browser_session);
+        navigation_enable_scripts(&navigation, heap_bytes, 4000);
+        navigation_set_fixed_script_memory_limits(&navigation, fixed_heap);
+        navigation_enable_document_scripts(&navigation, 4, 8u * MIB,
+                                           4u * MIB, 4000);
+        TestScriptPressureSeam seam = {
+            .navigation = &navigation,
+            .reservation = &reservation,
+            .leave_free = leave_free
+        };
+        navigation.heavy_policy_resolver = test_script_pressure_at_realm;
+        navigation.heavy_policy_opaque = &seam;
+        uint64_t generation = navigation_begin(&navigation);
+        bool committed = navigation_commit_html(
+            &navigation, generation, "https://cached.test/", html,
+            strlen(html), 480, NULL, NULL, true);
+        for (unsigned tick = 0; committed && navigation.page.runtime != NULL
+             && tick < 16u; tick++)
+            (void) navigation_advance_runtime(&navigation, 1, 8);
+        inspect(committed ? &navigation : NULL, opaque);
+        ok = seam.reserved;
+        budget_reservation_release(&reservation);
+        navigation_destroy(&navigation);
+    }
+    if (session_ready) browser_session_destroy(&browser_session);
+    return ok && budget.current == 0;
+}
+
+static bool test_page_probe(const NavigationSession *navigation,
+                            const char *expression)
+{
+    char source[256];
+    snprintf(source, sizeof(source),
+             "globalThis.pocSummary=(%s)?'yes':'no'", expression);
+    ScriptResult probe = {0};
+    return navigation != NULL && navigation->page.runtime != NULL
+        && script_runtime_evaluate_diagnostic(
+               navigation->page.runtime, source,
+               "https://cached.test/probe.js", &probe)
+        && strcmp(probe.summary, "yes") == 0;
+}
+
+/* A registry of `entries` small factories as `globalThis.<name>`, then
+   `tail`. */
+static char *test_registry_script(const char *name, size_t entries,
+                                  const char *tail, size_t *length)
+{
+    size_t capacity = 64u + entries * 256u + strlen(tail);
+    char *source = malloc(capacity);
+    if (source == NULL) return NULL;
+    size_t at = (size_t) snprintf(source, capacity, "globalThis.%s={", name);
+    for (size_t i = 0; i < entries; i++)
+        at += (size_t) snprintf(
+            source + at, capacity - at,
+            "%zu:function(e,t,n){var r=n(%zu),a='%s';"
+            "e.exports={id:%zu,label:a,size:r.length+a.length}},",
+            i, i / 2u, TEST_REGISTRY_LABEL, i);
+    at += (size_t) snprintf(source + at, capacity - at, "};%s", tail);
+    *length = at;
+    return source;
+}
+
+typedef struct {
+    bool committed;
+    bool realm_alive;      /* the page realm runs, not stopped for memory */
+    bool memory_stopped;
+    bool manager_ran;
+    bool bundle_ran;       /* its first run finished */
+    bool bundle_error;     /* its element got an error event */
+    bool after_ran;
+    size_t dynamic_failed;
+} TestScriptPairOutcome;
+
+static void test_script_pair_inspect(NavigationSession *navigation,
+                                     void *opaque)
+{
+    TestScriptPairOutcome *outcome = opaque;
+    memset(outcome, 0, sizeof(*outcome));
+    if (navigation == NULL) return;
+    outcome->committed = true;
+    outcome->memory_stopped = navigation->page.script_memory_limited;
+    outcome->realm_alive = navigation->page.runtime != NULL
+        && !outcome->memory_stopped;
+    outcome->manager_ran = test_page_probe(navigation,
+                                           "globalThis.managerRan===true");
+    outcome->bundle_ran = test_page_probe(navigation,
+                                          "globalThis.bundleRan===true");
+    outcome->bundle_error = test_page_probe(navigation,
+                                            "errors.indexOf('bundle')>=0");
+    outcome->after_ran = test_page_probe(navigation,
+                                         "globalThis.afterRan===true");
+    outcome->dynamic_failed =
+        navigation->page.script_result.dynamic_scripts_failed;
+}
+
+/* Two scripts a page inserts in one turn, as an ad stack loads an auction
+   bundle and a manager: a 660 KB bundle whose first run keeps 1.5 MiB,
+   and a 33 KB manager that keeps another 1.5 MiB, run in `bundle_first`
+   order (async=false). */
+#define TEST_PAIR_BUNDLE_URL "https://cached.test/bundle.js"
+#define TEST_PAIR_MANAGER_URL "https://cached.test/manager.js"
+
+/* The least free Budget (to 64 KiB) at which a page lets a small script
+   it inserts allocate `bytes`: the page's `html` inserts TEST_PROBE_URL,
+   which `scripts` must hold as test_probe_script(bytes). A test that puts a
+   larger script in the probe's place with this much free knows what the
+   realm can obtain at that script's admission from measured use rather
+   than a figure tuned to today's allocation sizes. */
+#define TEST_PROBE_URL "https://cached.test/probe-alloc.js"
+
+static char *test_probe_script(size_t bytes, size_t *length)
+{
+    char *source = malloc(128);
+    if (source == NULL) return NULL;
+    *length = (size_t) snprintf(
+        source, 128,
+        "try{new ArrayBuffer(%zu);globalThis.probeOk=true}catch(e){}",
+        bytes);
+    return source;
+}
+
+static void test_probe_alloc_inspect(NavigationSession *navigation,
+                                     void *opaque)
+{
+    *(bool *) opaque = navigation != NULL
+        && navigation->page.runtime != NULL
+        && !navigation->page.script_memory_limited
+        && test_page_probe(navigation, "globalThis.probeOk===true");
+}
+
+static bool test_free_for_probe(const char *html,
+                                const TestCachedScript *scripts,
+                                size_t script_count, size_t *free_bytes)
+{
+    size_t low = 1u * MIB, high = 16u * MIB;
+    bool fits = false;
+    if (!test_commit_cached_script_page(html, scripts, script_count, high,
+                                        8u * MIB, false,
+                                        test_probe_alloc_inspect, &fits)
+        || !fits) return false;
+    while (high - low > 64u * 1024u) {
+        size_t middle = low + (high - low) / 2u;
+        fits = false;
+        if (!test_commit_cached_script_page(html, scripts, script_count,
+                                            middle, 8u * MIB, false,
+                                            test_probe_alloc_inspect, &fits))
+            return false;
+        if (fits) high = middle;
+        else low = middle;
+    }
+    *free_bytes = high;
+    return true;
+}
+
+/* Between the old reserve beside a heavy script's compile
+   (SCRIPT_ADMISSION_EXECUTION_RESERVE_BYTES) and the memory stop rule's
+   headroom: what a probe in its place must obtain. */
+static size_t test_between_reserve_and_headroom(size_t script_length)
+{
+    return script_admission_compile_peak(script_length)
+        + (SCRIPT_ADMISSION_EXECUTION_RESERVE_BYTES
+           + SCRIPT_ADMISSION_MEMORY_STOP_HEADROOM_BYTES) / 2u;
+}
+
+static bool test_script_pair_html(char *html, size_t capacity,
+                                  const char *first_url,
+                                  const char *first_name,
+                                  const char *second_url,
+                                  const char *second_name)
+{
+    int length = snprintf(html, capacity,
+        "<!doctype html><body><p id=ready>READY</p><script>"
+        "globalThis.errors=[];function add(u,n){"
+        "var s=document.createElement('script');s.async=false;s.src=u;"
+        "s.onerror=function(){errors.push(n)};document.head.appendChild(s)}"
+        "add('%s','%s');add('%s','%s')</script>"
+        "<script>globalThis.afterRan=true</script></body>",
+        first_url, first_name, second_url, second_name);
+    return length > 0 && (size_t) length < capacity;
+}
+
+/* Commits the pair page with `leave_free`, or when `tight` with the free
+   Budget at which a probe in the bundle's place (bundle first) obtains
+   test_between_reserve_and_headroom of the bundle: the same for both
+   orders. */
+static bool test_commit_script_pair(bool bundle_first, bool tight,
+                                    size_t leave_free,
+                                    TestScriptPairOutcome *outcome)
+{
+    static const char bundle_tail[] =
+        "globalThis.bundleHeld=[];for(let i=0;i<24;i++)"
+        "bundleHeld.push(new ArrayBuffer(65536));globalThis.bundleRan=true";
+    static const char manager_tail[] =
+        "globalThis.managerHeld=new ArrayBuffer(1536*1024);"
+        "managerHeld[0]=1;globalThis.managerRan=true";
+    char html[1024];
+    TestCachedScript scripts[3] = {
+        { .url = TEST_PAIR_BUNDLE_URL }, { .url = TEST_PAIR_MANAGER_URL },
+        { .url = TEST_PROBE_URL }
+    };
+    char *bundle = test_registry_script("bundle", 3000u, bundle_tail,
+                                        &scripts[0].length);
+    char *manager = test_registry_script("manager", 150u, manager_tail,
+                                         &scripts[1].length);
+    char *probe = bundle == NULL ? NULL : test_probe_script(
+        test_between_reserve_and_headroom(scripts[0].length),
+        &scripts[2].length);
+    scripts[0].source = bundle;
+    scripts[1].source = manager;
+    scripts[2].source = probe;
+    bool ok = bundle != NULL && manager != NULL && probe != NULL;
+    if (ok && tight)
+        ok = test_script_pair_html(html, sizeof(html), TEST_PROBE_URL,
+                                   "probe", TEST_PAIR_MANAGER_URL, "manager")
+            && test_free_for_probe(html, scripts, 3u, &leave_free);
+    ok = ok && test_script_pair_html(
+                   html, sizeof(html),
+                   bundle_first ? TEST_PAIR_BUNDLE_URL : TEST_PAIR_MANAGER_URL,
+                   bundle_first ? "bundle" : "manager",
+                   bundle_first ? TEST_PAIR_MANAGER_URL : TEST_PAIR_BUNDLE_URL,
+                   bundle_first ? "manager" : "bundle")
+        && test_commit_cached_script_page(html, scripts, 3u, leave_free,
+                                          8u * MIB, false,
+                                          test_script_pair_inspect, outcome);
+    free(bundle);
+    free(manager);
+    free(probe);
+    return ok;
+}
+
+/* The pair in either order, with the Budget free when the realm starts
+   placed so the bundle's compile leaves about 1.25 MiB obtainable
+   (test_free_for_probe): under
+   the memory stop rule's 2 MiB (SCRIPT_ADMISSION_MEMORY_STOP_HEADROOM_
+   BYTES), so it is refused before it compiles, as an error event on its
+   element; the manager runs and the realm lives. Before, a bundle first
+   was admitted (its compile and the 512 KiB execution reserve fit), the
+   page Budget refused its first run, the stop rule found well under 2 MiB
+   obtainable and stopped the realm, the manager with it; a manager first
+   left too little for the bundle's old admission, so the page's fate
+   followed the order its scripts arrived in. With 12 MiB free both run
+   and the realm lives. */
+static bool test_inserted_script_pair_keeps_realm(Budget *main_budget)
+{
+    bool all = true;
+    for (int first = 0; first < 2; first++) {
+        bool bundle_first = first == 0;
+        TestScriptPairOutcome tight = {0}, roomy = {0};
+        bool ok = test_commit_script_pair(bundle_first, true, 0, &tight)
+            && test_commit_script_pair(bundle_first, false, 12u * MIB,
+                                       &roomy);
+        bool kept = ok && tight.committed && tight.realm_alive
+            && tight.manager_ran && !tight.bundle_ran && tight.bundle_error
+            && tight.after_ran && tight.dynamic_failed == 1u;
+        bool both = ok && roomy.committed && roomy.realm_alive
+            && roomy.manager_ran && roomy.bundle_ran && !roomy.bundle_error
+            && roomy.after_ran && roomy.dynamic_failed == 0u;
+        if (!kept || !both)
+            fprintf(stderr,
+                    "script pair %s ok=%d tight: committed=%d alive=%d "
+                    "stopped=%d manager=%d bundle=%d bundle-error=%d "
+                    "after=%d dynamic-failed=%zu; roomy: alive=%d "
+                    "manager=%d bundle=%d dynamic-failed=%zu\n",
+                    bundle_first ? "bundle-first" : "manager-first", ok,
+                    tight.committed, tight.realm_alive, tight.memory_stopped,
+                    tight.manager_ran, tight.bundle_ran, tight.bundle_error,
+                    tight.after_ran, tight.dynamic_failed, roomy.realm_alive,
+                    roomy.manager_ran, roomy.bundle_ran,
+                    roomy.dynamic_failed);
+        all = all && kept && both;
+    }
+    budget_install_lexbor(main_budget);
+    return all;
+}
+
+typedef struct {
+    bool committed;
+    bool realm_alive;
+    bool memory_stopped;
+    bool kept_ran;
+    bool later_ran;
+} TestCachedFailureOutcome;
+
+static void test_cached_failure_inspect(NavigationSession *navigation,
+                                        void *opaque)
+{
+    TestCachedFailureOutcome *outcome = opaque;
+    memset(outcome, 0, sizeof(*outcome));
+    if (navigation == NULL) return;
+    outcome->committed = true;
+    outcome->memory_stopped = navigation->page.script_memory_limited;
+    outcome->realm_alive = navigation->page.runtime != NULL
+        && !outcome->memory_stopped;
+    outcome->kept_ran = test_page_probe(
+        navigation, "globalThis.kept instanceof ArrayBuffer");
+    outcome->later_ran = test_page_probe(navigation,
+                                         "globalThis.later===1");
+}
+
+/* A page whose timer keeps `kept_bytes` and then asks for 64 MiB, which is
+   refused; a later timer must still run. The session's HTTP cache holds an
+   800 KB stylesheet response the page never asked for. */
+static bool test_commit_cached_failure(size_t kept_bytes,
+                                       TestCachedFailureOutcome *outcome)
+{
+    char html[512];
+    int html_length = snprintf(html, sizeof(html),
+        "<!doctype html><body><p>READY</p><script>globalThis.later=0;"
+        "setTimeout(()=>{globalThis.kept=new ArrayBuffer(%zu);"
+        "new Uint8Array(kept).fill(1);globalThis.big=new ArrayBuffer(64<<20)"
+        "},1);setTimeout(()=>{globalThis.later=1},8)</script></body>",
+        kept_bytes);
+    enum { STYLESHEET_BYTES = 800u * 1024u };
+    char *stylesheet = malloc(STYLESHEET_BYTES);
+    if (stylesheet == NULL) return false;
+    memset(stylesheet, ' ', STYLESHEET_BYTES);
+    memcpy(stylesheet, "p{color:red}", 12u);
+    TestCachedScript cached = {
+        .url = "https://cached.test/unused.css", .source = stylesheet,
+        .length = STYLESHEET_BYTES, .stylesheet = true
+    };
+    bool ok = html_length > 0 && (size_t) html_length < sizeof(html)
+        && test_commit_cached_script_page(
+               html, &cached, 1u, 12u * MIB, 8u * MIB, false,
+               test_cached_failure_inspect, outcome);
+    free(stylesheet);
+    return ok;
+}
+
+/* The memory stop rule's reclaim reaches the session's cached responses
+   before it stops a realm: they are optional, and what the failed task
+   leaves (its own body and garbage) is already gone by then. With 12 MiB of
+   the Budget free when the realm starts, keeping 6.5 MiB leaves about
+   1.6 MB obtainable once the refused request is collected, and about
+   2.4 MB once the cache gives the stylesheet's 800 KB back: the realm is
+   kept (one low keep) and its later timer runs. Before, the reclaim never
+   reached the response cache, measured 1.6 MB and stopped the realm.
+   Keeping 7.4 MiB is out of room either way: stopped. */
+static bool test_memory_verdict_reclaims_cached_responses(Budget *main_budget)
+{
+    TestCachedFailureOutcome freed = {0}, full = {0};
+    bool ok = test_commit_cached_failure(6656u * 1024u, &freed)
+        && test_commit_cached_failure(7552u * 1024u, &full);
+    bool kept = ok && freed.committed && freed.realm_alive
+        && freed.kept_ran && freed.later_ran;
+    bool stopped = ok && full.committed && full.memory_stopped
+        && !full.realm_alive;
+    if (!kept || !stopped)
+        fprintf(stderr,
+                "memory verdict cache reclaim ok=%d tight: alive=%d "
+                "stopped=%d kept=%d later=%d; full: alive=%d stopped=%d\n",
+                ok, freed.realm_alive, freed.memory_stopped, freed.kept_ran,
+                freed.later_ran, full.realm_alive, full.memory_stopped);
+    budget_install_lexbor(main_budget);
+    return kept && stopped;
+}
+
+/* A page that keeps `hold_bytes` and inserts one heavy script (a 660 KB
+   registry that keeps nothing), its session's HTTP cache also holding a
+   `sheet_bytes` stylesheet response the page never asks for. */
+#define TEST_UNUSED_SHEET_URL "https://cached.test/unused.css"
+
+typedef struct {
+    bool committed;
+    bool realm_alive;
+    bool bundle_ran;
+    bool bundle_error;
+    bool sheet_cached;
+} TestRefusedBundleOutcome;
+
+static void test_refused_bundle_inspect(NavigationSession *navigation,
+                                        void *opaque)
+{
+    TestRefusedBundleOutcome *outcome = opaque;
+    memset(outcome, 0, sizeof(*outcome));
+    if (navigation == NULL) return;
+    outcome->committed = true;
+    outcome->realm_alive = navigation->page.runtime != NULL
+        && !navigation->page.script_memory_limited;
+    outcome->bundle_ran = test_page_probe(navigation,
+                                          "globalThis.bundleRan===true");
+    outcome->bundle_error = test_page_probe(navigation,
+                                            "errors.indexOf('bundle')>=0");
+    for (size_t i = 0; i < BROWSER_CACHE_ENTRIES; i++) {
+        const BrowserCacheEntry *entry =
+            &navigation->browser_session->cache[i];
+        if (entry->data != NULL
+            && strcmp(entry->url, TEST_UNUSED_SHEET_URL) == 0)
+            outcome->sheet_cached = true;
+    }
+}
+
+static bool test_bundle_beside_sheet_html(char *html, size_t capacity,
+                                          size_t hold_bytes, const char *url,
+                                          const char *name)
+{
+    int length = snprintf(html, capacity,
+        "<!doctype html><body><p>READY</p><script>globalThis.errors=[];"
+        "globalThis.hold=new ArrayBuffer(%zu);new Uint8Array(hold).fill(1);"
+        "var s=document.createElement('script');s.async=false;"
+        "s.src='%s';s.onerror=function(){errors.push('%s')};"
+        "document.head.appendChild(s)</script></body>",
+        hold_bytes, url, name);
+    return length > 0 && (size_t) length < capacity;
+}
+
+/* `leave_free` of 0 is the free Budget at which a probe in the bundle's
+   place obtains test_between_reserve_and_headroom of the bundle. */
+static bool test_commit_bundle_beside_sheet(
+    size_t leave_free, bool fixed_heap, size_t hold_bytes,
+    size_t sheet_bytes, TestRefusedBundleOutcome *outcome)
+{
+    char html[768];
+    TestCachedScript cached[3] = {
+        { .url = TEST_PAIR_BUNDLE_URL },
+        { .url = TEST_UNUSED_SHEET_URL, .length = sheet_bytes,
+          .stylesheet = true },
+        { .url = TEST_PROBE_URL }
+    };
+    char *bundle = test_registry_script("bundle", 3000u,
+                                        "globalThis.bundleRan=true",
+                                        &cached[0].length);
+    char *sheet = malloc(sheet_bytes);
+    char *probe = bundle == NULL ? NULL : test_probe_script(
+        test_between_reserve_and_headroom(cached[0].length),
+        &cached[2].length);
+    cached[0].source = bundle;
+    cached[1].source = sheet;
+    cached[2].source = probe;
+    bool ok = bundle != NULL && sheet != NULL && probe != NULL;
+    if (ok) {
+        memset(sheet, ' ', sheet_bytes);
+        memcpy(sheet, "p{color:red}", 12u);
+    }
+    if (ok && leave_free == 0)
+        ok = test_bundle_beside_sheet_html(html, sizeof(html), hold_bytes,
+                                           TEST_PROBE_URL, "probe")
+            && test_free_for_probe(html, cached, 3u, &leave_free);
+    ok = ok && test_bundle_beside_sheet_html(html, sizeof(html), hold_bytes,
+                                             TEST_PAIR_BUNDLE_URL, "bundle")
+        && test_commit_cached_script_page(
+               html, cached, 3u, leave_free, 8u * MIB, fixed_heap,
+               test_refused_bundle_inspect, outcome);
+    free(bundle);
+    free(sheet);
+    free(probe);
+    return ok;
+}
+
+/* A heavy inserted script that is refused gives up cached responses only
+   for the page Budget it lacks, and only when they could make it fit:
+   - heap at its limit (a fixed 8 MiB heap keeping 3 MiB, the Budget
+     roomy): no Budget raises what the realm obtains, so the unused
+     stylesheet stays;
+   - Budget short by about 0.75 MiB with only a 200 KB response to give:
+     evicting it could not admit the script, so it stays;
+   - the same with a 2 MB response: it goes, and the script runs.
+   Before, the refusal reclaimed its whole compile plus the 2 MiB headroom
+   from the cache every time, emptying it for a script refused anyway. */
+static bool test_refused_heavy_script_keeps_cache(Budget *main_budget)
+{
+    TestRefusedBundleOutcome heap_bound = {0}, short_cache = {0},
+        enough = {0};
+    bool ok = test_commit_bundle_beside_sheet(16u * MIB, true, 3u * MIB,
+                                              800u * 1024u, &heap_bound)
+        && test_commit_bundle_beside_sheet(0, false, 64u * 1024u,
+                                           200u * 1024u, &short_cache)
+        && test_commit_bundle_beside_sheet(0, false, 64u * 1024u,
+                                           2u * MIB, &enough);
+    bool kept_heap = ok && heap_bound.committed && heap_bound.realm_alive
+        && !heap_bound.bundle_ran && heap_bound.bundle_error
+        && heap_bound.sheet_cached;
+    bool kept_short = ok && short_cache.committed && short_cache.realm_alive
+        && !short_cache.bundle_ran && short_cache.bundle_error
+        && short_cache.sheet_cached;
+    bool reclaimed = ok && enough.committed && enough.realm_alive
+        && enough.bundle_ran && !enough.bundle_error && !enough.sheet_cached;
+    if (!kept_heap || !kept_short || !reclaimed)
+        fprintf(stderr,
+                "refused heavy script cache ok=%d heap-bound: alive=%d "
+                "ran=%d error=%d cached=%d; short: alive=%d ran=%d "
+                "error=%d cached=%d; enough: alive=%d ran=%d error=%d "
+                "cached=%d\n",
+                ok, heap_bound.realm_alive, heap_bound.bundle_ran,
+                heap_bound.bundle_error, heap_bound.sheet_cached,
+                short_cache.realm_alive, short_cache.bundle_ran,
+                short_cache.bundle_error, short_cache.sheet_cached,
+                enough.realm_alive, enough.bundle_ran, enough.bundle_error,
+                enough.sheet_cached);
+    budget_install_lexbor(main_budget);
+    return kept_heap && kept_short && reclaimed;
+}
+
+/* After the page has run, a fixed 16 MiB heap is padded until it obtains
+   about 256 KiB more than a 300 KB inserted script's compile plus the stop
+   headroom; then the page leaves 512 KiB of cyclic garbage, less than the
+   amortized step of its 13 MB live heap (js_rt_gc_due), and inserts the
+   script. */
+#define TEST_HEAVY_URL "https://cached.test/heavy.js"
+
+typedef struct {
+    size_t script_length;
+    bool prepared;
+    bool heavy_ran;
+    bool heavy_error;
+    bool realm_alive;
+    size_t margin;
+    size_t garbage;
+    size_t live;
+} TestGarbageHeavyOutcome;
+
+static void test_garbage_heavy_inspect(NavigationSession *navigation,
+                                       void *opaque)
+{
+    TestGarbageHeavyOutcome *outcome = opaque;
+    if (navigation == NULL || navigation->page.runtime == NULL) return;
+    ScriptRuntime *runtime = navigation->page.runtime;
+    size_t needed = script_admission_compile_peak(outcome->script_length)
+        + SCRIPT_ADMISSION_MEMORY_STOP_HEADROOM_BYTES;
+    char source[512];
+    ScriptResult result = {0};
+    (void) script_runtime_collect_and_trim(runtime);
+    size_t obtainable = script_runtime_heap_obtainable(runtime);
+    if (obtainable < needed + 512u * 1024u) return;
+    snprintf(source, sizeof(source),
+             "globalThis.pad=new ArrayBuffer(%zu);"
+             "new Uint8Array(pad).fill(1)",
+             obtainable - needed - 256u * 1024u);
+    if (!script_runtime_evaluate_diagnostic(
+            runtime, source, "https://cached.test/pad.js", &result)) return;
+    (void) script_runtime_collect_and_trim(runtime);
+    obtainable = script_runtime_heap_obtainable(runtime);
+    outcome->live = script_runtime_heap_used(runtime);
+    if (obtainable <= needed) return;
+    outcome->margin = obtainable - needed;
+    /* Short by 256 KiB until the garbage is collected. */
+    outcome->garbage = outcome->margin + 256u * 1024u;
+    size_t chunks = (outcome->garbage + 65535u) / 65536u;
+    if (outcome->margin > 1u * MIB
+        || chunks * 65536u + 128u * 1024u >= outcome->live / 16u) return;
+    snprintf(source, sizeof(source),
+             "for(let i=0;i<%zu;i++){const o={b:new ArrayBuffer(65536)};"
+             "o.o=o}var s=document.createElement('script');s.async=false;"
+             "s.src='%s';s.onerror=function(){errors.push('heavy')};"
+             "document.head.appendChild(s)",
+             chunks, TEST_HEAVY_URL);
+    if (!script_runtime_evaluate_diagnostic(
+            runtime, source, "https://cached.test/insert.js", &result))
+        return;
+    outcome->prepared = true;
+    for (unsigned tick = 0; navigation->page.runtime != NULL && tick < 16u;
+         tick++)
+        (void) navigation_advance_runtime(navigation, 1, 8);
+    outcome->realm_alive = navigation->page.runtime != NULL
+        && !navigation->page.script_memory_limited;
+    outcome->heavy_ran = test_page_probe(navigation,
+                                         "globalThis.heavyRan===true");
+    outcome->heavy_error = test_page_probe(navigation,
+                                           "errors.indexOf('heavy')>=0");
+}
+
+/* A heavy inserted script that fits only once the heap is collected is
+   collected for and runs: the collection before a refusal is not paced.
+   Before, with the garbage under the amortized step, the script was
+   refused with the garbage still counted, so whether it ran followed when
+   the heap was last collected. */
+static bool test_heavy_script_collects_before_refusal(Budget *main_budget)
+{
+    static const char html[] =
+        "<!doctype html><body><p>READY</p>"
+        "<script>globalThis.errors=[]</script></body>";
+    TestGarbageHeavyOutcome outcome = {0};
+    TestCachedScript cached = { .url = TEST_HEAVY_URL };
+    char *heavy = test_registry_script("heavy", 1400u,
+                                       "globalThis.heavyRan=true",
+                                       &cached.length);
+    cached.source = heavy;
+    outcome.script_length = cached.length;
+    bool ok = heavy != NULL && cached.length >= SCRIPT_HEAVY_UNIT_BYTES
+        && test_commit_cached_script_page(
+               html, &cached, 1u, 24u * MIB, 16u * MIB, true,
+               test_garbage_heavy_inspect, &outcome);
+    free(heavy);
+    bool ran = ok && outcome.prepared && outcome.realm_alive
+        && outcome.heavy_ran && !outcome.heavy_error;
+    if (!ran)
+        fprintf(stderr,
+                "heavy script after garbage ok=%d prepared=%d alive=%d "
+                "ran=%d error=%d margin=%zu garbage=%zu live=%zu\n",
+                ok, outcome.prepared, outcome.realm_alive, outcome.heavy_ran,
+                outcome.heavy_error, outcome.margin, outcome.garbage,
+                outcome.live);
+    budget_install_lexbor(main_budget);
+    return ran;
 }
 
 static bool test_cache_put_classic_script(
@@ -6401,7 +7043,7 @@ static bool test_decoded_image_cache_partition_and_lifetime(Budget *budget)
         && cached != NULL
         && browser_session_decoded_image_put(
             &session, image_url, &context, cached->data, cached->length,
-            pixels, 8, 8, 2, 2);
+            pixels, 8, 8, 2, 2, false);
     if (pixels != NULL) browser_shared_body_release(pixels);
 
     BrowserDecodedImage decoded = {0};
@@ -6468,11 +7110,13 @@ static bool count_test_message(void *opaque, ScriptRuntime *source,
                                const char *json,
                                const char *target_origin,
                                const char *task_kind,
-                               uint64_t task_sequence)
+                               uint64_t task_sequence,
+                               const uint8_t *key_bytes, size_t key_length)
 {
     (void) source;
     (void) json; (void) target_origin;
     (void) task_kind; (void) task_sequence;
+    if (key_bytes != NULL || key_length != 0) return false;
     MessageOpaqueProbe *probe = opaque;
     if (probe == NULL) return false;
     probe->calls++;
@@ -6485,14 +7129,57 @@ static bool forward_test_message(void *opaque, ScriptRuntime *source,
                                  const char *json,
                                  const char *target_origin,
                                  const char *task_kind,
-                                 uint64_t task_sequence)
+                                 uint64_t task_sequence,
+                                 const uint8_t *key_bytes, size_t key_length)
 {
     (void) source; (void) target_frame_handle; (void) target_origin;
     (void) task_kind; (void) task_sequence;
     MessageTestTarget *target = opaque;
-    return script_runtime_dispatch_message(target->target, json,
-                                           "https://child.test", 7,
-                                           target->result);
+    return script_runtime_dispatch_message_with_keys(
+        target->target, json, "https://child.test", 7, key_bytes, key_length,
+        target->result);
+}
+
+/* Appends a message to the owner queue as navigation_queue_frame_message
+   would, with bytes no page encoder produces. Key bytes trail the JSON's
+   NUL, as in the real queue. */
+static bool queue_raw_frame_message(NavigationSession *session,
+                                    ScriptRuntime *source,
+                                    long source_handle,
+                                    uint64_t source_generation,
+                                    long target_handle,
+                                    uint64_t target_generation,
+                                    const char *json,
+                                    const uint8_t *key_bytes,
+                                    size_t key_length)
+{
+    if (session->page.message_count >= NAVIGATION_MESSAGE_LIMIT) return false;
+    NavigationMessage *message =
+        &session->page.messages[session->page.message_count];
+    size_t length = strlen(json);
+    *message = (NavigationMessage) {0};
+    message->json = budget_malloc_category(
+        session->budget, BUDGET_CATEGORY_NAVIGATION, length + 1 + key_length);
+    message->target_origin = budget_malloc_category(
+        session->budget, BUDGET_CATEGORY_NAVIGATION, 2);
+    if (message->json == NULL || message->target_origin == NULL) return false;
+    memcpy(message->json, json, length + 1);
+    if (key_length != 0) {
+        message->key_offset = length + 1;
+        memcpy(message->json + length + 1, key_bytes, key_length);
+        message->key_length = key_length;
+    }
+    memcpy(message->target_origin, "*", 2);
+    message->source = source;
+    message->source_frame_handle = source_handle;
+    message->source_generation = source_generation;
+    message->target_frame_handle = target_handle;
+    message->target_generation = target_generation;
+    snprintf(message->source_origin, sizeof(message->source_origin),
+             "https://frame-owner.test");
+    message->sequence = ++session->next_frame_message_sequence;
+    session->page.message_count++;
+    return true;
 }
 
 static uint64_t test_platform_wall(void *context)
@@ -9078,7 +9765,9 @@ static int test_tiny_budget_rejection(void)
 }
 
 #include "suites/web_runtime_hidden_mutations.inc"
+#include "suites/web_runtime_frame_media.inc"
 #include "suites/web_runtime_relayout_reuse.inc"
+#include "suites/web_runtime_geometry_journal.inc"
 #include "suites/web_runtime_bounded_focus.inc"
 #include "suites/opfs_sync.inc"
 #include "suites/image_rebuild_pressure.inc"

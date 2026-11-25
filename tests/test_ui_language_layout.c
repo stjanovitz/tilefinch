@@ -1254,6 +1254,40 @@ static bool test_page_dialog_language(PspUiState *ui, TilefinchGlyphProvider *pr
         }
     }
     {
+        /* The browser's own draft warning uses logical copy for the
+           dialog's bidi/wrapping pass and a preordered, fixed key hint. */
+        static const char warning[] =
+            "Not all edits can be saved. Leave this page without saving them?";
+        static const char hint[] = "X Leave without saving   O Stay";
+        Budget budget;
+        budget_init(&budget, 256u * 1024u);
+        char message[PSP_UI_PAGE_DIALOG_SHOWN_MESSAGE_BYTES];
+        char value[PSP_UI_PAGE_DIALOG_SHOWN_VALUE_BYTES];
+        PspUiPageDialogView draft = {.kind = PAGE_DIALOG_CONFIRM,
+            .browser_draft = true, .message = tilefinch_ui_logical_text(warning)};
+        psp_ui_page_dialog_prepare(&budget, &draft, message, value);
+        CHECK(draft.right_to_left == ui_rtl());
+        psp_ui_show_page_dialog(ui, &draft);
+        CHECK(paint(ui, provider) && player_has_text(hint) && run_count >= 3);
+        CHECK(!strcmp(runs[0].text, "Tilefinch"));
+        /* The inset is the text origin, not an ink clip: proportional
+           glyphs may overhang it. Keep five pixels inside the panel edge. */
+        enum { DRAFT_INK_MARGIN = 32 + 5 };
+        for (size_t row = 1; row < run_count; row++) {
+            if (runs[row].truncated || runs[row].missing_glyph
+                || runs[row].left < DRAFT_INK_MARGIN
+                || runs[row].right > WIDTH - DRAFT_INK_MARGIN)
+                fprintf(stderr, "draft locale=%s row='%s' x=%d..%d clipped=%u missing=%u\n",
+                        language_code, runs[row].text, runs[row].left,
+                        runs[row].right, runs[row].truncated, runs[row].missing_glyph);
+            CHECK(!runs[row].truncated && !runs[row].missing_glyph
+                  && runs[row].left >= DRAFT_INK_MARGIN
+                  && runs[row].right <= WIDTH - DRAFT_INK_MARGIN);
+        }
+        psp_ui_clear_page_dialog(ui);
+        CHECK(budget.current == 0);
+    }
+    {
         /* Page text in a right-to-left script reads in visual order and
            starts at the box's right side; plain text keeps its own bytes. */
         static Budget dialog_budget;

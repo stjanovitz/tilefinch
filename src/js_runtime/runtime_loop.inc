@@ -210,9 +210,6 @@ static bool runtime_pump_timers(ScriptRuntime *runtime,
         JS_NewBool(runtime->context, tasks_only)
     };
     JSValue returned = JS_UNDEFINED;
-    double exceptions_before =
-        runtime->host_state[SCRIPT_HOST_STATE_TIMER_EXCEPTIONS];
-    size_t heap_rejections_before = script_runtime_heap_rejections(runtime);
     /* A zero-budget pump only advances the scheduler's clock: bookkeeping.
        A budgeted pump runs an author task. */
     unsigned ledger = work_ledger_enter(callback_budget == 0
@@ -235,21 +232,10 @@ static bool runtime_pump_timers(ScriptRuntime *runtime,
     JS_FreeValue(runtime->context, returned);
     JS_FreeValue(runtime->context, arguments[1]);
     JS_FreeValue(runtime->context, arguments[0]);
-    /* The scheduler reports a throwing timer callback and carries on. As for
-       a microtask (runtime_job_exception_is_fatal), the exception is fatal
-       when the realm's heap refused an allocation while it ran: the realm is
-       exhausted, however the exception text reads. */
-    if (ok && runtime->host_state[SCRIPT_HOST_STATE_TIMER_EXCEPTIONS]
-                  != exceptions_before
-        && script_runtime_heap_rejections(runtime) != heap_rejections_before) {
-        JSValue global = JS_GetGlobalObject(runtime->context);
-        js_rt_runtime_update_core(runtime, global);
-        JS_FreeValue(runtime->context, global);
-        if (runtime->result.error[0] == '\0')
-            snprintf(runtime->result.error, sizeof(runtime->result.error),
-                     "timer callback: out of memory");
-        ok = false;
-    }
+    /* The scheduler reports a throwing timer callback and carries on, an
+       allocation refusal's "out of memory" included: whether a refusal
+       stops the realm is the host's decision at the task boundary, from the
+       heap the realm can still obtain (navigation_assess_script_memory). */
     if (ok && callbacks_out != NULL) *callbacks_out = (size_t) callbacks;
     return ok;
 }
@@ -997,8 +983,6 @@ static size_t runtime_run_cleanup_tasks(ScriptRuntime *runtime, size_t limit,
            && runtime_task_slice_available(runtime, task_slice_started_ns,
                                            *remaining, callback_budget)) {
         if (!js_rt_runtime_native_checkpoint(runtime)) { *ok = false; break; }
-        size_t failures = runtime->budget->failure_count;
-        size_t rejections = script_runtime_heap_rejections(runtime);
         JSContext *context = NULL;
         BudgetAllocationOwner owner = document_allocation_owner_enter(
             runtime->document);
@@ -1020,7 +1004,7 @@ static size_t runtime_run_cleanup_tasks(ScriptRuntime *runtime, size_t limit,
             js_rt_record_exception(context != NULL ? context : runtime->context,
                                     &runtime->result);
             js_lazy_webpack_recover_failure(runtime);
-            if (runtime_job_exception_is_fatal(runtime, failures, rejections)) {
+            if (runtime_job_exception_is_fatal(runtime)) {
                 *ok = false;
                 break;
             }

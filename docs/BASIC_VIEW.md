@@ -153,11 +153,12 @@ starting even though navigation links survived. That covers:
 - scripts that fail after the page was shown: a page is examined when it
   first appears, and once more when a later script turn fails or its scripts
   are stopped after a failure;
-- a script that runs out of JavaScript memory after the page was shown while
-  the page's scripts keep running (the page caught or reported the "out of
-  memory" error): the page is examined once more if it is then blank or has
-  no usable action. A page that keeps its content and links after such an
-  error is left alone;
+- a script refused JavaScript memory after the page was shown while the
+  page's scripts keep running (enough memory was left to keep them; how the
+  page handled the error does not matter,
+  [the rule](engineering/SCRIPT_MEMORY.md#exhaustion)): the page is examined
+  once more if it is then blank or has no usable action. A page that keeps
+  its content and links after such a refusal is left alone;
 - script loading refused under memory pressure while the page was being
   built, or scripts stopped at their memory limit. This uses what the
   current page's memory accounting reports, not a site's name or its error

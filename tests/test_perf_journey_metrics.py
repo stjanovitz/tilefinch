@@ -91,10 +91,34 @@ class ScrollFeedbackTests(unittest.TestCase):
         self.assertEqual(metrics["scroll.complete_max_ms"], 300.0)
         self.assertNotIn("scroll.noop_max_ms", metrics)
 
+    def test_superseded_visibility_source_does_not_change_historical_metrics(self):
+        moved = MOVED % (100000, 10000)
+        with_own_frame = SUPERSEDED % (200000, 50000)
+        without_own_frame = SUPERSEDED % (2079978, 1879778)
+        legacy = journeys.extract_metrics("\n".join([
+            moved, with_own_frame, without_own_frame,
+        ]))
+        annotated = journeys.extract_metrics("\n".join([
+            moved, with_own_frame + " visible-source=press",
+            without_own_frame + " visible-source=replacement",
+        ]))
+        for field in ("first_visible", "complete"):
+            for statistic in ("p50", "p95", "max"):
+                key = "scroll.%s_%s_ms" % (field, statistic)
+                self.assertEqual(annotated[key], legacy[key])
+        self.assertEqual(legacy["scroll.first_visible_max_ms"], 1879.8)
+        self.assertEqual(legacy["scroll.direct_first_visible_max_ms"], 10.0)
+        self.assertNotIn("scroll.replacement_first_visible_max_ms", legacy)
+        self.assertEqual(annotated["scroll.direct_first_visible_max_ms"], 50.0)
+        self.assertEqual(annotated["scroll.replacement_first_visible_max_ms"],
+                         1879.8)
+
     def test_unknown_feedback_shape_fails_instead_of_vanishing(self):
         for line in ("tilefinch-scroll-feedback: action=7 first-visible=5us",
                      "tilefinch-scroll-feedback: action=7 elapsed=5us",
-                     "tilefinch-scroll-feedback: action=preview presses=1"):
+                     "tilefinch-scroll-feedback: action=preview presses=1",
+                     MOVED % (100, 50) + " visible-source=replacement",
+                     SUPERSEDED % (100, 50) + " visible-source=unknown"):
             with self.subTest(line=line):
                 with self.assertRaises(journeys.MetricShapeError):
                     journeys.extract_metrics(line)
@@ -116,6 +140,14 @@ class ScrollFeedbackTests(unittest.TestCase):
 
 
 class LoadAndCadenceTests(unittest.TestCase):
+    def test_details_preview_counts_presentations_not_activations(self):
+        prefix = "tilefinch-details-preview: press-to-present-us="
+        metrics = journeys.extract_metrics(prefix + "16680\n" + prefix + "33376")
+        self.assertEqual(metrics["control.details_preview_max_ms"], 33.4)
+        self.assertNotIn("control.details_preview_max_ms", journeys.extract_metrics(""))
+        with self.assertRaises(journeys.MetricShapeError):
+            journeys.extract_metrics(prefix + "0")
+
     def test_repeated_follow_scopes_are_numbered(self):
         log = "\n".join([
             load("initial", 3000, 6000),

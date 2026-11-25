@@ -14,10 +14,15 @@
    progress (image_svg_decode_busy). */
 bool image_svg_decode_busy(void);
 typedef bool (*ImageSvgOversizeTarget)(void *opaque, int source_width,
-                                      int source_height, int *width,
-                                      int *height);
-/* Only consult the target when the intrinsic raster exceeds the quota.
-   Successful ordinary decodes are unchanged; intrinsic dimensions remain
+                                      int source_height, bool painted,
+                                      int *width, int *height);
+/* The target is consulted with `painted` true first when the document has
+   no natural size (its root gives no width and height, only a viewBox):
+   returning true rasterizes it at *width x *height, the size its uses
+   paint it (the viewBox size, whose ratio layout keeps, is still reported
+   as the source size). Otherwise it is
+   consulted, with `painted` false, only when the intrinsic raster exceeds
+   the quota. Successful ordinary decodes are unchanged; intrinsic dimensions remain
    separate from the returned pixels. Refused allocations are never retried.
    On a NULL return, *limited (when not NULL) tells why: true when the
    decode was refused by this engine's limits rather than by the markup,
@@ -44,13 +49,25 @@ unsigned char *image_svg_decode_bounded(
 typedef bool (*ImageSvgDefer)(void *opaque, int source_width,
                               int source_height);
 typedef struct ImageSvgParse ImageSvgParse;
+typedef enum {
+    IMAGE_SVG_LIMIT_OTHER,
+    IMAGE_SVG_LIMIT_TRANSIENT,
+    IMAGE_SVG_LIMIT_BUDGET,
+    IMAGE_SVG_LIMIT_SIZE
+} ImageSvgLimitReason;
+typedef struct {
+    ImageSvgLimitReason reason;
+    /* Bytes short at the allocation that refused, or zero if the
+       allocation failed even though its charge fit the page Budget. */
+    size_t budget_shortfall;
+} ImageSvgLimit;
 unsigned char *image_svg_decode_deferrable(
     const void *data, size_t length, Budget *budget,
     size_t maximum_decoded_bytes, int *width, int *height,
     ImageSvgOversizeTarget target, void *opaque,
     ImageSvgDefer defer, void *defer_opaque,
     int *source_width, int *source_height, bool *limited, bool *deferred,
-    size_t keep_limit, ImageSvgParse **kept);
+    size_t keep_limit, ImageSvgParse **kept, ImageSvgLimit *limit);
 /* Whether `parse` was made from exactly these markup bytes. */
 bool image_svg_parse_matches(const ImageSvgParse *parse, const void *data,
                              size_t length);

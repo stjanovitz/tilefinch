@@ -307,7 +307,7 @@
         "const file=new File(new Set(['tile','finch']),'bird/name.txt',"
         "{type:'TEXT/PLAIN',lastModified:123}),slice=file.slice(4,9),"
         "fileInput=document.createElement('input');fileInput.type='file';"
-        "const fileShape=file instanceof Blob&&file.name==='bird:name.txt'"
+        "const fileShape=file instanceof Blob&&file.name==='bird/name.txt'"
         "&&file.type==='text/plain'&&file.lastModified===123"
         "&&slice.size===5&&fileInput.files instanceof FileList"
         "&&fileInput.files.length===0&&fileInput.files.item(0)===null;"
@@ -683,10 +683,12 @@
         fprintf(stderr, "canvas summary=%s error=%s\n",
                 canvas_navigation.page.script_result.summary,
                 canvas_navigation.page.script_result.error);
+    /* Canvas, and the layout-less geometry module: the host pointer
+       dispatch measures its target for offsetX before layout has run. */
     CHECK(strcmp(canvas_navigation.page.script_result.summary,
                  "canvas:ok") == 0
           && canvas_navigation.page.script_result
-                 .bootstrap_lazy_module_loads == 1
+                 .bootstrap_lazy_module_loads == 2
           && canvas_navigation.page.script_result
                  .bootstrap_lazy_module_failures == 0);
     navigation_destroy(&canvas_navigation);
@@ -1417,6 +1419,255 @@
           && strcmp(frame_owner_navigation.page.script_result.summary,
                     "CHECKPOINT-SIBLING") == 0
           && frame_owner_navigation.page.message_count == 0u);
+    puts("test: frame postMessage clones private CryptoKeys in both directions");
+    const size_t drops_before_wrong_origin =
+        frame_owner_navigation.frame_messages_dropped;
+    CHECK(script_runtime_evaluate_diagnostic(
+              owned_frame->runtime,
+              "(()=>{let count=0;addEventListener('message',async e=>{"
+              "if(e.data.event!=='key-probe')return;count++;try{"
+              "const k=e.data.first,s=crypto.subtle,valid=count===1&&!e.data.wrong"
+              "&&e.source===parent&&e.origin==='https://frame-owner.test'"
+              "&&k===e.data.again&&k instanceof CryptoKey&&!k.extractable"
+              "&&k.algorithm.hash.name==='SHA-256'&&k.usages.join()==='sign'"
+              "&&typeof globalThis.__tilefinchReceiveKeyMessage==='undefined';"
+              "const sig=String(new Uint8Array(await s.sign('HMAC',k,"
+              "new Uint8Array([9])))),exported=await s.exportKey('raw',k)"
+              ".then(()=>'exported',e=>e.name);"
+              "parent.postMessage({event:'key-reply',valid,sig,exported,key:k},"
+              "'https://frame-owner.test')}catch(e){pocSummary=e.name+':'+e.message}"
+              "});pocSummary='KEY-LISTENER-READY'})()",
+              "https://frame-owner.test/key-message-listener.js",
+              &owned_frame->script_result)
+          && script_runtime_evaluate_diagnostic(
+              frame_owner_navigation.page.runtime,
+              "(async()=>{const target=document.getElementById('owned').contentWindow,"
+              "s=crypto.subtle,key=await s.importKey('raw',new Uint8Array([1,2,3]),"
+              "{name:'HMAC',hash:'SHA-256'},false,['sign']),"
+              "want=String(new Uint8Array(await s.sign('HMAC',key,new Uint8Array([9]))));"
+              "addEventListener('message',async e=>{if(e.data.event!=='key-reply')return;"
+              "try{const d=e.data,k=d.key,sig=String(new Uint8Array("
+              "await s.sign('HMAC',k,new Uint8Array([9]))));pocSummary="
+              "d.valid&&d.sig===want&&sig===want&&d.exported==='InvalidAccessError'"
+              "&&k instanceof CryptoKey&&k!==key&&!k.extractable"
+              "&&k.usages.join()==='sign'&&e.source===target"
+              "&&typeof globalThis.__tilefinchPostKeyMessage==='undefined'"
+              "?'FRAME-KEY-OK':'FRAME-KEY-BAD'}"
+              "catch(error){pocSummary=error.name+':'+error.message}});"
+              "key.algorithm.hash.name='SHA-1';key.usages[0]='verify';"
+              "const payload={event:'key-probe',first:key,again:key};"
+              "target.postMessage({...payload,wrong:true},'https://wrong-origin.test');"
+              "target.postMessage(payload,'*')})()"
+              ".catch(e=>pocSummary=e.name+':'+e.message)",
+              "https://frame-owner.test/key-message-send.js",
+              &frame_owner_navigation.page.script_result));
+    for (size_t turn = 0; turn < 32u; turn++) {
+        CHECK(navigation_advance_runtime(&frame_owner_navigation, 0, 8));
+        if (strcmp(frame_owner_navigation.page.script_result.summary,
+                   "FRAME-KEY-OK") == 0) break;
+    }
+    if (strcmp(frame_owner_navigation.page.script_result.summary,
+               "FRAME-KEY-OK") != 0)
+        fprintf(stderr, "frame key: parent=%s child=%s error=%s\n",
+                frame_owner_navigation.page.script_result.summary,
+                owned_frame->script_result.summary, owned_frame->script_result.error);
+    CHECK(strcmp(frame_owner_navigation.page.script_result.summary,
+                 "FRAME-KEY-OK") == 0
+          && frame_owner_navigation.frame_messages_dropped
+                 == drops_before_wrong_origin + 1u);
+    puts("test: frame message senders are not page globals");
+    static const char hidden_sender_probe[] =
+        "pocSummary=typeof __tilefinchPostMessage+':'"
+        "+('__tilefinchPostMessage' in globalThis)";
+    CHECK(script_runtime_evaluate_diagnostic(
+              owned_frame->runtime, hidden_sender_probe,
+              "https://frame-owner.test/hidden-sender.js",
+              &owned_frame->script_result)
+          && strcmp(owned_frame->script_result.summary,
+                    "undefined:false") == 0
+          && script_runtime_evaluate_diagnostic(
+              frame_owner_navigation.page.runtime, hidden_sender_probe,
+              "https://frame-owner.test/hidden-sender.js",
+              &frame_owner_navigation.page.script_result)
+          && strcmp(frame_owner_navigation.page.script_result.summary,
+                    "undefined:false") == 0);
+    puts("test: browser timer, crypto and ancestor helpers are not page globals");
+    /* No name of them, nor the names that carry dom.js's private share,
+       can be read, listed or called in the frame, or in its parent before
+       and after the lazy modules that take the share load there (motion.js
+       through AnimationEvent, Worker, SubtleCrypto). A page that could
+       reserve tasks or cancel timers would stall the browser's
+       clocks; one that could stop a crypto scope or call an ancestor
+       sender would end or forge browser work. The frame still posts to
+       its parent through parent.postMessage. */
+#define HIDDEN_INTERNALS_PROBE                                              \
+    "pocSummary=['StopCryptoScope','PostParentMessage','PostTopMessage',"   \
+    "'ScheduleReservedTask','ScheduleReservedFrame','CancelTimer',"         \
+    "'DomShared','TakeDomShared']"                                          \
+    ".map(n=>'__tilefinch'+n).filter(n=>(0,eval)('typeof '+n)!=="          \
+    "'undefined'||n in globalThis||Object.getOwnPropertyNames(globalThis)"  \
+    ".includes(n)).join()||'hidden'"
+    const size_t hidden_messages_before =
+        frame_owner_navigation.page.message_count;
+    bool hidden_in_frame = script_runtime_evaluate_diagnostic(
+              owned_frame->runtime, HIDDEN_INTERNALS_PROBE,
+              "https://frame-owner.test/hidden-internals.js",
+              &owned_frame->script_result)
+          && strcmp(owned_frame->script_result.summary, "hidden") == 0;
+    bool hidden_in_parent = script_runtime_evaluate_diagnostic(
+              frame_owner_navigation.page.runtime, HIDDEN_INTERNALS_PROBE,
+              "https://frame-owner.test/hidden-internals.js",
+              &frame_owner_navigation.page.script_result)
+          && strcmp(frame_owner_navigation.page.script_result.summary,
+                    "hidden") == 0
+          && script_runtime_evaluate_diagnostic(
+              frame_owner_navigation.page.runtime,
+              "void AnimationEvent;void Worker;void crypto.subtle.sign;"
+              HIDDEN_INTERNALS_PROBE,
+              "https://frame-owner.test/hidden-internals.js",
+              &frame_owner_navigation.page.script_result)
+          && strcmp(frame_owner_navigation.page.script_result.summary,
+                    "hidden") == 0;
+#undef HIDDEN_INTERNALS_PROBE
+    if (!hidden_in_frame || !hidden_in_parent)
+        fprintf(stderr, "hidden internals: frame=%s %s parent=%s %s\n",
+                owned_frame->script_result.summary,
+                owned_frame->script_result.error,
+                frame_owner_navigation.page.script_result.summary,
+                frame_owner_navigation.page.script_result.error);
+    CHECK(hidden_in_frame && hidden_in_parent
+          && script_runtime_evaluate_diagnostic(
+              owned_frame->runtime,
+              "parent.postMessage({event:'hidden-internals'},'*')",
+              "https://frame-owner.test/hidden-internals-post.js",
+              &owned_frame->script_result)
+          && frame_owner_navigation.page.message_count
+                 == hidden_messages_before + 1u);
+    for (size_t turn = 0; turn < 8u
+             && frame_owner_navigation.page.message_count != 0u; turn++) {
+        CHECK(navigation_advance_runtime(&frame_owner_navigation, 0, 8));
+    }
+    puts("test: a frame message that fails to deserialize is dropped");
+    /* Bytes no page encoder produces, as a frame with the native sender
+       could once queue them: an unknown node type, a key node without key
+       bytes, a keyed message whose graph is malformed, and text that is
+       not JSON. Each reaches the parent as a messageerror event; the
+       parent's document and the frame stay live, and the next message is
+       delivered as usual. */
+    static const char clone_bad_node[] =
+        "{\"tilefinchClone\":\"tilefinch-clone-v1\",\"root\":[\"r\",0],"
+        "\"nodes\":[{\"t\":\"zz\"}]}";
+    static const char clone_bare_key[] =
+        "{\"tilefinchClone\":\"tilefinch-clone-v1\",\"root\":[\"r\",0],"
+        "\"nodes\":[{\"t\":\"k\",\"o\":0}]}";
+    static const uint8_t stray_key_byte[] = {0};
+    const size_t malformed_failed_before = frame_owner_navigation.frames_failed;
+    CHECK(script_runtime_evaluate_diagnostic(
+              frame_owner_navigation.page.runtime,
+              "(()=>{const frame=document.getElementById('owned').contentWindow;"
+              "let errors=0,good=true;addEventListener('messageerror',e=>{"
+              "errors++;good=good&&e.data===null&&e.source===frame"
+              "&&e.origin==='https://frame-owner.test'});"
+              "addEventListener('message',e=>{if(e.data&&e.data.event==="
+              "'after-malformed')pocSummary='MALFORMED:'+errors+':'+good});"
+              "pocSummary='MALFORMED-READY'})()",
+              "https://frame-owner.test/malformed-listener.js",
+              &frame_owner_navigation.page.script_result)
+          && frame_owner_navigation.page.message_count == 0u
+          && queue_raw_frame_message(
+              &frame_owner_navigation, owned_frame->runtime,
+              owned_frame->parent_handle, owned_frame->lifecycle_generation,
+              0, 0, clone_bad_node, NULL, 0)
+          && queue_raw_frame_message(
+              &frame_owner_navigation, owned_frame->runtime,
+              owned_frame->parent_handle, owned_frame->lifecycle_generation,
+              0, 0, clone_bare_key, NULL, 0)
+          && queue_raw_frame_message(
+              &frame_owner_navigation, owned_frame->runtime,
+              owned_frame->parent_handle, owned_frame->lifecycle_generation,
+              0, frame_owner_navigation.generation, clone_bad_node,
+              stray_key_byte, sizeof(stray_key_byte))
+          && queue_raw_frame_message(
+              &frame_owner_navigation, owned_frame->runtime,
+              owned_frame->parent_handle, owned_frame->lifecycle_generation,
+              0, 0, "{", NULL, 0)
+          && script_runtime_evaluate_diagnostic(
+              owned_frame->runtime,
+              "parent.postMessage({event:'after-malformed'},'*')",
+              "https://frame-owner.test/after-malformed.js",
+              &owned_frame->script_result)
+          && frame_owner_navigation.page.message_count == 5u);
+    for (size_t turn = 0; turn < 8u
+             && frame_owner_navigation.page.message_count != 0u; turn++) {
+        CHECK(navigation_advance_runtime(&frame_owner_navigation, 0, 8));
+    }
+    if (strcmp(frame_owner_navigation.page.script_result.summary,
+               "MALFORMED:4:true") != 0)
+        fprintf(stderr, "malformed frame message: parent=%s error=%s\n",
+                frame_owner_navigation.page.script_result.summary,
+                frame_owner_navigation.page.script_result.error);
+    CHECK(frame_owner_navigation.page.runtime != NULL
+          && owned_frame->runtime != NULL && !owned_frame->retired
+          && frame_owner_navigation.frames_failed == malformed_failed_before
+          && frame_owner_navigation.page.message_count == 0u
+          && strcmp(frame_owner_navigation.page.script_result.summary,
+                    "MALFORMED:4:true") == 0);
+    puts("test: a keyed frame message is dropped when its document changes");
+    /* The owner's document generation moves on while a keyed message waits
+       in the queue, as when the top-level document is replaced. Neither
+       direction may deliver the key; once the generation is current again
+       the same kind of message is delivered. */
+    CHECK(script_runtime_evaluate_diagnostic(
+              owned_frame->runtime,
+              "addEventListener('message',e=>{if(e.data.event==='stale-key')"
+              "pocSummary='STALE-KEY:'+(e.data.key instanceof CryptoKey)});"
+              "pocSummary='STALE-KEY-READY'",
+              "https://frame-owner.test/stale-key-listener.js",
+              &owned_frame->script_result)
+          && script_runtime_evaluate_diagnostic(
+              frame_owner_navigation.page.runtime,
+              "addEventListener('message',e=>{if(e.data.event==='stale-up')"
+              "pocSummary='STALE-UP:'+(e.data.key instanceof CryptoKey)});"
+              "pocSummary='STALE-UP-READY';(async()=>{const key=await "
+              "crypto.subtle.importKey('raw',new Uint8Array([4,5,6]),"
+              "{name:'HMAC',hash:'SHA-256'},false,['sign']);"
+              "globalThis.__staleKey=key;document.getElementById('owned')"
+              ".contentWindow.postMessage({event:'stale-key',key},'*')})()",
+              "https://frame-owner.test/stale-key-send.js",
+              &frame_owner_navigation.page.script_result)
+          && script_runtime_evaluate_diagnostic(
+              owned_frame->runtime,
+              "(async()=>{const key=await crypto.subtle.importKey('raw',"
+              "new Uint8Array([7,8]),{name:'HMAC',hash:'SHA-256'},false,"
+              "['sign']);parent.postMessage({event:'stale-up',key},'*')})()",
+              "https://frame-owner.test/stale-up-send.js",
+              &owned_frame->script_result)
+          && frame_owner_navigation.page.message_count == 2u
+          && frame_owner_navigation.page.messages[0].key_length != 0u
+          && frame_owner_navigation.page.messages[1].key_length != 0u);
+    const size_t stale_drops_before =
+        frame_owner_navigation.frame_messages_dropped;
+    frame_owner_navigation.generation++;
+    bool stale_advanced =
+        navigation_advance_runtime(&frame_owner_navigation, 0, 8);
+    frame_owner_navigation.generation--;
+    CHECK(stale_advanced && frame_owner_navigation.page.message_count == 0u
+          && frame_owner_navigation.frame_messages_dropped
+                 == stale_drops_before + 2u
+          && strcmp(owned_frame->script_result.summary,
+                    "STALE-KEY-READY") == 0
+          && strcmp(frame_owner_navigation.page.script_result.summary,
+                    "STALE-UP-READY") == 0);
+    CHECK(script_runtime_evaluate_diagnostic(
+              frame_owner_navigation.page.runtime,
+              "document.getElementById('owned').contentWindow.postMessage("
+              "{event:'stale-key',key:__staleKey},'*')",
+              "https://frame-owner.test/current-key-send.js",
+              &frame_owner_navigation.page.script_result)
+          && navigation_advance_runtime(&frame_owner_navigation, 0, 8)
+          && navigation_advance_runtime(&frame_owner_navigation, 0, 8)
+          && strcmp(owned_frame->script_result.summary,
+                    "STALE-KEY:true") == 0);
     puts("test: Window onmessage retains its listener-list position");
     CHECK(script_runtime_evaluate_diagnostic(
               owned_frame->runtime,
@@ -1688,11 +1939,14 @@
              "https://frame-owner.test");
     failed_child_message->sequence = 1;
     frame_owner_navigation.page.message_count = 1;
+    const size_t drops_before_failed_child =
+        frame_owner_navigation.frame_messages_dropped;
     /* Author replacement of a compatibility global must not intercept the
        native scheduler's retained bootstrap callback. */
     CHECK(navigation_advance_runtime(&frame_owner_navigation, 1, 8)
           && frame_owner_navigation.frames_failed == 1
-          && frame_owner_navigation.frame_messages_dropped == 1
+          && frame_owner_navigation.frame_messages_dropped
+                 == drops_before_failed_child
           && frame_owner_navigation.page.message_count == 0
           && frame_owner_navigation.page.runtime != NULL
           && owned_frame->runtime != NULL
@@ -1728,6 +1982,8 @@
              "https://frame-owner.test");
     queued->sequence = 2;
     frame_owner_navigation.page.message_count = 1;
+    const size_t drops_before_detach =
+        frame_owner_navigation.frame_messages_dropped;
     CHECK(frame_owner_navigation.page.message_count == 1
           && script_runtime_evaluate_diagnostic(
               frame_owner_navigation.page.runtime,
@@ -1739,7 +1995,7 @@
           && navigation_advance_runtime(&frame_owner_navigation, 1, 8)
           && frame_owner_navigation.frames_detached == 1
           && frame_owner_navigation.frame_messages_dropped
-                 == early_message_drops + 1u
+                 == drops_before_detach + 1u
           && frame_owner_navigation.page.message_count == 0
           && owned_frame->retired && owned_frame->runtime == NULL
           && owned_frame->document.html == NULL
@@ -2157,6 +2413,18 @@
          "impossible compile");
     CHECK(test_external_scripts_refused_before_compile(&budget));
 
+    puts("test: an inserted script pair keeps the realm in either order");
+    CHECK(test_inserted_script_pair_keeps_realm(&budget));
+
+    puts("test: the memory stop rule reclaims cached responses first");
+    CHECK(test_memory_verdict_reclaims_cached_responses(&budget));
+
+    puts("test: a refused heavy script leaves the cache it cannot use");
+    CHECK(test_refused_heavy_script_keeps_cache(&budget));
+
+    puts("test: a heavy script is collected for before it is refused");
+    CHECK(test_heavy_script_collects_before_refusal(&budget));
+
     puts("test: script pressure admission skips before allocator failure");
     static const char pressure_script_page[] =
         "<!doctype html><title>Pressure</title><body><p>READY</p>"
@@ -2185,7 +2453,7 @@
         /* Room for the page's layout after both scripts are skipped. The
            realm heap takes Budget memory in arena steps, so a few hundred
            bootstrap bytes can move this by 4 KiB: keep a margin. */
-        .leave_free = 272 * 1024
+        .leave_free = 288 * 1024
     };
     pressure_navigation.heavy_policy_resolver = test_script_pressure_at_realm;
     pressure_navigation.heavy_policy_opaque = &pressure_seam;
@@ -3166,9 +3434,13 @@
           && mutation_scripts.events_dispatched >= 2
           && mutation_scripts.performance_now_calls >= 1
           /* Canvas, Worker, DOM traversal, shadow ownership, secondary
-             documents (DOMParser) and form collections (form.elements) are
+             documents (DOMParser), form collections (form.elements),
+             layout-less geometry (a measurement before layout), constraint
+             validation (the submit button's click validates the form),
+             detached documents (template contents' owner), WebGPU
+             (navigator.gpu) and FileReader (the Worker realm's reader) are
              each admitted on first use by this interface probe. */
-          && mutation_scripts.bootstrap_lazy_module_loads == 6
+          && mutation_scripts.bootstrap_lazy_module_loads == 11
           && mutation_scripts.bootstrap_lazy_module_failures == 0
           && mutated.body_text == NULL
           && strcmp(mutation_scripts.summary,
@@ -3320,7 +3592,9 @@
     }
     CHECK(strcmp(worker_boundary_result.summary,
                  "POLICY-BLOCKED:1:0:0:0:0:0:0:true:undefined") == 0
-          && worker_boundary_result.bootstrap_lazy_module_loads == 1
+          /* Worker, and the FileReader and WebGPU modules the worker
+             realm's FileReader and navigator.gpu are built from */
+          && worker_boundary_result.bootstrap_lazy_module_loads == 3
           && worker_boundary_result.bootstrap_lazy_module_failures == 0);
     script_runtime_destroy(worker_boundary_runtime);
     document_destroy(&worker_boundary_document);
@@ -3414,7 +3688,9 @@
               "probe,true,true,function,function,true";
     bool worker_lifecycle_valid = strcmp(
             worker_lifecycle_result.summary, expected_worker_lifecycle) == 0
-        && worker_lifecycle_result.bootstrap_lazy_module_loads == 1
+        /* Worker, FileReader and WebGPU (the worker realm's FileReader
+           and navigator.gpu) */
+        && worker_lifecycle_result.bootstrap_lazy_module_loads == 3
         && worker_lifecycle_result.bootstrap_lazy_module_failures == 0;
     if (!worker_lifecycle_valid)
         fprintf(stderr, "worker lifecycle summary=%s error=%s lazy=%zu/%zu\n",
@@ -3486,7 +3762,8 @@
             fprintf(stderr, "shared worker dedicated summary=%s error=%s\n",
                     shared_result.summary, shared_result.error);
         CHECK(strcmp(shared_result.summary, "worker:ping:undefined") == 0
-              && shared_result.bootstrap_lazy_module_loads == 1
+              /* Worker, FileReader and WebGPU */
+              && shared_result.bootstrap_lazy_module_loads == 3
               && shared_result.bootstrap_lazy_module_failures == 0);
         script_runtime_destroy(shared_runtime);
         document_destroy(&shared_document);
@@ -5225,7 +5502,7 @@
               "source])),worker=new Worker(url);worker.onmessage=event=>{const v="
               "event.data;pocSummary=v.local&&v.blob instanceof Blob&&v.file "
               "instanceof File&&v.blob.type==='text/plain'&&v.file.type==="
-              "'text/custom'&&v.file.name==='a:b.txt'&&v.file.lastModified===42"
+              "'text/custom'&&v.file.name==='a/b.txt'&&v.file.lastModified===42"
               "&&v.text.join(',')==='blob,file'?'WORKER-BLOB-CLONE-OK':"
               "'WORKER-BLOB-CLONE-BAD';worker.terminate();URL.revokeObjectURL("
               "url)};worker.postMessage({blob:new Blob(['blob'],{type:'text/plain'"
@@ -7298,11 +7575,12 @@
                  count_test_message, NULL)
           && script_runtime_evaluate_diagnostic(
                  failed_message_runtime,
-                 "let negative='';try{__tilefinchPostMessage(0,'{}','*',"
-                 "'event:test',-1)}catch(error){negative=error.name}"
-                 "__tilefinchPostMessage(0,'{}','*','event:'+"
-                 "'x'.repeat(160),1);globalThis.pocSummary=negative==="
-                 "'RangeError'?'failed-child-safe':'failed-child-bad'",
+                 "let failed='';try{parent.postMessage({event:'test'},'*');"
+                 "top.postMessage({event:'x'.repeat(160)},'*')}catch(error)"
+                 "{failed=error.name}globalThis.pocSummary=failed===''&&"
+                 "typeof __tilefinchPostParentMessage==='undefined'&&"
+                 "typeof __tilefinchPostTopMessage==='undefined'"
+                 "?'failed-child-safe':'failed-child-bad:'+failed",
                  "<failed-child-post-message>", &failed_message_result)
           && strcmp(failed_message_result.summary,
                     "failed-child-safe") == 0);
@@ -7314,6 +7592,20 @@
     /* Last: it installs its own budget for the parser. */
     CHECK(test_hidden_mutation_relayouts() == 0);
     CHECK(test_relayout_style_reuse() == 0);
+    CHECK(test_relayout_structure_subjects() == 0);
+    CHECK(test_relayout_identity_attribute_kinds() == 0);
+    CHECK(test_relayout_identity_subject_arguments() == 0);
+    CHECK(test_relayout_style_append_keyed() == 0);
+    CHECK(test_relayout_style_append_unchanged() == 0);
+    CHECK(test_frame_image_source_swaps() == 0);
+    CHECK(test_frame_failed_image_keeps_background() == 0);
+    CHECK(test_image_swap_accounting() == 0);
+    CHECK(test_frame_media_device_features() == 0);
+    CHECK(test_relayout_tail_style_past_source_bound() == 0);
+    CHECK(test_geometry_after_transient_probe() == 0);
+    CHECK(test_geometry_reads_apply_records_once() == 0);
+    CHECK(test_transient_journal_skips_relayout() == 0);
+    CHECK(test_detached_record_keeps_has_styles() == 0);
     CHECK(test_bounded_focus_relayout() == 0);
     CHECK(test_bounded_focus_consecutive_region() == 0);
     CHECK(test_bounded_focus_observer_pass_deferred() == 0);
@@ -7323,6 +7615,10 @@
     CHECK(test_bounded_focus_shift() == 0);
     CHECK(test_bounded_focus_float_columns() == 0);
     CHECK(test_relayout_style_table_sizing() == 0);
+    CHECK(test_relayout_adopted_append_keeps_user_rules() == 0);
+    CHECK(test_relayout_empty_adopted_append_stays_in_order() == 0);
+    CHECK(test_relayout_stale_children_reach_has() == 0);
+    CHECK(test_relayout_identity_bound_survives_removal() == 0);
     CHECK(test_full_rebuild_shares_discovery_styles() == 0);
     CHECK(test_tiny_budget_rejection() == 0);
     return 0;

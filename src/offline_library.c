@@ -131,15 +131,34 @@ static bool offline_directory_ready(const OfflineLibrary *library)
     return errno == EEXIST;
 }
 
-static uint64_t offline_existing_file_size(
-    const OfflineLibrary *library, uint32_t id, const char *suffix)
+typedef enum {
+    OFFLINE_PAYLOAD_MISSING,
+    OFFLINE_PAYLOAD_INVALID,
+    OFFLINE_PAYLOAD_PRESENT,
+    OFFLINE_PAYLOAD_UNAVAILABLE
+} OfflinePayloadStatus;
+
+static OfflinePayloadStatus offline_payload_stat(
+    const char *path, uint64_t *bytes)
+{
+    struct stat status;
+    *bytes = 0;
+    if (stat(path, &status) != 0)
+        return errno == ENOENT ? OFFLINE_PAYLOAD_MISSING
+                              : OFFLINE_PAYLOAD_UNAVAILABLE;
+    if (!S_ISREG(status.st_mode) || status.st_size < 0)
+        return OFFLINE_PAYLOAD_INVALID;
+    *bytes = (uint64_t) status.st_size;
+    return OFFLINE_PAYLOAD_PRESENT;
+}
+
+static OfflinePayloadStatus offline_item_payload_stat(
+    const OfflineLibrary *library, uint32_t id, const char *suffix,
+    uint64_t *bytes)
 {
     char path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
-    struct stat status;
-    return offline_library_item_path(
-               library, id, suffix, path, sizeof(path))
-            && stat(path, &status) == 0 && status.st_size >= 0
-        ? (uint64_t) status.st_size : 0;
+    return offline_library_item_path(library, id, suffix, path, sizeof(path))
+        ? offline_payload_stat(path, bytes) : OFFLINE_PAYLOAD_UNAVAILABLE;
 }
 
 bool offline_library_item_path(
@@ -730,27 +749,40 @@ static bool offline_library_load_with_staged(
                 item->state = OFFLINE_ITEM_PAUSED;
                 normalized = true;
             }
-            char path[FILE_DOWNLOAD_PATH_LIMIT] = {0};
-            struct stat status;
+            if (item->state != OFFLINE_ITEM_READY) continue;
+            char path[FILE_DOWNLOAD_PATH_LIMIT];
+            uint64_t bytes;
             /* Use the staged index for lookup before publishing it. */
             bool was_loaded = staged->loaded;
             staged->loaded = true;
-            bool exists = file_download_path(staged, item->id, path, sizeof(path))
-                && stat(path, &status) == 0 && S_ISREG(status.st_mode) && status.st_size >= 0;
-            if (!exists && path[0] != '\0' && item->state == OFFLINE_ITEM_READY) {
+            OfflinePayloadStatus payload = file_download_path(
+                staged, item->id, path, sizeof(path))
+                ? offline_payload_stat(path, &bytes) : OFFLINE_PAYLOAD_UNAVAILABLE;
+            staged->loaded = was_loaded;
+            if (payload == OFFLINE_PAYLOAD_MISSING) {
                 char part[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
-                struct stat partial;
+                uint64_t partial_bytes;
                 /* READY was committed only after a complete, flushed stream.
                    Recover the final rename, never an ordinary partial stream. */
-                exists = offline_library_item_path(staged, item->id, ".file.part", part, sizeof(part))
-                    && stat(path, &status) != 0 && errno == ENOENT
-                    && stat(part, &partial) == 0 && S_ISREG(partial.st_mode)
-                    && partial.st_size >= 0 && (uint64_t) partial.st_size == item->content_bytes
-                    && rename(part, path) == 0 && stat(path, &status) == 0;
+                OfflinePayloadStatus partial = offline_library_item_path(
+                    staged, item->id, ".file.part", part, sizeof(part))
+                    ? offline_payload_stat(part, &partial_bytes)
+                    : OFFLINE_PAYLOAD_UNAVAILABLE;
+                if (partial == OFFLINE_PAYLOAD_UNAVAILABLE) continue;
+                if (partial == OFFLINE_PAYLOAD_PRESENT
+                    && partial_bytes == item->content_bytes) {
+                    /* The bytes are present, but publication may be
+                       temporarily unavailable on a read-only card. */
+                    payload = offline_payload_stat(path, &bytes);
+                    if (payload == OFFLINE_PAYLOAD_MISSING) {
+                        if (rename(part, path) != 0) continue;
+                        payload = OFFLINE_PAYLOAD_PRESENT;
+                        bytes = partial_bytes;
+                    }
+                }
             }
-            staged->loaded = was_loaded;
-            if (item->state == OFFLINE_ITEM_READY
-                && (!exists || (uint64_t) status.st_size != item->content_bytes)) {
+            if (payload != OFFLINE_PAYLOAD_UNAVAILABLE
+                && (payload != OFFLINE_PAYLOAD_PRESENT || bytes != item->content_bytes)) {
                 item->state = OFFLINE_ITEM_FAILED;
                 snprintf(item->failure_reason, sizeof(item->failure_reason), "Saved file is missing or incomplete");
                 normalized = true;
@@ -762,22 +794,28 @@ static bool offline_library_load_with_staged(
             item->state = OFFLINE_ITEM_PAUSED;
             normalized = true;
         }
-        uint64_t video_part = offline_existing_file_size(
-            staged, item->id, ".video.part");
-        uint64_t audio_part = offline_existing_file_size(
-            staged, item->id, ".audio.part");
-        uint64_t video_final = offline_existing_file_size(
-            staged, item->id, ".video.mp4");
-        uint64_t audio_final = offline_existing_file_size(
-            staged, item->id, ".audio.mp4");
-        bool complete = video_final == item->content_bytes
+        uint64_t video_final, audio_final = 0;
+        OfflinePayloadStatus video = offline_item_payload_stat(
+            staged, item->id, ".video.mp4", &video_final);
+        OfflinePayloadStatus audio = item->split_streams
+            ? offline_item_payload_stat(staged, item->id, ".audio.mp4", &audio_final)
+            : OFFLINE_PAYLOAD_MISSING;
+        if (video == OFFLINE_PAYLOAD_UNAVAILABLE || audio == OFFLINE_PAYLOAD_UNAVAILABLE)
+            continue;
+        bool complete = video == OFFLINE_PAYLOAD_PRESENT
+            && video_final == item->content_bytes
             && (!item->split_streams
-                || audio_final == item->audio_bytes);
+                || (audio == OFFLINE_PAYLOAD_PRESENT && audio_final == item->audio_bytes));
         if (item->state == OFFLINE_ITEM_READY && !complete) {
             item->state = OFFLINE_ITEM_FAILED;
             normalized = true;
         }
         if (item->state != OFFLINE_ITEM_READY) {
+            uint64_t video_part, audio_part;
+            if (offline_item_payload_stat(staged, item->id, ".video.part", &video_part)
+                    == OFFLINE_PAYLOAD_UNAVAILABLE
+                || offline_item_payload_stat(staged, item->id, ".audio.part", &audio_part)
+                    == OFFLINE_PAYLOAD_UNAVAILABLE) continue;
             uint64_t recovered = video_part <= item->content_bytes
                     && audio_part <= item->audio_bytes
                     && (video_final == 0
@@ -1115,6 +1153,7 @@ static bool write_reader_subtree(
                         strlen(closing), hash, bytes)) return false;
                 if (hidden) hidden_depth--;
             }
+            if (node == root) return true;
             if (node->next != NULL) {
                 node = node->next;
                 break;
@@ -1142,12 +1181,17 @@ static bool write_hashed(
 }
 
 static bool offline_article_file_matches(
-    const char *path, uint64_t expected_bytes, uint32_t expected_hash)
+    const char *path, uint64_t expected_bytes, uint32_t expected_hash,
+    bool *unavailable)
 {
+    *unavailable = false;
     if (path == NULL || expected_bytes == 0
         || expected_bytes > OFFLINE_LIBRARY_ARTICLE_LIMIT) return false;
     FILE *file = fopen(path, "rb");
-    if (file == NULL) return false;
+    if (file == NULL) {
+        *unavailable = errno != ENOENT;
+        return false;
+    }
     unsigned char chunk[4096];
     uint64_t remaining = expected_bytes;
     uint32_t hash = UINT32_C(2166136261);
@@ -1166,10 +1210,10 @@ static bool offline_article_file_matches(
         }
         remaining -= read;
     }
-    if (okay) okay = fgetc(file) == EOF && !ferror(file)
-        && hash == expected_hash;
-    if (fclose(file) != 0) okay = false;
-    return okay;
+    if (okay) okay = fgetc(file) == EOF && hash == expected_hash;
+    *unavailable = ferror(file) != 0;
+    if (fclose(file) != 0) *unavailable = true;
+    return okay && !*unavailable;
 }
 
 bool offline_library_save_article(
@@ -1269,8 +1313,14 @@ bool offline_library_save_article(
         offline_error(error, error_size, "article exceeded storage or write bound");
         return false;
     }
+    bool unavailable = false;
     bool prior_primary_valid = replacing && offline_article_file_matches(
-        path, previous.content_bytes, previous.article_hash);
+        path, previous.content_bytes, previous.article_hash, &unavailable);
+    if (unavailable) {
+        remove(temporary);
+        offline_error(error, error_size, "prior article could not be read");
+        return false;
+    }
     /* A valid prior article is kept as the backup beside the prior index
        generation; an invalid one is simply replaced. */
     bool backed_up = prior_primary_valid;

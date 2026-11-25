@@ -73,6 +73,7 @@ const PspUiOfflineAppPreview *psp_offline_store_app_preview(
     const PspOfflineStore *store);
 bool psp_offline_store_open_library(
     PspOfflineStore *store, BrowserEngine *engine, bool record_history);
+bool psp_offline_store_remove_item(PspOfflineStore *store, uint32_t id);
 /* No filesystem or network access until the native confirmation is accepted. */
 bool psp_offline_store_offer_file(PspOfflineStore *store,
                                  BrowserEngine *engine, const char *url);

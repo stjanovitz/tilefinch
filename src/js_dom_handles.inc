@@ -1013,11 +1013,20 @@ static JSValue bridge_retain_wrapper(JSContext *context, DomBridge *bridge,
             bridge_pin_node_slot(bridge, slot);
             return JS_ThrowOutOfMemory(context);
         }
-        bridge_wrapper_ref_clear(bridge, slot);
-        /* The weak target is the object itself (JS_NewWeakTarget). */
-        JSValue target = JS_NewWeakTarget(context, wrapper);
-        bridge->wrapper_refs[slot] =
-            JS_IsObject(target) ? JS_VALUE_GET_PTR(target) : NULL;
+        void *ptr = JS_VALUE_GET_PTR(wrapper);
+        if (bridge->wrapper_refs[slot] == ptr) {
+            /* Renew the lease without acquiring another weak reference. */
+            if ((bridge->node_retention_flags[slot]
+                 & BRIDGE_NODE_EVENT_KEPT) != 0)
+                bridge_set_event_state(bridge, slot, 0, false);
+        } else {
+            /* Acquire before replacing: a refusal leaves the old cache,
+               lease and held event state intact. */
+            JSValue target = JS_NewWeakTarget(context, wrapper);
+            if (JS_IsException(target)) return target;
+            bridge_wrapper_ref_clear(bridge, slot);
+            bridge->wrapper_refs[slot] = JS_VALUE_GET_PTR(target);
+        }
     } else {
         bridge_wrapper_ref_clear(bridge, slot);
     }

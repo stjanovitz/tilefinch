@@ -1,0 +1,4 @@
+<!doctype html><style>html,body{margin:0}img,div{display:block;width:40px;height:20px}</style><body>
+<p>Placeholders</p>
+<div id=b> </div><noscript><img src=/b.svg></noscript>
+<script>globalThis.ready=1</script>

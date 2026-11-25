@@ -242,6 +242,7 @@ static const char responsive_page[] =
 /* Focused helpers and the long integration inventory remain one translation
    unit, but live in ownership-oriented files for faster review. */
 #include "suites/layout_flow.inc"
+#include "suites/layout_invalidation_reach.inc"
 #include "suites/layout_paint.inc"
 #include "suites/layout_structure.inc"
 #include "suites/layout_news_compat.inc"
@@ -431,6 +432,54 @@ static int check_grid_track_page(const char *page, int viewport,
     CHECK(budget.current == 0u && budget_uninstall_lexbor(&budget));
     CHECK(failures == 0);
     return 0;
+}
+
+static int test_grid_zero_height_fixed_rows(void)
+{
+    puts("test: fixed zero-height grid rows do not grow to fit content");
+    static const char page[] =
+        "<!doctype html><style>body{margin:0}"
+        ".grid{display:grid;grid-template-columns:40px 40px;row-gap:3px}"
+        ".grid>div{height:20px}div.probe{height:1px}"
+        "#explicit{grid-template-rows:0px 0px 4px}"
+        "#implicit{grid-auto-rows:0px 4px}"
+        ".span{grid-row:1/3;grid-column:2}</style>"
+        "<div id=explicit class=grid><div></div><div class=span></div>"
+        "<div class=probe id=e2 style='grid-row:2;grid-column:1'></div>"
+        "<div class=probe id=e3 style='grid-row:3;grid-column:1'></div></div>"
+        "<div id=implicit class=grid><div></div>"
+        "<div class=probe id=i2 style='grid-row:2;grid-column:1'></div></div>";
+    static const GridTrackExpectation expected[] = {
+        {"e2", 0, 3, 40}, {"e3", 0, 6, 40},
+        {"implicit", 0, 10, 480}, {"i2", 0, 13, 40}
+    };
+    return check_grid_track_page(page, 480, expected,
+                                 sizeof(expected) / sizeof(expected[0]));
+}
+
+static int test_grid_overlapping_row_spans(void)
+{
+    puts("test: equal overlapping grid row spans share a sizing baseline");
+    static const char page[] =
+        "<!doctype html><style>body{margin:0}"
+        ".grid{display:grid;grid-template-columns:40px 40px 40px;"
+        "grid-template-rows:auto auto auto}.span{height:40px}"
+        ".a{grid-row:1/3;grid-column:1}.b{grid-row:2/4;grid-column:2;height:60px}"
+        ".probe{grid-column:3}</style>"
+        "<div class=grid><div class='span a'></div><div class='span b'></div>"
+        "<div class=probe id=a2 style='grid-row:2'></div>"
+        "<div class=probe id=a3 style='grid-row:3'></div></div>"
+        "<div class=grid><div class='span b'></div><div class='span a'></div>"
+        "<div class=probe id=b2 style='grid-row:2'></div>"
+        "<div class=probe id=b3 style='grid-row:3'></div></div>"
+        "<div id=after></div>";
+    static const GridTrackExpectation expected[] = {
+        {"a2", 80, 20, 40}, {"a3", 80, 50, 40},
+        {"b2", 80, 100, 40}, {"b3", 80, 130, 40},
+        {"after", 0, 160, 480}
+    };
+    return check_grid_track_page(page, 480, expected,
+                                 sizeof(expected) / sizeof(expected[0]));
 }
 
 /* grid-auto-rows/columns size every implicit track, cycling through the
@@ -838,6 +887,91 @@ static int test_style_cache_preserves_layout_workspace(void)
     return 0;
 }
 
+/* Viewport-fixed bars stacked over more than half the viewport are laid
+   out as scrolling with the page; a page that already unpinned keeps them
+   so down to 40%, and a footer goes only when it alone covers half. */
+static int unpin_build(const char *html, uint8_t previous, uint8_t *state,
+                       size_t *fixed_count, int *second_y)
+{
+    Budget budget;
+    budget_init(&budget, 32u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ViewportContext viewport;
+    CHECK(document_parse(&document, &budget, html, strlen(html), 17)
+          && viewport_context_init(&viewport, 480, 272, 480, 272)
+          && stylesheet_build_context(&sheet, &budget, &document, &viewport));
+    LayoutReuseCache *cache = layout_reuse_cache_create(&budget);
+    CHECK(cache != NULL);
+    cache->fixed_unpin_state = previous;
+    LayoutDocument layout = {0};
+    CHECK(layout_build_context_reuse(&layout, &budget, &document, &sheet,
+                                     NULL, NULL, &viewport, cache));
+    *state = cache->fixed_unpin_state;
+    /* Bars of no height still record an empty range; count the real ones. */
+    *fixed_count = 0;
+    for (size_t i = 0; i < layout.fixed_count; ++i) {
+        if (layout.fixed_ranges[i].height > 0)
+            ++*fixed_count;
+    }
+    const LayoutNodeBox *box = layout_box_for_node(
+        &layout, find_id(lxb_dom_interface_node(document.html), "second"));
+    *second_y = box == NULL ? INT_MIN : box->y;
+    layout_destroy(&layout);
+    layout_reuse_cache_destroy(cache);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_unpin_tall_fixed_stacks(void)
+{
+    puts("test: fixed bars covering most of the viewport scroll with "
+         "the page, with hysteresis");
+    /* Two top bars and a footer of the given heights (a bar of no height
+       is left out of the count), placed in flow after a
+       long page so their static position is far from where they show. */
+    static const char shape[] =
+        "<!doctype html><style>body{margin:0}#long{height:2000px}"
+        "#first,#second,#foot{position:fixed;left:0;right:0;"
+        "background:#036}#first{top:0;height:%dpx}"
+        "#second{top:%dpx;height:%dpx}#foot{bottom:0;height:%dpx}</style>"
+        "<div id=long>Story</div><div id=first></div><div id=second></div>"
+        "<div id=foot></div>";
+    char html[1024];
+    uint8_t state = 0;
+    size_t fixed = 0;
+    int second_y = 0;
+    /* 60 + 80 = 140 of 272 (51%): unpinned, the second bar at y 60. */
+    snprintf(html, sizeof(html), shape, 60, 60, 80, 0);
+    CHECK(unpin_build(html, 0, &state, &fixed, &second_y) == 0);
+    CHECK(state == 1u && fixed == 0u && second_y == 60);
+    /* 60 + 60 = 120 (44%): pinned for a new page, unpinned for one that
+       already was. */
+    snprintf(html, sizeof(html), shape, 60, 60, 60, 0);
+    CHECK(unpin_build(html, 0, &state, &fixed, &second_y) == 0);
+    CHECK(state == 0u && fixed == 2u && second_y != 60);
+    CHECK(unpin_build(html, 1, &state, &fixed, &second_y) == 0);
+    CHECK(state == 1u && fixed == 0u && second_y == 60);
+    /* 60 + 40 = 100 (37%): pinned again either way. */
+    snprintf(html, sizeof(html), shape, 60, 60, 40, 0);
+    CHECK(unpin_build(html, 1, &state, &fixed, &second_y) == 0);
+    CHECK(state == 0u && fixed == 2u);
+    /* A 50 px footer under the 100 px top stack: 150 together, so the top
+       stack goes and the footer, 18% alone, stays pinned. */
+    snprintf(html, sizeof(html), shape, 60, 60, 40, 50);
+    CHECK(unpin_build(html, 0, &state, &fixed, &second_y) == 0);
+    CHECK(state == 1u && fixed == 1u && second_y == 60);
+    /* A footer alone over half the viewport (140 px) is unpinned and sits
+       at the bottom of the first screen. */
+    snprintf(html, sizeof(html), shape, 0, 0, 0, 140);
+    CHECK(unpin_build(html, 0, &state, &fixed, &second_y) == 0);
+    CHECK(state == 2u && fixed == 0u);
+    return 0;
+}
+
 static int test_oversized_style_cache_scan(void)
 {
     Budget budget;
@@ -1101,6 +1235,40 @@ static int test_rtl_coalesced_fragment_commands(void)
 
 int main(int argc, char **argv)
 {
+    /* The reuse-invalidation cases, for the differential verifier gate
+       (tests/run_invalidation_verify.py runs this with
+       TILEFINCH_TRACE_INVALIDATION_VERIFY=1 and reads the verifier lines
+       each case prints before its marker). */
+    if (argc == 2 && strcmp(argv[1], "--invalidation-verify") == 0) {
+        Budget budget;
+        budget_init(&budget, 16 * MIB);
+        budget_install_lexbor(&budget);
+#define INVALIDATION_VERIFY_CASE(test, expect) \
+        fprintf(stderr, "invalidation-verify-case %s expect=%s verdict=%d\n", \
+                #test, expect, (int) (test)(&budget))
+        INVALIDATION_VERIFY_CASE(test_invalidation_verifier_planted_miss,
+                                 "miss");
+        INVALIDATION_VERIFY_CASE(test_invalidation_verifier_streaming_miss,
+                                 "streaming");
+        INVALIDATION_VERIFY_CASE(test_invalidation_verifier_listless_miss,
+                                 "miss");
+        INVALIDATION_VERIFY_CASE(test_retained_matches_reuse, "clean");
+        INVALIDATION_VERIFY_CASE(test_has_scoped_invalidation_matches_fresh,
+                                 "clean");
+        INVALIDATION_VERIFY_CASE(test_state_invalidation_matches_fresh,
+                                 "clean");
+        INVALIDATION_VERIFY_CASE(test_children_invalidation_scope, "clean");
+        INVALIDATION_VERIFY_CASE(test_partial_identity_tests_flip, "clean");
+        INVALIDATION_VERIFY_CASE(test_identity_presence_reaches, "clean");
+        INVALIDATION_VERIFY_CASE(test_partial_identity_fallbacks, "clean");
+        INVALIDATION_VERIFY_CASE(test_attribute_reach_by_kind_narrows,
+                                 "clean");
+        INVALIDATION_VERIFY_CASE(test_attribute_reach_by_kind_keeps,
+                                 "clean");
+        INVALIDATION_VERIFY_CASE(test_inner_html_has_probe, "clean");
+#undef INVALIDATION_VERIFY_CASE
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--text-measure-cache-only") == 0) {
         int keys = test_text_measure_cache_keys();
         int yields = test_text_measure_cache_yields();
@@ -1136,8 +1304,29 @@ int main(int argc, char **argv)
     if (argc == 2 && strcmp(argv[1], "--grid-rows-only") == 0)
         return test_grid_rows_past_placement_window();
     CHECK(test_grid_rows_past_placement_window() == 0);
+    if (argc == 2 && strcmp(argv[1], "--grid-zero-rows-only") == 0)
+        return test_grid_zero_height_fixed_rows();
+    if (argc == 2 && strcmp(argv[1], "--grid-overlapping-spans-only") == 0)
+        return test_grid_overlapping_row_spans();
+    CHECK(test_grid_zero_height_fixed_rows() == 0);
+    CHECK(test_grid_overlapping_row_spans() == 0);
     if (argc == 2 && strcmp(argv[1], "--grid-positioned-lines-only") == 0)
         return test_grid_positioned_lines_past_tracks();
+    if (argc == 2 && strcmp(argv[1], "--bidi-direction-values-only") == 0) {
+        Budget budget;
+        budget_init(&budget, 16 * MIB);
+        budget_install_lexbor(&budget);
+        return test_bidi_direction_change_values(&budget);
+    }
+    if (argc == 2 && strcmp(argv[1], "--has-anchor-placement-only") == 0) {
+        Budget budget;
+        budget_init(&budget, 16 * MIB);
+        budget_install_lexbor(&budget);
+        CHECK(test_has_sibling_subject_placed_by_anchor(&budget) == 0);
+        CHECK(test_has_key_set_scope(&budget) == 0);
+        CHECK(test_has_descendant_subject_and_fallback(&budget) == 0);
+        return test_has_scoped_invalidation_matches_fresh(&budget);
+    }
     if (argc == 2 && strcmp(argv[1], "--bidi-translate-only") == 0) {
         Budget budget;
         budget_init(&budget, 16 * MIB);
@@ -1201,6 +1390,8 @@ int main(int argc, char **argv)
         return test_auto_grid_block_alignment();
     if (argc == 2 && strcmp(argv[1], "--oversized-style-cache-only") == 0)
         return test_oversized_style_cache_scan();
+    if (argc == 2 && strcmp(argv[1], "--unpin-fixed-only") == 0)
+        return test_unpin_tall_fixed_stacks();
     if (argc == 2 && strcmp(argv[1], "--style-workspace-only") == 0)
         return test_style_cache_preserves_layout_workspace();
     if (argc == 2 && strcmp(argv[1], "--container-cache-only") == 0) {
@@ -1226,6 +1417,7 @@ int main(int argc, char **argv)
     CHECK(test_layout_corrections() == 0);
     CHECK(test_auto_grid_block_alignment() == 0);
     CHECK(test_oversized_style_cache_scan() == 0);
+    CHECK(test_unpin_tall_fixed_stacks() == 0);
     CHECK(test_style_cache_preserves_layout_workspace() == 0);
     if (argc == 3 && strcmp(argv[1], "--visual-regression") == 0) {
         unsigned selected = (unsigned) strtoul(argv[2], NULL, 10);

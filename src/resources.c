@@ -53,7 +53,17 @@ _Static_assert(STYLESHEET_DOCUMENT_RESOURCE_LIMIT <= 32,
 #define STYLESHEET_LARGE_SOURCE_EXTRA_RELEVANT_RULES 2304u
 #define STYLESHEET_SELECTOR_TOKEN_BLOOM_WORDS 64u
 #define STYLESHEET_PRIORITY_TOKEN_BLOOM_WORDS 128u
+/* The priority census approximates the first screen by the first elements
+   in document order. It counts elements, the only nodes that carry selector
+   tokens: whitespace text between indented tags (often half the nodes)
+   would otherwise push a header past the window. Its walk stays bounded by
+   STYLESHEET_SELECTOR_WALK_FACTOR times the element limit. The per-mutation
+   dynamic sample keeps counting nodes, so a script appending many times to
+   a long parent walks at most STYLESHEET_SELECTOR_DYNAMIC_NODE_LIMIT nodes
+   per record. */
 #define STYLESHEET_SELECTOR_PRIORITY_NODE_LIMIT 512u
+#define STYLESHEET_SELECTOR_WALK_FACTOR 4u
+#define STYLESHEET_SELECTOR_DYNAMIC_NODE_LIMIT 512u
 /* Count text nodes too, but leave room for a hydrated document to add its
    first dynamic panels without immediately saturating the token census. */
 #define STYLESHEET_SELECTOR_TOKEN_NODE_LIMIT 16384u
@@ -88,17 +98,28 @@ static void stylesheet_selector_token_add_words(
     bloom[second / 32u] |= UINT32_C(1) << (second & 31u);
 }
 
+typedef enum {
+    STYLESHEET_CENSUS_NODES,          /* limit counts every node */
+    STYLESHEET_CENSUS_FIRST_ELEMENTS, /* limit counts elements; bounded walk */
+    STYLESHEET_CENSUS_DOCUMENT        /* counts nodes; saturates on overflow */
+} StylesheetCensusMode;
+
 /* Returns true when the census visited every node under root, so the bloom
    answers "absent" only for tokens the document really lacks. */
 static bool stylesheet_collect_selector_tokens(
     lxb_dom_node_t *root, uint32_t *bloom, size_t bloom_words,
-    size_t node_limit, bool saturate_on_overflow)
+    size_t node_limit, StylesheetCensusMode mode)
 {
     memset(bloom, 0, bloom_words * sizeof(*bloom));
     lxb_dom_node_t *node = root;
-    size_t visited = 0;
-    while (node != NULL && visited++ < node_limit) {
+    bool count_elements = mode == STYLESHEET_CENSUS_FIRST_ELEMENTS;
+    size_t counted = 0, walked = 0;
+    size_t walk_limit = count_elements
+        ? node_limit * STYLESHEET_SELECTOR_WALK_FACTOR : node_limit;
+    while (node != NULL && counted < node_limit && walked++ < walk_limit) {
+        if (!count_elements) counted++;
         if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+            if (count_elements) counted++;
             size_t name_length = 0;
             const char *name = document_element_name(node, &name_length);
             stylesheet_selector_token_add_words(
@@ -129,7 +150,7 @@ static bool stylesheet_collect_selector_tokens(
         }
         node = node == NULL || node == root ? NULL : node->next;
     }
-    if (node != NULL && saturate_on_overflow) {
+    if (node != NULL && mode == STYLESHEET_CENSUS_DOCUMENT) {
         /* An incomplete census must not create false negatives. Saturating
            the fixed index converts the overflow case to ordinary bounded
            source order rather than pretending unseen tokens are absent. */
@@ -449,8 +470,9 @@ size_t stylesheet_complete_rules_prefix(const char *css, size_t length)
    what remains, and omits this optional author source before the allocator
    can fail halfway through it. Earlier document-order sheets therefore win
    deterministically on constrained pages. Before refusing, the Budget's
-   reclaim hook may release optional caches (module bytecode): an unstyled
-   page is worse than a slower revisit. */
+   reclaim hook may release optional caches (module bytecode, and, as no
+   layout build runs while sheets are parsed, the page's layout reuse
+   cache): an unstyled page is worse than a slower revisit or restyle. */
 static bool stylesheet_parse_admitted(ResourceContext *context,
                                       size_t source_bytes, size_t working)
 {
@@ -462,7 +484,7 @@ static bool stylesheet_parse_admitted(ResourceContext *context,
     if (!budget_pressure_required(context->budget, working,
                                   STYLESHEET_LAYOUT_RESERVE)
         || (required != SIZE_MAX
-            && budget_make_room(context->budget, required))) {
+            && budget_make_room_between_builds(context->budget, required))) {
         return true;
     }
 #ifndef TILEFINCH_NO_TRACE
@@ -1129,7 +1151,11 @@ static TilefinchRequestContext stylesheet_request_context(
     return (TilefinchRequestContext) {
         .target_url = url,
         .initiator_url = context == NULL ? NULL : context->document_url,
-        .top_level_url = context == NULL ? NULL : context->document_url,
+        .top_level_url = context == NULL ? NULL
+            : context->document_resources != NULL
+                && context->document_resources->top_level_url != NULL
+            ? context->document_resources->top_level_url
+            : context->document_url,
         .method = "GET",
         .mode = cors ? TILEFINCH_REQUEST_MODE_CORS
                      : TILEFINCH_REQUEST_MODE_NO_CORS,
@@ -3469,12 +3495,13 @@ static bool stylesheets_append_ordered_suffix_impl(
     stylesheet_collect_selector_tokens(
         selector_root, context.priority_token_bloom,
         STYLESHEET_PRIORITY_TOKEN_BLOOM_WORDS,
-        STYLESHEET_SELECTOR_PRIORITY_NODE_LIMIT, false);
+        STYLESHEET_SELECTOR_PRIORITY_NODE_LIMIT,
+        STYLESHEET_CENSUS_FIRST_ELEMENTS);
     context.selector_token_census_complete =
         stylesheet_collect_selector_tokens(
             selector_root, context.selector_token_bloom,
             STYLESHEET_SELECTOR_TOKEN_BLOOM_WORDS,
-            STYLESHEET_SELECTOR_TOKEN_NODE_LIMIT, true);
+            STYLESHEET_SELECTOR_TOKEN_NODE_LIMIT, STYLESHEET_CENSUS_DOCUMENT);
     context.deadline_ms = context.started_ms + (double) timeout_ms;
     stylesheet_restore_alternate_themes(&context);
     /* The full ordered loader suppresses URLs already encountered earlier
@@ -3656,13 +3683,14 @@ static bool stylesheets_load_external_impl(
     stylesheet_collect_selector_tokens(
         lxb_dom_interface_node(document->html), context.priority_token_bloom,
         STYLESHEET_PRIORITY_TOKEN_BLOOM_WORDS,
-        STYLESHEET_SELECTOR_PRIORITY_NODE_LIMIT, false);
+        STYLESHEET_SELECTOR_PRIORITY_NODE_LIMIT,
+        STYLESHEET_CENSUS_FIRST_ELEMENTS);
     context.selector_token_census_complete =
         stylesheet_collect_selector_tokens(
             lxb_dom_interface_node(document->html),
             context.selector_token_bloom,
             STYLESHEET_SELECTOR_TOKEN_BLOOM_WORDS,
-            STYLESHEET_SELECTOR_TOKEN_NODE_LIMIT, true);
+            STYLESHEET_SELECTOR_TOKEN_NODE_LIMIT, STYLESHEET_CENSUS_DOCUMENT);
     size_t parallel_working = maximum_single_bytes;
     if (parallel_working <= SIZE_MAX / STYLESHEET_FETCH_BATCH) {
         parallel_working *= STYLESHEET_FETCH_BATCH;
@@ -3893,7 +3921,8 @@ bool stylesheet_document_resources_note_dynamic_tokens(
         || resources->dynamic_selector_resamples >= 8u) return false;
     uint32_t tokens[STYLESHEET_SELECTOR_TOKEN_BLOOM_WORDS];
     bool complete = stylesheet_collect_selector_tokens(
-        root, tokens, STYLESHEET_SELECTOR_TOKEN_BLOOM_WORDS, 512u, false);
+        root, tokens, STYLESHEET_SELECTOR_TOKEN_BLOOM_WORDS,
+        STYLESHEET_SELECTOR_DYNAMIC_NODE_LIMIT, STYLESHEET_CENSUS_NODES);
     /* A bounded partial census is still useful: absence is never used here,
        only the positively observed tokens. */
     (void) complete;

@@ -14,7 +14,8 @@
 #     --scenario NAME   start-page or menu-tour (default start-page)
 #     --timeout N       seconds to wait for each run (default 300)
 #     --runs N          boot N times; runs 2+ prove determinism (default 2)
-#     --debug-log       add PPSSPP's -d syscall trace to the emulator log
+#     --debug-log       kept for compatibility: every run now records
+#                       PPSSPP's -d syscall trace (see below)
 #     --update-baseline rewrite the baseline from this run instead of checking
 #     --skip-when-missing  exit 77 (CTest's skip code) instead of 2 when
 #                       PPSSPP, python3, or the validation EBOOT is absent
@@ -29,7 +30,12 @@
 #
 # Both scenarios are hermetic on purpose: an empty `url=` follows the ordinary
 # native-HOME boot, so nothing is fetched and no wall-clock-dependent network
-# work enters the counters.
+# work enters the counters. The boot also sets `validation_preconnect=0`:
+# PPSSPP hands the PSP's sockets and name lookups to the host's real network,
+# and once the emulated Wi-Fi is up the HOME tile's speculative preconnect
+# would reach the provider. Each run records PPSSPP's -d syscall log and
+# fails on any connect or name lookup past loopback
+# (tools/check_ppsspp_network.py).
 #
 #   start-page  `exit_after_report=1` takes the normal report and cleanup
 #               paths without any controller injection: the floor cost of
@@ -63,7 +69,6 @@ build_dir="$root/build-preset-psp-validation"
 scenario=start-page
 timeout_seconds=300
 runs=2
-debug_log=0
 update_baseline=0
 skip_when_missing=0
 
@@ -88,10 +93,10 @@ while [ "$#" -gt 0 ]; do
         --timeout=*) timeout_seconds=${1#--timeout=}; shift ;;
         --runs) runs=$2; shift 2 ;;
         --runs=*) runs=${1#--runs=}; shift ;;
-        --debug-log) debug_log=1; shift ;;
+        --debug-log) shift ;;
         --update-baseline) update_baseline=1; shift ;;
         --skip-when-missing) skip_when_missing=1; missing_exit=77; shift ;;
-        -h|--help) sed -n '2,62p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,64p' "$0"; exit 0 ;;
         *) printf 'unknown option: %s\n' "$1" >&2; exit 2 ;;
     esac
 done
@@ -322,7 +327,8 @@ run_once() {
             "validation_preview_scroll=0" \
             "validation_media_play=0" \
             "validation_media_stability_auto=0" \
-            "validation_power_test_auto=0"
+            "validation_power_test_auto=0" \
+            "validation_preconnect=0"
     } >"$app_dir/boot.cfg"
 
     {
@@ -343,8 +349,8 @@ run_once() {
     cp "$run_dir/cost.ini" \
         "$home_dir/.config/ppsspp/PSP/SYSTEM/ppsspp.ini"
 
-    debug_flag=
-    [ "$debug_log" -eq 1 ] && debug_flag=-d
+    # The network check below reads the -d syscall log.
+    debug_flag=-d
 
     printf 'PPSSPP device cost: %s run %s/%s\n' "$scenario" "$run_index" "$runs"
     if [ "$is_darwin" -eq 1 ]; then
@@ -402,6 +408,14 @@ run_once() {
              "$emulator_stderr" "$validation_log"; do
         [ -f "$f" ] && cp "$f" "$run_result/" 2>/dev/null || true
     done
+    "$python3" "$root/tools/check_ppsspp_network.py" \
+        "$run_result/ppsspp.log" >"$run_result/network-check.txt" 2>&1 || {
+        cat "$run_result/network-check.txt" >&2
+        printf 'FAIL: run %s reached past loopback (or left no -d log).\n' \
+            "$run_index" >&2
+        return 1
+    }
+    cat "$run_result/network-check.txt"
     [ "$saw_outcome" -eq 1 ] || {
         printf 'FAIL: run %s never reached a clean exit.\n' "$run_index" >&2
         return 1

@@ -40,7 +40,8 @@ bool js_rt_bridge_flush_synchronous_layout(DomBridge *bridge,
 {
     if (bridge == NULL || bridge->synchronous_layout == NULL) return false;
     js_rt_bridge_settle_pending_sheets(bridge);
-    if (bridge->synchronous_layout_images_only) {
+    if (bridge->synchronous_layout_images_only
+        && !bridge->synchronous_layout_loading) {
         size_t length = 0;
         const char *name = document_element_name(node, &length);
         if (name == NULL || length != 3 || memcmp(name, "img", 3) != 0)

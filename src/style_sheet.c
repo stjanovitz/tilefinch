@@ -418,6 +418,7 @@ void stylesheet_drop_rule_index(Stylesheet *sheet)
     sheet->rule_index_slots = NULL;
     sheet->rule_index_payload_count = 0;
     sheet->rule_index_payload_capacity = 0;
+    sheet->rule_index_key_limit = 0;
     sheet->rule_index_entries = NULL;
     sheet->rule_filters = NULL;
     sheet->rule_relational_tokens = NULL;
@@ -845,7 +846,10 @@ static bool selector_text_has_ci(const char *text, size_t length,
     return false;
 }
 
-static bool attribute_selector_targets_identity(const char *text,
+/* '.' for a [class] test, '#' for an [id] test, '\\' for an escaped name
+   (the matcher may decode it to either: callers treat it as reading every
+   identity), otherwise 0. */
+static char attribute_selector_targets_identity(const char *text,
                                                 size_t length)
 {
     size_t at = 0;
@@ -853,9 +857,12 @@ static bool attribute_selector_targets_identity(const char *text,
     size_t begin = at;
     while (at < length && (isalnum((unsigned char) text[at])
                            || text[at] == '-' || text[at] == '_')) at++;
+    if (at < length && text[at] == '\\') return '\\';
     size_t name_length = at - begin;
-    return (name_length == 5 && strncasecmp(text + begin, "class", 5) == 0)
-           || (name_length == 2 && strncasecmp(text + begin, "id", 2) == 0);
+    if (name_length == 5 && strncasecmp(text + begin, "class", 5) == 0)
+        return '.';
+    return name_length == 2 && strncasecmp(text + begin, "id", 2) == 0
+           ? '#' : 0;
 }
 
 uint32_t stylesheet_identity_token_hash(bool id, const char *text,
@@ -1027,16 +1034,376 @@ uint32_t stylesheet_identity_attribute_hash(const char *name, size_t length)
                        name, length, true);
 }
 
+/* Whether the compound holding `at` (a token, or a pseudo-class's '(') is
+   the last of its complex selector: no combinator follows before the item
+   ends (a ',' or the enclosing ')' at this level, or the text's end). */
+static bool identity_compound_is_last(const char *text, size_t length,
+                                      size_t at)
+{
+    unsigned nested = 0;
+    char quote = 0;
+    for (; at < length; at++) {
+        char value = text[at];
+        if (quote != 0) {
+            if (value == '\\' && at + 1 < length) at++;
+            else if (value == quote) quote = 0;
+            continue;
+        }
+        if (value == '"' || value == '\'') {
+            quote = value;
+        } else if (value == '\\') {
+            at++;
+        } else if (value == '(' || value == '[') {
+            nested++;
+        } else if (value == ')' || value == ']') {
+            if (nested == 0) return true;
+            nested--;
+        } else if (nested != 0) {
+            continue;
+        } else if (value == ',') {
+            return true;
+        } else if (value == '>' || value == '+' || value == '~') {
+            return false;
+        } else if (isspace((unsigned char) value)) {
+            while (at < length && isspace((unsigned char) text[at])) at++;
+            return at >= length || text[at] == ',' || text[at] == ')';
+        }
+    }
+    return true;
+}
+
+/* Whether the '(' at `paren` opens :is(), :where(), :not() or an older
+   spelling of :is(): an argument matched against the element itself. */
+static bool identity_logical_pseudo_at(const char *text, size_t paren)
+{
+    size_t begin = paren;
+    while (begin > 0 && (isalnum((unsigned char) text[begin - 1])
+                         || text[begin - 1] == '-')) begin--;
+    if (begin == 0 || text[begin - 1] != ':'
+        || (begin >= 2 && text[begin - 2] == ':')) return false;
+    static const char *const names[] = {
+        "is", "where", "not", "matches", "any", "-webkit-any", "-moz-any"
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        size_t n = strlen(names[i]);
+        if (paren - begin == n && strncasecmp(text + begin, names[i], n) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* For `[class~=name]` or `[id=name]` (no flag, no escape), given the text
+   after its '[', the one token it tests, as `.name` or `#name` would: true
+   and *hash set. Other [class]/[id] tests read every token of their kind. */
+static bool identity_attribute_exact_token(const char *text, size_t length,
+                                           char kind, uint32_t *hash)
+{
+    size_t at = 0;
+    while (at < length && isspace((unsigned char) text[at])) at++;
+    at += kind == '#' ? 2u : 5u;
+    while (at < length && isspace((unsigned char) text[at])) at++;
+    if (kind == '.') {
+        if (at + 1 >= length || text[at] != '~' || text[at + 1] != '=')
+            return false;
+        at += 2;
+    } else {
+        if (at >= length || text[at] != '=') return false;
+        at++;
+    }
+    while (at < length && isspace((unsigned char) text[at])) at++;
+    char quote = at < length && (text[at] == '"' || text[at] == '\'')
+        ? text[at] : 0;
+    if (quote != 0) at++;
+    size_t begin = at;
+    while (at < length && text[at] != quote && text[at] != ']'
+           && !isspace((unsigned char) text[at])) {
+        if (text[at] == '\\' || text[at] == '"' || text[at] == '\''
+            || text[at] == '[') return false;
+        at++;
+    }
+    size_t end = at;
+    if (quote != 0) {
+        if (at >= length || text[at] != quote) return false;
+        at++;
+    }
+    while (at < length && isspace((unsigned char) text[at])) at++;
+    if (end == begin || at >= length || text[at] != ']') return false;
+    *hash = stylesheet_identity_token_hash(kind == '#', text + begin,
+                                           end - begin);
+    return true;
+}
+
+/* ---- Partial [class]/[id] tests ------------------------------------
+
+   A [class*=x] or [id^=x] test off a rule's subject used to read every
+   identity of its kind (the empty-name token every change carries). Each
+   such test now has a token of its own, hashed from its form and value; a
+   change carries it only when the test's answer differs between the old
+   and the new value (stylesheet_attribute_change_tokens). Past the row or
+   value bounds the sheet keeps the empty-name token for all of them, and
+   stays that way for its lifetime: a change journaled then carries only
+   that token, and a later generation with fewer rules (a removed adopted
+   sheet) must not register a test under a token the change never carried.
+   A change and the identity tables so never disagree about which token
+   names a test. */
+#define STYLE_IDENTITY_TEST_ROW_LIMIT 256u
+#define STYLE_IDENTITY_TEST_POOL_LIMIT 8192u
+#define STYLE_IDENTITY_TEST_ID 0x80u
+
+typedef struct {
+    uint32_t token;
+    uint16_t offset;
+    uint8_t length;
+    uint8_t form;  /* STYLE_ATTRIBUTE_TEST_*, | STYLE_IDENTITY_TEST_ID */
+} StyleIdentityTestRow;
+
+struct StyleIdentityTests {
+    uint64_t generation;
+    size_t rules, custom_rules;
+    bool complete;
+    uint16_t count, capacity, pool_used, pool_capacity;
+    StyleIdentityTestRow *rows;
+    char *pool;
+};
+
+static uint32_t identity_test_hash(unsigned form, const char *value,
+                                   size_t length)
+{
+    unsigned char key = (unsigned char) form;
+    return style_fnv1a(style_fnv1a(STYLE_FNV1A_SEED ^ UINT32_C(0x5bd1e995),
+                                   &key, 1, false), value, length, false);
+}
+
+/* The closing bracket of the test opening at text[at], as the matcher
+   finds it; `length` when there is none. */
+static size_t identity_test_close(const char *text, size_t length, size_t at)
+{
+    char quote = 0;
+    for (size_t end = at + 1u; end < length; end++) {
+        if (quote != 0) { if (text[end] == quote) quote = 0; }
+        else if (text[end] == '\'' || text[end] == '"') quote = text[end];
+        else if (text[end] == ']') return end;
+    }
+    return length;
+}
+
+/* The token of the identity test opening at text[at] (kind '.' or '#'),
+   false when the matcher rejects it. */
+static bool identity_test_token(const char *text, size_t length, size_t at,
+                                char kind, unsigned *form, char *value,
+                                size_t *value_length, uint32_t *token)
+{
+    size_t close = identity_test_close(text, length, at);
+    if (close == length
+        || !style_attribute_identity_test_parse(
+               text + at + 1u, close - at - 1u, form, value, value_length))
+        return false;
+    if (kind == '#') *form |= STYLE_IDENTITY_TEST_ID;
+    *token = identity_test_hash(*form, value, *value_length);
+    return true;
+}
+
+/* Whether the table lists the test (form, value): a test the table missed
+   keeps the empty-name token, so a token no change carries is never
+   registered. */
+static bool identity_tests_hold(const StyleIdentityTests *tests,
+                                unsigned form, const char *value,
+                                size_t length)
+{
+    for (size_t i = 0; i < tests->count; i++) {
+        const StyleIdentityTestRow *row = &tests->rows[i];
+        if (row->form == form && row->length == length
+            && (length == 0
+                || memcmp(tests->pool + row->offset, value, length) == 0))
+            return true;
+    }
+    return false;
+}
+
+static void stylesheet_identity_tests_free(Stylesheet *sheet)
+{
+    StyleIdentityTests *tests = sheet->identity_tests;
+    if (tests == NULL) return;
+    budget_free(sheet->budget, tests->rows);
+    budget_free(sheet->budget, tests->pool);
+    budget_free(sheet->budget, tests);
+    sheet->identity_tests = NULL;
+}
+
+/* Adds every identity test of one selector; false when an allocation was
+   refused. Past the bounds the table is marked incomplete. */
+static bool identity_tests_add_selector(Stylesheet *sheet,
+                                        StyleIdentityTests *tests,
+                                        const char *text, size_t length)
+{
+    char quote = 0;
+    for (size_t at = 0; tests->complete && text != NULL && at < length;
+         at++) {
+        char c = text[at];
+        if (quote != 0) {
+            if (c == '\\' && at + 1 < length) at++;
+            else if (c == quote) quote = 0;
+            continue;
+        }
+        if (c == '"' || c == '\'') { quote = c; continue; }
+        if (c == '\\') { at++; continue; }
+        if (c != '[') continue;
+        char kind = attribute_selector_targets_identity(text + at + 1u,
+                                                        length - at - 1u);
+        unsigned form = 0;
+        char value[STYLE_SELECTOR_IDENTIFIER_CAPACITY];
+        size_t value_length = 0;
+        uint32_t token = 0;
+        if (kind == 0 || kind == '\\'
+            || !identity_test_token(text, length, at, kind, &form, value,
+                                    &value_length, &token))
+            continue;
+        if (identity_tests_hold(tests, form, value, value_length)) continue;
+        if (tests->count == STYLE_IDENTITY_TEST_ROW_LIMIT
+            || value_length > UINT8_MAX
+            || value_length > STYLE_IDENTITY_TEST_POOL_LIMIT
+                              - tests->pool_used) {
+            tests->complete = false;
+            return true;
+        }
+        if (tests->count == tests->capacity) {
+            uint16_t grown = tests->capacity == 0 ? 16u
+                : (uint16_t) (tests->capacity * 2u);
+            StyleIdentityTestRow *rows = budget_realloc(
+                sheet->budget, tests->rows, grown * sizeof(*rows));
+            if (rows == NULL) return false;
+            tests->rows = rows;
+            tests->capacity = grown;
+        }
+        if (value_length > (size_t) (tests->pool_capacity
+                                     - tests->pool_used)) {
+            size_t grown = tests->pool_capacity == 0 ? 256u
+                : tests->pool_capacity * 2u;
+            while (grown - tests->pool_used < value_length) grown *= 2u;
+            if (grown > STYLE_IDENTITY_TEST_POOL_LIMIT)
+                grown = STYLE_IDENTITY_TEST_POOL_LIMIT;
+            char *pool = budget_realloc(sheet->budget, tests->pool, grown);
+            if (pool == NULL) return false;
+            tests->pool = pool;
+            tests->pool_capacity = (uint16_t) grown;
+        }
+        /* The pool stays unallocated while every value is empty. */
+        if (value_length != 0)
+            memcpy(tests->pool + tests->pool_used, value, value_length);
+        tests->rows[tests->count++] = (StyleIdentityTestRow) {
+            token, tests->pool_used, (uint8_t) value_length, (uint8_t) form};
+        tests->pool_used = (uint16_t) (tests->pool_used + value_length);
+    }
+    return true;
+}
+
+/* The sheet's tests for its current generation and rule counts; NULL when
+   past the bounds (the empty-name token stands for every test), and
+   *refused when the table could not be allocated (callers stay
+   conservative). */
+static const StyleIdentityTests *stylesheet_identity_tests(
+    const Stylesheet *const_sheet, bool *refused)
+{
+    Stylesheet *sheet = (Stylesheet *) const_sheet;
+    *refused = false;
+#ifndef TILEFINCH_NO_TRACE
+    static int disabled = -1;
+    if (disabled < 0)
+        disabled = getenv("TILEFINCH_DISABLE_PARTIAL_IDENTITY_TOKENS") != NULL;
+    if (disabled) return NULL;
+#endif
+    if (sheet == NULL || sheet->budget == NULL) return NULL;
+    StyleIdentityTests *tests = sheet->identity_tests;
+    /* Incomplete stays incomplete for the sheet's lifetime. */
+    if (tests != NULL && !tests->complete) return NULL;
+    if (tests != NULL && tests->generation == sheet->build_generation
+        && tests->rules == sheet->count
+        && tests->custom_rules == sheet->custom_rule_count)
+        return tests;
+    if (tests == NULL) {
+        tests = budget_calloc(sheet->budget, 1, sizeof(*tests));
+        if (tests == NULL) {
+            *refused = true;
+            return NULL;
+        }
+        sheet->identity_tests = tests;
+    }
+    tests->generation = sheet->build_generation;
+    tests->rules = sheet->count;
+    tests->custom_rules = sheet->custom_rule_count;
+    tests->count = tests->pool_used = 0;
+    tests->complete = true;
+    bool ok = true;
+    for (size_t i = 0; ok && tests->complete && i < sheet->count; i++) {
+        const StyleRule *rule = &sheet->rules[i];
+        if (rule->selector != NULL
+            && memchr(rule->selector, '[', rule->selector_length) != NULL)
+            ok = identity_tests_add_selector(sheet, tests, rule->selector,
+                                             rule->selector_length);
+    }
+    for (size_t i = 0;
+         ok && tests->complete && i < sheet->custom_rule_count; i++) {
+        const char *selector = sheet->custom_rules[i].selector;
+        if (selector != NULL && strchr(selector, '[') != NULL)
+            ok = identity_tests_add_selector(sheet, tests, selector,
+                                             strlen(selector));
+    }
+    if (!ok) {
+        /* Built again on the next query. */
+        stylesheet_identity_tests_free(sheet);
+        *refused = true;
+        return NULL;
+    }
+    return tests->complete ? tests : NULL;
+}
+
+static bool change_tokens_add(uint32_t *hashes, size_t capacity,
+                              size_t *count, uint32_t hash);
+
+/* Appends the tokens of `kind`'s tests whose answer differs between the
+   old and the new value (NULL: absent). False when they do not fit. */
+static bool identity_tests_flips(const StyleIdentityTests *tests, bool id,
+                                 const char *old_value, size_t old_length,
+                                 const char *new_value, size_t new_length,
+                                 uint32_t *hashes, size_t capacity,
+                                 size_t *count)
+{
+    for (size_t i = 0; i < tests->count; i++) {
+        const StyleIdentityTestRow *row = &tests->rows[i];
+        if (((row->form & STYLE_IDENTITY_TEST_ID) != 0) != id) continue;
+        unsigned form = row->form & ~STYLE_IDENTITY_TEST_ID;
+        /* Not NULL for an empty value: the matcher reads NULL as none. */
+        const char *value = row->length == 0 ? ""
+            : tests->pool + row->offset;
+        if (style_attribute_identity_test_matches(
+                form, value, row->length, old_value, old_length)
+            != style_attribute_identity_test_matches(
+                form, value, row->length, new_value, new_length)
+            && !change_tokens_add(hashes, capacity, count, row->token))
+            return false;
+    }
+    return true;
+}
+
 bool style_selector_identity_tokens(const char *text, size_t length,
                                     size_t split, bool every_position,
                                     StyleIdentityTokenVisit visit,
-                                    void *context, bool *attributes_opaque)
+                                    void *context, bool *attributes_opaque,
+                                    const StyleIdentityTests *tests)
 {
     if (text == NULL) return true;
     if (split > length) split = 0;
     enum { NESTING = 32 };
     bool has_argument[NESTING] = {false};
+    /* An :is()/:where()/:not() argument in the subject compound (or in
+       such an argument's own last compound): its last compound tests the
+       subject itself, like the subject compound does. */
+    bool subject_argument[NESTING] = {false};
     unsigned depth = 0, has_depth = 0;
+#define IDENTITY_LOCAL(position) \
+    (depth == 0 ? (position) > split \
+     : depth <= NESTING && subject_argument[depth - 1u] \
+       && identity_compound_is_last(text, length, (position)))
     char quote = 0;
     unsigned square = 0;
     bool ok = true;
@@ -1054,10 +1421,34 @@ bool style_selector_identity_tokens(const char *text, size_t length,
         }
         if (value == '[') {
             square++;
-            /* A [class]/[id] test reads identities no token names. */
-            if ((every_position || at < split || depth != 0)
-                && attribute_selector_targets_identity(
-                       text + at + 1u, length - at - 1u)) ok = false;
+            /* A [class~=x]/[id=x] test reads that token; another
+               [class]/[id] test its own token when the sheet's table
+               lists it (carried only by a change that flips its answer),
+               else the kind's empty-name token, which every change of the
+               kind carries (stylesheet_attribute_change_tokens). */
+            char kind = attribute_selector_targets_identity(
+                text + at + 1u, length - at - 1u);
+            if (kind == '\\' && (every_position || !IDENTITY_LOCAL(at))) {
+                ok = false;
+            } else if (kind != 0 && (every_position || !IDENTITY_LOCAL(at))) {
+                uint32_t exact = 0;
+                unsigned form = 0;
+                char value[STYLE_SELECTOR_IDENTIFIER_CAPACITY];
+                size_t value_length = 0;
+                if (has_depth != 0 && !every_position) ok = false;
+                else if (identity_attribute_exact_token(
+                             text + at + 1u, length - at - 1u, kind, &exact))
+                    visit(context, exact);
+                else if (tests != NULL
+                         && identity_test_token(text, length, at, kind,
+                                                &form, value, &value_length,
+                                                &exact)
+                         && identity_tests_hold(tests, form, value,
+                                                value_length))
+                    visit(context, exact);
+                else visit(context, stylesheet_identity_token_hash(
+                    kind == '#', "", 0));
+            }
             if (attributes_opaque != NULL && has_depth == 0
                 && (every_position || !(at > split && depth == 0))) {
                 size_t begin = at + 1u;
@@ -1087,7 +1478,12 @@ bool style_selector_identity_tokens(const char *text, size_t length,
         }
         if (value == '(') {
             bool has = at >= 4 && strncasecmp(text + at - 4, ":has", 4) == 0;
-            if (depth < NESTING) has_argument[depth] = has;
+            if (depth < NESTING) {
+                has_argument[depth] = has;
+                subject_argument[depth] = !has && has_depth == 0
+                    && identity_logical_pseudo_at(text, at)
+                    && IDENTITY_LOCAL(at);
+            }
             if (has) has_depth++;
             depth++;
             continue;
@@ -1108,7 +1504,7 @@ bool style_selector_identity_tokens(const char *text, size_t length,
         size_t end = skip_selector_identifier(text, length, begin);
         if (end == begin) continue;
         at = end - 1u;
-        bool local = begin > split && depth == 0;
+        bool local = IDENTITY_LOCAL(begin);
         if (!every_position && (local || has_depth != 0)) continue;
         char decoded[256];
         size_t decoded_length = 0;
@@ -1128,6 +1524,7 @@ bool style_selector_identity_tokens(const char *text, size_t length,
             value == '#', name, name_length));
     }
     return ok;
+#undef IDENTITY_LOCAL
 }
 
 /* Whether a selector can match its subject by way of a sibling: a sibling
@@ -1158,6 +1555,7 @@ typedef struct {
     const char *text;
     size_t length, split;
     bool ready;
+    const StyleIdentityTests *tests;
 } IdentityScanSelector;
 
 /* The subject key and sibling reach are worked out for the few selectors
@@ -1177,18 +1575,62 @@ static void identity_scan_visit(void *context, uint32_t hash)
 }
 
 static bool identity_scan_selector(const char *text, size_t length,
-                                   size_t split, StyleIdentityScan *scan)
+                                   size_t split, StyleIdentityScan *scan,
+                                   const StyleIdentityTests *tests)
 {
     /* Most selectors are one compound with no functional argument or
        attribute test (atomic CSS): nothing in them is off the subject. */
     if (split == 0 && memchr(text, '(', length) == NULL
         && memchr(text, '[', length) == NULL) return true;
     IdentityScanSelector selector = {
-        .scan = scan, .text = text, .length = length, .split = split
+        .scan = scan, .text = text, .length = length, .split = split,
+        .tests = tests
     };
     return style_selector_identity_tokens(text, length, split, false,
                                           identity_scan_visit, &selector,
-                                          &scan->attributes_opaque);
+                                          &scan->attributes_opaque, tests);
+}
+
+static bool structural_name_after_colon(const char *at)
+{
+    return at[0] == ':'
+        && (strncmp(at + 1, "first-", 6) == 0
+            || strncmp(at + 1, "last-", 5) == 0
+            || strncmp(at + 1, "only-", 5) == 0
+            || strncmp(at + 1, "empty", 5) == 0);
+}
+
+/* One pass: identity_selector_reaches_siblings's walk, with the positional
+   names matched as written wherever they sit (inside strings and after an
+   escape too, as a plain substring search finds them). */
+bool style_selector_structural_text(const char *selector)
+{
+    char quote = 0;
+    for (const char *at = selector; *at != '\0'; at++) {
+        if (structural_name_after_colon(at)) return true;
+        char value = *at;
+        if (quote != 0) {
+            if (value == '\\' && at[1] != '\0') {
+                at++;
+                if (structural_name_after_colon(at)) return true;
+            } else if (value == quote) {
+                quote = 0;
+            }
+            continue;
+        }
+        if (value == '"' || value == '\'') {
+            quote = value;
+        } else if (value == '\\') {
+            if (at[1] == '\0') break;
+            at++;
+            if (structural_name_after_colon(at)) return true;
+        } else if (value == '+' || value == '~') {
+            return true;
+        } else if (value == ':' && strncasecmp(at + 1, "nth-", 4) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool stylesheet_structural_custom_rules(const Stylesheet *sheet,
@@ -1196,14 +1638,13 @@ bool stylesheet_structural_custom_rules(const Stylesheet *sheet,
                                         void *context)
 {
     for (size_t i = 0; sheet != NULL && i < sheet->custom_rule_count; i++) {
-        const StyleCustomRule *rule = &sheet->custom_rules[i];
-        if (rule->selector == NULL) continue;
+        /* The fact the rule keeps (style_selector_structural_text). */
+        StyleCustomRule *rule = &((Stylesheet *) sheet)->custom_rules[i];
+        if (i != 0)
+            style_custom_rule_facts_from(rule, &sheet->custom_rules[i - 1]);
+        if (rule->selector == NULL || !style_custom_rule_structural(rule))
+            continue;
         size_t length = strlen(rule->selector);
-        if (!identity_selector_reaches_siblings(rule->selector, length)
-            && strstr(rule->selector, ":first-") == NULL
-            && strstr(rule->selector, ":last-") == NULL
-            && strstr(rule->selector, ":only-") == NULL
-            && strstr(rule->selector, ":empty") == NULL) continue;
         StyleKeyNames entry = {
             style_selector_compound_key_at(
                 rule->selector, length,
@@ -1221,11 +1662,15 @@ bool stylesheet_identity_scan(const Stylesheet *sheet,
                               StyleIdentityScan *scan)
 {
     if (sheet == NULL || scan == NULL) return false;
+    bool refused = false;
+    const StyleIdentityTests *tests = stylesheet_identity_tests(sheet,
+                                                                &refused);
+    if (refused) return false;
     for (size_t i = 0; i < sheet->count; i++) {
         const StyleRule *rule = &sheet->rules[i];
         if (!identity_scan_selector(rule->selector, rule->selector_length,
                                     style_rule_rightmost_compound(rule),
-                                    scan)) return false;
+                                    scan, tests)) return false;
     }
     for (size_t i = 0; i < sheet->custom_rule_count; i++) {
         const StyleCustomRule *rule = &sheet->custom_rules[i];
@@ -1234,12 +1679,12 @@ bool stylesheet_identity_scan(const Stylesheet *sheet,
                 rule->selector, length,
                 style_selector_rightmost_compound_start(rule->selector,
                                                         length),
-                scan)) return false;
+                scan, tests)) return false;
         scan->names = stylesheet_custom_property_name_bits(
             rule->name, rule->name_length);
         if (!style_selector_identity_tokens(rule->selector, length, 0, true,
                                             scan->declares, scan->context,
-                                            &scan->attributes_opaque))
+                                            &scan->attributes_opaque, tests))
             return false;
     }
     return true;
@@ -1294,25 +1739,33 @@ static bool class_list_difference_tokens(const char *from, size_t from_length,
 }
 
 bool stylesheet_attribute_change_tokens(
-    const char *name, size_t name_length,
+    const Stylesheet *sheet, const char *name, size_t name_length,
     const char *old_value, size_t old_length,
     const char *new_value, size_t new_length, uint32_t *hashes,
     size_t capacity, size_t *count)
 {
     if (name == NULL || hashes == NULL || count == NULL) return false;
     *count = 0;
+    bool id = name_length == 2 && strncasecmp(name, "id", 2) == 0;
+    if (!id && !(name_length == 5 && strncasecmp(name, "class", 5) == 0))
+        return false;
+    /* Presence alone moves a [class]/[id] test: an empty value is not an
+       absent one there, although it carries no token. */
+    bool presence = (old_value == NULL) != (new_value == NULL);
     if (old_value == NULL) old_length = 0;
     if (new_value == NULL) new_length = 0;
     if (old_length > 4096u || new_length > 4096u) return false;
-    if (name_length == 5 && strncasecmp(name, "class", 5) == 0) {
-        return class_list_difference_tokens(
-                   old_value, old_length, new_value, new_length,
-                   hashes, capacity, count)
-               && class_list_difference_tokens(
-                   new_value, new_length, old_value, old_length,
-                   hashes, capacity, count);
-    }
-    if (name_length == 2 && strncasecmp(name, "id", 2) == 0) {
+    bool same = !presence && old_length == new_length
+        && (old_length == 0
+            || memcmp(old_value, new_value, old_length) == 0);
+    if (!id) {
+        if (!class_list_difference_tokens(
+                old_value, old_length, new_value, new_length,
+                hashes, capacity, count)
+            || !class_list_difference_tokens(
+                new_value, new_length, old_value, old_length,
+                hashes, capacity, count)) return false;
+    } else {
         if (old_length != 0
             && !change_tokens_add(hashes, capacity, count,
                                   stylesheet_identity_token_hash(
@@ -1325,9 +1778,22 @@ bool stylesheet_attribute_change_tokens(
                                       true, new_value, new_length))) {
             return false;
         }
-        return true;
+        same = *count == 0 && !presence;
     }
-    return false;
+    if (same) return true;
+    /* Without the sheet its tests' tokens cannot be named. */
+    if (sheet == NULL
+        || !change_tokens_add(hashes, capacity, count,
+                              stylesheet_identity_token_hash(id, "", 0)))
+        return false;
+    bool refused = false;
+    const StyleIdentityTests *tests = stylesheet_identity_tests(sheet,
+                                                                &refused);
+    if (refused) return false;
+    return tests == NULL
+        || identity_tests_flips(tests, id, old_value, old_length,
+                                new_value, new_length, hashes, capacity,
+                                count);
 }
 
 /* Whether rule `index` can hide or reveal an element or give it an image:
@@ -1373,6 +1839,61 @@ bool stylesheet_rules_affect_discovery(const Stylesheet *sheet,
     return false;
 }
 
+bool stylesheet_rules_subject_keys(const Stylesheet *sheet,
+                                   const uint32_t *indices, size_t count,
+                                   uint32_t *keys, size_t capacity,
+                                   size_t *key_count)
+{
+    if (sheet == NULL || key_count == NULL
+        || (indices == NULL && count != 0)) return false;
+    for (size_t i = 0; i < count; i++) {
+        if (indices[i] >= sheet->count) return false;
+        const StyleRule *rule = &sheet->rules[indices[i]];
+        uint32_t key = style_selector_compound_key_at(
+            rule->selector, rule->selector_length,
+            style_rule_rightmost_compound(rule));
+        if (key == 0) return false;
+        bool known = false;
+        for (size_t k = 0; !known && k < *key_count; k++)
+            known = keys[k] == key;
+        if (known) continue;
+        if (*key_count == capacity) return false;
+        keys[(*key_count)++] = key;
+    }
+    return true;
+}
+
+static size_t style_index_skip_block(const char *, size_t, size_t);
+
+/* Only recognize a whole attribute predicate, or a flat list of such
+   alternatives. Never infer subject requirements from a negation, a
+   relative selector, or the ancestor of the rightmost compound. */
+static uint8_t style_attribute_alternatives(const StyleRule *rule)
+{
+    const char *s = rule->selector;
+    size_t n = rule->selector_length;
+    if (rule->has_fast_key || s == NULL || n == 0
+        || (s[0] != '[' && s[0] != ':')) return 0;
+    size_t p = 0;
+    bool list = n > 5 && !memcmp(s, ":is(", 4) && s[n - 1] == ')';
+    if (list) { p = 4; n--; }
+    uint8_t bits = 0;
+    for (unsigned i = 0; i < 16; i++) {
+        while (p < n && isspace((unsigned char) s[p])) p++;
+        if (n - p < 4 || s[p] != '[') return 0;
+        const unsigned char *name = (const unsigned char *) s + p + 1;
+        if ((unsigned) ((name[0] | 32) - 'a') >= 26u
+            || (unsigned) ((name[1] | 32) - 'a') >= 26u) return 0;
+        bits |= style_attribute_bit(name);
+        p = style_index_skip_block(s, n, p);
+        if (s[p - 1] != ']') return 0;
+        while (p < n && isspace((unsigned char) s[p])) p++;
+        if (p == n) return bits;
+        if (!list || s[p++] != ',') return 0;
+    }
+    return 0;
+}
+
 static void stylesheet_prepare_rule_filters(Stylesheet *sheet)
 {
     if (sheet == NULL || sheet->budget == NULL || sheet->count == 0
@@ -1390,6 +1911,7 @@ static void stylesheet_prepare_rule_filters(Stylesheet *sheet)
     bool ancestors_useful = false;
     for (size_t i = 0; i < sheet->count; i++) {
         filters[i] = (StyleRuleFilter) {
+            .attribute_alternatives = style_attribute_alternatives(&sheet->rules[i]),
             .compound = style_rule_compound_bloom(sheet, i),
             .ancestors = style_rule_ancestor_bloom(sheet, i)
         };
@@ -1463,7 +1985,8 @@ static void stylesheet_prepare_rule_filters(Stylesheet *sheet)
                  ? STYLE_RULE_SVG_RASTER_SIZE : 0));
         useful = useful || !style_token_bloom_empty_value(filters[i].compound)
             || !style_token_bloom_empty_value(filters[i].ancestors)
-            || filters[i].ancestor_token != 0;
+            || filters[i].ancestor_token != 0
+            || filters[i].attribute_alternatives != 0;
         ancestors_useful = ancestors_useful
             || !style_token_bloom_empty_value(filters[i].ancestors);
     }
@@ -1491,6 +2014,9 @@ void stylesheet_drop_custom_rule_index(Stylesheet *sheet)
     sheet->custom_rule_index = NULL;
     sheet->custom_rule_index_count = 0;
     sheet->custom_rule_index_bytes = 0;
+    budget_free(sheet->budget, (void *) sheet->custom_rule_index_carriers);
+    sheet->custom_rule_index_carriers = NULL;
+    sheet->custom_rule_index_carrier_count = 0;
     budget_free(sheet->budget, sheet->retained_gate);
     sheet->retained_gate = NULL;
     sheet->retained_gate_keyless = 0;
@@ -1739,6 +2265,36 @@ void style_retained_gate_end(const Stylesheet *sheet,
         sheet->resolve_scratch->retained_gate = previous;
 }
 
+static int compare_custom_rule_carriers(const void *left, const void *right)
+{
+    uintptr_t a = (uintptr_t) *(const lxb_dom_node_t *const *) left;
+    uintptr_t b = (uintptr_t) *(const lxb_dom_node_t *const *) right;
+    return a == b ? 0 : a < b ? -1 : 1;
+}
+
+/* Builds Stylesheet.custom_rule_index_carriers from the shadow-tree
+   <style> scopes. Without it (no scope, or a refused allocation) every
+   rule keeps group 0 and lookups scan them all, as before the groups. */
+static void stylesheet_prepare_custom_rule_carriers(Stylesheet *sheet)
+{
+    size_t scopes = sheet->scopes.shadow_scope_count;
+    if (scopes == 0) return;
+    const lxb_dom_node_t **carriers = budget_malloc(
+        sheet->budget, scopes * sizeof(*carriers));
+    if (carriers == NULL) return;
+    for (size_t i = 0; i < scopes; i++)
+        carriers[i] = sheet->scopes.shadow_scopes[i].carrier;
+    qsort(carriers, scopes, sizeof(*carriers), compare_custom_rule_carriers);
+    size_t distinct = 0;
+    for (size_t i = 0; i < scopes; i++) {
+        if (distinct == 0 || carriers[distinct - 1u] != carriers[i])
+            carriers[distinct++] = carriers[i];
+    }
+    sheet->custom_rule_index_carriers = carriers;
+    sheet->custom_rule_index_carrier_count = distinct;
+    sheet->custom_rule_index_bytes += scopes * sizeof(*carriers);
+}
+
 static void stylesheet_prepare_custom_rule_index(Stylesheet *sheet)
 {
     if (sheet == NULL || sheet->budget == NULL
@@ -1759,6 +2315,8 @@ static void stylesheet_prepare_custom_rule_index(Stylesheet *sheet)
     uint64_t keyless = 0;
     uint64_t shadow_only = sheet->scopes.adopted_scopes_failed
         ? 0 : sheet->scopes.adopted_shadow_only_mask;
+    sheet->custom_rule_index_bytes = 0;
+    stylesheet_prepare_custom_rule_carriers(sheet);
     for (size_t i = 0; i < sheet->custom_rule_count; i++) {
         const StyleCustomRule *rule = &sheet->custom_rules[i];
         /* Retained rules pack declaration order in the low eight bits. */
@@ -1778,8 +2336,12 @@ static void stylesheet_prepare_custom_rule_index(Stylesheet *sheet)
             else
                 keyless |= bit;
         }
+        /* A rule of a sheet only shadow roots adopt is admitted by its
+           adopting roots, not a <style>'s tree; it stays in group 0. */
+        uint32_t group = scoped ? 0 : custom_rule_carrier_group(
+            sheet, style_shadow_scope_carrier(sheet, rule->order >> 8));
         entries[i] = (StyleCustomRuleIndexEntry) {
-            .hash = hash,
+            .key = (hash & ~STYLE_CUSTOM_KEY_GROUP_MASK) | group,
             .index = (uint32_t) i | (scoped ? STYLE_CUSTOM_INDEX_SCOPED : 0)
                 | (keyed ? STYLE_CUSTOM_INDEX_KEYED : 0)
         };
@@ -1788,7 +2350,7 @@ static void stylesheet_prepare_custom_rule_index(Stylesheet *sheet)
           compare_custom_rule_index_entries);
     sheet->custom_rule_index = entries;
     sheet->custom_rule_index_count = sheet->custom_rule_count;
-    sheet->custom_rule_index_bytes =
+    sheet->custom_rule_index_bytes +=
         sheet->custom_rule_count * sizeof(*entries);
     if (gate != NULL) {
         sheet->retained_gate = gate;
@@ -1852,16 +2414,10 @@ const char *style_rule_fast_key(const StyleRule *rule)
    at the rule's prepared rightmost-compound offset, the split both the
    string matcher and the compiled program use. Nothing else reads this key:
    every other fast-key consumer still treats the rule as keyless. */
-static const char *style_rule_index_derived_key(
-    const StyleRule *rule, char *scratch, size_t capacity,
+static const char *style_compound_index_key(
+    const char *text, size_t length, char *scratch, size_t capacity,
     SelectorType *type, size_t *key_length)
 {
-    if (rule == NULL || rule->has_fast_key || rule->selector == NULL
-        || scratch == NULL || type == NULL || key_length == NULL)
-        return NULL;
-    const char *text = NULL;
-    size_t length = 0;
-    if (!style_rule_matcher_compound(rule, &text, &length)) return NULL;
     size_t at = 0;
     if (length == 0 || (text[0] != '.' && text[0] != '#')) return NULL;
     const char *class_key = NULL, *id_key = NULL;
@@ -1891,6 +2447,139 @@ static const char *style_rule_index_derived_key(
     if (key == NULL || *key_length == 0) return NULL;
     *type = id_key != NULL ? SELECTOR_ID : SELECTOR_CLASS;
     return key;
+}
+
+static const char *style_rule_index_derived_key(
+    const StyleRule *rule, char *scratch, size_t capacity,
+    SelectorType *type, size_t *key_length)
+{
+    if (rule == NULL || rule->has_fast_key || rule->selector == NULL
+        || scratch == NULL || type == NULL || key_length == NULL)
+        return NULL;
+    const char *text = NULL;
+    size_t length = 0;
+    if (!style_rule_matcher_compound(rule, &text, &length)) return NULL;
+    return style_compound_index_key(text, length, scratch, capacity, type,
+                                    key_length);
+}
+
+/* Past the string, bracket or parenthesis block opening at `at`. */
+static size_t style_index_skip_block(const char *text, size_t length,
+                                     size_t at)
+{
+    char open = text[at];
+    if (open == '"' || open == '\'') {
+        for (at++; at < length; at++) {
+            if (text[at] == '\\') at++;
+            else if (text[at] == open) return at + 1;
+        }
+        return length;
+    }
+    char close = open == '(' ? ')' : ']';
+    unsigned depth = 0;
+    for (; at < length; at++) {
+        char value = text[at];
+        if (value == '\\') at++;
+        else if (value == '"' || value == '\'')
+            at = style_index_skip_block(text, length, at) - 1;
+        else if (value == open) depth++;
+        else if (value == close && --depth == 0) return at + 1;
+    }
+    return length;
+}
+
+#define STYLE_RULE_INDEX_OPTION_LIMIT 16u
+typedef bool (*StyleRuleOptionVisit)(void *context, SelectorType type,
+                                     const char *key, size_t length);
+
+/* The options of one :is()/:where() argument [at, end): their number when
+   each ends on a compound with a leading class or id (calling `visit`, when
+   given, with each key; it stops the walk by returning true), else 0. */
+static size_t style_index_list_keys(const char *text, size_t at, size_t end,
+                                    StyleRuleOptionVisit visit,
+                                    void *context)
+{
+    size_t options = 0;
+    while (at < end) {
+        size_t item_end = at;
+        while (item_end < end && text[item_end] != ',') {
+            char value = text[item_end];
+            item_end = value == '\\' ? item_end + 2
+                : value == '(' || value == '[' || value == '"'
+                  || value == '\'' ? style_index_skip_block(text, end, item_end)
+                : item_end + 1;
+        }
+        if (item_end > end) item_end = end;
+        const char *option = text + at;
+        size_t length = item_end - at;
+        trim(&option, &length);
+        size_t start = length == 0 ? 0
+            : style_selector_rightmost_compound_start(option, length);
+        char scratch[STYLE_SELECTOR_IDENTIFIER_CAPACITY];
+        SelectorType type = SELECTOR_TAG;
+        size_t key_length = 0;
+        const char *key = start >= length ? NULL
+            : style_compound_index_key(option + start, length - start,
+                                       scratch, sizeof(scratch), &type,
+                                       &key_length);
+        if (key == NULL || ++options > STYLE_RULE_INDEX_OPTION_LIMIT)
+            return 0;
+        if (visit != NULL && visit(context, type, key, key_length))
+            return options;
+        at = item_end + 1;
+    }
+    return options;
+}
+
+/* The options of the first :is()/:where() of the rule's rightmost compound
+   whose options all end on a compound with a leading class or id (see
+   style_index_list_keys), at most STYLE_RULE_INDEX_OPTION_LIMIT; 0 when it
+   has none. An element the rule matches matches one option, so carries its
+   key: the rule index files the rule in one bucket per key instead of the
+   universal range. Only the index reads these keys, as it reads the
+   derived ones. */
+static size_t style_rule_index_option_keys(const StyleRule *rule,
+                                           StyleRuleOptionVisit visit,
+                                           void *context)
+{
+    const char *text = NULL;
+    size_t length = 0;
+    if (rule == NULL || rule->has_fast_key
+        || !style_rule_matcher_compound(rule, &text, &length)) return 0;
+    for (size_t at = 0; at < length;) {
+        char value = text[at];
+        if (value == '\\') {
+            at += 2;
+            continue;
+        }
+        if (value == '"' || value == '\'' || value == '[' || value == '(') {
+            at = style_index_skip_block(text, length, at);
+            continue;
+        }
+        if (value != ':' || (at + 1 < length && text[at + 1] == ':')) {
+            at += value == ':' ? 2 : 1;
+            continue;
+        }
+        size_t name = at + 1;
+        size_t open = skip_selector_identifier(text, length, name);
+        at = open > name ? open : name;
+        if (open >= length || text[open] != '('
+            || !((open - name == 2 && strncasecmp(text + name, "is", 2) == 0)
+                 || (open - name == 5
+                     && strncasecmp(text + name, "where", 5) == 0)))
+            continue;
+        size_t close = style_index_skip_block(text, length, open);
+        if (close > length || text[close - 1] != ')') return 0;
+        at = close;
+        size_t options = style_index_list_keys(text, open + 1, close - 1,
+                                               NULL, NULL);
+        if (options == 0) continue;
+        if (visit != NULL)
+            (void) style_index_list_keys(text, open + 1, close - 1, visit,
+                                         context);
+        return options;
+    }
+    return 0;
 }
 
 /* The key a rule is indexed under: its stored fast key, else the derived
@@ -1924,9 +2613,13 @@ static bool style_rule_bucket_key_matches(
         size_t derived_length = 0;
         const char *derived = style_rule_index_derived_key(
             rule, scratch, sizeof(scratch), &derived_type, &derived_length);
-        return derived != NULL && derived_type == type
-            && derived_length == length
-            && style_rule_key_text_equal(type, derived, text, length);
+        /* With none, a rule filed under its :is() options
+           (style_rule_index_option_keys): the hash decides, and the
+           build and every lookup decide alike, so a collision only
+           merges two keys' candidates, which the matcher still tests. */
+        return derived == NULL
+            || (derived_type == type && derived_length == length
+                && style_rule_key_text_equal(type, derived, text, length));
     }
     const char *fast_key = style_rule_fast_key(rule);
     return rule->type == type
@@ -1953,9 +2646,10 @@ StyleRuleIndexBucket *style_rule_find_bucket(
             if (sheet->rule_index_payload_count
                 == sheet->rule_index_payload_capacity) {
                 size_t capacity = sheet->rule_index_payload_capacity;
+                size_t keys = sheet->rule_index_key_limit;
                 capacity = capacity == 0 ? 128u
-                    : capacity > sheet->count / 2u ? sheet->count : capacity * 2u;
-                if (capacity > sheet->count) capacity = sheet->count;
+                    : capacity > keys / 2u ? keys : capacity * 2u;
+                if (capacity > keys) capacity = keys;
                 if (capacity <= sheet->rule_index_payload_count
                     || capacity > UINT32_MAX
                     || capacity > SIZE_MAX / sizeof(StyleRuleIndexBucket))
@@ -2015,6 +2709,75 @@ static void stylesheet_compact_storage(Stylesheet *sheet)
 #undef STYLE_SHRINK
 }
 
+/* Files one rule under each distinct key of its :is() options: counting
+   (style_rule_option_count, creating buckets) or filling the entries
+   (style_rule_option_fill, each bucket's `first` its cursor). */
+typedef struct {
+    Stylesheet *sheet;
+    uint32_t rule;
+    bool scoped;
+    bool failed;
+    size_t limit;
+    size_t used;
+    /* Bucket indices, not pointers: creating a bucket may move them. */
+    uint32_t buckets[STYLE_RULE_INDEX_OPTION_LIMIT];
+} StyleRuleOptionFile;
+
+static StyleRuleIndexBucket *style_rule_option_bucket(
+    StyleRuleOptionFile *file, SelectorType type, const char *key,
+    size_t length, bool create)
+{
+    const StyleRule *rule = &file->sheet->rules[file->rule];
+    StyleRuleIndexBucket *bucket = style_rule_find_bucket(
+        file->sheet, type, key, length, create, (PseudoElement) rule->pseudo);
+    if (bucket == NULL) {
+        file->failed = true;
+        return NULL;
+    }
+    uint32_t index = (uint32_t) (bucket - file->sheet->rule_index_buckets);
+    for (size_t i = 0; i < file->used; i++)
+        if (file->buckets[i] == index) return NULL;
+    file->buckets[file->used++] = index;
+    return bucket;
+}
+
+static bool style_rule_option_count(void *context, SelectorType type,
+                                    const char *key, size_t length)
+{
+    StyleRuleOptionFile *file = context;
+    StyleRuleIndexBucket *bucket =
+        style_rule_option_bucket(file, type, key, length, true);
+    if (bucket != NULL) {
+        if (bucket->representative == STYLE_RULE_INDEX_EMPTY)
+            bucket->representative = file->rule;
+        bucket->count++;
+        if (!file->scoped) bucket->unscoped++;
+    }
+    return file->failed;
+}
+
+static bool style_rule_option_fill(void *context, SelectorType type,
+                                   const char *key, size_t length)
+{
+    StyleRuleOptionFile *file = context;
+    StyleRuleIndexBucket *bucket =
+        style_rule_option_bucket(file, type, key, length, false);
+    if (bucket != NULL) {
+        if (bucket->first >= file->limit) file->failed = true;
+        else file->sheet->rule_index_entries[bucket->first++] = file->rule;
+    }
+    return file->failed;
+}
+
+size_t stylesheet_rules_tested_per_element(Stylesheet *sheet)
+{
+    if (sheet == NULL) return 0;
+    stylesheet_prepare_rule_index(sheet);
+    return sheet->rule_index_ready
+        ? sheet->rule_index_universal_unscoped_ends[PSEUDO_NONE]
+        : sheet->count;
+}
+
 void stylesheet_prepare_rule_index(Stylesheet *sheet)
 {
     stylesheet_prepare_custom_rule_index(sheet);
@@ -2030,8 +2793,17 @@ void stylesheet_prepare_rule_index(Stylesheet *sheet)
         || sheet->count > SIZE_MAX / 2u
         || sheet->count > SIZE_MAX / sizeof(uint32_t)) return;
 
+    /* Option rules file under up to STYLE_RULE_INDEX_OPTION_LIMIT keys. */
+    size_t keys = sheet->count;
+    for (size_t i = 0; i < sheet->count; i++) {
+        size_t options = style_rule_index_option_keys(
+            &sheet->rules[i], NULL, NULL);
+        if (options > 1u && keys <= SIZE_MAX / 4u - options)
+            keys += options - 1u;
+    }
+    if (keys > SIZE_MAX / 4u) return;
     size_t bucket_count = 16;
-    while (bucket_count < sheet->count * 2u) {
+    while (bucket_count < keys * 2u) {
         if (bucket_count > SIZE_MAX / 2u) return;
         bucket_count *= 2u;
     }
@@ -2048,10 +2820,11 @@ void stylesheet_prepare_rule_index(Stylesheet *sheet)
     sheet->rule_index_slots = slots;
     sheet->rule_index_entries = entries;
     sheet->rule_index_bucket_count = bucket_count;
+    sheet->rule_index_key_limit = keys;
 
     char key_scratch[STYLE_SELECTOR_IDENTIFIER_CAPACITY];
     sheet->rule_index_derived_keys = 0;
-    size_t universal_count = 0;
+    size_t universal_count = 0, option_entries = 0;
     uint32_t universal_counts[PSEUDO_COUNT] = {0};
     uint32_t universal_scoped[PSEUDO_COUNT] = {0};
     /* Rules of adopted sheets only shadow roots adopt are kept after the
@@ -2079,6 +2852,20 @@ void stylesheet_prepare_rule_index(Stylesheet *sheet)
         const char *fast_key = style_rule_index_key(
             rule, key_scratch, &key_type, &length);
         if (fast_key == NULL && !rule->has_fast_key) {
+            StyleRuleOptionFile file = {
+                .sheet = sheet, .rule = (uint32_t) i, .scoped = scoped
+            };
+            if (style_rule_index_option_keys(rule, NULL, NULL) != 0) {
+                (void) style_rule_index_option_keys(
+                    rule, style_rule_option_count, &file);
+                if (file.failed) {
+                    stylesheet_drop_rule_index(sheet);
+                    sheet->rule_index_attempted = true;
+                    return;
+                }
+                option_entries += file.used - 1u;
+                continue;
+            }
             universal_count++;
             universal_counts[rule->pseudo]++;
             if (scoped) universal_scoped[rule->pseudo]++;
@@ -2104,6 +2891,19 @@ void stylesheet_prepare_rule_index(Stylesheet *sheet)
         bucket->count++;
         if (!scoped) bucket->unscoped++;
     }
+    size_t entry_count = sheet->count + option_entries;
+    if (option_entries != 0) {
+        entries = entry_count > UINT32_MAX
+                || entry_count > SIZE_MAX / sizeof(*entries) ? NULL
+            : budget_realloc(sheet->budget, sheet->rule_index_entries,
+                             entry_count * sizeof(*entries));
+        if (entries == NULL) {
+            stylesheet_drop_rule_index(sheet);
+            sheet->rule_index_attempted = true;
+            return;
+        }
+        sheet->rule_index_entries = entries;
+    }
     size_t next = universal_count;
     for (size_t i = 0; i < bucket_count; i++) {
         if (slots[i] == 0) continue;
@@ -2112,7 +2912,7 @@ void stylesheet_prepare_rule_index(Stylesheet *sheet)
         bucket->first = (uint32_t) next;
         next += bucket->count;
     }
-    if (next != sheet->count) {
+    if (next != entry_count) {
         stylesheet_drop_rule_index(sheet);
         sheet->rule_index_attempted = true;
         return;
@@ -2139,6 +2939,22 @@ void stylesheet_prepare_rule_index(Stylesheet *sheet)
             size_t key_length = 0;
             const char *fast_key = style_rule_index_key(
                 rule, key_scratch, &key_type, &key_length);
+            if (fast_key == NULL && !rule->has_fast_key
+                && style_rule_index_option_keys(rule, NULL, NULL) != 0) {
+                if (scoped != (pass == 1)) continue;
+                StyleRuleOptionFile file = {
+                    .sheet = sheet, .rule = (uint32_t) i, .scoped = scoped,
+                    .limit = entry_count
+                };
+                (void) style_rule_index_option_keys(
+                    rule, style_rule_option_fill, &file);
+                if (file.failed) {
+                    stylesheet_drop_rule_index(sheet);
+                    sheet->rule_index_attempted = true;
+                    return;
+                }
+                continue;
+            }
             if (fast_key == NULL && !rule->has_fast_key) {
                 if (pass == 0)
                     entries[scoped ? universal_scoped_at[rule->pseudo]++
@@ -2151,7 +2967,7 @@ void stylesheet_prepare_rule_index(Stylesheet *sheet)
                 : style_rule_find_bucket(
                       sheet, key_type, fast_key, key_length, false,
                       (PseudoElement) rule->pseudo);
-            if (bucket == NULL || bucket->first >= sheet->count) {
+            if (bucket == NULL || bucket->first >= entry_count) {
                 stylesheet_drop_rule_index(sheet);
                 sheet->rule_index_attempted = true;
                 return;
@@ -2166,7 +2982,7 @@ void stylesheet_prepare_rule_index(Stylesheet *sheet)
     sheet->rule_index_bytes = bucket_count * sizeof(*slots)
                               + sheet->rule_index_payload_capacity
                                 * sizeof(*sheet->rule_index_buckets)
-                              + sheet->count * sizeof(*entries);
+                              + entry_count * sizeof(*entries);
     stylesheet_prepare_rule_filters(sheet);
     sheet->rule_index_ready = true;
 }
@@ -2256,7 +3072,8 @@ bool stylesheet_build(Stylesheet *sheet, Budget *budget,
 }
 
 static bool stylesheet_initialize(
-    Stylesheet *sheet, Budget *budget, int viewport_width, int viewport_height)
+    Stylesheet *sheet, Budget *budget, int viewport_width, int viewport_height,
+    int device_width, int device_height)
 {
     if (sheet == NULL || budget == NULL || viewport_width <= 0
         || viewport_height <= 0) return false;
@@ -2265,6 +3082,8 @@ static bool stylesheet_initialize(
     sheet->build_generation = stylesheet_next_generation();
     sheet->viewport_width = viewport_width;
     sheet->viewport_height = viewport_height;
+    sheet->device_width = device_width;
+    sheet->device_height = device_height;
     sheet->prefers_dark = stylesheet_prefers_dark_color_scheme();
     sheet->current_layer = UINT_MAX;
     memset(sheet->layer_parents, UINT8_MAX, sizeof(sheet->layer_parents));
@@ -2282,7 +3101,11 @@ bool stylesheet_build_context(Stylesheet *sheet, Budget *budget,
         || document->html == NULL || viewport == NULL
         || viewport->css_width <= 0 || viewport->css_height <= 0) return false;
     if (!stylesheet_initialize(
-            sheet, budget, viewport->css_width, viewport->css_height)) {
+            sheet, budget, viewport->css_width, viewport->css_height,
+            viewport->screen_width > 0
+                ? viewport->screen_width : viewport->device_width,
+            viewport->screen_height > 0
+                ? viewport->screen_height : viewport->device_height)) {
         return false;
     }
     sheet->block_inline_style_attributes =
@@ -2291,6 +3114,7 @@ bool stylesheet_build_context(Stylesheet *sheet, Budget *budget,
     sheet->noscript_rendered = document->noscript_rendered;
     sheet->font_text_pages = document->font_text_pages;
     sheet->api_registrations = document->registered_properties;
+    sheet->noscript_images = document->noscript_images;
     for (const DocumentRegisteredProperty *property = document->registered_properties;
          property != NULL; property = property->next) {
         if (!stylesheet_register_api_property(sheet, property)) {
@@ -2328,7 +3152,11 @@ bool stylesheet_build_context_deferred(
         || document->html == NULL || viewport == NULL
         || viewport->css_width <= 0 || viewport->css_height <= 0) return false;
     if (!stylesheet_initialize(
-            sheet, budget, viewport->css_width, viewport->css_height)) {
+            sheet, budget, viewport->css_width, viewport->css_height,
+            viewport->screen_width > 0
+                ? viewport->screen_width : viewport->device_width,
+            viewport->screen_height > 0
+                ? viewport->screen_height : viewport->device_height)) {
         return false;
     }
     sheet->block_inline_style_attributes =
@@ -2337,6 +3165,7 @@ bool stylesheet_build_context_deferred(
     sheet->noscript_rendered = document->noscript_rendered;
     sheet->font_text_pages = document->font_text_pages;
     sheet->api_registrations = document->registered_properties;
+    sheet->noscript_images = document->noscript_images;
     sheet->document_rules_deferred = true;
     for (const DocumentRegisteredProperty *property = document->registered_properties;
          property != NULL; property = property->next) {
@@ -2357,14 +3186,18 @@ bool stylesheet_reset_document_rules(Stylesheet *sheet)
     Budget *budget = sheet->budget;
     int viewport_width = sheet->viewport_width;
     int viewport_height = sheet->viewport_height;
+    int device_width = sheet->device_width;
+    int device_height = sheet->device_height;
     bool block_inline_style_attributes =
         sheet->block_inline_style_attributes;
     bool noscript_rendered = sheet->noscript_rendered;
     uint64_t font_text_pages = sheet->font_text_pages;
     const DocumentRegisteredProperty *api_registrations = sheet->api_registrations;
+    ImageNoscriptStore *noscript_images = sheet->noscript_images;
     stylesheet_destroy(sheet);
     bool initialized = stylesheet_initialize(
-        sheet, budget, viewport_width, viewport_height);
+        sheet, budget, viewport_width, viewport_height, device_width,
+        device_height);
     if (initialized) {
         sheet->document_rules_deferred = true;
         sheet->block_inline_style_attributes =
@@ -2372,6 +3205,7 @@ bool stylesheet_reset_document_rules(Stylesheet *sheet)
         sheet->noscript_rendered = noscript_rendered;
         sheet->font_text_pages = font_text_pages;
         sheet->api_registrations = api_registrations;
+        sheet->noscript_images = noscript_images;
         for (const DocumentRegisteredProperty *property = api_registrations;
              property != NULL; property = property->next) {
             if (!stylesheet_register_api_property(sheet, property)) {
@@ -3867,6 +4701,51 @@ bool stylesheet_append_style_elements_tracked(
         result);
 }
 
+/* The first order of the user rules that follow every author rule below
+   `tail_start` (stylesheet_add_user_css ends a built sheet), or
+   `tail_start` when no user rule does. */
+static unsigned stylesheet_trailing_user_order(const Stylesheet *sheet,
+                                               unsigned tail_start)
+{
+    bool author = false;
+    unsigned last_author = 0;
+#define STYLE_NOTE_AUTHOR(origin_value, order_value) do { \
+        unsigned noted = (order_value); \
+        if ((origin_value) == 0 && noted < tail_start \
+            && (!author || noted > last_author)) { \
+            author = true; \
+            last_author = noted; \
+        } \
+    } while (0)
+    for (size_t i = 0; i < sheet->count; i++)
+        STYLE_NOTE_AUTHOR(sheet->rules[i].origin, sheet->rules[i].order);
+    for (size_t i = 0; i < sheet->custom_rule_count; i++)
+        STYLE_NOTE_AUTHOR(sheet->custom_rules[i].origin,
+                          sheet->custom_rules[i].order >> 8);
+    for (size_t i = 0; i < sheet->transition_rule_count; i++)
+        STYLE_NOTE_AUTHOR(sheet->transition_rules[i].origin,
+                          sheet->transition_rules[i].order >> 8);
+#undef STYLE_NOTE_AUTHOR
+    unsigned first = tail_start;
+#define STYLE_NOTE_USER(origin_value, order_value) do { \
+        unsigned noted = (order_value); \
+        if ((origin_value) != 0 && noted < first \
+            && (!author || noted > last_author)) first = noted; \
+    } while (0)
+    for (size_t i = 0; i < sheet->count; i++)
+        STYLE_NOTE_USER(sheet->rules[i].origin, sheet->rules[i].order);
+    for (size_t i = 0; i < sheet->custom_rule_count; i++)
+        STYLE_NOTE_USER(sheet->custom_rules[i].origin,
+                        sheet->custom_rules[i].order >> 8);
+    for (size_t i = 0; i < sheet->transition_rule_count; i++)
+        STYLE_NOTE_USER(sheet->transition_rules[i].origin,
+                        sheet->transition_rules[i].order >> 8);
+#undef STYLE_NOTE_USER
+    return first;
+}
+
+static uint64_t stylesheet_head_fixed_signature(const Stylesheet *sheet);
+
 bool stylesheet_append_sources_tracked(
     Stylesheet *sheet, StylesheetSourceAppender append, void *opaque,
     size_t after_source, StylesheetAppendResult *result)
@@ -3877,6 +4756,7 @@ bool stylesheet_append_sources_tracked(
     size_t old_count = sheet->count;
     size_t old_sources = sheet->style_source_count;
     unsigned old_adopted_end = sheet->scopes.adopted_rule_order_end;
+    size_t old_adopted_sources = sheet->scopes.adopted_source_count;
     if (old_count > UINT16_MAX || after_source > old_sources) return false;
     unsigned *old_orders = old_count == 0 ? NULL
         : budget_malloc(sheet->budget, old_count * sizeof(*old_orders));
@@ -3891,6 +4771,7 @@ bool stylesheet_append_sources_tracked(
             + (sheet->rules[i].important ? 1u : 0u);
     }
     uint64_t signature_before = stylesheet_parse_context_signature(sheet);
+    uint64_t fixed_before = stylesheet_head_fixed_signature(sheet);
     unsigned tail_start = sheet->next_order;
     bool ok = append(sheet, opaque);
     if (!ok) {
@@ -3900,6 +4781,9 @@ bool stylesheet_append_sources_tracked(
     result->old_count = old_count;
     result->context_changed =
         stylesheet_parse_context_signature(sheet) != signature_before;
+    result->cascade_unchanged = sheet->count == old_count
+        && !result->context_changed
+        && stylesheet_head_fixed_signature(sheet) == fixed_before;
     /* A selector's normal and important declarations share `order`. Their
        pair (order, importance) survives the cascade re-sort. The appended
        rules were numbered after every existing rule; move them to their
@@ -3909,6 +4793,14 @@ bool stylesheet_append_sources_tracked(
     unsigned appended_orders = sheet->next_order - tail_start;
     unsigned boundary = after_source < old_sources
         ? sheet->style_source_first_order[after_source] : tail_start;
+    /* An adopted source owns the orders from its first one up to the next
+       source's, the last one up to adopted_rule_order_end. A rebuild adds
+       the user stylesheet after the adopted sheets; numbered after the
+       user rules, a sheet adopted since would take them in, and they
+       would reach only its shadow trees. It goes in front of them. */
+    if (boundary == tail_start
+        && sheet->scopes.adopted_source_count > old_adopted_sources)
+        boundary = stylesheet_trailing_user_order(sheet, tail_start);
     bool shifted = boundary != tail_start && appended_orders != 0;
     if (shifted) {
         sheet->rewrite_epoch++;
@@ -3953,18 +4845,6 @@ bool stylesheet_append_sources_tracked(
                 scope->begin, tail_start, boundary, appended_orders);
             scope->end = last + 1u;
         }
-        if (sheet->scopes.adopted_rule_order_end != 0) {
-            unsigned end = stylesheet_inserted_rule_order(
-                sheet->scopes.adopted_rule_order_end - 1u, tail_start,
-                boundary, appended_orders) + 1u;
-            if (old_adopted_end != 0) {
-                unsigned old_end = stylesheet_inserted_rule_order(
-                    old_adopted_end - 1u, tail_start, boundary,
-                    appended_orders) + 1u;
-                if (old_end > end) end = old_end;
-            }
-            sheet->scopes.adopted_rule_order_end = end;
-        }
         for (size_t j = 1; j < sheet->scopes.shadow_scope_count; j++) {
             StyleShadowScope moving = sheet->scopes.shadow_scopes[j];
             size_t k = j;
@@ -3987,17 +4867,39 @@ bool stylesheet_append_sources_tracked(
         stylesheet_drop_custom_rule_index(sheet);
         stylesheet_finalize_rule_order(sheet);
     }
+    /* The adopted range ends with the last adopted source's rules, in front
+       of the user rules. stylesheet_add_adopted_sheet ended it at the tail;
+       an appended adopted source ends at its boundary plus what it parsed,
+       even when it parsed nothing and no rule moved. */
+    if (shifted || sheet->scopes.adopted_source_count > old_adopted_sources) {
+        unsigned end = old_adopted_end;
+        if (shifted && end != 0)
+            end = stylesheet_inserted_rule_order(
+                end - 1u, tail_start, boundary, appended_orders) + 1u;
+        if (sheet->scopes.adopted_source_count > old_adopted_sources
+            && boundary + appended_orders > end)
+            end = boundary + appended_orders;
+        sheet->scopes.adopted_rule_order_end = end;
+    }
     /* Keep the source list in document order, with first orders matching
        the moved rules. A source that parsed no rule (an empty block, a
-       sheet whose fetch failed) still takes its place: it is a boundary. */
-    if (boundary != tail_start && !sheet->style_sources_bounded_out) {
+       sheet whose fetch failed) still takes its place: it is a boundary.
+       A bounded-out sheet records no new source, but the ones it holds
+       still bound later insertions. Which sources move follows their
+       place in the list, not their first orders: an empty source in front
+       of the insertion shares the boundary's order and stays in front,
+       and one at the user rules (only an empty source starts there) moves
+       down to the boundary. */
+    if (boundary != tail_start) {
         for (size_t s = 0; s < sheet->style_source_count; s++) {
             unsigned order = sheet->style_source_first_order[s];
             if (s >= old_sources) {
                 sheet->style_source_first_order[s] =
                     order - tail_start + boundary;
-            } else if (order >= boundary) {
+            } else if (s >= after_source) {
                 sheet->style_source_first_order[s] = order + appended_orders;
+            } else if (order > boundary) {
+                sheet->style_source_first_order[s] = boundary;
             }
         }
         size_t new_sources = sheet->style_source_count - old_sources;
@@ -5099,11 +6001,16 @@ bool stylesheet_add_user_css(Stylesheet *sheet, const char *css, size_t length)
     return parsed;
 }
 
-/* `name` as a declared property in deferred declaration text: at the
-   start or after `;`, `{` or whitespace, followed by `:`. A substring test
-   took every `flex-direction` for `direction`. */
-static bool style_span_declares_property_ci(const char *text, size_t length,
-                                            const char *name)
+/* Whether every declaration of `name` in declaration text has one of
+   `inert`'s values (case-insensitive, `!important` allowed). A declared
+   property starts the text or follows `;`, `{` or whitespace and is
+   followed by `:`; a substring test took every `flex-direction` for
+   `direction`. Any other value, including var(), a comment or an escape,
+   is taken as a change. */
+static bool style_span_property_values_inert(const char *text, size_t length,
+                                             const char *name,
+                                             const char *const *inert,
+                                             size_t inert_count)
 {
     size_t name_length = strlen(name);
     for (size_t at = 0; at + name_length <= length; at++) {
@@ -5111,11 +6018,62 @@ static bool style_span_declares_property_ci(const char *text, size_t length,
         char before = at == 0 ? ';' : text[at - 1];
         if (before != ';' && before != '{' && !isspace((unsigned char) before))
             continue;
-        size_t after = at + name_length;
-        while (after < length && isspace((unsigned char) text[after])) after++;
-        if (after < length && text[after] == ':') return true;
+        size_t cursor = at + name_length;
+        while (cursor < length && isspace((unsigned char) text[cursor]))
+            cursor++;
+        if (cursor >= length || text[cursor] != ':') continue;
+        cursor++;
+        while (cursor < length && isspace((unsigned char) text[cursor]))
+            cursor++;
+        size_t end = cursor;
+        while (end < length && text[end] != ';' && text[end] != '}') end++;
+        size_t value_end = end;
+        while (value_end > cursor
+               && isspace((unsigned char) text[value_end - 1u])) value_end--;
+        if (value_end - cursor >= 9u
+            && strncasecmp(text + value_end - 9u, "important", 9u) == 0) {
+            size_t bang = value_end - 9u;
+            while (bang > cursor && isspace((unsigned char) text[bang - 1u]))
+                bang--;
+            if (bang > cursor && text[bang - 1u] == '!') {
+                value_end = bang - 1u;
+                while (value_end > cursor
+                       && isspace((unsigned char) text[value_end - 1u]))
+                    value_end--;
+            }
+        }
+        bool matched = false;
+        for (size_t i = 0; !matched && i < inert_count; i++) {
+            matched = strlen(inert[i]) == value_end - cursor
+                && strncasecmp(text + cursor, inert[i],
+                               value_end - cursor) == 0;
+        }
+        if (!matched) return false;
+        at = end > at ? end - 1u : at;
     }
-    return false;
+    return true;
+}
+
+bool style_declarations_may_change_direction(const char *text, size_t length)
+{
+    /* As the parsed declarations count (style_property_direction and
+       style_property_unicode_bidi): only an RTL direction or an override
+       can reorder text without RTL codepoints. A CSS-wide keyword takes a
+       value some other source must already have supplied. */
+    static const char *const direction_inert[] = {
+        "ltr", "initial", "inherit", "unset", "revert", "revert-layer"
+    };
+    static const char *const unicode_bidi_inert[] = {
+        "normal", "embed", "isolate", "plaintext", "initial", "inherit",
+        "unset", "revert", "revert-layer"
+    };
+    if (text == NULL) return false;
+    return !style_span_property_values_inert(
+               text, length, "direction", direction_inert,
+               sizeof(direction_inert) / sizeof(direction_inert[0]))
+        || !style_span_property_values_inert(
+               text, length, "unicode-bidi", unicode_bidi_inert,
+               sizeof(unicode_bidi_inert) / sizeof(unicode_bidi_inert[0]));
 }
 
 /* The selector requires [dir=rtl] on some element outside any functional
@@ -5183,13 +6141,9 @@ bool stylesheet_direction_change_rules(const Stylesheet *sheet,
                 && (values.unicode_bidi == STYLE_UNICODE_BIDI_OVERRIDE
                     || values.unicode_bidi
                         == STYLE_UNICODE_BIDI_ISOLATE_OVERRIDE))
-            || (declaration->deferred_declarations != NULL
-                && (style_span_declares_property_ci(
-                        declaration->deferred_declarations,
-                        declaration->deferred_length, "direction")
-                    || style_span_declares_property_ci(
-                        declaration->deferred_declarations,
-                        declaration->deferred_length, "unicode-bidi")));
+            || style_declarations_may_change_direction(
+                   declaration->deferred_declarations,
+                   declaration->deferred_length);
         if (!changes) continue;
         if (rtl_markup_absent
             && style_selector_requires_dir_rtl(sheet->rules[i].selector))
@@ -5402,8 +6356,11 @@ void stylesheet_destroy(Stylesheet *sheet)
         budget_free(sheet->budget, sheet->grid_areas);
         budget_free(sheet->budget, sheet->border_color_sets);
         budget_free(sheet->budget, sheet->custom_rule_index);
+        budget_free(sheet->budget,
+                    (void *) sheet->custom_rule_index_carriers);
         budget_free(sheet->budget, sheet->retained_gate);
         budget_free(sheet->budget, sheet->svg_raster_tokens);
+        stylesheet_identity_tests_free(sheet);
         budget_free(sheet->budget, sheet->inline_scans);
         budget_free(sheet->budget, sheet->selector_attribute_names);
         budget_free(sheet->budget, sheet->deferred_instructions);

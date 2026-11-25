@@ -341,7 +341,166 @@ globalThis.__tilefinchEventInterfaces.defineProperty(globalThis,
           Math.floor((Math.round(max * scale) - baseUnits) / stepUnits) * stepUnits : Infinity;
       if (low <= high) input.value = String(Math.max(low, Math.min(high, units)) / scale);
     };
+    /* Snapshot after formdata listeners edit the entry list. Call the
+       bounded Fetch multipart encoder only for a multipart POST. */
+    const submissionLineBreaks = (value) =>
+      value.replace(/\r\n|\r|\n/g, "\r\n");
+    const submissionBody = (form, submitter, FormData, URLSearchParams,
+                            fileStates, weakMapGet, String, multipart) => {
+      const data = new FormData(form, submitter);
+      const method = String(
+        submitter?.getAttribute?.("formmethod") ??
+          form.getAttribute("method") ?? "",
+      ).toLowerCase();
+      const enctype = String(
+        submitter?.getAttribute?.("formenctype") ??
+          form.getAttribute("enctype") ?? "",
+      ).toLowerCase();
+      if (method === "post" && enctype === "multipart/form-data")
+        return multipart ? multipart(data) : false;
+      const plain = method === "post" && enctype === "text/plain";
+      const params = new URLSearchParams();
+      let body = "";
+      for (const [key, value] of data) {
+        const name = submissionLineBreaks(key),
+          field = submissionLineBreaks(weakMapGet(fileStates, value)?.name ?? value);
+        if (plain) {
+          if (name.length + field.length + 3 > 65536 - body.length) return false;
+          body += name + "=" + field + "\r\n";
+        } else params.append(name, field);
+      }
+      return plain ? body : params.toString();
+    };
+    const encodeMultipart = (source, headers, navigationForm, requestBodyByteLimit,
+                             encoder, String, RangeError, Uint8Array,
+                             Uint8ArrayCtor, Blob, fileName, tilefinchBlobBytes,
+                             trustedCryptoRandomFill, defaultHeader) => {
+      const limit = navigationForm ? 65536 : requestBodyByteLimit,
+        entries = [], random = new Uint8ArrayCtor(navigationForm ? 16 : 18),
+        normalizeLineBreaks = (value) => String(value)
+          .replace(/\r\n|\r|\n/g, "\r\n");
+      let total = 0;
+      for (const [name, value] of source) {
+        const bytes = value instanceof Blob
+          ? tilefinchBlobBytes(value) : encoder.encode(normalizeLineBreaks(value));
+        if (bytes.byteLength > limit - total)
+          throw new RangeError("FormData body exceeds bounded size");
+        entries.push({ name: String(name), value, bytes });
+        total += bytes.byteLength;
+      }
+      const contains = (bytes, text) => {
+        const needle = encoder.encode(text);
+        if (needle.byteLength > bytes.byteLength) return false;
+        outer: for (let at = 0;
+             at <= bytes.byteLength - needle.byteLength; at++) {
+          for (let index = 0; index < needle.byteLength; index++)
+            if (bytes[at + index] !== needle[index]) continue outer;
+          return true;
+        }
+        return false;
+      };
+      let boundary = "";
+      for (let attempt = 0; attempt < 8 && !boundary; attempt++) {
+        trustedCryptoRandomFill(random);
+        let suffix = "";
+        for (let index = 0; index < random.length; index++)
+          suffix += random[index].toString(16).padStart(2, "0");
+        const candidate = navigationForm ? suffix : "----tilefinch-" + suffix;
+        if (!entries.some((entry) => contains(entry.bytes, candidate)))
+          boundary = candidate;
+      }
+      if (!boundary)
+        throw new RangeError("Unable to choose multipart boundary");
+      if (!navigationForm) defaultHeader(headers, "content-type",
+                    "multipart/form-data; boundary=" + boundary);
+      const chunks = [];
+      total = 0;
+      const append = (bytes) => {
+        if (!(bytes instanceof Uint8Array)) bytes = encoder.encode(String(bytes));
+        if (bytes.byteLength > limit - total)
+          throw new RangeError("FormData body exceeds bounded size");
+        chunks.push(bytes);
+        total += bytes.byteLength;
+      },
+        quote = (value) => String(value)
+          .replaceAll("\r", "%0D")
+          .replaceAll("\n", "%0A")
+          .replaceAll('"', "%22");
+      for (const entry of entries) {
+        const { name, value } = entry;
+        append("--" + boundary +
+          "\r\nContent-Disposition: form-data; name=\"" +
+          quote(normalizeLineBreaks(name)) + "\"");
+        const filename = fileName(value);
+        if (filename !== undefined)
+          append('; filename="' + quote(filename) + '"');
+        append("\r\n");
+        if (value instanceof Blob)
+          append("Content-Type: " + (value.type || "application/octet-stream") + "\r\n");
+        append("\r\n");
+        append(entry.bytes);
+        append("\r\n");
+      }
+      append("--" + boundary + "--\r\n");
+      const bytes = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      return bytes;
+    };
+    const queueFormSubmission = (form, submitter, String, document, location,
+                                 HTMLFormElement, HTMLIFrameElement, TilefinchURL,
+                                 submitBody) => {
+      if (!(form instanceof HTMLFormElement)) return false;
+      const target = String(
+        submitter?.getAttribute?.("formtarget") ??
+          form.getAttribute("target") ??
+          "",
+      );
+      if (!target || /^_(?:self|parent|top|blank)$/i.test(target))
+        return false;
+      let frame = null;
+      for (const candidate of document.querySelectorAll("iframe"))
+        if (candidate.getAttribute("name") === target) {
+          frame = candidate;
+          break;
+        }
+      if (!(frame instanceof HTMLIFrameElement)) return false;
+      const method = String(
+        submitter?.getAttribute?.("formmethod") ??
+          form.getAttribute("method") ??
+          "get",
+      ).toLowerCase();
+      /* Remote child-frame POST needs a body-bearing frame scheduler request.
+         GET can use the existing dynamic iframe lifecycle without turning a
+         named target into a top-level navigation. */
+      if (method !== "get") return false;
+      const action = String(
+        submitter?.getAttribute?.("formaction") ??
+          form.getAttribute("action") ??
+          location.href,
+      );
+      let url;
+      try {
+        url = new TilefinchURL(action || location.href, location.href);
+      } catch (_) {
+        return false;
+      }
+      const serialized = submitBody(form, submitter);
+      if (typeof serialized !== "string") return false;
+      frame.src =
+        url._origin +
+        url._pathname +
+        "?" + serialized +
+        url._hash;
+      return true;
+    };
     return {
+      queueFormSubmission,
+      encodeMultipart,
+      submissionBody,
       calendarNumber,
       calendarDate,
       rangeValue,

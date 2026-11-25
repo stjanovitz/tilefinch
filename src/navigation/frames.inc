@@ -70,13 +70,20 @@ static bool navigation_frame_presentable(const NavigationFrame *frame)
 static bool navigation_frame_element_hidden(
     NavigationSession *session, const NavigationFrame *frame);
 
+enum {
+    NAVIGATION_MESSAGE_TARGET_TOP = -1,
+    NAVIGATION_MESSAGE_SOURCE_UNAVAILABLE = -2
+};
+
 static bool navigation_queue_frame_message(void *opaque,
                                            ScriptRuntime *source,
                                            long target_frame_handle,
                                            const char *json,
                                            const char *target_origin,
                                            const char *task_kind,
-                                           uint64_t task_sequence)
+                                           uint64_t task_sequence,
+                                           const uint8_t *key_bytes,
+                                           size_t key_length)
 {
     NavigationSession *session = opaque;
     if (session == NULL || source == NULL || json == NULL
@@ -100,7 +107,10 @@ static bool navigation_queue_frame_message(void *opaque,
     NavigationMessage *message =
         &session->page.messages[session->page.message_count];
     size_t json_length = strlen(json), origin_length = strlen(target_origin);
-    if (json_length > 65536 || origin_length > NAVIGATION_URL_LIMIT) {
+    if (json_length > SCRIPT_FRAME_MESSAGE_BYTE_LIMIT
+        || key_length > SCRIPT_FRAME_MESSAGE_BYTE_LIMIT - json_length
+        || (key_length != 0 && key_bytes == NULL)
+        || origin_length > NAVIGATION_URL_LIMIT) {
         return false;
     }
     if (strcmp(target_origin, "*") != 0
@@ -110,17 +120,21 @@ static bool navigation_queue_frame_message(void *opaque,
                 target_origin, canonical, sizeof(canonical))
             || strcmp(canonical, target_origin) != 0) return false;
     }
-    message->json = budget_malloc(session->budget, json_length + 1);
+    message->json = budget_malloc(session->budget, json_length + 1 + key_length);
     message->target_origin = budget_malloc(session->budget,
                                             origin_length + 1);
     if (message->json == NULL || message->target_origin == NULL) {
-        budget_free(session->budget, message->json);
-        budget_free(session->budget, message->target_origin);
+        navigation_free_frame_message(session->budget, message);
         memset(message, 0, sizeof(*message));
         return false;
     }
     memcpy(message->json, json, json_length + 1);
     memcpy(message->target_origin, target_origin, origin_length + 1);
+    if (key_length != 0) {
+        message->key_offset = json_length + 1;
+        memcpy(message->json + message->key_offset, key_bytes, key_length);
+        message->key_length = key_length;
+    }
     message->source = source;
     if (session->next_frame_message_sequence != UINT64_MAX) {
         session->next_frame_message_sequence++;
@@ -137,6 +151,14 @@ static bool navigation_queue_frame_message(void *opaque,
                     session->page.frames[i].parent_handle;
                 message->source_generation =
                     session->page.frames[i].lifecycle_generation;
+                if (key_length != 0 && target_frame_handle <= 0) {
+                    const NavigationFrame *parent = navigation_frame_parent(
+                        session, &session->page.frames[i]);
+                    message->target_generation =
+                        target_frame_handle == NAVIGATION_MESSAGE_TARGET_TOP
+                        || parent == NULL ? session->generation
+                                          : parent->lifecycle_generation;
+                }
                 if (session->page.frames[i].opaque_origin) {
                     snprintf(message->source_origin,
                              sizeof(message->source_origin), "null");
@@ -150,16 +172,14 @@ static bool navigation_queue_frame_message(void *opaque,
             }
         }
         if (message->source_frame_handle == 0) {
-            budget_free(session->budget, message->json);
-            budget_free(session->budget, message->target_origin);
+            navigation_free_frame_message(session->budget, message);
             memset(message, 0, sizeof(*message));
             return false;
         }
     } else if (!tilefinch_url_origin(
                    session->page.document_url, message->source_origin,
                    sizeof(message->source_origin))) {
-        budget_free(session->budget, message->json);
-        budget_free(session->budget, message->target_origin);
+        navigation_free_frame_message(session->budget, message);
         memset(message, 0, sizeof(*message));
         return false;
     } else {
@@ -179,8 +199,7 @@ static bool navigation_queue_frame_message(void *opaque,
             }
         }
         if (!target_found) {
-            budget_free(session->budget, message->json);
-            budget_free(session->budget, message->target_origin);
+            navigation_free_frame_message(session->budget, message);
             memset(message, 0, sizeof(*message));
             /* WindowProxy creation can precede native iframe discovery by a
                turn.  Posting to that not-yet-known browsing context is a
@@ -386,10 +405,6 @@ static bool navigation_frame_presentation_dimensions(
 
 static bool navigation_deliver_frame_messages(NavigationSession *session)
 {
-    enum {
-        NAVIGATION_MESSAGE_TARGET_TOP = -1,
-        NAVIGATION_MESSAGE_SOURCE_UNAVAILABLE = -2
-    };
     size_t delivered = 0;
     size_t deferred_run = 0;
     while (session->page.message_count != 0
@@ -435,6 +450,23 @@ static bool navigation_deliver_frame_messages(NavigationSession *session)
                        == message.source_generation;
         } else {
             lifecycle_valid = false;
+        }
+        if (lifecycle_valid && message.key_length != 0) {
+            /* Both ends of a private delivery must still name the queued
+               documents, not a recycled browsing context or runtime. */
+            lifecycle_valid = message.source == session->page.runtime
+                ? message.source_generation == session->generation
+                : source_frame != NULL
+                    && source_frame->parent_handle == source_handle
+                    && source_frame->lifecycle_generation
+                           == message.source_generation;
+            if (message.target_frame_handle <= 0) {
+                uint64_t current_generation = target_owner_frame == NULL
+                    ? session->generation
+                    : target_owner_frame->lifecycle_generation;
+                lifecycle_valid = lifecycle_valid
+                    && message.target_generation == current_generation;
+            }
         }
         /* A WindowProxy exists before its remote document has finished
            creating a ScriptRuntime.  postMessage queues a task against that
@@ -518,14 +550,15 @@ static bool navigation_deliver_frame_messages(NavigationSession *session)
                     source_handle, message.target_frame_handle);
         }
 #endif
-        bool ok = !target_allowed || script_runtime_dispatch_message(
+        bool ok = !target_allowed || script_runtime_dispatch_message_with_keys(
             target, message.json, message.source_origin,
-            dispatch_source_handle,
+            dispatch_source_handle, message.key_length == 0 ? NULL
+                : (const uint8_t *) message.json + message.key_offset,
+            message.key_length,
             target == session->page.runtime
                 ? &session->page.script_result
                 : &target_owner_frame->script_result);
-        budget_free(session->budget, message.target_origin);
-        budget_free(session->budget, message.json);
+        navigation_free_frame_message(session->budget, &message);
         if (!ok && navigation_retire_failed_document_refresh(
                 session, target)) return false;
         if (!ok && target_owner_frame != NULL) {
@@ -647,8 +680,7 @@ static void navigation_drop_frame_messages(NavigationSession *session,
                 && message->target_generation
                        == frame->lifecycle_generation);
         if (drop) {
-            budget_free(session->budget, message->json);
-            budget_free(session->budget, message->target_origin);
+            navigation_free_frame_message(session->budget, message);
             session->frame_messages_dropped++;
             continue;
         }
@@ -916,25 +948,18 @@ static void navigation_retire_unloaded_frame(NavigationSession *session,
    whose realm was retired. The author already saw a catchable
    InternalError in the task that ran out.
 
-   As for the page realm, only an allocation this realm's allocator actually
-   refused since the last check counts (an author can throw the text), with
-   the task reporting it, its heap at its end, or the task failing. */
-static bool navigation_stop_exhausted_frame_realm(NavigationSession *session,
-                                                  NavigationFrame *frame,
-                                                  bool task_failed)
+   The realm is judged as the page's is (navigation_judge_realm_memory):
+   after a refusal by its own limit or the page Budget, by the heap it can
+   obtain once collected, however the refusal surfaced. */
+static NavigationScriptMemoryVerdict navigation_stop_exhausted_frame_realm(
+    NavigationSession *session, NavigationFrame *frame)
 {
-    if (frame->retired || frame->runtime == NULL) return false;
-    size_t refusals = script_runtime_allocation_refusals(frame->runtime);
-    bool refused = refusals > frame->realm_refusals_seen;
-    frame->realm_refusals_seen = refusals;
-    if (!refused) return false;
-    const ScriptResult *result = &frame->script_result;
-    if (!task_failed
-        && !script_error_reports_out_of_memory(result->error)
-        && !script_error_reports_out_of_memory(
-               result->last_uncaught_callback_error)
-        && script_runtime_heap_available(frame->runtime) >= 256u * 1024u)
-        return false;
+    if (frame->retired || frame->runtime == NULL)
+        return NAVIGATION_SCRIPT_MEMORY_UNREFUSED;
+    NavigationScriptMemoryVerdict verdict = navigation_judge_realm_memory(
+        frame->runtime, &frame->realm_refusals_seen,
+        &frame->realm_memory_kept_low, "frame");
+    if (verdict != NAVIGATION_SCRIPT_MEMORY_STOPPED) return verdict;
     size_t slot = (size_t) (frame - session->page.frames);
     navigation_retire_frame_descendants(
         session, slot, "ancestor iframe stopped at its memory limit");
@@ -948,29 +973,33 @@ static bool navigation_stop_exhausted_frame_realm(NavigationSession *session,
              sizeof(frame->script_result.summary),
              "JavaScript stopped at its memory limit");
     session->frames_memory_stopped++;
-    return true;
+    return verdict;
 }
 
 /* After work that can run child realms outside their own turn (message
-   delivery), stop each that ran out. */
-static void navigation_stop_exhausted_frame_realms(NavigationSession *session)
+   delivery), judge each that was refused. True when any was. */
+static bool navigation_stop_exhausted_frame_realms(NavigationSession *session)
 {
+    bool refused = false;
     for (size_t i = 0; i < session->page.frame_count; i++)
-        (void) navigation_stop_exhausted_frame_realm(
-            session, &session->page.frames[i], false);
+        refused |= navigation_stop_exhausted_frame_realm(
+                       session, &session->page.frames[i])
+            != NAVIGATION_SCRIPT_MEMORY_UNREFUSED;
+    return refused;
 }
 
 /* A page realm that has run out of heap is retired the same way wherever
    that is noticed: its DOM, stylesheet and layout stay, scripts stop with
    "JavaScript stopped at its memory limit", and the static-content cascade
-   is rebuilt. Returns false when the realm still has room, so the caller's
-   failure is not a memory failure and keeps its own handling. */
-static bool navigation_retire_exhausted_page_realm(
-    NavigationSession *session, bool allocator_rejection_observed)
+   is rebuilt. A realm refused but kept, or never refused, is left running
+   (the verdict says which), so the caller's failure keeps its own
+   handling. */
+static NavigationScriptMemoryVerdict navigation_retire_exhausted_page_realm(
+    NavigationSession *session, const char *where)
 {
-    if (!navigation_retire_exhausted_script_realms(
-            session, allocator_rejection_observed))
-        return false;
+    NavigationScriptMemoryVerdict verdict =
+        navigation_assess_script_memory(session, where);
+    if (verdict != NAVIGATION_SCRIPT_MEMORY_STOPPED) return verdict;
     /* Frames that had not loaded can no longer start: the realm that owns
        their elements' WindowProxies is gone, and the runtime pump that would
        complete them stops with it. Release their fetches now instead of
@@ -984,7 +1013,7 @@ static bool navigation_retire_exhausted_page_realm(
     }
     /* A refused rebuild keeps the committed layout usable. */
     (void) navigation_relayout_static_fallback(session);
-    return true;
+    return verdict;
 }
 
 /* The parent realm could not set up an iframe it discovered (on a page at
@@ -1006,7 +1035,8 @@ static bool navigation_contain_frame_setup_failure(
     if (frame != NULL && !frame->retired)
         navigation_retire_unloaded_frame(session, frame, "iframe setup failed");
     if (parent_frame_slot_plus_one == 0
-        && navigation_retire_exhausted_page_realm(session, false)) return true;
+        && navigation_retire_exhausted_page_realm(session, "frame-setup")
+               == NAVIGATION_SCRIPT_MEMORY_STOPPED) return true;
     /* The realm survives (a child frame's realm, or a refusal that left
        room): its WindowProxy for the element must not claim a live browsing
        context that has no C frame behind it, so mark it closed. */
@@ -1045,7 +1075,6 @@ static bool navigation_dispatch_frame_event_contained(
         *retired = session->page.loaded && session->page.runtime == NULL;
         return *retired;
     }
-    size_t rejections = script_runtime_heap_rejections(parent_runtime);
     if (!navigation_dispatch_frame_parent_event(
             session, parent_runtime, parent_frame_slot_plus_one, node,
             event_type)) return false;
@@ -1055,8 +1084,8 @@ static bool navigation_dispatch_frame_event_contained(
         return true;
     }
     *retired = parent_frame_slot_plus_one == 0
-        && script_runtime_heap_rejections(parent_runtime) > rejections
-        && navigation_retire_exhausted_page_realm(session, true);
+        && navigation_retire_exhausted_page_realm(session, "frame-event")
+               == NAVIGATION_SCRIPT_MEMORY_STOPPED;
     return true;
 }
 
@@ -1304,8 +1333,11 @@ static bool navigation_load_frames_for_context(
     if (navigation_deliver_frame_messages(session)) return true;
     /* As at the runtime pump's own delivery point: a realm out of heap is
        retired with the page kept, anything else stays a failure. */
-    if (session->page.runtime == NULL
-        || !navigation_retire_exhausted_page_realm(session, false)) return false;
+    if (session->page.runtime == NULL) return false;
+    bool frames_refused = navigation_stop_exhausted_frame_realms(session);
+    if (navigation_retire_exhausted_page_realm(session, "messages")
+            == NAVIGATION_SCRIPT_MEMORY_UNREFUSED && !frames_refused)
+        return false;
     session->performance.frame_message_soft_failures++;
     return true;
 }
@@ -1399,6 +1431,91 @@ static bool navigation_frame_element_hidden(
         && layout_box_for_node(parent_layout, frame->element) == NULL;
 }
 
+/* A child document's author style and images, loaded as the top-level
+   page's are: its stylesheets (and their imports) through the frame's own
+   response ledger, its images into the frame's table, under the page's
+   limits and the child document's CSP, with the top-level page as the
+   site for cookies. A frame that links no stylesheet, or whose sheets fail
+   to load, keeps its inline styles. */
+static bool navigation_frame_build_style(
+    NavigationSession *session, NavigationFrame *frame, Stylesheet *sheet,
+    const ViewportContext *viewport, bool *renumbered)
+{
+    char base_url[NAVIGATION_URL_LIMIT];
+    bool external = session->external_resources_enabled
+        && navigation_document_resource_base(
+               &frame->document, frame->url, base_url);
+    lxb_dom_node_t *root = lxb_dom_interface_node(frame->document.html);
+    for (lxb_dom_node_t *node = root; external
+             && frame->stylesheet_resources == NULL && node != NULL;) {
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && node_name_is(node, "link"))
+            frame->stylesheet_resources = budget_calloc_category(
+                session->budget, BUDGET_CATEGORY_STYLE, 1u,
+                sizeof(*frame->stylesheet_resources));
+        if (node->first_child != NULL) {
+            node = node->first_child;
+            continue;
+        }
+        while (node != root && node->next == NULL) node = node->parent;
+        node = node == root ? NULL : node->next;
+    }
+    bool styled = false;
+    if (external && frame->stylesheet_resources != NULL) {
+        ExternalStylesheetStats stats;
+        frame->stylesheet_resources->top_level_url =
+            session->page.document_url;
+        styled = stylesheet_build_context_deferred(
+                sheet, session->budget, &frame->document, viewport)
+            && stylesheets_load_external_tracked_with_context(
+                &frame->document, sheet, session->budget, base_url,
+                frame->url, frame->referrer_policy,
+                session->maximum_stylesheets,
+                session->maximum_stylesheet_bytes,
+                session->maximum_stylesheet_file_bytes,
+                session->resource_timeout_ms,
+                session->page.resource_scheduler, session->browser_session,
+                frame->stylesheet_resources, &stats);
+        if (!styled) {
+            stylesheet_destroy(sheet);
+            memset(sheet, 0, sizeof(*sheet));
+        }
+    }
+    if (!styled && !stylesheet_build_context(
+            sheet, session->budget, &frame->document, viewport))
+        return false;
+    if (external) {
+        /* A failed <img> source can give up its slot without discarding
+           live backgrounds or compacting the retained image table. */
+        images_discard_stale_failures(&frame->images, sheet,
+                                      session->maximum_images);
+        /* Retire an old loaded source before admitting its replacement. */
+        for (size_t i = 0; i < frame->images.count; i++) {
+            const ImageResource *item = &frame->images.items[i];
+            lxb_dom_node_t *node = item->node;
+            if (item->is_mask || item->is_background
+                || item->pseudo != PSEUDO_NONE || item->adopted_surface
+                || item->source_hash == 0
+                || !document_node_is_tag(node, LXB_TAG_IMG)
+                || image_resource_source_current(sheet, item)) continue;
+            images_discard_nodes(&frame->images, &node, 1u,
+                                 session->maximum_images);
+            *renumbered = true;
+            i = (size_t) -1;
+        }
+        frame->images.top_level_url = session->page.document_url;
+        (void) images_load_external(
+            &frame->document, sheet, &frame->images, session->budget,
+            base_url, frame->url, frame->referrer_policy,
+            session->maximum_images, session->maximum_image_bytes,
+            session->maximum_image_file_bytes,
+            session->maximum_decoded_image_bytes,
+            session->resource_timeout_ms, session->page.resource_scheduler,
+            session->browser_session);
+    }
+    return true;
+}
+
 /* Build one bounded visual snapshot of a child browsing context. The child
    DOM and its control nodes stay inside NavigationFrame; the parent receives
    only opaque pixels attached to the iframe element. This is deliberately a
@@ -1443,13 +1560,32 @@ static bool navigation_refresh_frame_presentation(
        pixel per snapshot pixel, and the parent's own scale applies when it
        draws the image. Using the physical display as the child's device
        made every frame narrower than the screen paint at display/frame
-       scale (1.6x for Turnstile's 300px widget) and crop. */
+       scale (1.6x for Turnstile's 300px widget) and crop. Its device-*
+       media features still describe the screen, as its script's do. */
+    /* Loading the frame's images may move that table: the current
+       snapshot's display list is rebound to it, or loses its pointers into
+       it when a changed image's entry left and renumbered it. */
+    uintptr_t image_base = (uintptr_t) frame->images.items;
+    size_t image_count = frame->images.count;
+    bool renumbered = false;
     bool okay = images_reserve_capacity(
             &frame->images, session->budget, NAVIGATION_FRAME_LIMIT)
-        && viewport_context_init(&viewport, width, height, width, height)
-        && stylesheet_build_context(
-            &fresh->stylesheet, session->budget, &frame->document,
-            &viewport)
+        && viewport_context_init(&viewport, width, height, width, height);
+    viewport.screen_width = device_width;
+    viewport.screen_height = device_height;
+    okay = okay
+        && navigation_frame_build_style(
+            session, frame, &fresh->stylesheet, &viewport, &renumbered)
+        && images_reserve_capacity(
+            &frame->images, session->budget,
+            frame->images.count + NAVIGATION_FRAME_LIMIT);
+    static const ImageResources no_images;
+    if (frame->presentation != NULL
+        && (renumbered || (uintptr_t) frame->images.items != image_base))
+        (void) layout_rebind_image_resources(
+            &frame->presentation->layout, image_base, image_count,
+            renumbered ? &no_images : &frame->images);
+    okay = okay
         && layout_build_context(
             &fresh->layout, session->budget, &frame->document,
             &fresh->stylesheet, session->fonts, &frame->images, &viewport);
@@ -1700,7 +1836,8 @@ static bool navigation_finish_frame(NavigationSession *session,
                     session, parent_runtime)) return false;
             if (parent_slot_plus_one == 0
                 && navigation_retire_exhausted_page_realm(
-                    session, parent_state_oom))
+                       session, "frame-state")
+                       == NAVIGATION_SCRIPT_MEMORY_STOPPED)
                 return true;
         }
         bool realm_retired = false;
@@ -1710,7 +1847,7 @@ static bool navigation_finish_frame(NavigationSession *session,
     }
     frame->loaded = true;
     session->frames_loaded++;
-    (void) navigation_stop_exhausted_frame_realm(session, frame, false);
+    (void) navigation_stop_exhausted_frame_realm(session, frame);
     (void) script_runtime_trim_pool(frame->runtime);
     if (!navigation_refresh_frame_presentation_or_defer(
             session, frame)) return false;

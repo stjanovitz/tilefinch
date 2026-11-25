@@ -132,6 +132,8 @@ JSValue js_dom_parse_color(JSContext *context,
 #define DOM_SCROLL_INTENT_LIMIT 16u
 #define SCRIPT_DEFAULT_SLOW_DEPENDENCY_US UINT64_C(16000)
 #define SCRIPT_CRYPTO_DIGEST_INPUT_LIMIT (1024u * 1024u)
+/* A Web Crypto slice's time (PBKDF2 and the jobs of src/web_crypto.c). */
+#define SCRIPT_CRYPTO_SLICE_NS UINT64_C(8000000)
 #define SCRIPT_LAZY_MAX_RETAINED_SOURCE_BYTES (6u * 1024u * 1024u)
 #define SCRIPT_LAZY_RESIDENT_FACTORY_LIMIT 8192u
 /* Browser-authored, non-page-controlled constructor facade installed into a
@@ -181,7 +183,7 @@ JSValue js_dom_parse_color(JSContext *context,
 #define SCRIPT_REALM_MAXIMUM_SCRIPTS 256u
 #define SCRIPT_REALM_MAXIMUM_FILE_BYTES (8u * 1024u * 1024u)
 #define SCRIPT_REALM_MAXIMUM_TOTAL_BYTES (128u * 1024u * 1024u)
-#define SCRIPT_LAZY_BOOTSTRAP_FEATURE_COUNT 20u
+#define SCRIPT_LAZY_BOOTSTRAP_FEATURE_COUNT 29u
 /* A fully hydrated long article exceeds 4096 nodes several times
    over; a truncated walk silently drops querySelectorAll matches (the
    mobile section transform only saw the first few sections).
@@ -480,7 +482,12 @@ typedef enum {
 /* One entry of the document's map of preloaded resources (HTML, <link
    rel=preload>) for a classic script: the response of a preload whose key
    is url, destination "script", mode and credentials, kept for the first
-   consumer (script_runtime_offer_preloaded_script). */
+   consumer (script_runtime_offer_preloaded_script). A module entry (HTML's
+   module map, which a modulepreload fills) is an adopted request: while
+   PENDING it goes to the first module fetch of the same key
+   (script_runtime_take_module_preload); completed, its response is in the
+   module HTTP cache that module fetches consult, and READY for a
+   script-inserted module script. */
 typedef struct {
     char *url;
     /* The link's integrity metadata; NULL when it had none. */
@@ -502,6 +509,12 @@ typedef struct {
     FetchScheduler *scheduler;
     uint64_t request_id;
     uint8_t csp_grant;
+    /* The document's CSP policy count when the request was made. */
+    uint8_t csp_policies;
+    bool module;
+    /* A module response's Referrer-Policy (its code; 0: none), which the
+       module's imports use. */
+    uint8_t referrer_policy;
 } ScriptPreloadedScript;
 /* How long after the load event an unconsumed entry is kept: Chromium's
    kUnusedPreloadTimeout (resource_fetcher.cc), after which it reports the
@@ -890,6 +903,10 @@ typedef struct DomBridge {
        (anything but id, form, name, type or an internal state
        attribute). */
     uint64_t dom_structure_version;
+    /* Advances with every script mutation but attribute, inline-style and
+       canvas ones, and with document.write(): what can change how many
+       nodes the document holds. */
+    uint64_t tree_version;
     /* The document's parser_writes the two versions above last took in
        (js_rt_bridge_note_parser_writes). */
     uint64_t parser_writes_seen;
@@ -1012,6 +1029,19 @@ typedef struct DomBridge {
     ScriptSynchronousLayoutCallback synchronous_layout;
     void *synchronous_layout_opaque;
     bool synchronous_layout_images_only;
+    /* The load lifecycle's layout allowance (script_runtime_finish_loading):
+       the work its builds after the first may still do, and the work of
+       its first build (0 until that ran). Only builds spend it. */
+    uint64_t loading_layout_allowance;
+    uint64_t loading_layout_first;
+    /* The live document's nodes and elements as the load allowance's
+       estimate last counted them (up to its cap), and the tree_version
+       they were counted at; loading_count_valid is cleared at each load. */
+    size_t loading_count_nodes;
+    size_t loading_count_elements;
+    uint64_t loading_count_version;
+    bool loading_count_valid;
+    bool synchronous_layout_loading;
     bool synchronous_layout_geometry_only;
     bool expect_navigation_layout;
     /* script_runtime_set_sheet_settle_callback; a refusal stands until
@@ -1188,6 +1218,7 @@ typedef enum {
     SCRIPT_HOST_REFRESH_NAMED_PROPERTIES = 0,
     SCRIPT_HOST_PARSER_MUTATION_CHECKPOINT,
     SCRIPT_HOST_RECEIVE_MESSAGE,
+    SCRIPT_HOST_RECEIVE_KEY_MESSAGE,
     SCRIPT_HOST_SET_FRAME_WINDOW_STATE,
     SCRIPT_HOST_INTERSECTION_RECHECK,
     SCRIPT_HOST_MEDIA_RECHECK,
@@ -1228,6 +1259,11 @@ typedef enum {
     SCRIPT_HOST_RELEASE_EVENT_HOLDERS,
     /* compat.js: a microphone permission changed; statuses re-read. */
     SCRIPT_HOST_PERMISSIONS_CHANGED,
+    /* platform.js's parent and top senders, kept last: deleted from the
+       global once captured and handed only to the child messaging set-up
+       (script_runtime_configure_messaging). */
+    SCRIPT_HOST_POST_PARENT_MESSAGE,
+    SCRIPT_HOST_POST_TOP_MESSAGE,
     SCRIPT_HOST_CALLBACK_COUNT
 } ScriptHostCallback;
 
@@ -1299,6 +1335,12 @@ bool js_rt_geometry_attribute_write_begin(DomBridge *bridge,
                                           JsRtGeometryAttributeWrite *write);
 void js_rt_geometry_attribute_write_end(DomBridge *bridge,
                                         const JsRtGeometryAttributeWrite *write);
+/* A class or inline style write under a display:none ancestor keeps
+   script's current geometry (see dispatch_state.inc). `relational`: the
+   write may change a :has() answer. end, after the write was journaled. */
+bool js_rt_geometry_hidden_write_begin(DomBridge *bridge, lxb_dom_node_t *node,
+                                       bool relational);
+void js_rt_geometry_hidden_write_end(DomBridge *bridge);
 #define SCRIPT_FRAME_REALM_LIMIT 16
 #define SCRIPT_CHECKPOINT_CONTINUATION_LIMIT 8
 /* Consecutive turns FinalizationRegistry cleanup may go without a task slot
@@ -1327,6 +1369,15 @@ struct ScriptRuntime {
     uint64_t geometry_sheet_generation;
     uint64_t geometry_font_generation;
     uint64_t geometry_container_generation;
+    /* The five generations above as geometry_incumbent had them, kept
+       while a scratch snapshot holds them (geometry_inputs_save). */
+    uint64_t geometry_incumbent_inputs[5];
+    /* Bumped whenever the geometry's inputs are captured or restored: the
+       display:none ancestor last found for a kept write (hidden_root) is
+       known only for the geometry of its serial. */
+    uint64_t geometry_serial;
+    uint64_t geometry_hidden_serial;
+    lxb_dom_node_t *geometry_hidden_root;
     bool geometry_paint_stale;
     /* The inputs and free budget of the geometry build the budget last
        refused (script_runtime_flush_geometry_layout_reuse). */
@@ -1422,6 +1473,9 @@ struct ScriptRuntime {
        collection pacing grows from (0 before the first). */
     size_t heap_live_after_gc;
     size_t heap_collections;
+    /* Page Budget refusals of the host memory a network delivery needs
+       (js_rt_note_delivery_refusal); counted with the realm's own. */
+    size_t delivery_refusals;
     /* Collection pacing (js_rt_gc_pacing): collections the allocation
        threshold ran, collections that left less than an amortized
        allocation step, and times it backed off for the rest of an advance.
@@ -1493,6 +1547,8 @@ struct ScriptRuntime {
     bool test_probes;
     /* Frame realm setups still to refuse (__tilefinchRefuseFrameSetups). */
     unsigned refused_frame_setups;
+    /* A test's Web Crypto slice length in ns; 0 is SCRIPT_CRYPTO_SLICE_NS. */
+    uint64_t crypto_slice_ns;
 #endif
     Watchdog watchdog;
     DomBridge bridge;
@@ -1586,6 +1642,7 @@ struct ScriptRuntime {
     size_t image_load_state_capacity;
     size_t image_load_pending;
     struct ScriptImagePreloads *image_preloads;
+    struct ScriptImageDecodeTickets *image_decode_tickets;
     /* Created lazily as a private callable, never published to page script. */
     JSValue media_update;
     /* The private WeakMap from each Document to its document.all
@@ -1633,6 +1690,11 @@ struct ScriptRuntime {
     JSValue host_viewport_dispatch;
     JSValue host_event_constructor;
     JSValue host_trusted_event;
+    /* dom.js's private share of browser-only helpers (reserved timers, the
+       timer cancel, the crypto-scope stop), taken off the global before
+       author code: lent to motion.js while it loads, and passed to the
+       Worker installer. */
+    JSValue dom_share;
     /* First resize only: do not charge every tiny realm for this code. */
     JSValue viewport_resize_dispatch;
     /* CONTENT_BLOCKER_SHIM_* answers this realm already gave for refused
@@ -2078,6 +2140,7 @@ bool js_rt_evaluate_browser_source(JSContext *context, const char *source,
                                    ScriptResult *result);
 const char *js_rt_bridge_calculated_base_url(DomBridge *bridge);
 bool js_rt_image_preload_changed(DomBridge *bridge, lxb_dom_node_t *node);
+int js_rt_image_decode_ticket(DomBridge *bridge, long handle, int op, int ticket);
 const ImageResource *js_rt_image_preload_find(DomBridge *bridge,
                                              const lxb_dom_node_t *node);
 ImageResources *js_rt_image_preload_resources(DomBridge *bridge);
@@ -2708,6 +2771,20 @@ size_t js_rt_heap_growth_hook(void *opaque, size_t live, size_t growth,
    would otherwise end in a refusal runs regardless. */
 size_t js_rt_gc_amortized_step(size_t live);
 bool js_rt_gc_due(const ScriptRuntime *runtime);
+/* A completed response the realm could not take for memory stays queued
+   for a later turn; the refusal is judged like the realm's own
+   (script_runtime_allocation_refusals), so a page whose memory stays
+   exhausted has its realm kept or stopped by the memory stop rule instead
+   of failing the turn. */
+void js_rt_note_delivery_refusal(ScriptRuntime *runtime);
+/* Gives up the session's cached responses (browser_session_cache_reclaim)
+   for only the page Budget the realm still lacks to obtain `wanted` more
+   heap, and nothing when Budget cannot raise what it obtains (the heap is
+   at its limit or ceiling), when the whole cache could not cover the
+   shortfall (browser_session_cache_reclaimable_bytes), or when the session
+   draws on another Budget. Returns the bytes freed. */
+size_t js_rt_reclaim_cached_responses_for_heap(ScriptRuntime *runtime,
+                                               size_t wanted);
 JSValue js_dom_make_fast_getter(JSContext *context, JSValueConst this_value,
                                 int argc, JSValueConst *argv);
 JSValue js_dom_make_fast_method(JSContext *context, JSValueConst this_value,

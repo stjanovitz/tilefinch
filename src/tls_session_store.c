@@ -412,16 +412,8 @@ int tls_session_store_save(const TlsSessionStore *store, const char *path,
              && verify_hash == hash && verify_bytes == payload_bytes
              && verify_count == entry_count;
     }
-    ok = fclose(file) == 0 && ok;
-    if (!ok) {
-        (void) remove(temporary);
-        return -1;
-    }
-    if (!tilefinch_platform_replace_file(temporary, path, backup)) {
-        (void) remove(temporary);
-        return -1;
-    }
-    return 0;
+    return tilefinch_platform_finish_file(file, ok, temporary, path, backup)
+        ? 0 : -1;
 }
 
 static TlsSessionStore *load_one(const char *path, uint32_t crypto_pin,

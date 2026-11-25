@@ -131,6 +131,10 @@ bool style_shadow_selector_rewrite(const Stylesheet *sheet,
                                    const char *selector, size_t length,
                                    char *output, size_t capacity,
                                    bool *rewritten);
+/* The carrier of the shadow tree whose <style> holds the rule of cascade
+   order `order`, or NULL for a rule of no shadow tree's <style>. */
+const lxb_dom_node_t *style_shadow_scope_carrier(const Stylesheet *sheet,
+                                                unsigned order);
 /* Whether a shadow-confined rule (adopted by shadow roots only, or from a
    shadow tree's <style>) may apply to `node`, given its selector: a :host
    rule applies to the scope's host, a ::slotted() rule to the host's light

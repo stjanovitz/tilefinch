@@ -71,6 +71,9 @@ void psp_media_request_user_retry(PspMediaSession *media)
         media->ui.retry_unavailable = true;
         return;
     }
+    /* Retry belongs to the visible failure panel. Close may retain its
+       source, and the first Retry already replaced that panel. */
+    if (!media->ui.visible || !media->ui.failed) return;
     /* The failed open's own play intent. Its pipeline records it as a
        continuation; an open that failed before it built one -- a resolve or
        probe failure, or the unencrypted-audio question -- has nothing to

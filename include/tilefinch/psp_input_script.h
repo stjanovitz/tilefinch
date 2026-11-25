@@ -34,8 +34,12 @@
 
 /* Frames the browser may stay busy before a stalled script gives up. At the
    nominal 16 ms cadence this is about 30 s, far longer than any hermetic
-   navigation and far shorter than a hung emulator session. */
+   navigation and far shorter than a hung emulator session. A host that sets
+   `now_us` has the limit measured as that much time (busy supervisors poll
+   faster than frames); four times as many ticks still end a run whose clock
+   stops. */
 #define PSP_INPUT_SCRIPT_STALL_LIMIT 1800u
+#define PSP_INPUT_SCRIPT_NOMINAL_FRAME_US 16000u
 
 typedef enum {
     /* Idle frames: no buttons held. */
@@ -107,6 +111,7 @@ typedef struct {
     uint32_t busy_press_edges;
     uint32_t stall_limit;
     uint32_t stalled_ticks;
+    uint64_t stall_started_us;
     bool armed;
     bool finished;
     bool stalled;

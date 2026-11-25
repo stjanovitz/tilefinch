@@ -64,6 +64,12 @@ bool psp_profile_store_flush(PspProfileStore *store)
         profile_store_clean(store);
         return true;
     }
+    /* A generation boot could not read is read again at each attempt (the
+       retry backoff spaces them); saving waits until nothing would be
+       lost. */
+    if (browser_profile_save_blocked(store->profile)
+        && !browser_profile_recheck_unread(store->profile, store->path))
+        return false;
     BrowserProfileFingerprint written;
     if (!browser_profile_save_fingerprinted(
             store->profile, store->path, &written)) return false;
@@ -71,6 +77,12 @@ bool psp_profile_store_flush(PspProfileStore *store)
     store->saved_known = true;
     profile_store_clean(store);
     return true;
+}
+
+bool psp_profile_store_commit_edit(PspProfileStore *store, uint64_t now_us)
+{
+    psp_profile_store_mark_dirty(store, now_us);
+    return psp_profile_store_flush(store);
 }
 
 bool psp_profile_store_flush_due(

@@ -1,0 +1,17 @@
+# Cancel an outstanding Details load, not the committed watch page.
+wait 1
+tap right
+wait 1
+mark details
+tap cross
+wait-live 3
+tap-live circle
+wait 2
+mark restored
+tap cross
+wait 1
+mark watch
+tap circle
+wait 1
+mark returned
+end

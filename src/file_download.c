@@ -445,11 +445,13 @@ refuse:
     return false;
 }
 
-static bool file_size(const char *path, uint64_t *size)
+/* An absent partial means start at zero. An inaccessible one doesn't. */
+static bool file_size_or_absent(const char *path, uint64_t *size)
 {
     struct stat status;
-    if (stat(path, &status) != 0 || !S_ISREG(status.st_mode) || status.st_size < 0)
-        return false;
+    *size = 0;
+    if (stat(path, &status) != 0) return errno == ENOENT;
+    if (!S_ISREG(status.st_mode) || status.st_size < 0) return false;
     *size = (uint64_t) status.st_size;
     return true;
 }
@@ -473,56 +475,49 @@ static bool save_validator(FileDownloadManager *manager)
     FILE *file = fopen(temporary, "wb");
     if (file == NULL) return false;
     const OfflineLibraryItem *item = offline_library_find(manager->library, manager->id);
-    bool okay = item != NULL && fputs("TFDL02\n", file) >= 0
+    bool okay = item != NULL && fputs("TFDL03\n", file) >= 0
         && fputs(item->source_url, file) >= 0 && fputc('\n', file) != EOF
         && fputs(manager->validator, file) >= 0 && fputc('\n', file) != EOF
         && fwrite(manager->resource_digest, 1, sizeof(manager->resource_digest),
                   file) == sizeof(manager->resource_digest);
-    if (fflush(file) != 0 || ferror(file)) okay = false;
-    if (fclose(file) != 0) okay = false;
-    if (!okay || !tilefinch_platform_replace_file(temporary, path, NULL)) {
-        remove(temporary);
-        return false;
-    }
-    return true;
+    return tilefinch_platform_finish_file(file, okay, temporary, path, NULL);
 }
 
-static void load_validator(FileDownloadManager *manager)
+static bool load_validator(FileDownloadManager *manager)
 {
     manager->validator[0] = '\0';
     memset(manager->resource_digest, 0, sizeof(manager->resource_digest));
     char path[FILE_DOWNLOAD_PATH_LIMIT];
-    if (!offline_library_item_path(manager->library, manager->id, ".file.meta", path, sizeof(path))) return;
+    if (!offline_library_item_path(manager->library, manager->id, ".file.meta", path, sizeof(path))) return false;
     FILE *file = fopen(path, "rb");
-    if (file == NULL) return;
+    if (file == NULL) return errno == ENOENT;
     char magic[16] = {0}, url[OFFLINE_LIBRARY_URL_LIMIT + 2u] = {0}, validator[FILE_VALIDATOR_LIMIT + 2u] = {0};
-    /* Old sidecars lack the identity and can only restart from zero. */
-    bool okay = fgets(magic, sizeof(magic), file) != NULL && !strcmp(magic, "TFDL02\n")
+    /* Older receipts may identify only the path, even if the original
+       resource had a query. They cannot authorize a range or a 416. */
+    bool okay = fgets(magic, sizeof(magic), file) != NULL && !strcmp(magic, "TFDL03\n")
         && fgets(url, sizeof(url), file) != NULL
         && fgets(validator, sizeof(validator), file) != NULL
         && fread(manager->resource_digest, 1, sizeof(manager->resource_digest),
                  file) == sizeof(manager->resource_digest)
         && fgetc(file) == EOF && !ferror(file);
-    fclose(file);
+    bool read_error = ferror(file) != 0;
+    if (fclose(file) != 0 || read_error) return false;
     const OfflineLibraryItem *item = offline_library_find(manager->library, manager->id);
     size_t u = strlen(url), v = strlen(validator);
-    if (!okay || item == NULL || u == 0 || v == 0 || url[u - 1] != '\n' || validator[v - 1] != '\n') return;
+    if (!okay || item == NULL || u == 0 || v == 0 || url[u - 1] != '\n' || validator[v - 1] != '\n') return true;
     url[u - 1] = validator[v - 1] = '\0';
     if (!strcmp(item->source_url, url) && safe_validator(validator))
         memcpy(manager->validator, validator, strlen(validator) + 1u);
+    return true;
 }
 
-/* Names the resource that answered after redirects. A signed CDN
-   redirect puts a fresh signature and expiry in the query of every
-   attempt, so under a strong ETag, which the origin assigns to one
-   entity, the scheme, host and path name the resource. A Last-Modified
-   date is shared by every file uploaded in the same second: there the
-   whole URL, query included, must match. */
+/* Validators describe a representation of one resource, and two query
+   variants can have the same validator. Fragments never go on the wire. */
 static bool response_resource_digest(const FetchResult *response,
-                                     bool strong, uint8_t digest[32])
+                                     uint8_t digest[32])
 {
     const char *url = response->effective_url;
-    size_t length = strong ? strcspn(url, "?#") : strlen(url);
+    size_t length = strcspn(url, "#");
     return length != 0 && tilefinch_sha256_digest(
         (const uint8_t *) url, length, digest);
 }
@@ -531,8 +526,7 @@ static bool matches_resource(const FileDownloadManager *manager,
                              const FetchResult *response)
 {
     uint8_t digest[TILEFINCH_SHA256_DIGEST_BYTES];
-    return response_resource_digest(
-               response, manager->validator[0] == 'E', digest)
+    return response_resource_digest(response, digest)
         && !memcmp(digest, manager->resource_digest, sizeof(digest));
 }
 
@@ -647,8 +641,7 @@ static bool headers(void *opaque, const FetchResult *response)
             memcpy(manager->validator + 2, response->last_modified, strlen(response->last_modified) + 1u);
         }
         if (!safe_validator(manager->validator)
-            || !response_resource_digest(response, manager->validator[0] == 'E',
-                                         manager->resource_digest))
+            || !response_resource_digest(response, manager->resource_digest))
             manager->validator[0] = '\0';
         char disposition[4097], filename[FILE_DOWNLOAD_FILENAME_LIMIT];
         bool have = fetch_response_header_value(response, "content-disposition", disposition, sizeof(disposition));
@@ -672,7 +665,7 @@ static bool headers(void *opaque, const FetchResult *response)
     char path[FILE_DOWNLOAD_PATH_LIMIT], final[FILE_DOWNLOAD_PATH_LIMIT];
     struct stat exists;
     if (!file_download_path(manager->library, manager->id, final, sizeof(final))
-        || stat(final, &exists) == 0
+        || stat(final, &exists) == 0 || errno != ENOENT
         || !offline_library_item_path(manager->library, manager->id, ".file.part", path, sizeof(path))
         || !offline_library_save(manager->library)) {
         snprintf(manager->error, sizeof(manager->error), "Download metadata or destination is unavailable");
@@ -747,10 +740,13 @@ bool file_download_start(FileDownloadManager *manager, uint32_t id)
     manager->resume_complete = false;
     manager->total = manager->available = 0;
     char path[FILE_DOWNLOAD_PATH_LIMIT];
-    load_validator(manager);
-    if (safe_validator(manager->validator)
-        && offline_library_item_path(manager->library, id, ".file.part", path, sizeof(path)))
-        file_size(path, &manager->offset);
+    if (!load_validator(manager) || !offline_library_item_path(
+            manager->library, id, ".file.part", path, sizeof(path))
+        || !file_size_or_absent(path, &manager->offset)) {
+        stop(manager, OFFLINE_ITEM_PAUSED, "Partial download could not be checked; retry");
+        return false;
+    }
+    if (!safe_validator(manager->validator)) manager->offset = 0;
     if (manager->offset >= FILE_DOWNLOAD_LIMIT) manager->offset = 0;
     manager->received = manager->offset;
     offline_download_speed_reset(&manager->speed, manager->offset);

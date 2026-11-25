@@ -544,7 +544,23 @@ void psp_app_route_controller_action(
                 action->url);
         }
         psp_ui_set_loading(&app->process->presentation.ui, true, -1);
-        if (reader_navigation)
+        PspUiState *ui = &app->process->presentation.ui;
+        char title[sizeof(ui->video_details.title)], channel[sizeof(ui->video_details.channel)];
+        if (!reader_navigation && engine_frame && ui->screen == PSP_UI_SCREEN_PAGE
+            && browser_engine_youtube_details_summary(engine, action,
+                title, sizeof(title), channel, sizeof(channel))) {
+            psp_ui_show_video_details(ui, title, channel);
+            bool shown = psp_present_internal(engine_frame, ui, false);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            uint64_t press = frame->replayed_press_us ? frame->replayed_press_us : frame->ui_sample_us;
+            if (shown && press)
+                printf("tilefinch-details-preview: press-to-present-us=%llu input-us=%llu\n",
+                       (unsigned long long)(sceKernelGetSystemTimeWide() - press),
+                       (unsigned long long)press);
+#else
+            (void)shown;
+#endif
+        } else if (reader_navigation)
             psp_ui_show_status(&app->process->presentation.ui,
                                "LOADING READER PAGE", 300);
         else
@@ -555,6 +571,7 @@ void psp_app_route_controller_action(
             &app->process->presentation.ui, engine_frame, engine);
         psp_text_input_before_navigation(&app->process->text_input);
     }
+    unsigned before_draft = psp_draft_stays();
     bool action_ok = action->type
             == CONTROLLER_ACTION_NONE
         || (navigates
@@ -571,6 +588,7 @@ void psp_app_route_controller_action(
             frame->page_dirty = true;
         }
     } else {
+        bool stayed = psp_draft_stays() != before_draft;
         if (navigates) {
             psp_navigation_abandon_javascript(engine, profile);
             (void) psp_engine_views_refresh(app->views, engine);
@@ -583,22 +601,24 @@ void psp_app_route_controller_action(
                 incumbent_url,
                 false);
             (void) psp_engine_views_refresh(app->views, engine);
-            (void) psp_write_failure_report(
-                "navigation-action-start",
-                browser_engine_last_error(engine),
-                action->url, 0, 0);
-            psp_report_job_failure(
-                "navigation-action-start",
-                "interactive-action-start-failed",
-                -1, 0,
-                browser_engine_last_error(engine));
+            if (!stayed) {
+                (void) psp_write_failure_report(
+                    "navigation-action-start",
+                    browser_engine_last_error(engine),
+                    action->url, 0, 0);
+                psp_report_job_failure(
+                    "navigation-action-start",
+                    "interactive-action-start-failed",
+                    -1, 0,
+                    browser_engine_last_error(engine));
+            }
             psp_navigation_cooperate_end(
                 "interactive-action-start-failed");
             psp_ui_set_loading(
                 &app->process->presentation.ui, false, 0);
         }
         psp_ui_show_status(
-            &app->process->presentation.ui, browser_engine_last_error(engine), 300);
+            &app->process->presentation.ui, stayed ? "CANCELLED" : browser_engine_last_error(engine), 300);
     }
 }
 

@@ -2171,6 +2171,7 @@ typedef struct {
     const char *method;
     /* The response's Accept-CH value; NULL: none. */
     const char *accept_ch;
+    const char *set_cookie;
 } GoogleIdentityRecord;
 
 static bool write_google_identity_replay(
@@ -2197,7 +2198,7 @@ static bool write_google_identity_replay(
             "redirect-origin-tainted=0\n"
             "effective-url=%s\ncontent-type=%s\netag=\nlast-modified=\n"
             "cf-mitigated=\naccept-ch=%s\ncritical-ch=\nserver=gws\n"
-            "cf-ray=\nset-cookie-count=0\n",
+            "cf-ray=\nset-cookie-count=%u\n",
             record->method == NULL ? "GET" : record->method,
             record->url, record->failed ? 0 : 1,
             record->failed ? "Invalid HTTP header field was received" : "",
@@ -2205,7 +2206,10 @@ static bool write_google_identity_replay(
             record->effective_url == NULL ? record->url
                                           : record->effective_url,
             record->content_type,
-            record->accept_ch == NULL ? "" : record->accept_ch) > 0;
+            record->accept_ch == NULL ? "" : record->accept_ch,
+            record->set_cookie == NULL ? 0u : 1u) > 0;
+        if (ok && record->set_cookie != NULL)
+            ok = fprintf(meta, "set-cookie-0=%s\n", record->set_cookie) > 0;
         ok = meta != NULL && fclose(meta) == 0 && ok;
     }
     snprintf(path, sizeof(path), "%s/trace.meta", directory);
@@ -6399,8 +6403,74 @@ static int test_basic_view_recovery_live_realm_oom_case(bool content_shown)
     return 0;
 }
 
+/* Test what a reader can actually do, not just that the renderer still
+   has commands. Fail a late enhancement with a draft already on screen. */
+static int test_readable_update_oom(bool refuse_static_layout)
+{
+    BrowserConfig config;
+    browser_config_init(&config, NULL);
+    config.memory_limit = 16u * MIB;
+    config.javascript.enabled = config.javascript.document_scripts_enabled = true;
+    config.javascript.heap_limit = 3u * MIB;
+    char error[128];
+    BrowserEngine *e = browser_engine_create(&config, error, sizeof(error));
+    CHECK(e);
+    NavigationSession *n = browser_engine_navigation(e);
+    navigation_set_fixed_script_memory_limits(n, true);
+    static const char page[] =
+        "<!doctype html><title>Field notes</title><article><h1>Field notes</h1>"
+        "<div id=tools style='height:32px'></div><p style='height:560px'>Introduction</p><h2>Second chapter</h2>"
+        "<p>Field observations and an unfinished draft.</p>"
+        "<form action='/find'><input id=q name=q><button id=send>Find</button></form>"
+        "<a id=next href='/next'>Next chapter</a>"
+        "<p style='height:640px'>Appendix</p></article>"
+        "<script>setTimeout(()=>{document.getElementById('tools').innerHTML="
+        "\"<input id='filter'><a href='/tools'>Tools</a>\";"
+        "globalThis.hold=[];for(let i=0;i<64;i++)hold.push(new ArrayBuffer(128*1024))},3000)</script>";
+    CHECK(browser_engine_commit_html(e, "https://notes.test/read", page, sizeof(page)-1, true));
+    CHECK(n->page.runtime != NULL);
+    lxb_dom_node_t *root = lxb_dom_interface_node(n->page.document.html);
+    CHECK(browser_engine_focus_node(e, test_reader_find_id(root,"q")));
+    CHECK(browser_engine_replace_text(e,"draft",5) && browser_engine_render_frame(e,NULL));
+    int scroll = navigation_current(n)->scroll_y;
+    CHECK(scroll > 0);
+    size_t count = 0;
+    const uint16_t *pixels = browser_engine_framebuffer(e,&count);
+    CHECK(pixels && count > 0);
+    uint64_t painted = frame_checksum(pixels,count);
+    Budget *budget = browser_engine_budget(e);
+    size_t refused = budget->injected_failure_count;
+    if (refuse_static_layout) navigation_test_refuse_next_static_fallback_layout();
+    for (unsigned k=0; k<8 && n->page.runtime; k++)
+        CHECK(browser_engine_advance_runtime(e,1000,4,NULL));
+    CHECK(!n->page.runtime && n->page.script_memory_limited && n->page.loaded);
+    CHECK(test_reader_find_id(lxb_dom_interface_node(n->page.document.html), "filter") != NULL);
+    CHECK(budget->injected_failure_count == refused + (refuse_static_layout ? 1u : 0u));
+    CHECK(navigation_current(n)->scroll_y == scroll && browser_engine_render_frame(e,NULL));
+    pixels = browser_engine_framebuffer(e,&count);
+    CHECK(frame_checksum(pixels,count) == painted);
+    char value[32];
+    size_t length;
+    CHECK(browser_engine_text_value(e,value,sizeof(value),&length) && !strcmp(value,"draft"));
+    CHECK(browser_engine_insert_text(e,"2",1));
+    ControllerAction action = {0};
+    CHECK(browser_engine_focus_node(e,test_reader_find_id(root,"send"))
+          && browser_engine_activate(e,&action) && action.type == CONTROLLER_ACTION_FORM_SUBMIT
+          && !strcmp(action.url,"https://notes.test/find?q=draft2"));
+    CHECK(browser_engine_scroll_by(e,96) && browser_engine_render_frame(e,NULL)
+          && navigation_current(n)->scroll_y > scroll);
+    CHECK(browser_engine_focus_node(e,test_reader_find_id(root,"next"))
+          && browser_engine_activate(e,&action) && action.type == CONTROLLER_ACTION_NAVIGATE
+          && !strcmp(action.url,"https://notes.test/next"));
+    CHECK(browser_engine_shutdown(e) && budget->current == 0 && !budget->accounting_repair_count);
+    browser_engine_destroy(e);
+    return 0;
+}
+
 static int test_basic_view_recovery_live_realm_oom(void)
 {
+    CHECK(test_readable_update_oom(false) == 0);
+    CHECK(test_readable_update_oom(true) == 0);
     CHECK(test_basic_view_recovery_live_realm_oom_case(false) == 0);
     CHECK(test_basic_view_recovery_live_realm_oom_case(true) == 0);
     return 0;
@@ -6415,8 +6485,10 @@ static int test_basic_view_recovery_compile_refusal_case(bool late)
     /* A literal table of small objects compiles at about eleven times its
        source (tests/suites/dynamic_script_quota.inc): admitted on the
        planned working set, its compile then runs out of the realm's heap
-       and is refused with the realm intact, as ima3.js is on cnn.com. */
-    size_t entries = 20000u, capacity = entries * 24u + 64u, used = 0;
+       and is refused with the realm intact, as ima3.js is on cnn.com. It
+       stays under SCRIPT_HEAVY_UNIT_BYTES, so an inserted copy is not held
+       to the memory stop rule's headroom before its compile. */
+    size_t entries = 15000u, capacity = entries * 24u + 64u, used = 0;
     char *source = malloc(capacity);
     CHECK(source != NULL);
     used = (size_t) snprintf(source, capacity, "window.adTable=[");
@@ -6652,10 +6724,12 @@ static int test_basic_view_reclaims_script_heap(void)
     for (unsigned i = 0; i < PARAGRAPHS; i++)
         length += (size_t) snprintf(page + length, capacity - length,
                                     "<p>Story summary %u.</p>", i);
+    /* About 5 MB held, short of any refusal: a page refused with under
+       2 MiB left would stop for memory at commit instead. */
     length += (size_t) snprintf(
         page + length, capacity - length,
         "<script>window.keep = [];"
-        "for (let i = 0; i < 40; i++) {"
+        "for (let i = 0; i < 6; i++) {"
         "  const block = new Array(8192);"
         "  for (let j = 0; j < 8192; j++) block[j] = {i: i, j: j};"
         "  window.keep.push(block);"
@@ -8077,7 +8151,7 @@ static int test_youtube_home_topics_are_lazy(void)
     config.tile_capacity = 8;
     config.resources.web_fonts_enabled = false;
     char error[256] = {0};
-    for (unsigned lane = 0; lane < 3; lane++) {
+    for (unsigned lane = 0; lane < 4; lane++) {
         bool enabled = lane != 0;
         bool refuse = lane == 2;
         CHECK(fetch_trace_replay_begin(fixture, error, sizeof(error)));
@@ -8103,6 +8177,25 @@ static int test_youtube_home_topics_are_lazy(void)
             bool visual = false;
             (void) browser_engine_run_idle_work(engine, &visual);
             /* Reapplying a preference must not replace/leak a live job. */
+            CHECK(browser_engine_set_youtube_topics(engine, true));
+        }
+        if (lane == 3) {
+            CHECK(browser_engine_youtube_feed_state(engine) == BROWSER_YOUTUBE_FEED_LOADING);
+            CHECK(browser_engine_set_youtube_topics(engine, false));
+            FetchTraceReplayStats cancelled, after;
+            CHECK(fetch_trace_replay_stats(&cancelled));
+            for (unsigned turn = 0; turn < 8; turn++) {
+                bool visual = false;
+                (void) browser_engine_run_idle_work(engine, &visual);
+            }
+            CHECK(!browser_engine_youtube_topics(engine)
+                && navigation->page.layout.link_count == base_links
+                && fetch_trace_replay_stats(&after)
+                && after.request_count == cancelled.request_count);
+            /* The strict trace has one response occurrence, already claimed
+               by the cancelled request. Replay it for the new request. */
+            fetch_trace_end();
+            CHECK(fetch_trace_replay_begin(fixture, error, sizeof(error)));
             CHECK(browser_engine_set_youtube_topics(engine, true));
         }
         for (unsigned turn = 0; turn < 256; turn++) {
@@ -8402,7 +8495,8 @@ static int test_youtube_personalized_home(void)
         TILEFINCH_TEST_SOURCE_DIR "/fonts/DejaVuSans-Bold-Latin.ttf", NULL, NULL, NULL,
         1536u * 1024u));
     char error[256] = {0};
-    for (unsigned lane = 0; lane < 8; lane++) {
+    size_t control_requests = 0;
+    for (unsigned lane = 0; lane < 9; lane++) {
         bool browsing = lane == 1 || lane == 6 || lane == 7;
         bool refuse = lane == 2;
         bool subscriptions = lane == 3 || lane == 5;
@@ -8460,12 +8554,21 @@ static int test_youtube_personalized_home(void)
             test_reader_find_id(lxb_dom_interface_node(navigation->page.document.html), "first")));
         if (refuse) browser_engine_test_refuse_next_render_shell_init();
         bool saw_loading = false;
+        unsigned preference_toggles = 0;
         for (unsigned turn = 0; turn < 256; turn++) {
             bool visual = false;
             (void) browser_engine_run_idle_work(engine, &visual);
             BrowserYoutubeFeedState state = browser_engine_youtube_feed_state(engine);
             saw_loading |= state == BROWSER_YOUTUBE_FEED_LOADING;
             if (state == BROWSER_YOUTUBE_FEED_LOADING) {
+                if (lane == 8 && preference_toggles < 3u) {
+                    /* Pump between preference changes while the personalized
+                       feed still owns the work slot. */
+                    bool enabled = !browser_engine_youtube_topics(engine);
+                    CHECK(browser_engine_set_youtube_topics(engine, enabled)
+                        && browser_engine_youtube_topics(engine) == enabled);
+                    preference_toggles++;
+                }
                 CHECK(test_reader_text_command(&navigation->page.layout,
                     "Reloading suggestions...") != NULL);
                 CHECK(youtube_notice_is_single_run(&navigation->page.layout,
@@ -8517,6 +8620,22 @@ static int test_youtube_personalized_home(void)
         CHECK(browser_engine_youtube_feed_state(engine) == (refuse
             ? BROWSER_YOUTUBE_FEED_FAILED : BROWSER_YOUTUBE_FEED_CURRENT));
         CHECK(navigation->page.layout.link_count == (refuse ? base_links : 9u));
+        if (lane == 0 || lane == 8) {
+            FetchTraceReplayStats stats;
+            CHECK(fetch_trace_replay_stats(&stats));
+            if (lane == 0) control_requests = stats.request_count;
+            else {
+                CHECK(preference_toggles >= 2u && stats.request_count == control_requests);
+                for (unsigned turn = 0; turn < 8; turn++) {
+                    bool visual = false;
+                    CHECK(browser_engine_set_youtube_topics(engine,
+                        !browser_engine_youtube_topics(engine)));
+                    (void) browser_engine_run_idle_work(engine, &visual);
+                    CHECK(browser_engine_youtube_feed_state(engine) == BROWSER_YOUTUBE_FEED_CURRENT);
+                }
+                CHECK(fetch_trace_replay_stats(&stats) && stats.request_count == control_requests);
+            }
+        }
         CHECK(youtube_notice_is_single_run(&navigation->page.layout, "yt-feed-status",
             refuse ? "Suggestions unavailable - try Refresh." : "Suggestions up to date."));
         size_t length = 0;
@@ -8833,8 +8952,98 @@ static int test_youtube_recent_history(void)
     return 0;
 }
 
+static int test_youtube_rating_session_owner(void)
+{
+    static const char home[] = "https://m.youtube.com/";
+    static const char like[] = "https://m.youtube.com/youtubei/v1/like/like?key=fixture-key&prettyPrint=false";
+    static const char unlike[] = "https://m.youtube.com/youtubei/v1/like/removelike?key=fixture-key&prettyPrint=false";
+    static const char bootstrap[] = "<script>ytcfg.set({\"INNERTUBE_API_KEY\":\"fixture-key\","
+        "\"INNERTUBE_CONTEXT_CLIENT_VERSION\":\"fixture-version\",\"INNERTUBE_CLIENT_NAME\":\"MWEB\","
+        "\"VISITOR_DATA\":\"fixture-visitor\",\"LOGGED_IN\":true});</script>";
+    static const char original[] = "SAPISID=fixture-original; Secure; HttpOnly; Path=/";
+    static const char replacement[] = "SAPISID=fixture-replacement; Secure; HttpOnly; Path=/";
+    static const char rotated_again[] = "SAPISID=fixture-rotated-again; Secure; HttpOnly; Path=/";
+    static const char like_body[] = "{\"responseContext\":{},\"likeStatus\":\"LIKE\"}";
+    static const char unlike_body[] = "{\"responseContext\":{},\"likeStatus\":\"INDIFFERENT\"}";
+    enum { COLD_QUEUED, BOOTSTRAP_TAKEN, CACHED_QUEUED, POST_TAKEN, OWN_ROTATION, CACHED_CONTROL };
+    for (unsigned lane = COLD_QUEUED; lane <= CACHED_CONTROL; lane++) {
+        bool cached = lane == CACHED_QUEUED || lane == CACHED_CONTROL;
+        bool rotated = lane == OWN_ROTATION;
+        GoogleIdentityRecord records[] = {
+            {.url=home, .status=200, .content_type="text/html", .body=bootstrap,
+             .set_cookie=rotated ? replacement : NULL},
+            {.url=like, .method="POST", .status=200, .content_type="application/json", .body=like_body,
+             .set_cookie=rotated ? rotated_again : NULL},
+            {.url=unlike, .method="POST", .status=200, .content_type="application/json", .body=unlike_body}
+        };
+        size_t record_count = cached ? 3u : 2u;
+        char fixture[128], error[256] = {0};
+        CHECK(write_google_identity_replay(fixture, records, record_count)
+            && fetch_trace_replay_begin(fixture, error, sizeof(error)));
+        Budget budget;
+        budget_init(&budget, 4u * MIB);
+        BrowserSession session;
+        CHECK(browser_session_init(&session, &budget, 512u * 1024u)
+            && browser_session_cookie_set_http(&session, home, original));
+        uint64_t original_identity = youtube_lite_session_login_identity(&session);
+        FetchPumpQuota quota = {.maximum_body_bytes=4096,
+            .maximum_body_callbacks=4, .maximum_time_us=1000};
+        tilefinch_test_faults()->replayed_request_count = 0;
+        for (unsigned run = 0; run < (cached ? 2u : 1u); run++) {
+            YoutubeLiteFeedJob *job = youtube_lite_rating_begin(&budget, &session,
+                "TFTEST00001", run == 0, 1000);
+            CHECK(job != NULL);
+            bool warmup = cached && run == 0;
+            bool change = !warmup && lane <= POST_TAKEN;
+            YoutubeLiteLoadStatus status = YOUTUBE_LITE_LOAD_PENDING;
+            YoutubeLiteRatingDiagnostics rating = {0};
+            if (lane == BOOTSTRAP_TAKEN || lane == POST_TAKEN || rotated) {
+                for (unsigned turn = 0; turn < 256u && status == YOUTUBE_LITE_LOAD_PENDING; turn++) {
+                    status = youtube_lite_feed_pump(job, &quota);
+                    CHECK(youtube_lite_rating_diagnostics(job, &rating));
+                    if (lane == POST_TAKEN ? rating.api_status == 200 : rating.bootstrap_status == 200)
+                        break;
+                }
+                CHECK(status == YOUTUBE_LITE_LOAD_PENDING
+                    && (lane == POST_TAKEN ? rating.api_status == 200 : rating.bootstrap_status == 200));
+            }
+            unsigned before = tilefinch_test_faults()->replayed_request_count;
+            if (lane == COLD_QUEUED || (lane == CACHED_QUEUED && !warmup))
+                CHECK(before == (cached ? 2u : 0u));
+            uint64_t before_api_identity = youtube_lite_session_login_identity(&session);
+            if (rotated) CHECK(before_api_identity != 0 && before_api_identity != original_identity);
+            if (change) CHECK(browser_session_cookie_set_http(&session, home, replacement));
+            for (unsigned turn = 0; turn < 256u && status == YOUTUBE_LITE_LOAD_PENDING; turn++)
+                status = youtube_lite_feed_pump(job, &quota);
+            CHECK(status == (change ? YOUTUBE_LITE_LOAD_CANCELLED : YOUTUBE_LITE_LOAD_SUCCEEDED));
+            if (rotated) {
+                uint64_t final_identity = youtube_lite_session_login_identity(&session);
+                CHECK(final_identity != 0 && final_identity != before_api_identity);
+            }
+            if (change) {
+                YoutubeLiteFeedDiagnostics feed;
+                CHECK(youtube_lite_feed_diagnostics(job, &feed)
+                    && feed.failure == YOUTUBE_FEED_FAILURE_SESSION_CHANGED);
+                CHECK(tilefinch_test_faults()->replayed_request_count == before);
+            }
+            if (warmup || (cached && !change)) {
+                CHECK(youtube_lite_rating_diagnostics(job, &rating)
+                    && rating.bootstrap_status == (warmup ? 200 : 0)
+                    && rating.api_status == 200);
+            }
+            youtube_lite_feed_destroy(job);
+        }
+        browser_session_destroy(&session);
+        fetch_trace_end();
+        remove_google_identity_replay(fixture, record_count);
+        CHECK(budget.current == 0 && budget.external_reserved == 0);
+    }
+    return 0;
+}
+
 static int test_youtube_rating_status_confirmation(void)
 {
+    CHECK(test_youtube_rating_session_owner() == 0);
     static const char bootstrap[] = "<script>ytcfg.set({\"INNERTUBE_API_KEY\":\"fixture-key\","
         "\"INNERTUBE_CONTEXT_CLIENT_VERSION\":\"fixture-version\",\"INNERTUBE_CLIENT_NAME\":\"MWEB\","
         "\"VISITOR_DATA\":\"fixture-visitor\",\"LOGGED_IN\":true});</script>";
@@ -9258,15 +9467,19 @@ static int test_youtube_like_action(void)
         "{\"actions\":[{\"updateToggleButtonStateCommand\":{\"buttonId\":\"like-button\",\"toggled\":false}}]}",
         "{\"error\":{\"code\":403}}", "{}"
     };
-    for (unsigned lane = 0; lane < 9u; lane++) {
+    for (unsigned lane = 0; lane < 11u; lane++) {
+        bool replaced_session = lane >= 9u;
         GoogleIdentityRecord records[] = {
             {.url="https://m.youtube.com/watch?v=TFTEST00001&bpctr=9999999999&has_verified=1", .status=200, .content_type="text/html", .body=watch},
             {.url="https://m.youtube.com/", .status=200, .content_type="text/html", .body=bootstrap},
             {.url="https://m.youtube.com/youtubei/v1/like/like?key=fixture-key&prettyPrint=false",
              .status=200, .content_type="application/json", .body=responses[lane < 4 ? lane : 0], .method="POST"},
             {.url="https://m.youtube.com/", .status=200, .content_type="text/html", .body=bootstrap},
-            {.url="https://m.youtube.com/youtubei/v1/like/removelike?key=fixture-key&prettyPrint=false",
-             .status=200, .content_type="application/json", .body=responses[lane == 8 ? 0 : 1], .method="POST"}
+            {.url=replaced_session
+                ? "https://m.youtube.com/youtubei/v1/like/like?key=fixture-key&prettyPrint=false"
+                : "https://m.youtube.com/youtubei/v1/like/removelike?key=fixture-key&prettyPrint=false",
+             .status=200, .content_type="application/json",
+             .body=responses[lane == 8 || replaced_session ? 0 : 1], .method="POST"}
         };
         char fixture[128], error[256] = {0};
         CHECK(write_google_identity_replay(fixture, records, 5u));
@@ -9341,6 +9554,23 @@ static int test_youtube_like_action(void)
                 CHECK(browser_engine_youtube_like_selected(engine));
                 CHECK(browser_engine_focus_node(engine, like) && browser_engine_activate(engine, &action));
                 CHECK(browser_engine_youtube_like_state(engine) == BROWSER_YOUTUBE_FEED_CURRENT);
+            }
+            if (replaced_session) {
+                CHECK(browser_session_cookie_set_http(browser_engine_session(engine),
+                    "https://m.youtube.com/", "SAPISID=mock-replacement; Secure; HttpOnly; Path=/"));
+                if (lane == 10u) {
+                    bool changed = false;
+                    (void) browser_engine_run_idle_work(engine, &changed);
+                    CHECK(browser_engine_youtube_like_state(engine) == BROWSER_YOUTUBE_FEED_IDLE);
+                }
+                CHECK(browser_engine_focus_node(engine, like) && browser_engine_activate(engine, &action));
+                CHECK(browser_engine_youtube_like_state(engine) == BROWSER_YOUTUBE_FEED_LOADING);
+                for (unsigned i = 0; i < 256u && browser_engine_youtube_like_state(engine) == BROWSER_YOUTUBE_FEED_LOADING; i++) {
+                    bool changed = false; (void) browser_engine_run_idle_work(engine, &changed);
+                }
+                CHECK(browser_engine_youtube_like_state(engine) == BROWSER_YOUTUBE_FEED_CURRENT
+                    && nav->generation == generation);
+            } else if (lane == 0 || lane >= 7) {
                 lxb_dom_node_t *account = test_reader_find_id(
                     lxb_dom_interface_node(nav->page.document.html), "yt-watch-account");
                 CHECK(account && browser_engine_focus_node(engine, account->first_child)

@@ -3,5 +3,5 @@
 "ins.adsbygoogle,.advertisement,.advertising,.ad-banner,.ad-container,"
 ".ad-slot,.ad-wrapper,.sponsored,.promoted,.promotedlink,[data-ad],[data-ad-slot],"
 "[data-csa-c-slot-id^=\"adplacements:\"],"
-"[data-ad-client],[aria-label=\"advertisement\"],"
-"[aria-label=\"sponsored\"]{display:none!important}"
+"[data-ad-client],[aria-label=\"advertisement\" i],"
+"[aria-label=\"sponsored\" i]{display:none!important}"

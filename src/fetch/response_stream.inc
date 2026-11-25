@@ -738,29 +738,51 @@ static void write_context_set_effective_url(WriteContext *context,
 }
 
 /* The macOS system libcurl (8.7.1) breaks a multiplexed HTTP/2 connection
-   when a callback aborts one of its streams that is not the connection's
-   first: the next stream decodes shifted HPACK fields ("Invalid HTTP header
-   field was received ... content-length: [DENY]"), and so does every later
-   one. 8.22.0, the PSP's owned transport, resets only the aborted stream.
-   Versions in between are untested, so any host libcurl older than 8.22.0
-   reads and discards an HTTP/2 redirect body instead, up to
-   FETCH_REDIRECT_DRAIN_LIMIT; a longer one is still aborted. */
+   whenever a callback fails one of its streams: a header or body callback
+   that returns a short count, or CURLOPT_FAILONERROR's rejection of an
+   error status at the end of the headers. That libcurl fails the nghttp2
+   callback in progress, nghttp2_session_mem_recv() returns -902, and the
+   input nghttp2 had already decoded stays in libcurl's buffer: the next read
+   feeds it to nghttp2 again. A header block decoded twice inserts its fields
+   into the HPACK dynamic table twice, so the client's table falls out of step
+   with the server's, and every later stream on the connection decodes field
+   names from the wrong entries ("content-length: <another field's value>", a
+   misnamed or foreign Set-Cookie). 8.22.0, the PSP's owned transport, keeps
+   a write error on its stream and resets only that stream. Versions in
+   between are untested, so with any host libcurl older than 8.22.0:
+   - CURLOPT_FAILONERROR stays off and receive_header rejects an error status
+     itself (fetch_curl_receive_header), at the same point;
+   - over HTTP/2 a callback's abort is deferred: the callbacks take and
+     discard the rest of the response, and the progress callback ends the
+     transfer outside nghttp2's callbacks, where libcurl resets only the
+     stream; fetch_settle_deferred_abort then reports what the abort would
+     have;
+   - an HTTP/2 redirect body is read and discarded, up to
+     FETCH_REDIRECT_DRAIN_LIMIT, before the next hop (a longer one is
+     aborted, deferred as above). */
 #define FETCH_REDIRECT_DRAIN_LIMIT (64u * 1024u)
 
-static bool fetch_redirect_abort_unsafe(CURL *easy)
+#if !defined(__PSP__)
+static bool fetch_libcurl_breaks_http2_aborts(void)
 {
-#if defined(__PSP__)
-    (void) easy;
-    return false;
-#else
     static int affected = -1;
     if (affected < 0) {
         const curl_version_info_data *info =
             curl_version_info(CURLVERSION_NOW);
         affected = info != NULL && info->version_num < 0x081600 ? 1 : 0;
     }
+    return affected == 1;
+}
+#endif
+
+static bool fetch_http2_abort_unsafe(CURL *easy)
+{
+#if defined(__PSP__)
+    (void) easy;
+    return false;
+#else
     long version = 0;
-    return affected == 1 && easy != NULL
+    return fetch_libcurl_breaks_http2_aborts() && easy != NULL
         && curl_easy_getinfo(easy, CURLINFO_HTTP_VERSION, &version)
                == CURLE_OK
         && version == CURL_HTTP_VERSION_2_0;
@@ -778,7 +800,7 @@ static size_t receive_data(char *data, size_t size, size_t count, void *opaque)
        the request deadline; the easy and multi drivers recognize this one
        internal write abort and immediately advance the validated hop. Where
        that abort would break a shared HTTP/2 connection
-       (fetch_redirect_abort_unsafe), up to FETCH_REDIRECT_DRAIN_LIMIT bytes
+       (fetch_http2_abort_unsafe), up to FETCH_REDIRECT_DRAIN_LIMIT bytes
        are read and discarded instead, and a larger body is aborted all the
        same. */
     if (context->redirect_response) {
@@ -1670,7 +1692,7 @@ static size_t receive_header(char *data, size_t size, size_t count,
             if (!enforce_response_credential_policy(context)) return 0;
             if (context->redirect_response) {
                 context->redirect_drain =
-                    fetch_redirect_abort_unsafe(context->easy);
+                    fetch_http2_abort_unsafe(context->easy);
                 if (context->redirect_drain) return length;
                 context->redirect_callback_aborted = true;
                 return 0;
@@ -1876,8 +1898,119 @@ static int transfer_progress(void *opaque, curl_off_t download_total,
         context->cancelled = true;
         return 1;
     }
+#if !defined(__PSP__)
+    if (context->abort_deferred) return 1;
+#endif
     return 0;
 }
+
+/* The callbacks libcurl calls: receive_data and receive_header, plus the
+   host libcurl workarounds described at fetch_libcurl_breaks_http2_aborts.
+   The PSP's libcurl needs none of them. */
+#if defined(__PSP__)
+#define fetch_curl_receive_data receive_data
+#define fetch_curl_receive_header receive_header
+#define fetch_settle_deferred_abort(context, code, error, capacity) (code)
+
+static long fetch_curl_fail_on_error(WriteContext *context,
+                                     bool allow_http_errors)
+{
+    (void) context;
+    return allow_http_errors ? 0L : 1L;
+}
+#else
+/* CURLOPT_FAILONERROR's value; with an affected libcurl, off, and
+   fetch_curl_receive_header rejects the error status instead. */
+static long fetch_curl_fail_on_error(WriteContext *context,
+                                     bool allow_http_errors)
+{
+    context->fail_on_http_error =
+        !allow_http_errors && fetch_libcurl_breaks_http2_aborts();
+    return allow_http_errors || context->fail_on_http_error ? 0L : 1L;
+}
+
+/* A callback's short count, over HTTP/2 with an affected libcurl, becomes a
+   deferred abort: the callback takes the bytes, and so do the callbacks
+   after it, until the progress callback ends the transfer. */
+static size_t fetch_defer_abort(WriteContext *context, size_t length,
+                                size_t taken)
+{
+    if (taken == length || !fetch_http2_abort_unsafe(context->easy))
+        return taken;
+    context->abort_deferred = true;
+    return length;
+}
+
+static size_t fetch_curl_receive_data(char *data, size_t size, size_t count,
+                                      void *opaque)
+{
+    WriteContext *context = opaque;
+    if (size != 0 && count > SIZE_MAX / size) return 0;
+    if (context->abort_deferred) return size * count;
+    return fetch_defer_abort(context, size * count,
+                             receive_data(data, size, count, opaque));
+}
+
+static size_t fetch_curl_receive_header(char *data, size_t size,
+                                        size_t count, void *opaque)
+{
+    WriteContext *context = opaque;
+    if (size != 0 && count > SIZE_MAX / size) return 0;
+    size_t length = size * count;
+    if (context->abort_deferred) return length;
+    size_t taken = receive_header(data, size, count, opaque);
+    /* CURLOPT_FAILONERROR rejects an error status at the same point: once
+       the final response's headers, blank line included, have reached the
+       header callback. */
+    if (taken == length && context->fail_on_http_error
+        && !context->interim_response && !context->redirect_response
+        && context->result->status_code >= 400
+        && ((length == 2 && data[0] == '\r' && data[1] == '\n')
+            || (length == 1 && data[0] == '\n'))) {
+        context->http_error_rejected = true;
+        taken = 0;
+    }
+    return fetch_defer_abort(context, length, taken);
+}
+
+/* The scheduler's progress callback, set only with an affected libcurl. */
+static int fetch_deferred_abort_progress(void *opaque,
+                                         curl_off_t download_total,
+                                         curl_off_t downloaded,
+                                         curl_off_t upload_total,
+                                         curl_off_t uploaded)
+{
+    (void) download_total; (void) downloaded;
+    (void) upload_total; (void) uploaded;
+    return ((const WriteContext *) opaque)->abort_deferred ? 1 : 0;
+}
+
+/* A finished transfer's code as the abort would have left it: libcurl's
+   code and message for a rejected error status, a write error for another
+   deferred abort. A cancellation, or another error that ended the transfer
+   first, stands. Clears the state for the transfer's next hop. */
+static CURLcode fetch_settle_deferred_abort(WriteContext *context,
+                                            CURLcode code, char *error,
+                                            size_t capacity)
+{
+    bool rejected = context->http_error_rejected;
+    bool deferred = context->abort_deferred;
+    context->http_error_rejected = false;
+    context->abort_deferred = false;
+    bool ended_by_abort = deferred
+        ? code == CURLE_OK || code == CURLE_ABORTED_BY_CALLBACK
+        : code == CURLE_WRITE_ERROR;
+    if (context->cancelled || !(rejected || deferred) || !ended_by_abort)
+        return code;
+    if (rejected) {
+        snprintf(error, capacity, "The requested URL returned error: %ld",
+                 context->result->status_code);
+        return CURLE_HTTP_RETURNED_ERROR;
+    }
+    snprintf(error, capacity, "Failure writing output to destination");
+    return CURLE_WRITE_ERROR;
+}
+#endif
 
 static bool enforce_response_credential_policy(WriteContext *context)
 {

@@ -151,10 +151,11 @@ int main(void)
 {
     char directory[] = "/tmp/tilefinch-login-XXXXXX";
     CHECK(mkdtemp(directory));
-    char path[256], profile_path[256], temporary[260], victim[256];
+    char path[256], profile_path[256], temporary[260], aside[260], victim[256];
     snprintf(path, sizeof(path), "%s/login", directory);
     snprintf(profile_path, sizeof(profile_path), "%s/profile", directory);
     snprintf(temporary, sizeof(temporary), "%s.tmp", path);
+    snprintf(aside, sizeof(aside), "%s.old", path);
     snprintf(victim, sizeof(victim), "%s/victim", directory);
     Budget budget; budget_init(&budget, 4u * 1024u * 1024u);
     if (test_login_identity_follows_the_jar(&budget)) return 1;
@@ -187,12 +188,21 @@ int main(void)
     CHECK(browser_session_cookie_set_http(&source, "https://youtube.com/",
         "SAPISID=synthetic-updated; Secure; HttpOnly; SameSite=Lax; Path=/; Domain=youtube.com"));
     tilefinch_test_faults()->replace_file_no_replace = true;
-    CHECK(youtube_login_save(&source, path, 1700000000));
+    CHECK(write_login_file(aside, "SAPISID", 10u)
+          && youtube_login_save(&source, path, 1700000000)
+          && access(aside, F_OK) != 0);
     tilefinch_test_faults()->replace_file_no_replace = false;
     CHECK(youtube_login_load(&target, path, 1700000000, NULL));
     CHECK(browser_session_cookie_header(&target, "https://m.youtube.com/watch", header, sizeof(header))
         && strstr(header, "SAPISID=synthetic-updated"));
     browser_session_cookie_clear(&target);
+    /* A failed FAT install leaves no credential in any store-owned name. */
+    tilefinch_test_faults()->replace_file_no_replace = true;
+    tilefinch_test_faults()->replace_file_fail_install = true;
+    CHECK(!youtube_login_save(&source, path, 1700000000)
+          && access(path, F_OK) != 0 && access(aside, F_OK) != 0
+          && access(temporary, F_OK) != 0);
+    tilefinch_test_faults()->replace_file_no_replace = false;
     CHECK(browser_session_cookie_set_http(&source, "https://youtube.com/",
         "SAPISID=synthetic; Secure; HttpOnly; SameSite=Lax; Path=/; Domain=youtube.com"));
     CHECK(youtube_login_save(&source, path, 1700000000));
@@ -211,7 +221,18 @@ int main(void)
     CHECK(lstat(path, &st) == 0 && S_ISREG(st.st_mode));
     CHECK(symlink(victim, temporary) == 0);
     CHECK(youtube_login_save(&source, path, 1700000000));
-    CHECK(youtube_login_remove(path) && access(path, F_OK) != 0 && access(temporary, F_OK) != 0);
+    CHECK(write_login_file(aside, "SAPISID", 10u)
+          && write_login_file(temporary, "SAPISID", 10u));
+    CHECK(youtube_login_remove(path) && access(path, F_OK) != 0
+          && access(temporary, F_OK) != 0 && access(aside, F_OK) != 0);
+    /* A failed cleanup is not success and does not skip another name. */
+    char blocker[280];
+    snprintf(blocker, sizeof(blocker), "%s/occupied", aside);
+    CHECK(mkdir(aside, 0700) == 0 && write_login_file(blocker, "SAPISID", 10u)
+          && write_login_file(temporary, "SAPISID", 10u));
+    CHECK(!youtube_login_save(&source, path, 1700000000)
+          && !youtube_login_remove(path) && access(temporary, F_OK) != 0);
+    CHECK(unlink(blocker) == 0 && rmdir(aside) == 0 && youtube_login_remove(path));
     CHECK(youtube_login_load(&target, victim, 1700000000, NULL)); /* Link targets stayed intact. */
     browser_session_cookie_clear(&target);
     for (size_t i = 0; i < BROWSER_COOKIE_ENTRIES; i++)

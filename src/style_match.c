@@ -119,6 +119,26 @@ bool style_tag_is(lxb_dom_node_t *node, const char *wanted)
    resolves style on one thread. */
 static StyleFocusOverride style_focus_override;
 
+uint8_t style_subject_attribute_bits(lxb_dom_node_t *node)
+{
+    if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT
+        || node->ns != LXB_NS_HTML) return UINT8_MAX;
+    uint8_t bits = node == style_focus_override.node
+        ? style_attribute_bit((const unsigned char *) STYLE_FOCUS_MARKER) : 0;
+    unsigned count = 0;
+    for (lxb_dom_attr_t *attr = lxb_dom_interface_element(node)->first_attr;
+         attr != NULL; attr = attr->next) {
+        /* The matcher handles namespaced lookup. Do not guess which spelling
+           it would use, or scan an exceptionally wide element to save work. */
+        if (++count > 16 || attr->node.prefix != 0) return UINT8_MAX;
+        size_t length = 0;
+        const lxb_char_t *name = lxb_dom_attr_local_name(attr, &length);
+        if (name == NULL) return UINT8_MAX;
+        if (length >= 2) bits |= style_attribute_bit(name);
+    }
+    return bits;
+}
+
 StyleFocusOverride style_focus_override_swap(StyleFocusOverride next)
 {
     StyleFocusOverride previous = style_focus_override;
@@ -614,30 +634,18 @@ static bool attribute_value_matches(AttributeOperator operator,
 #undef ATTRIBUTE_SPAN_EQUAL
 }
 
-static bool attribute_matches(lxb_dom_node_t *node, const char *text,
-                              size_t length)
+bool style_attribute_identity_test_parse(const char *text, size_t length,
+                                         unsigned *form, char *wanted,
+                                         size_t *wanted_length)
 {
-    AttributeOperator operator = ATTRIBUTE_EXACT;
     trim(&text, &length);
-    size_t name_end = skip_selector_identifier(text, length, 0);
-    if (name_end == 0) return false;
-    size_t name_length = 0, value_length = 0;
-    char name[64];
-    if (!decode_css_identifier(
-            text, name_end, name, sizeof(name), &name_length)
-        || name_length == 0) return false;
-    for (size_t i = 0; i < name_length; i++) {
-        name[i] = (char) tolower((unsigned char) name[i]);
-    }
-    bool exists = node != NULL && node->type == LXB_DOM_NODE_TYPE_ELEMENT
-        && style_element_has_attribute(
-               node, (const lxb_char_t *) name, name_length);
-    if (!exists) return false;
-    size_t at = name_end;
+    size_t at = skip_selector_identifier(text, length, 0);
+    if (at == 0) return false;
     while (at < length && isspace((unsigned char) text[at])) at++;
+    *form = STYLE_ATTRIBUTE_TEST_EXISTS;
+    *wanted_length = 0;
     if (at == length) return true;
-    const char *actual = style_element_attribute(node, name, &value_length);
-    if (actual == NULL) actual = "";
+    AttributeOperator operator = ATTRIBUTE_EXACT;
     if (at + 1 < length && text[at + 1] == '=') {
         switch (text[at]) {
         case '~': operator = ATTRIBUTE_WORD; break;
@@ -671,23 +679,63 @@ static bool attribute_matches(lxb_dom_node_t *node, const char *text,
     size_t wanted_source_length = at - wanted_start;
     if (quote != 0) at++;
     while (at < length && isspace((unsigned char) text[at])) at++;
-    bool case_insensitive = false;
+    *form = (unsigned) operator + 1u;
     if (at < length
         && (text[at] == 'i' || text[at] == 'I'
             || text[at] == 's' || text[at] == 'S')) {
-        case_insensitive = text[at] == 'i' || text[at] == 'I';
+        if (text[at] == 'i' || text[at] == 'I')
+            *form |= STYLE_ATTRIBUTE_TEST_CASELESS;
         at++;
         while (at < length && isspace((unsigned char) text[at])) at++;
     }
     if (at != length) return false;
+    return decode_css_identifier(
+        text + wanted_start, wanted_source_length,
+        wanted, STYLE_SELECTOR_IDENTIFIER_CAPACITY, wanted_length);
+}
+
+bool style_attribute_identity_test_matches(unsigned form,
+                                           const char *wanted,
+                                           size_t wanted_length,
+                                           const char *actual,
+                                           size_t actual_length)
+{
+    if (actual == NULL) return false;
+    unsigned operator = form & ~STYLE_ATTRIBUTE_TEST_CASELESS;
+    if (operator == STYLE_ATTRIBUTE_TEST_EXISTS) return true;
+    return attribute_value_matches(
+        (AttributeOperator) (operator - 1u), actual, actual_length, wanted,
+        wanted_length, (form & STYLE_ATTRIBUTE_TEST_CASELESS) != 0);
+}
+
+static bool attribute_matches(lxb_dom_node_t *node, const char *text,
+                              size_t length)
+{
+    trim(&text, &length);
+    size_t name_end = skip_selector_identifier(text, length, 0);
+    if (name_end == 0) return false;
+    size_t name_length = 0, value_length = 0;
+    char name[64];
+    if (!decode_css_identifier(
+            text, name_end, name, sizeof(name), &name_length)
+        || name_length == 0) return false;
+    for (size_t i = 0; i < name_length; i++) {
+        name[i] = (char) tolower((unsigned char) name[i]);
+    }
+    bool exists = node != NULL && node->type == LXB_DOM_NODE_TYPE_ELEMENT
+        && style_element_has_attribute(
+               node, (const lxb_char_t *) name, name_length);
+    if (!exists) return false;
+    unsigned form = 0;
     char wanted[STYLE_SELECTOR_IDENTIFIER_CAPACITY];
     size_t wanted_length = 0;
-    if (!decode_css_identifier(
-            text + wanted_start, wanted_source_length,
-            wanted, sizeof(wanted), &wanted_length)) return false;
-
-    return attribute_value_matches(operator, actual, value_length,
-                                   wanted, wanted_length, case_insensitive);
+    if (!style_attribute_identity_test_parse(text, length, &form, wanted,
+                                             &wanted_length)) return false;
+    if (form == STYLE_ATTRIBUTE_TEST_EXISTS) return true;
+    const char *actual = style_element_attribute(node, name, &value_length);
+    return style_attribute_identity_test_matches(
+        form, wanted, wanted_length, actual == NULL ? "" : actual,
+        value_length);
 }
 
 static bool style_selector_matches_internal(

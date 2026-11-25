@@ -2349,6 +2349,17 @@ bool js_rt_network_call_global(ScriptRuntime *runtime, const char *name,
         return false;
     }
     JSValue function = JS_GetPropertyStr(context, global, name);
+    /* A lazy module's delivery hook (EventSource, multiplayer) reads
+       undefined until that module loads; a stream a page opened through
+       the bare native then has no script owner, as an unknown id has.
+       Any other hook is published before page script runs, so its absence
+       is a failure. */
+    if (JS_IsUndefined(function)
+        && (strcmp(name, "__tilefinchDeliverEventSource") == 0
+            || strcmp(name, "__tilefinchDeliverMultiplayer") == 0)) {
+        JS_FreeValue(context, global);
+        return true;
+    }
     if (JS_IsException(function) || !JS_IsFunction(context, function)) {
         JS_FreeValue(context, function);
         JS_FreeValue(context, global);
@@ -2413,7 +2424,10 @@ bool js_rt_event_sources_deliver(ScriptRuntime *runtime,
         bool success = false;
         FetchStreamMetrics metrics;
         FetchResult *fetched = fetch_result_create(bridge->budget);
-        if (fetched == NULL) return false;
+        if (fetched == NULL) {
+            js_rt_note_delivery_refusal(runtime);
+            continue;
+        }
         if (!fetch_scheduler_take_stream(
                 bridge->fetch_scheduler, source->id, &success,
                 &metrics, fetched)) {
@@ -3454,19 +3468,31 @@ void script_runtime_cancel_preload_requests(ScriptRuntime *runtime)
     }
 }
 
-/* The entry with this preload key, in any state. */
+/* The entry with this preload key, in any state. A module entry is only
+   ever a module fetch's: a classic script never consumes a modulepreload. */
 static ScriptPreloadedScript *preloaded_script_find(
     DomBridge *bridge, const char *url, TilefinchRequestMode mode,
-    TilefinchCredentialsMode credentials)
+    TilefinchCredentialsMode credentials, bool module)
 {
     if (url == NULL) return NULL;
     for (size_t i = 0; i < SCRIPT_PRELOADED_SCRIPT_LIMIT; i++) {
         ScriptPreloadedScript *entry = &bridge->preloaded_scripts[i];
         if (entry->state != SCRIPT_PRELOADED_SCRIPT_EMPTY
             && entry->mode == mode && entry->credentials == credentials
+            && entry->module == module
             && strcmp(entry->url, url) == 0) return entry;
     }
     return NULL;
+}
+
+/* Whether every CSP policy the document has now existed when the entry's
+   request was made (one a later <meta> added never checked it). */
+static bool preloaded_policies_current(const DomBridge *bridge,
+                                       const ScriptPreloadedScript *entry)
+{
+    return bridge->document == NULL
+        || bridge->document->content_security_policy.policy_count
+               <= entry->csp_policies;
 }
 
 /* HTML's "consume a preloaded resource": the entry whose preload key (URL,
@@ -3474,14 +3500,17 @@ static ScriptPreloadedScript *preloaded_script_find(
    provided the request has no integrity metadata or the same metadata as
    the preload (compared as written, which is never looser than the
    standard's comparison of the parsed metadata). An entry whose integrity
-   differs stays for another consumer. */
+   differs stays for another consumer. None made before a policy the
+   document now has is one. */
 static ScriptPreloadedScript *preloaded_script_match(
     DomBridge *bridge, const char *url, TilefinchRequestMode mode,
     TilefinchCredentialsMode credentials, const char *integrity,
     size_t integrity_length)
 {
     ScriptPreloadedScript *entry =
-        preloaded_script_find(bridge, url, mode, credentials);
+        preloaded_script_find(bridge, url, mode, credentials, false);
+    if (entry != NULL && !preloaded_policies_current(bridge, entry))
+        return NULL;
     if (entry == NULL || integrity == NULL || integrity_length == 0)
         return entry;
     if (entry->integrity == NULL
@@ -3495,9 +3524,9 @@ static ScriptPreloadedScript *preloaded_script_match(
    keeps one entry per key). */
 static ScriptPreloadedScript *preloaded_script_slot(
     DomBridge *bridge, const char *url, TilefinchRequestMode mode,
-    TilefinchCredentialsMode credentials)
+    TilefinchCredentialsMode credentials, bool module)
 {
-    if (preloaded_script_find(bridge, url, mode, credentials) != NULL)
+    if (preloaded_script_find(bridge, url, mode, credentials, module) != NULL)
         return NULL;
     for (size_t i = 0; i < SCRIPT_PRELOADED_SCRIPT_LIMIT; i++) {
         if (bridge->preloaded_scripts[i].state
@@ -3602,7 +3631,7 @@ bool script_runtime_offer_preloaded_script(
     ScriptRuntime *runtime, const char *url, TilefinchRequestMode mode,
     TilefinchCredentialsMode credentials, const char *integrity,
     BrowserSharedBody *body, size_t length, const char *response_url,
-    const char *content_type)
+    const char *content_type, uint8_t csp_policies)
 {
     /* Only a body the consumer can compile in place (NUL-terminated)
        becomes an entry; anything else is left to the consumer's fetch. */
@@ -3611,9 +3640,10 @@ bool script_runtime_offer_preloaded_script(
         return false;
     DomBridge *bridge = &runtime->bridge;
     ScriptPreloadedScript entry = {
-        .mode = mode, .credentials = credentials
+        .mode = mode, .credentials = credentials,
+        .csp_policies = csp_policies
     };
-    if (preloaded_script_slot(bridge, url, mode, credentials) == NULL
+    if (preloaded_script_slot(bridge, url, mode, credentials, false) == NULL
         || !preloaded_script_copy_key(bridge, &entry, url, integrity)
         || !preloaded_script_fill(bridge, &entry, body, length,
                                   response_url, content_type)) {
@@ -3623,7 +3653,7 @@ bool script_runtime_offer_preloaded_script(
     }
     /* The copies may have run the reclaim hooks; look again. */
     ScriptPreloadedScript *slot =
-        preloaded_script_slot(bridge, url, mode, credentials);
+        preloaded_script_slot(bridge, url, mode, credentials, false);
     if (slot == NULL) {
         preloaded_script_clear(bridge, &entry);
         return false;
@@ -3632,10 +3662,11 @@ bool script_runtime_offer_preloaded_script(
     return true;
 }
 
-/* A completed preload's response, authorized for a classic script. */
+/* A completed preload's response, authorized for a classic script (or,
+   module, a module script: strict JavaScript MIME). */
 static bool preloaded_response_accept(
     DomBridge *bridge, const char *url, TilefinchRequestMode mode,
-    TilefinchCredentialsMode credentials, uint8_t csp_grant,
+    TilefinchCredentialsMode credentials, uint8_t csp_grant, bool module,
     FetchResult *result)
 {
     if (result->status_code < 200 || result->status_code >= 300
@@ -3655,29 +3686,28 @@ static bool preloaded_response_accept(
     TilefinchResourceGrant grant = {0};
     return fetch_resource_grant_create(
         result, &context, mode == TILEFINCH_REQUEST_MODE_CORS,
-        script_module_mime_type_allowed(result->content_type), false,
+        script_module_mime_type_allowed(result->content_type), module,
         &grant, NULL);
 }
 
-bool script_runtime_adopt_preload_request(
-    ScriptRuntime *runtime, FetchScheduler *scheduler, uint64_t request_id,
+static bool preloaded_script_adopt(
+    DomBridge *bridge, FetchScheduler *scheduler, uint64_t request_id,
     const char *url, TilefinchRequestMode mode,
     TilefinchCredentialsMode credentials, uint8_t csp_grant,
-    const char *integrity)
+    uint8_t csp_policies, const char *integrity, bool module)
 {
-    if (runtime == NULL || scheduler == NULL || request_id == 0
-        || url == NULL) return false;
-    DomBridge *bridge = &runtime->bridge;
+    if (scheduler == NULL || request_id == 0 || url == NULL) return false;
     ScriptPreloadedScript entry = {
-        .mode = mode, .credentials = credentials
+        .mode = mode, .credentials = credentials, .module = module,
+        .csp_policies = csp_policies
     };
-    if (preloaded_script_slot(bridge, url, mode, credentials) == NULL
+    if (preloaded_script_slot(bridge, url, mode, credentials, module) == NULL
         || !preloaded_script_copy_key(bridge, &entry, url, integrity)) {
         preloaded_script_clear(bridge, &entry);
         return false;
     }
     ScriptPreloadedScript *slot =
-        preloaded_script_slot(bridge, url, mode, credentials);
+        preloaded_script_slot(bridge, url, mode, credentials, module);
     if (slot == NULL) {
         preloaded_script_clear(bridge, &entry);
         return false;
@@ -3691,6 +3721,109 @@ bool script_runtime_adopt_preload_request(
         js_rt_saturating_add_size(
             &bridge->result->preloaded_scripts_adopted, 1);
     return true;
+}
+
+bool script_runtime_adopt_preload_request(
+    ScriptRuntime *runtime, FetchScheduler *scheduler, uint64_t request_id,
+    const char *url, TilefinchRequestMode mode,
+    TilefinchCredentialsMode credentials, uint8_t csp_grant,
+    uint8_t csp_policies, const char *integrity)
+{
+    return runtime != NULL && preloaded_script_adopt(
+        &runtime->bridge, scheduler, request_id, url, mode, credentials,
+        csp_grant, csp_policies, integrity, false);
+}
+
+bool script_runtime_adopt_module_preload_request(
+    ScriptRuntime *runtime, FetchScheduler *scheduler, uint64_t request_id,
+    const char *url, TilefinchCredentialsMode credentials, uint8_t csp_grant,
+    uint8_t csp_policies, const char *integrity, const char *initiator_url,
+    const char *top_level_url)
+{
+    if (runtime == NULL) return false;
+    DomBridge *bridge = &runtime->bridge;
+    /* The request's initiator origin and top-level URL are what its
+       cookies, Sec-Fetch-Site and module cache provenance were made for;
+       pushState or a fragment may since have changed the document's URL
+       within its origin. */
+    return !bridge->opaque_origin && bridge->document_url != NULL
+        && bridge->top_level_url != NULL && initiator_url != NULL
+        && top_level_url != NULL
+        && tilefinch_url_same_origin(bridge->document_url, initiator_url)
+        && strcmp(bridge->top_level_url, top_level_url) == 0
+        && preloaded_script_adopt(
+               bridge, scheduler, request_id, url,
+               TILEFINCH_REQUEST_MODE_CORS, credentials, csp_grant,
+               csp_policies, integrity, true);
+}
+
+/* Whether a preload's request, whose redirects its CSP grant admitted,
+   is one the consumer's grant would have made: every policy whose nonce
+   or integrity the preload matched (and which then admitted any redirect)
+   the consumer matched too. The parser-inserted flag need not agree (HTML
+   fetches a modulepreload as not parser-inserted): a parser-inserted
+   consumer that passed its own URL check under a 'strict-dynamic' policy
+   matched that policy's nonce or hash, and under any other policy the
+   flag changes nothing. */
+static bool preloaded_csp_grant_within(uint8_t preload, uint8_t consumer)
+{
+    uint8_t policies = (uint8_t) ~TILEFINCH_CSP_GRANT_PARSER_INSERTED;
+    return (preload & policies & (uint8_t) ~consumer) == 0;
+}
+
+/* The module entry a module fetch with this key, integrity metadata and
+   CSP grant uses. The preload's request carried its own redirect-time CSP
+   grant, and its integrity metadata is checked on the response only when
+   it is the fetch's own: any other fetch goes to the network. */
+static ScriptPreloadedScript *preloaded_module_entry(
+    DomBridge *bridge, const char *url, TilefinchCredentialsMode credentials,
+    const char *integrity, size_t integrity_length, uint8_t csp_grant)
+{
+    ScriptPreloadedScript *entry = preloaded_script_find(
+        bridge, url, TILEFINCH_REQUEST_MODE_CORS, credentials, true);
+    if (integrity == NULL) integrity_length = 0;
+    size_t preload_integrity_length = entry == NULL
+        || entry->integrity == NULL ? 0 : strlen(entry->integrity);
+    return entry == NULL || !preloaded_policies_current(bridge, entry)
+        || preload_integrity_length != integrity_length
+        || (integrity_length != 0
+            && memcmp(entry->integrity, integrity, integrity_length) != 0)
+        || !preloaded_csp_grant_within(entry->csp_grant, csp_grant)
+        ? NULL : entry;
+}
+
+uint64_t script_runtime_take_module_preload(
+    ScriptRuntime *runtime, const char *url,
+    TilefinchCredentialsMode credentials, const char *integrity,
+    size_t integrity_length, uint8_t csp_grant, FetchScheduler **scheduler)
+{
+    *scheduler = NULL;
+    ScriptPreloadedScript *entry = runtime == NULL || url == NULL ? NULL
+        : preloaded_module_entry(&runtime->bridge, url, credentials,
+                                 integrity, integrity_length, csp_grant);
+    if (entry == NULL || entry->state != SCRIPT_PRELOADED_SCRIPT_PENDING)
+        return 0;
+    /* Its scheduler no longer knows the request (cancelled and
+       discarded): the caller fetches the URL itself. */
+    FetchRequestProgress progress = {0};
+    uint64_t request_id = entry->request_id;
+    FetchScheduler *owner = entry->scheduler;
+    preloaded_script_clear(&runtime->bridge, entry);
+    if (owner == NULL || request_id == 0
+        || !fetch_scheduler_request_progress(owner, request_id, &progress))
+        return 0;
+    *scheduler = owner;
+    return request_id;
+}
+
+bool script_runtime_module_preload_pending(
+    ScriptRuntime *runtime, const char *url,
+    TilefinchCredentialsMode credentials, uint8_t csp_grant)
+{
+    const ScriptPreloadedScript *entry = runtime == NULL || url == NULL
+        ? NULL : preloaded_module_entry(&runtime->bridge, url, credentials,
+                                        NULL, 0, csp_grant);
+    return entry != NULL && entry->state == SCRIPT_PRELOADED_SCRIPT_PENDING;
 }
 
 /* A pending entry whose request completed becomes READY, or goes when its
@@ -3727,7 +3860,7 @@ static bool preloaded_script_settle(DomBridge *bridge,
     bool kept = success
         && preloaded_response_accept(bridge, entry->url, entry->mode,
                                      entry->credentials, entry->csp_grant,
-                                     result)
+                                     entry->module, result)
         && (result->length == 0
             || dynamic_source_body_usable(result->shared_body,
                                           result->length));
@@ -3735,6 +3868,40 @@ static bool preloaded_script_settle(DomBridge *bridge,
         js_rt_script_store_response_cookies(
             bridge, result, entry->url, entry->mode, entry->credentials,
             TILEFINCH_DESTINATION_SCRIPT);
+    /* A module preload's response is the module map's. Unredirected, it
+       goes to the module HTTP cache, which every module fetch consults (as
+       for one the navigation completed before the realm existed), and
+       leaves the map once the cache holds it fresh. Otherwise it stays
+       READY for a script-inserted module script, whose grant and policy
+       checks the map makes (a cache hit skips the redirect-time CSP checks
+       the preload's grant passed), with the Referrer-Policy its imports
+       use; the map keeps no redirect taint, which resource timing needs. */
+    char policy[FETCH_REFERRER_POLICY_LIMIT];
+    bool policy_present = false;
+    if (kept && entry->module) {
+        char initiator_origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
+        const BrowserCacheEntry *cached = NULL;
+        if (!fetch_result_was_redirected(result, entry->url)
+            && tilefinch_url_origin(bridge->document_url, initiator_origin,
+                                    sizeof(initiator_origin))
+            && script_module_cache_record(
+                   bridge->session, entry->url, entry->url,
+                   initiator_origin, bridge->top_level_url, false,
+                   entry->credentials, result, false,
+                   js_rt_monotonic_time_ns())
+            && browser_session_cache_match_module(
+                   bridge->session, entry->url, initiator_origin,
+                   bridge->top_level_url, false, entry->credentials,
+                   js_rt_monotonic_time_ns(), &cached)
+                   == BROWSER_CACHE_FRESH)
+            kept = false;
+        kept = kept && !result->redirect_origin_tainted
+            && fetch_response_referrer_policy(result, &policy_present,
+                                              policy);
+        entry->referrer_policy = kept && policy_present
+            ? js_rt_runtime_module_referrer_policy_code(policy) : 0;
+        kept = kept && entry->referrer_policy != UINT8_MAX;
+    }
     kept = kept && preloaded_script_fill(
         bridge, entry, result->shared_body, result->length,
         result->effective_url[0] == '\0' ? entry->url
@@ -3789,11 +3956,15 @@ void js_rt_preloaded_scripts_step(DomBridge *bridge)
 bool js_rt_dynamic_task_awaits_preload(DomBridge *bridge,
                                        const ScriptDynamicTask *task)
 {
-    if (task->module || task->request_url == NULL) return false;
-    const ScriptPreloadedScript *entry = preloaded_script_match(
-        bridge, task->request_url, task->mode, task->credentials,
-        task->integrity,
-        task->integrity == NULL ? 0 : strlen(task->integrity));
+    if (task->request_url == NULL) return false;
+    const ScriptPreloadedScript *entry = task->module
+        ? preloaded_module_entry(
+              bridge, task->request_url, task->credentials, task->integrity,
+              task->integrity_length, dynamic_script_csp_grant(bridge, task))
+        : preloaded_script_match(
+              bridge, task->request_url, task->mode, task->credentials,
+              task->integrity,
+              task->integrity == NULL ? 0 : strlen(task->integrity));
     return entry != NULL && entry->state == SCRIPT_PRELOADED_SCRIPT_PENDING;
 }
 
@@ -3907,7 +4078,7 @@ static bool dynamic_task_consume_preload(DomBridge *bridge,
         /* Back in the map for the next attempt, unless its key was
            offered again meanwhile. */
         ScriptPreloadedScript *slot = preloaded_script_slot(
-            bridge, taken.url, taken.mode, taken.credentials);
+            bridge, taken.url, taken.mode, taken.credentials, taken.module);
         if (slot != NULL) {
             taken.state = SCRIPT_PRELOADED_SCRIPT_READY;
             *slot = taken;
@@ -3939,6 +4110,22 @@ static bool dynamic_task_consume_preload(DomBridge *bridge,
     budget_free(bridge->budget, task->response_url);
     task->response_url = taken.response_url;
     taken.response_url = NULL;
+    /* A module keeps its response URL (its base URL) and the response's
+       Referrer-Policy for its imports. */
+    if (task->module) {
+        if (task->response_url == NULL)
+            task->response_url = js_rt_dynamic_copy_text(
+                bridge->budget, task->request_url);
+        task->effective_referrer_policy = taken.referrer_policy != 0
+            ? taken.referrer_policy : task->incoming_referrer_policy;
+        if (task->response_url == NULL) {
+            js_rt_bridge_script_quota_abort(bridge, &task->quota_reservation);
+            browser_shared_body_release(body);
+            preloaded_script_clear(bridge, &taken);
+            task->success = false;
+            return true;
+        }
+    }
     char content_type[sizeof(taken.content_type)];
     memcpy(content_type, taken.content_type, sizeof(content_type));
     preloaded_script_clear(bridge, &taken);
@@ -4016,8 +4203,11 @@ bool js_rt_dynamic_start_task(ScriptRuntime *runtime,
                    ? "cors" : "no-cors");
     TilefinchRequestContext resource_context =
         dynamic_script_request_context(bridge, task);
-    ScriptPreloadedScript *preloaded = cache_blocked || task->module
-        ? NULL : preloaded_script_match(
+    ScriptPreloadedScript *preloaded = cache_blocked ? NULL
+        : task->module ? preloaded_module_entry(
+              bridge, task->request_url, task->credentials, task->integrity,
+              task->integrity_length, dynamic_script_csp_grant(bridge, task))
+        : preloaded_script_match(
               bridge, task->request_url, task->mode, task->credentials,
               task->integrity,
               task->integrity == NULL ? 0 : strlen(task->integrity));
@@ -4345,8 +4535,19 @@ bool js_rt_dynamic_take_completion(ScriptRuntime *runtime,
         || task->state != SCRIPT_DYNAMIC_FETCHING
         || task->request_id == 0) return true;
     bool transport_success = false;
-    FetchResult *fetched = fetch_result_create(bridge->budget);
-    if (fetched == NULL) return false;
+    if (!fetch_scheduler_request_complete(bridge->fetch_scheduler,
+                                          task->request_id)) return true;
+    FetchResult *fetched = NULL;
+#ifndef __PSP__
+    if (tilefinch_test_faults()->refuse_dynamic_script_takes != 0)
+        tilefinch_test_faults()->refuse_dynamic_script_takes--;
+    else
+#endif
+        fetched = fetch_result_create(bridge->budget);
+    if (fetched == NULL) {
+        js_rt_note_delivery_refusal(runtime);
+        return true;
+    }
     if (!fetch_scheduler_take(
             bridge->fetch_scheduler, task->request_id,
             &transport_success, fetched)) {
@@ -4659,6 +4860,19 @@ ScriptQuotaProgressResult script_runtime_script_quota_progress(
                    : SCRIPT_QUOTA_PROGRESS_EXHAUSTED);
 }
 
+/* Whether `working_bytes` and `reserve` beside it fit the page Budget and
+   the heap the realm can still reach: headroom under its limit and growth
+   both come out of the free page Budget, so they are not added
+   (script_runtime_heap_obtainable). */
+static bool dynamic_compile_fits(ScriptRuntime *runtime, size_t working_bytes,
+                                 size_t reserve)
+{
+    if (budget_pressure_required(runtime->budget, working_bytes, reserve))
+        return false;
+    size_t heap = script_runtime_heap_obtainable(runtime);
+    return working_bytes <= heap && reserve <= heap - working_bytes;
+}
+
 static bool dynamic_admit_compile(ScriptRuntime *runtime,
                                   size_t unit_bytes, bool continuing_classic)
 {
@@ -4680,17 +4894,25 @@ static bool dynamic_admit_compile(ScriptRuntime *runtime,
         : script_admission_work_reserve(
               unit_bytes, SCRIPT_ADMISSION_DYNAMIC_HEAP_MULTIPLIER,
               SCRIPT_ADMISSION_EXECUTION_RESERVE_BYTES);
+    /* A new script whose unit (the compile admitted now: the whole script,
+       a lazy bundle's largest factory, or a loader statement) is at least
+       SCRIPT_HEAVY_UNIT_BYTES must also leave the memory stop rule's
+       headroom beside its compile
+       (SCRIPT_ADMISSION_MEMORY_STOP_HEADROOM_BYTES): a refusal anywhere in
+       its first run with less left stops the realm, and the scripts the
+       page already runs with it. Refused here, it fails alone, as an error
+       event on its element. Smaller scripts are left to the heap: their
+       first runs rarely need much, and a page living under the headroom
+       still runs them (refusing them all cost a census page dozens of small
+       scripts and changed no frame). A continued classic script was
+       admitted whole. */
     size_t reserve = floor;
-    /* Admission asks whether the planned working set fits the heap the
-       realm can still reach: headroom under its limit and growth both come
-       out of the free page Budget, so they are not added
-       (script_runtime_heap_obtainable). */
-    bool budget_pressure = budget_pressure_required(
-        runtime->budget, working_bytes, reserve);
-    size_t heap = script_runtime_heap_obtainable(runtime);
-    bool heap_pressure = working_bytes > heap
-        || reserve > heap - (working_bytes > heap ? heap : working_bytes);
-    if (!budget_pressure && !heap_pressure) {
+    if (!continuing_classic && unit_bytes >= SCRIPT_HEAVY_UNIT_BYTES
+        && reserve < SCRIPT_ADMISSION_MEMORY_STOP_HEADROOM_BYTES)
+        reserve = SCRIPT_ADMISSION_MEMORY_STOP_HEADROOM_BYTES;
+    size_t obtainable_before = script_runtime_heap_obtainable(runtime);
+    bool admitted = dynamic_compile_fits(runtime, working_bytes, reserve);
+    if (admitted) {
         /* Admitted. When the source and its reserve do not fit the heap's
            current limit, collect before growing it, paced like every
            other compile-pressure collection (js_rt_compile_source_type):
@@ -4701,6 +4923,7 @@ static bool dynamic_admit_compile(ScriptRuntime *runtime,
            script, each a full mark that freed nothing. */
         size_t source_reserve = unit_bytes > floor ? unit_bytes : floor;
         size_t current = script_runtime_heap_remaining(runtime);
+        size_t heap = obtainable_before;
         bool tight = unit_bytes > current
             || source_reserve > current - unit_bytes;
         bool growth_short = budget_pressure_required(
@@ -4708,21 +4931,34 @@ static bool dynamic_admit_compile(ScriptRuntime *runtime,
             || unit_bytes > heap || source_reserve > heap - unit_bytes;
         if (tight && (growth_short || js_rt_gc_due(runtime)))
             (void) script_runtime_collect_and_trim(runtime);
-        return true;
+    } else {
+        /* The last resort before refusing the compile: a collection, which
+           would otherwise end in this refusal, so it is not paced
+           (js_rt_gc_due); only a heap that has allocated nothing since its
+           last collection skips it, as it would free nothing. Then the
+           session's cached responses, for only the page Budget still
+           short, and none when Budget cannot raise the heap. */
+        if (runtime->heap_collections == 0
+            || script_runtime_heap_used(runtime) > runtime->heap_live_after_gc)
+            (void) script_runtime_collect_and_trim(runtime);
+        if (!dynamic_compile_fits(runtime, working_bytes, reserve)) {
+            size_t wanted = working_bytes > SIZE_MAX - reserve
+                ? SIZE_MAX : working_bytes + reserve;
+            (void) js_rt_reclaim_cached_responses_for_heap(runtime, wanted);
+        }
+        admitted = dynamic_compile_fits(runtime, working_bytes, reserve);
     }
-    /* The last resort before refusing the compile. */
-    (void) script_runtime_collect_and_trim(runtime);
-    if (runtime->session != NULL
-        && runtime->session->budget == runtime->budget) {
-        (void) browser_session_cache_reclaim(runtime->session,
-                                             working_bytes + reserve);
+#ifndef TILEFINCH_NO_TRACE
+    if (tilefinch_trace_script_failures()) {
+        fprintf(stderr,
+                "dynamic-script-admission unit=%zu working=%zu reserve=%zu "
+                "obtainable=%zu/%zu budget-free=%zu admitted=%s\n",
+                unit_bytes, working_bytes, reserve, obtainable_before,
+                script_runtime_heap_obtainable(runtime),
+                budget_remaining(runtime->budget), admitted ? "yes" : "no");
     }
-    budget_pressure = budget_pressure_required(
-        runtime->budget, working_bytes, reserve);
-    heap = script_runtime_heap_obtainable(runtime);
-    heap_pressure = working_bytes > heap
-        || reserve > heap - (working_bytes > heap ? heap : working_bytes);
-    return !budget_pressure && !heap_pressure;
+#endif
+    return admitted;
 }
 
 static void dynamic_source_lease_release(void *opaque)

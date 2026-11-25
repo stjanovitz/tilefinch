@@ -1458,6 +1458,32 @@ size_t fetch_scheduler_cancel_all(
 bool fetch_scheduler_discard(FetchScheduler *scheduler,
                              uint64_t request_id);
 size_t fetch_scheduler_pending(const FetchScheduler *scheduler);
+/* An owner that gives a request up while still wanting its response (an
+   image job released for a relayout) parks it under `key` instead of
+   cancelling it: the transfer runs on, and the next owner asking for the
+   same key adopts it (fetch_scheduler_adopt) instead of starting it again.
+   A parked request nobody adopts within FETCH_SCHEDULER_PARK_PUMPS pumps
+   (fetch_scheduler_release_parked counts the turns that do not pump), or
+   whose slot or bytes a new request needs, is cancelled and released.
+   Refused (the caller cancels) for a stream, the blocking slot, a failed
+   result, or a replayed record its capture saw cancelled. */
+#define FETCH_SCHEDULER_PARK_PUMPS 64u
+bool fetch_scheduler_park(FetchScheduler *scheduler, uint64_t request_id,
+                          uint64_t key);
+/* The parked request for `key`, now the caller's to take or cancel, when it
+   is for the same logical URL and was made with the same initiator,
+   top-level URL and Content-Security-Policy as `request`; 0 otherwise. One
+   that failed, or whose response bound exceeds `limit`, is released. */
+uint64_t fetch_scheduler_adopt(FetchScheduler *scheduler, uint64_t key,
+                               const char *url, const FetchRequest *request,
+                               size_t limit);
+/* Memory pressure (`all`): releases every parked request, returning the
+   body bytes they held. Otherwise one host turn for a scheduler that was
+   not pumped (nothing else in flight): it ages the parked requests as a
+   pump would and releases the expired ones. */
+size_t fetch_scheduler_release_parked(FetchScheduler *scheduler, bool all);
+/* The response body bytes the parked requests hold. */
+size_t fetch_scheduler_parked_bytes(const FetchScheduler *scheduler);
 /* Whether request `request_id` has a complete result waiting to be taken:
    fetch_scheduler_take would return it now. */
 bool fetch_scheduler_request_complete(const FetchScheduler *scheduler,
@@ -1610,6 +1636,10 @@ FetchResult *fetch_result_create(Budget *budget);
    The payload may relocate even on failure (a shrink can succeed before the
    shared-body descriptor is refused); reacquire borrowed pointers afterward. */
 bool fetch_result_share_body(FetchResult *result);
+/* Whether result answers request_url from another URL: a followed
+   redirect, or a recorded response whose effective URL differs. */
+bool fetch_result_was_redirected(const FetchResult *result,
+                                 const char *request_url);
 void fetch_result_destroy(FetchResult *result);
 void fetch_result_free(FetchResult *result);
 bool fetch_resolve_url(const char *base_url, const char *reference,

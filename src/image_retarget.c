@@ -937,6 +937,15 @@ ImageRetargetOutcome images_retarget_display_step(
         if (larger) {
             if (owner->width >= full_width && owner->height >= full_height)
                 continue;
+            /* A JPEG whose decode at its first size cannot fit (by its
+               frame header, after the Budget's reclaim) waits for a later
+               pass rather than retrying a decode the Budget refuses. */
+            int fit_width = full_width, fit_height = full_height;
+            size_t needed = 0;
+            (void) image_decode_reduced_fallback(owner, images->budget, false,
+                SIZE_MAX, &fit_width, &fit_height, &needed);
+            if (!budget_make_room(images->budget, needed))
+                continue;
             /* A raster grows back to its first-decoded size. SVG markup is
                rasterized at the painted size instead, at least doubling, so
                a size that keeps growing (zoom steps, an animation) costs a

@@ -27,6 +27,8 @@
 #define CONTROLLER_DEFAULT_VIEWPORT_HEIGHT 272
 #define CONTROLLER_DEFAULT_FOCUS_MARGIN 16
 #define CONTROLLER_PAGE_OBSTRUCTION_SCAN 4096u
+#define CONTROLLER_FORM_NODE_LIMIT 65536u
+#define CONTROLLER_FORM_BOUNDARY_LENGTH 32u
 
 static bool controller_set_scroll(BrowserController *controller, int scroll_y,
                                   int viewport_height);
@@ -40,7 +42,15 @@ static int controller_add_coordinate(int value, int delta)
     return value + delta;
 }
 
-static bool fixed_region_offset(const LayoutDocument *layout, bool control,
+/* What fixed_region_offset's index counts: a link region, a control
+   region (callers pass their bool control flag) or a draw command. */
+enum {
+    FIXED_REGION_LINK = 0,
+    FIXED_REGION_CONTROL = 1,
+    FIXED_REGION_COMMAND = 2
+};
+
+static bool fixed_region_offset(const LayoutDocument *layout, unsigned kind,
                                 size_t index, int viewport_height,
                                 int scroll_y, int *dy)
 {
@@ -50,8 +60,12 @@ static bool fixed_region_offset(const LayoutDocument *layout, bool control,
     size_t owner_span = SIZE_MAX;
     for (size_t at = 0; at < layout->fixed_count; at++) {
         const FixedRange *range = &layout->fixed_ranges[at];
-        size_t start = control ? range->control_start : range->link_start;
-        size_t end = control ? range->control_end : range->link_end;
+        size_t start = kind == FIXED_REGION_COMMAND ? range->command_start
+            : kind == FIXED_REGION_CONTROL ? range->control_start
+                                           : range->link_start;
+        size_t end = kind == FIXED_REGION_COMMAND ? range->command_end
+            : kind == FIXED_REGION_CONTROL ? range->control_end
+                                           : range->link_end;
         if (index < start || index >= end) continue;
         size_t span = range->command_end >= range->command_start
             ? range->command_end - range->command_start : SIZE_MAX;
@@ -210,18 +224,26 @@ static bool node_effectively_disabled(lxb_dom_node_t *node)
     return false;
 }
 
-/* Url-encoded entry list being written. Past `capacity` it stops storing and
+/* Form entry list being written. Past `capacity` it stops storing and
    keeps counting, so one pass learns the size a spilled body needs. */
 typedef struct {
     char *output;
     size_t capacity;
     size_t length;
     bool overflowed;
+    bool failed;
+    bool plain_text;
+    const char *boundary;
 } FormBodyWriter;
 
 static void form_body_put(FormBodyWriter *writer, const char *bytes,
                           size_t count)
 {
+    if (writer->failed) return;
+    if (count > NAVIGATION_FORM_BODY_LIMIT - writer->length) {
+        writer->failed = true;
+        return;
+    }
     if (!writer->overflowed && count < writer->capacity - writer->length) {
         memcpy(writer->output + writer->length, bytes, count);
         writer->output[writer->length + count] = '\0';
@@ -235,14 +257,21 @@ static void form_body_put_encoded(FormBodyWriter *writer, const char *text,
                                   size_t length)
 {
     static const char hex[] = "0123456789ABCDEF";
-    for (size_t i = 0; i < length; i++) {
+    for (size_t i = 0; i < length && !writer->failed; i++) {
         unsigned char value = (unsigned char) text[i];
+        if (value == '\r' || value == '\n') {
+            if (value == '\r' && i + 1u < length && text[i + 1u] == '\n')
+                i++;
+            if (writer->plain_text) form_body_put(writer, "\r\n", 2);
+            else form_body_put(writer, "%0D%0A", 6);
+            continue;
+        }
         bool plain = (value >= 'a' && value <= 'z')
                      || (value >= 'A' && value <= 'Z')
                      || (value >= '0' && value <= '9')
                      || value == '-' || value == '_' || value == '.'
-                     || value == '~';
-        if (plain) {
+                     || value == '*';
+        if (plain || writer->plain_text) {
             form_body_put(writer, (const char *) &value, 1);
         } else if (value == ' ') {
             form_body_put(writer, "+", 1);
@@ -257,18 +286,97 @@ static void append_form_pair(FormBodyWriter *writer,
                              const char *name, size_t name_length,
                              const char *value, size_t value_length)
 {
-    if (writer->length != 0) form_body_put(writer, "&", 1);
+    if (writer->boundary != NULL) {
+        /* Reject an ambiguous delimiter even if the platform RNG produced
+           the same token as one of the fields. Check before writing. */
+        if (value_length > NAVIGATION_FORM_BODY_LIMIT
+            || name_length > NAVIGATION_FORM_BODY_LIMIT) {
+            writer->failed = true;
+            return;
+        }
+        for (size_t i = 0; value_length >= CONTROLLER_FORM_BOUNDARY_LENGTH
+             && i <= value_length - CONTROLLER_FORM_BOUNDARY_LENGTH; i++) {
+            if (value[i] == writer->boundary[0]
+                && memcmp(value + i, writer->boundary,
+                          CONTROLLER_FORM_BOUNDARY_LENGTH) == 0) {
+                writer->failed = true;
+                return;
+            }
+        }
+        form_body_put(writer, "--", 2u);
+        form_body_put(writer, writer->boundary, CONTROLLER_FORM_BOUNDARY_LENGTH);
+        static const char disposition[] =
+            "\r\nContent-Disposition: form-data; name=\"";
+        form_body_put(writer, disposition, sizeof(disposition) - 1u);
+        for (size_t i = 0; i < name_length && !writer->failed; i++) {
+            if (name[i] == '\r' || name[i] == '\n') {
+                if (name[i] == '\r' && i + 1u < name_length && name[i + 1u] == '\n')
+                    i++;
+                form_body_put(writer, "%0D%0A", 6u);
+            } else if (name[i] == '"') {
+                form_body_put(writer, "%22", 3u);
+            } else form_body_put(writer, name + i, 1u);
+        }
+        form_body_put(writer, "\"\r\n\r\n", 5u);
+        form_body_put_encoded(writer, value, value_length);
+        form_body_put(writer, "\r\n", 2u);
+        return;
+    }
+    if (writer->length != 0 && !writer->plain_text)
+        form_body_put(writer, "&", 1);
     form_body_put_encoded(writer, name, name_length);
     form_body_put(writer, "=", 1);
     form_body_put_encoded(writer, value, value_length);
+    if (writer->plain_text) form_body_put(writer, "\r\n", 2);
 }
 
-static bool option_value(lxb_dom_node_t *select, const char **value,
-                         size_t *value_length, lxb_char_t **allocated)
+static lxb_dom_node_t *form_tree_next(lxb_dom_node_t *at,
+                                      lxb_dom_node_t *root, bool skip)
+{
+    if (!skip && !document_node_is_shadow_carrier(at)
+        && at->first_child != NULL) return at->first_child;
+    while (at != root && at->next == NULL) at = at->parent;
+    return at == root ? NULL : at->next;
+}
+
+static void append_form_control_value(FormBodyWriter *writer,
+                                      lxb_dom_node_t *node,
+                                      const char *name, size_t name_length,
+                                      const char *value, size_t length)
+{
+    lxb_char_t *allocated = NULL;
+    if (value == NULL) {
+        allocated = lxb_dom_node_text_content(node, &length);
+        value = (const char *) allocated;
+    }
+    if (value == NULL) writer->failed = true;
+    else append_form_pair(writer, name, name_length, value, length);
+    if (allocated != NULL)
+        lxb_dom_document_destroy_text(node->owner_document, allocated);
+}
+
+static void append_form_option(FormBodyWriter *writer, lxb_dom_node_t *option,
+                               const char *name, size_t name_length)
+{
+    size_t length = 0;
+    const char *value = document_attribute(option, "value", &length);
+    append_form_control_value(writer, option, name, name_length, value, length);
+}
+
+static void serialize_form_select(lxb_dom_node_t *select,
+                                   const char *name, size_t name_length,
+                                   FormBodyWriter *writer)
 {
     lxb_dom_node_t *first = NULL, *selected = NULL;
-    bool any_selected = false;
-    for (lxb_dom_node_t *at = select->first_child; at != NULL;) {
+    bool multiple = has_attribute(select, "multiple");
+    size_t visited = 0;
+    for (lxb_dom_node_t *at = select->first_child;
+         at != NULL && !writer->failed;
+         at = form_tree_next(at, select, document_element_name_is(at, "select"))) {
+        if (visited++ == CONTROLLER_FORM_NODE_LIMIT) {
+            writer->failed = true;
+            return;
+        }
         if (document_element_name_is(at, "option")) {
             bool disabled = node_effectively_disabled(at);
             if (!disabled && first == NULL) first = at;
@@ -278,39 +386,74 @@ static bool option_value(lxb_dom_node_t *select, const char **value,
             bool option_selected = state != NULL
                 ? state_length == 4 && memcmp(state, "true", 4) == 0
                 : has_attribute(at, "selected");
-            if (option_selected) {
-                any_selected = true;
-                if (!disabled && selected == NULL) selected = at;
-            }
+            if (!option_selected) continue;
+            if (multiple) {
+                if (!disabled) append_form_option(writer, at, name, name_length);
+            } else selected = at;
         }
-        if (at->first_child != NULL) {
-            at = at->first_child;
-            continue;
-        }
-        while (at != NULL && at != select && at->next == NULL) {
-            at = at->parent;
-        }
-        if (at == NULL || at == select) break;
-        at = at->next;
     }
-    lxb_dom_node_t *option = selected != NULL ? selected
-                             : (any_selected ? NULL : first);
-    if (option == NULL) return false;
-    *value = document_attribute(option, "value", value_length);
-    if (*value == NULL) {
-        *allocated = lxb_dom_node_text_content(option, value_length);
-        *value = (const char *) *allocated;
-    }
-    return *value != NULL;
+    if (multiple || writer->failed) return;
+    lxb_dom_node_t *option = selected != NULL ? selected : first;
+    if (option != NULL && !node_effectively_disabled(option))
+        append_form_option(writer, option, name, name_length);
 }
 
-static void serialize_form_controls(lxb_dom_node_t *node,
+static lxb_dom_node_t *form_owner(lxb_dom_node_t *node);
+static lxb_dom_node_t *form_tree_find_id(lxb_dom_node_t *root,
+                                        const char *id, size_t length);
+
+static lxb_dom_node_t *form_tree_root(lxb_dom_node_t *node)
+{
+    for (size_t depth = 0; depth < 256u; depth++) {
+        if (node->parent == NULL || document_node_is_shadow_carrier(node))
+            return node;
+        node = node->parent;
+    }
+    return NULL;
+}
+
+static bool form_control_has_owner(lxb_dom_node_t *control,
+                                   lxb_dom_node_t *form,
+                                   const char *explicit_id, size_t id_length)
+{
+    size_t length = 0;
+    const char *id = document_attribute(control, "form", &length);
+    if (id != NULL)
+        return explicit_id != NULL && length == id_length
+            && memcmp(id, explicit_id, length) == 0;
+    return form_owner(control) == form;
+}
+
+static const char *form_explicit_owner_id(lxb_dom_node_t *form,
+                                          lxb_dom_node_t *root, size_t *length)
+{
+    if (root->type != LXB_DOM_NODE_TYPE_DOCUMENT
+        && !document_node_is_shadow_carrier(root)) return NULL;
+    const char *id = document_attribute(form, "id", length);
+    return id != NULL && *length != 0
+        && form_tree_find_id(root, id, *length) == form ? id : NULL;
+}
+
+static void serialize_form_controls(lxb_dom_node_t *form, bool native_basic,
                                     lxb_dom_node_t *submitter,
                                     FormBodyWriter *writer)
 {
-    for (lxb_dom_node_t *at = node; at != NULL; at = at->next) {
-        if (at->type == LXB_DOM_NODE_TYPE_ELEMENT
-            && !node_effectively_disabled(at)) {
+    lxb_dom_node_t *root = form_tree_root(form);
+    if (root == NULL) {
+        writer->failed = true;
+        return;
+    }
+    size_t id_length = 0;
+    const char *id = form_explicit_owner_id(form, root, &id_length);
+    if (native_basic) root = form;
+    size_t visited = 0;
+    for (lxb_dom_node_t *at = root->first_child; at != NULL && !writer->failed;
+         at = form_tree_next(at, root, false)) {
+        if (visited++ == CONTROLLER_FORM_NODE_LIMIT) {
+            writer->failed = true;
+            return;
+        }
+        if (at->type == LXB_DOM_NODE_TYPE_ELEMENT) {
             bool input = document_element_name_is(at, "input");
             bool textarea = document_element_name_is(at, "textarea");
             bool select = document_element_name_is(at, "select");
@@ -318,13 +461,17 @@ static void serialize_form_controls(lxb_dom_node_t *node,
             size_t name_length = 0;
             const char *name = (input || textarea || select || button)
                 ? document_attribute(at, "name", &name_length) : NULL;
-            bool successful = name != NULL && name_length != 0;
+            if (name == NULL || name_length == 0
+                || !form_control_has_owner(at, form, id, id_length)
+                || node_effectively_disabled(at)) continue;
+            bool successful = true;
             if (input && (attribute_is(at, "type", "checkbox")
                           || attribute_is(at, "type", "radio"))
                 && !document_control_checked(at)) successful = false;
             if (input && (attribute_is(at, "type", "submit")
                           || attribute_is(at, "type", "button")
-                          || attribute_is(at, "type", "reset"))) {
+                          || attribute_is(at, "type", "reset")
+                          || attribute_is(at, "type", "image"))) {
                 successful = successful && at == submitter
                              && attribute_is(at, "type", "submit");
             }
@@ -333,18 +480,16 @@ static void serialize_form_controls(lxb_dom_node_t *node,
                                       && !attribute_is(at, "type", "reset");
             const char *value = NULL;
             size_t value_length = 0;
-            lxb_char_t *allocated = NULL;
             if (successful) {
                 if (textarea) {
                     value = document_control_value(at, &value_length);
-                    if (value == NULL) {
-                        allocated =
-                            lxb_dom_node_text_content(at, &value_length);
-                        value = (const char *) allocated;
-                    }
+                    append_form_control_value(
+                        writer, at, name, name_length, value, value_length);
                 } else if (select) {
-                    successful = option_value(at, &value, &value_length,
-                                              &allocated);
+                    serialize_form_select(at, name, name_length, writer);
+                } else if (input && attribute_is(at, "type", "file")) {
+                    if (writer->boundary != NULL) writer->failed = true;
+                    else append_form_pair(writer, name, name_length, "", 0);
                 } else {
                     value = input
                         ? document_control_value(at, &value_length) : NULL;
@@ -358,19 +503,23 @@ static void serialize_form_controls(lxb_dom_node_t *node,
                         value = "on"; value_length = 2;
                     }
                     if (value == NULL) { value = ""; value_length = 0; }
-                }
-                if (successful && value != NULL) {
                     append_form_pair(writer, name, name_length,
                                      value, value_length);
                 }
             }
-            if (allocated != NULL) {
-                lxb_dom_document_destroy_text(at->owner_document, allocated);
-            }
         }
-        if (at->first_child != NULL) {
-            serialize_form_controls(at->first_child, submitter, writer);
-        }
+    }
+}
+
+static void serialize_form(lxb_dom_node_t *form, lxb_dom_node_t *submitter,
+                           bool native_basic,
+                           FormBodyWriter *writer)
+{
+    serialize_form_controls(form, native_basic, submitter, writer);
+    if (writer->boundary != NULL) {
+        form_body_put(writer, "--", 2u);
+        form_body_put(writer, writer->boundary, CONTROLLER_FORM_BOUNDARY_LENGTH);
+        form_body_put(writer, "--\r\n", 4u);
     }
 }
 
@@ -394,26 +543,37 @@ static void controller_action_adopt_body(NavigationSession *navigation,
 static bool controller_serialize_form_body(NavigationSession *navigation,
                                            lxb_dom_node_t *form,
                                            lxb_dom_node_t *submitter,
-                                           ControllerAction *action)
+                                           ControllerAction *action,
+                                           bool native_basic,
+                                           bool plain_text,
+                                           const char *boundary)
 {
     FormBodyWriter writer = {
-        .output = action->body, .capacity = sizeof(action->body)
+        .output = action->body, .capacity = sizeof(action->body),
+        .plain_text = plain_text || boundary != NULL, .boundary = boundary
     };
     action->body[0] = '\0';
-    serialize_form_controls(form->first_child, submitter, &writer);
+    serialize_form(form, submitter, native_basic, &writer);
+    if (writer.failed) return false;
     if (!writer.overflowed) {
         action->body_length = writer.length;
         return true;
     }
     action->body[0] = '\0';
-    if (writer.length > NAVIGATION_FORM_BODY_LIMIT) return false;
     size_t length = writer.length;
     char *body = budget_malloc_category(
         navigation->budget, BUDGET_CATEGORY_NAVIGATION, length + 1u);
     if (body == NULL) return false;
-    writer = (FormBodyWriter) { .output = body, .capacity = length + 1u };
+    writer = (FormBodyWriter) {
+        .output = body, .capacity = length + 1u,
+        .plain_text = plain_text || boundary != NULL, .boundary = boundary
+    };
     body[0] = '\0';
-    serialize_form_controls(form->first_child, submitter, &writer);
+    serialize_form(form, submitter, native_basic, &writer);
+    if (writer.failed || writer.overflowed || writer.length != length) {
+        budget_free(navigation->budget, body);
+        return false;
+    }
     controller_action_adopt_body(navigation, action, body, length);
     return true;
 }
@@ -428,35 +588,13 @@ static lxb_dom_node_t *form_owner(lxb_dom_node_t *node)
            by ancestry. Walk only for that uncommon case. The submission
            sink must recheck ownership after author callbacks can move
            the control or change its form attribute. */
-        lxb_dom_node_t *root = node;
-        unsigned depth = 0;
-        while (root->parent != NULL && !document_node_is_shadow_carrier(root)
-               && depth++ < 256u) root = root->parent;
-        if (depth > 256u) return NULL;
+        lxb_dom_node_t *root = form_tree_root(node);
+        if (root == NULL) return NULL;
         if (root->type == LXB_DOM_NODE_TYPE_DOCUMENT
             || document_node_is_shadow_carrier(root)) {
             if (length == 0) return NULL;
-            lxb_dom_node_t *at = root->first_child;
-            for (unsigned visited = 0; at != NULL && visited < 65536u; visited++) {
-                bool shadow = document_node_is_shadow_carrier(at);
-                if (!shadow && at->type == LXB_DOM_NODE_TYPE_ELEMENT) {
-                    lxb_dom_attr_t *attribute = lxb_dom_element_id_attribute(
-                        lxb_dom_interface_element(at));
-                    if (attribute != NULL) {
-                        size_t size = 0;
-                        const lxb_char_t *value = lxb_dom_attr_value(attribute, &size);
-                        if (size == length && value != NULL
-                            && memcmp(value, id, length) == 0)
-                            return document_element_name_is(at, "form") ? at : NULL;
-                    }
-                }
-                if (!shadow && at->first_child != NULL) at = at->first_child;
-                else {
-                    while (at != root && at->next == NULL) at = at->parent;
-                    at = at == root ? NULL : at->next;
-                }
-            }
-            return NULL;
+            lxb_dom_node_t *owner = form_tree_find_id(root, id, length);
+            return document_element_name_is(owner, "form") ? owner : NULL;
         }
     }
     lxb_dom_node_t *parser_owner = document_control_parser_form_owner(node);
@@ -464,6 +602,28 @@ static lxb_dom_node_t *form_owner(lxb_dom_node_t *node)
     for (lxb_dom_node_t *at = node; at != NULL; at = at->parent) {
         if (document_element_name_is(at, "form")) return at;
         if (document_node_is_shadow_carrier(at)) break;
+    }
+    return NULL;
+}
+
+lxb_dom_node_t *controller_control_form_owner(lxb_dom_node_t *node)
+{
+    return form_owner(node);
+}
+
+static lxb_dom_node_t *form_tree_find_id(lxb_dom_node_t *root,
+                                        const char *id, size_t length)
+{
+    size_t visited = 0;
+    for (lxb_dom_node_t *at = root->first_child;
+         at != NULL && visited++ < CONTROLLER_FORM_NODE_LIMIT;
+         at = form_tree_next(at, root, false)) {
+        if (at->type != LXB_DOM_NODE_TYPE_ELEMENT
+            || document_node_is_shadow_carrier(at)) continue;
+        size_t size = 0;
+        const char *value = document_attribute(at, "id", &size);
+        if (value != NULL && size == length && memcmp(value, id, size) == 0)
+            return at;
     }
     return NULL;
 }
@@ -1175,24 +1335,28 @@ static bool controller_try_structured_audio_fallback(
 /* The form's default button is its first submit button in tree order,
    disabled or not: a disabled one means Enter submits nothing (HTML
    implicit submission; Chrome's HTMLFormElement::SubmitImplicitly). */
-static void form_implicit_controls(lxb_dom_node_t *node,
+static bool form_implicit_controls(lxb_dom_node_t *form, bool native_basic,
                                    lxb_dom_node_t **default_submitter,
                                    size_t *blocking_fields)
 {
-    for (lxb_dom_node_t *at = node; at != NULL; at = at->next) {
-        if (at->type == LXB_DOM_NODE_TYPE_ELEMENT) {
-            if (*default_submitter == NULL && node_is_submit_button(at)) {
-                *default_submitter = at;
-            } else if (!node_effectively_disabled(at)
-                       && input_blocks_implicit_submission(at)) {
-                (*blocking_fields)++;
-            }
+    lxb_dom_node_t *root = form_tree_root(form);
+    if (root == NULL) return false;
+    size_t id_length = 0;
+    const char *id = form_explicit_owner_id(form, root, &id_length);
+    if (native_basic) root = form;
+    size_t visited = 0;
+    for (lxb_dom_node_t *at = root->first_child; at != NULL;
+         at = form_tree_next(at, root, false)) {
+        if (visited++ == CONTROLLER_FORM_NODE_LIMIT) return false;
+        if (*default_submitter == NULL && node_is_submit_button(at)
+            && form_control_has_owner(at, form, id, id_length)) {
+            *default_submitter = at;
         }
-        if (at->first_child != NULL) {
-            form_implicit_controls(at->first_child, default_submitter,
-                                   blocking_fields);
-        }
+        if (input_blocks_implicit_submission(at)
+            && form_control_has_owner(at, form, id, id_length)
+            && !node_effectively_disabled(at)) (*blocking_fields)++;
     }
+    return true;
 }
 
 static bool controller_build_form_action_with_outcome(
@@ -1209,7 +1373,10 @@ static bool controller_build_implicit_form_action(
         || !input_blocks_implicit_submission(input)) return false;
     lxb_dom_node_t *submitter = NULL;
     size_t blocking_fields = 0;
-    form_implicit_controls(form->first_child, &submitter, &blocking_fields);
+    if (!form_implicit_controls(form,
+            controller_node_in_native_basic_root(controller, form),
+            &submitter, &blocking_fields))
+        return false;
     if (submitter != NULL && node_effectively_disabled(submitter))
         return false;
     if (submitter != NULL) {
@@ -1281,9 +1448,12 @@ static bool controller_prepare_form_action(
                == CONTROLLER_ACTIVATION_NOT_DISPATCHED) {
         action->activation_outcome = CONTROLLER_ACTIVATION_RUNTIME_UNAVAILABLE;
     }
+    bool native_body_ready = false;
     if (callback_runtime != NULL) {
+        script_runtime_clear_form_submission_body(callback_runtime, true);
         bool dispatched = navigation_dispatch_node_submit_event(
             navigation, form, submitter);
+        native_body_ready = dispatched;
         form = controller_node_snapshot_resolve(
             controller, form_handle, form);
         if (submitter != NULL) {
@@ -1354,32 +1524,72 @@ static bool controller_prepare_form_action(
     if (!tilefinch_csp_allows_form_action(
             &navigation->page.document.content_security_policy,
             action->url)) return false;
-    bool post = override != NULL && has_attribute(override, "formmethod")
-        ? attribute_is(override, "formmethod", "post")
-        : attribute_is(form, "method", "post");
+    lxb_dom_node_t *method_node = override != NULL
+        && has_attribute(override, "formmethod") ? override : form;
+    const char *method_attribute = method_node == override ? "formmethod" : "method";
+    if (attribute_is(method_node, method_attribute, "dialog")) return false;
+    bool post = attribute_is(method_node, method_attribute, "post");
+    lxb_dom_node_t *type_node = override != NULL
+        && has_attribute(override, "formenctype") ? override : form;
+    const char *type_attribute = type_node == override ? "formenctype" : "enctype";
+    bool plain_text = post && attribute_is(type_node, type_attribute, "text/plain");
+    bool multipart = post && attribute_is(type_node, type_attribute,
+                                          "multipart/form-data");
+    char boundary[CONTROLLER_FORM_BOUNDARY_LENGTH + 1u] = {0};
     snprintf(action->method, sizeof(action->method), "%s",
              post ? "POST" : "GET");
-    snprintf(action->content_type, sizeof(action->content_type),
-             "application/x-www-form-urlencoded");
+    snprintf(action->content_type, sizeof(action->content_type), "%s",
+             plain_text ? "text/plain" : "application/x-www-form-urlencoded");
     action->type = CONTROLLER_ACTION_FORM_SUBMIT;
     /* With a live realm the entry list comes from script: it holds control
        values native state cannot (above DOCUMENT_CONTROL_VALUE_LIMIT) and
-       what `formdata` listeners added. Null means script left this form to
-       the DOM serializer (multipart, or the entry list failed to build). A
-       list too large to send is refused, not replaced by those stale values. */
+       what `formdata` listeners added. A list which failed to build is
+       refused, not replaced by those stale values. */
     char *entries = NULL;
     size_t entries_length = 0;
     ScriptFormBodyTake take = navigation->page.runtime != NULL
             && !native_basic_form
+            && (!dispatch_submit_event || native_body_ready)
         ? script_runtime_take_form_submission_body(
-              navigation->page.runtime, navigation->budget,
+              navigation->page.runtime, dispatch_submit_event, navigation->budget,
               NAVIGATION_FORM_BODY_LIMIT, &entries, &entries_length)
         : SCRIPT_FORM_BODY_NONE;
-    if (take == SCRIPT_FORM_BODY_REFUSED) {
+    if (take == SCRIPT_FORM_BODY_REFUSED
+        || (take == SCRIPT_FORM_BODY_TAKEN && multipart)
+        || (take == SCRIPT_FORM_BODY_BINARY && !multipart)) {
+        budget_free(navigation->budget, entries);
         action->type = CONTROLLER_ACTION_NONE;
         return false;
     }
-    if (take == SCRIPT_FORM_BODY_TAKEN) {
+    if (multipart) {
+        if (take == SCRIPT_FORM_BODY_BINARY) {
+            /* Read the encoder's boundary from the opening delimiter,
+               leaving the binary payload untouched. */
+            const size_t end = 2u + CONTROLLER_FORM_BOUNDARY_LENGTH;
+            if (entries_length < end + 2u || memcmp(entries, "--", 2u) != 0
+                || strspn(entries + 2u, "0123456789abcdef")
+                    != CONTROLLER_FORM_BOUNDARY_LENGTH
+                || (memcmp(entries + end, "\r\n", 2u) != 0
+                    && (entries_length != end + 4u
+                        || memcmp(entries + end, "--\r\n", 4u) != 0))) {
+                budget_free(navigation->budget, entries);
+                return false;
+            }
+            memcpy(boundary, entries + 2u, CONTROLLER_FORM_BOUNDARY_LENGTH);
+        } else {
+            unsigned char random[CONTROLLER_FORM_BOUNDARY_LENGTH / 2u];
+            static const char hex[] = "0123456789abcdef";
+            if (!tilefinch_platform_secure_random(random, sizeof(random)))
+                return false;
+            for (size_t i = 0; i < sizeof(random); i++) {
+                boundary[2u * i] = hex[random[i] >> 4u];
+                boundary[2u * i + 1u] = hex[random[i] & 15u];
+            }
+        }
+        snprintf(action->content_type, sizeof(action->content_type),
+                 "multipart/form-data; boundary=%s", boundary);
+    }
+    if (take == SCRIPT_FORM_BODY_TAKEN || take == SCRIPT_FORM_BODY_BINARY) {
         if (entries_length < sizeof(action->body)) {
             memcpy(action->body, entries, entries_length + 1u);
             action->body_length = entries_length;
@@ -1389,29 +1599,35 @@ static bool controller_prepare_form_action(
                 navigation, action, entries, entries_length);
         }
     } else if (!controller_serialize_form_body(
-                   navigation, form, submitter, action)) {
+                   navigation, form, submitter, action, native_basic_form, plain_text,
+                   multipart ? boundary : NULL)) {
         action->type = CONTROLLER_ACTION_NONE;
         return false;
     }
-    if (!post && action->body_length != 0) {
+    if (!post) {
         size_t url_length = strlen(action->url);
-        size_t needed = 1 + action->body_length;
-        if (url_length + needed >= sizeof(action->url)) return false;
         char *fragment = strchr(action->url, '#');
-        size_t insert_at = fragment == NULL
+        size_t old_end = fragment == NULL
             ? url_length : (size_t) (fragment - action->url);
-        bool has_query = memchr(action->url, '?', insert_at) != NULL;
-        if (fragment != NULL) {
-            memmove(action->url + insert_at + needed,
-                    action->url + insert_at,
-                    url_length - insert_at + 1u);
+        const char *query = memchr(action->url, '?', old_end);
+        size_t insert_at = query == NULL
+            ? old_end : (size_t) (query - action->url);
+        size_t suffix = url_length - old_end;
+        bool fits = action->body_length < sizeof(action->url) - insert_at - suffix - 1u;
+        if (fits) {
+            size_t needed = action->body_length + 1u;
+            memmove(action->url + insert_at + needed, action->url + old_end,
+                    suffix + 1u);
+            action->url[insert_at] = '?';
+            memcpy(action->url + insert_at + 1u, controller_action_body(action),
+                   action->body_length);
         }
-        action->url[insert_at] = has_query ? '&' : '?';
-        memcpy(action->url + insert_at + 1u, controller_action_body(action),
-               action->body_length);
-        if (fragment == NULL)
-            action->url[insert_at + needed] = '\0';
+        if (action->external_body != NULL) {
+            budget_free(navigation->budget, navigation->form_submission_body);
+            navigation->form_submission_body = NULL;
+        }
         controller_action_clear_body(action);
+        if (!fits) return false;
     }
     return true;
 }
@@ -1421,9 +1637,15 @@ static bool controller_build_form_action_with_outcome(
     lxb_dom_node_t *submitter, bool dispatch_submit_event,
     ControllerActivationOutcome initial_outcome, ControllerAction *action)
 {
-    if (controller_prepare_form_action(
+    bool prepared = controller_prepare_form_action(
             controller, form, submitter, dispatch_submit_event,
-            initial_outcome, action)) return true;
+            initial_outcome, action);
+    /* A rejected native activation and a queued script request own
+       different snapshots. Discard only the one we just handled. */
+    if (controller != NULL && controller->navigation != NULL)
+        script_runtime_clear_form_submission_body(
+            controller->navigation->page.runtime, dispatch_submit_event);
+    if (prepared) return true;
     if (action != NULL) {
         memset(action, 0, sizeof(*action));
         action->activation_outcome = initial_outcome;
@@ -3183,8 +3405,8 @@ static bool controller_select_apply(lxb_dom_node_t **options, size_t count,
     return true;
 }
 
-size_t controller_select_history(lxb_dom_node_t *select, char *state,
-                                 size_t length, bool restore)
+static size_t controller_select_history_state(lxb_dom_node_t *select, char *state,
+                                               size_t length, bool restore, bool edited_only)
 {
     lxb_dom_node_t *options[128];
     char previous[128];
@@ -3192,9 +3414,12 @@ size_t controller_select_history(lxb_dom_node_t *select, char *state,
     size_t count = controller_select_options(select, options);
     if (count == 0 || count > 128u || (restore ? count != length : count > length)) return 0;
     if (!restore) {
-        for (size_t at = 0; at < count; at++)
+        bool dirty = false;
+        for (size_t at = 0; at < count; at++) {
             state[at] = controller_option_selected(options[at]) ? '1' : '0';
-        return count;
+            dirty |= edited_only && has_attribute(options[at], "data-tilefinch-option-selected");
+        }
+        return !edited_only || dirty ? count : 0;
     }
     bool changed = false;
     for (size_t at = 0; at < count; at++) {
@@ -3209,6 +3434,18 @@ size_t controller_select_history(lxb_dom_node_t *select, char *state,
        force the caller to rebuild an already-correct label and focus map. */
     if (!changed) return 0;
     return controller_select_apply(options, count, state, previous) ? count : SIZE_MAX;
+}
+
+size_t controller_select_history(lxb_dom_node_t *select, char *state,
+                                 size_t length, bool restore)
+{
+    return controller_select_history_state(select, state, length, restore, false);
+}
+
+size_t controller_select_history_edited(lxb_dom_node_t *select, char *state,
+                                       size_t length)
+{
+    return controller_select_history_state(select, state, length, false, true);
 }
 
 static ControllerNativeDefaultResult controller_advance_select(
@@ -4468,7 +4705,9 @@ bool controller_keyboard_done_submits(const BrowserController *controller)
         || !input_blocks_implicit_submission(input)) return false;
     lxb_dom_node_t *submitter = NULL;
     size_t blocking_fields = 0;
-    form_implicit_controls(form->first_child, &submitter, &blocking_fields);
+    if (!form_implicit_controls(form,
+            controller_node_in_native_basic_root(controller, form),
+            &submitter, &blocking_fields)) return false;
     return blocking_fields == 1
         && (submitter == NULL || !node_effectively_disabled(submitter));
 }
@@ -4603,6 +4842,115 @@ static bool controller_set_scroll(BrowserController *controller, int scroll_y,
     return navigation_set_scroll(controller->navigation, scroll_y);
 }
 
+/* Whether the document can still move in direction (-1 up, 1 down). */
+static bool controller_document_can_scroll(
+    const BrowserController *controller, int direction)
+{
+    const NavigationEntry *entry = navigation_current(controller->navigation);
+    if (entry == NULL) return false;
+    if (direction < 0) return entry->scroll_y > 0;
+    return entry->scroll_y < viewport_max_scroll_css(
+        &controller->navigation->viewport,
+        controller->navigation->page.layout.height);
+}
+
+/* The scroll container a press reaches once the document cannot move that
+   way: the one showing the most of the screen, among those that show at
+   least half its width and half its height and can still move in
+   direction. A desktop reader clicks into such a box first; with no click,
+   a page that keeps everything below its header in one inner scroller (an
+   app shell one screen tall) would never scroll. *visible_height is how
+   much of it the screen shows, for a page step. */
+static lxb_dom_node_t *controller_dominant_scroller(
+    const BrowserController *controller, int direction, int *visible_height)
+{
+    const NavigationSession *navigation = controller->navigation;
+    const LayoutDocument *layout = &navigation->page.layout;
+    const ViewportContext *viewport = &navigation->viewport;
+    const NavigationEntry *entry = navigation_current(navigation);
+    if (entry == NULL || viewport->css_width <= 0
+        || viewport->css_height <= 0) return NULL;
+    lxb_dom_node_t *best = NULL;
+    long long best_area = 0;
+    for (size_t i = 0; i < layout->scroll_container_count; i++) {
+        size_t box_index = layout->scroll_containers[i].node_box_index;
+        if (box_index >= layout->node_box_count) continue;
+        const LayoutNodeBox *box = &layout->node_boxes[box_index];
+        if (box->node == NULL || !box->clips_y || box->clip_only_y
+            || box->scroll_hidden_y
+            || box->client_width * 2 < viewport->css_width
+            || box->client_height * 2 < viewport->css_height
+            || (direction > 0
+                ? box->scroll_y >= box->content_height - box->client_height
+                : box->scroll_y <= 0)) continue;
+        LayoutScrollPlacement placement;
+        (void) layout_node_overflow_placement(layout, box->node,
+                                              &placement);
+        int left, top, right, bottom;
+        layout_node_box_clip_rect(box, box->x + placement.dx,
+                                  box->y + placement.dy,
+                                  &left, &top, &right, &bottom);
+        if (left < placement.clip_left) left = placement.clip_left;
+        if (top < placement.clip_top) top = placement.clip_top;
+        if (right > placement.clip_right) right = placement.clip_right;
+        if (bottom > placement.clip_bottom) bottom = placement.clip_bottom;
+        int dy = 0;
+        if (!fixed_region_offset(layout, FIXED_REGION_COMMAND,
+                                 box->command_start, viewport->css_height,
+                                 entry->scroll_y, &dy)) dy = -entry->scroll_y;
+        top = controller_add_coordinate(top, dy);
+        bottom = controller_add_coordinate(bottom, dy);
+        if (left < 0) left = 0;
+        if (top < 0) top = 0;
+        if (right > viewport->css_width) right = viewport->css_width;
+        if (bottom > viewport->css_height) bottom = viewport->css_height;
+        int width = right - left, height = bottom - top;
+        if (width * 2 < viewport->css_width
+            || height * 2 < viewport->css_height) continue;
+        long long area = (long long) width * height;
+        if (area <= best_area) continue;
+        best_area = area;
+        best = box->node;
+        *visible_height = height;
+    }
+    return best;
+}
+
+/* Moves the scroller controller_dominant_scroller picked, and only it:
+   what it cannot take is dropped, never chained into the boxes around it
+   (an overflow:hidden root among them). A page press with no remainder
+   override uses a full page of that scroller. */
+static bool controller_scroll_dominant(BrowserController *controller,
+                                       int direction, int delta, bool page)
+{
+    int visible = 0;
+    if (controller_document_can_scroll(controller, direction)) return false;
+    lxb_dom_node_t *node =
+        controller_dominant_scroller(controller, direction, &visible);
+    if (node == NULL) return false;
+    LayoutDocument *layout = &controller->navigation->page.layout;
+    const LayoutNodeBox *box = layout_box_for_node(layout, node);
+    if (box == NULL) return false;
+    if (page && delta == 0) {
+        /* What the screen shows of it, less the overlap a document page
+           step keeps. */
+        int overlap = visible / 8;
+        int minimum_overlap = viewport_device_to_css(
+            &controller->navigation->viewport, 16);
+        if (overlap < minimum_overlap) overlap = minimum_overlap;
+        delta = visible - overlap;
+        if (delta < visible / 4) delta = visible / 4;
+        delta *= direction;
+    }
+    int before_x = box->scroll_x, before_y = box->scroll_y;
+    long long target = (long long) before_y + delta;
+    if (target < 0) target = 0;
+    if (target > INT_MAX) target = INT_MAX;
+    (void) layout_scroll_node(layout, node, before_x, (int) target);
+    if (page) (void) layout_scroll_node_settle(layout, node);
+    return box->scroll_y != before_y || box->scroll_x != before_x;
+}
+
 bool controller_scroll_by(BrowserController *controller, int delta_y,
                           int viewport_height)
 {
@@ -4619,6 +4967,8 @@ bool controller_scroll_by(BrowserController *controller, int delta_y,
     if (remaining_y == 0) return nested;
     const NavigationEntry *entry = navigation_current(controller->navigation);
     if (entry == NULL) return nested;
+    if (controller_scroll_dominant(
+            controller, remaining_y < 0 ? -1 : 1, remaining_y, false)) return true;
     long long requested = (long long) entry->scroll_y + remaining_y;
     if (requested < 0) requested = 0;
     if (requested > INT_MAX) requested = INT_MAX;
@@ -4864,6 +5214,9 @@ bool controller_scroll_page(BrowserController *controller, int direction,
             &controller->navigation->page.layout, target);
     }
     if (remaining_y == 0) return nested;
+    int dominant_delta = remaining_y == requested_delta ? 0 : remaining_y;
+    if (controller_scroll_dominant(controller, direction, dominant_delta, true))
+        return true;
     if (remaining_y == requested_delta) {
         remaining_y = direction * controller_page_step(
             &controller->navigation->page.layout, viewport,

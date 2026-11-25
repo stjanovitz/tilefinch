@@ -78,10 +78,16 @@ void psp_boot_config_defaults(PspBootConfig *config)
 
 #if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
 static long boot_config_js_heap_detail;
+static long boot_config_preconnect = 1;
 
 bool psp_boot_config_validation_js_heap_detail(void)
 {
     return boot_config_js_heap_detail == 1;
+}
+
+bool psp_boot_config_validation_preconnect_disabled(void)
+{
+    return boot_config_preconnect == 0;
 }
 #endif
 
@@ -189,6 +195,7 @@ void psp_boot_config_disable_automation(PspBootConfig *config)
     config->exit_to[0] = '\0';
 #if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
     boot_config_js_heap_detail = 0;
+    boot_config_preconnect = 1;
     tilefinch_frame_lite_reset();
 #endif
 }
@@ -229,6 +236,7 @@ static BootConfigLoad psp_boot_config_load_one(
     PspBootConfig loaded = *config;
 #if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
     long loaded_js_heap_detail = boot_config_js_heap_detail;
+    long loaded_preconnect = boot_config_preconnect;
     /* Frame-realm prototype switches (frame_lite_* keys, frame_lite.h):
        applied as they parse and restored if the file is not accepted. */
     TilefinchFrameLiteSwitches loaded_frame_lite = *tilefinch_frame_lite();
@@ -420,6 +428,8 @@ static BootConfigLoad psp_boot_config_load_one(
 #if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
         } else if (strcmp(line, "validation_js_heap_detail") == 0) {
             loaded_js_heap_detail = atol(value);
+        } else if (strcmp(line, "validation_preconnect") == 0) {
+            loaded_preconnect = atol(value);
         } else if (strncmp(line, "frame_lite_", 11) == 0
                    && tilefinch_frame_lite_set(line + 11, value)) {
             /* applied; restored below unless the load is accepted */
@@ -441,6 +451,7 @@ static BootConfigLoad psp_boot_config_load_one(
     *config = loaded;
 #if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
     boot_config_js_heap_detail = loaded_js_heap_detail;
+    boot_config_preconnect = loaded_preconnect;
 #endif
     return BOOT_CONFIG_LOADED;
 }
@@ -458,16 +469,6 @@ bool psp_boot_config_load(
         && psp_boot_config_load_one(
                config, backup, warning, warning_context)
                == BOOT_CONFIG_LOADED;
-}
-
-/* Replaces `path` with the written `temporary`, keeping the previous file
-   as `backup` until the rename lands (the PSP's rename cannot replace). */
-static bool boot_config_publish(const char *temporary, const char *path,
-                                const char *backup)
-{
-    if (tilefinch_platform_replace_file(temporary, path, backup)) return true;
-    remove(temporary);
-    return false;
 }
 
 /* A boot file is small; one larger than this is not one an in-app edit
@@ -634,13 +635,7 @@ bool psp_boot_config_write_overrides(
         if ((keys & (1u << key)) != 0u && last[key] == SIZE_MAX)
             ok = boot_config_write_key(file, config, key, eol);
     }
-    if (ok) ok = fflush(file) == 0;
-    if (file != NULL && fclose(file) != 0) ok = false;
-    if (!ok) {
-        remove(temporary);
-        return false;
-    }
-    return boot_config_publish(temporary, path, backup);
+    return tilefinch_platform_finish_file(file, ok, temporary, path, backup);
 }
 
 unsigned psp_boot_config_drop_invalid_developer_urls(PspBootConfig *config)
@@ -1063,13 +1058,7 @@ PspBootConfigMigration psp_boot_config_migrate_file_kb(const char *path)
                out,
                "# Memory-based script admission replaced the old "
                "file_kb=512 default.%s%s%s",
-               eol, PSP_BOOT_CONFIG_FILE_KB_MIGRATED_MARK, eol) > 0
-        && fflush(out) == 0;
-    if (fclose(out) != 0) ok = false;
-    if (!ok) {
-        remove(temporary);
-        return PSP_BOOT_CONFIG_MIGRATION_FAILED;
-    }
-    return boot_config_publish(temporary, path, backup)
+               eol, PSP_BOOT_CONFIG_FILE_KB_MIGRATED_MARK, eol) > 0;
+    return tilefinch_platform_finish_file(out, ok, temporary, path, backup)
         ? PSP_BOOT_CONFIG_MIGRATION_DONE : PSP_BOOT_CONFIG_MIGRATION_FAILED;
 }

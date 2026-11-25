@@ -1063,7 +1063,7 @@ cleanup:
    can obtain is under 4 times its source (script_admission_large_unit_heap),
    as cnn.com's 2.3 MB inline bundle and ign.com's 1.4 MB _app chunk were
    not: both passed the 1.0x floor and ran out of heap mid-compile after
-   100-150 ms of host compile. A 2 MB literal table on an 8 MiB heap clears
+   100-150 ms of host compile. A 2 MB literal table on a 9 MiB heap clears
    the floor and needs about 22 MB; it gets an error event without being
    parsed, the realm is intact, and the next script runs. A 1.2 MB script
    that compiles small (its text is one lazy function) still runs when the
@@ -1147,9 +1147,14 @@ static bool test_large_unit_without_compile_room_is_refused_before_compile(
     replaying = true;
     REQUIRE(browser_session_init(&browser, budget, 1u * MIB));
     browser_ready = true;
-    REQUIRE(start_custom_runtime_page(
+    /* A 9 MiB heap: the table clears the floor and the 2 MiB an inserted
+       script must leave beside its planned compile
+       (SCRIPT_ADMISSION_MEMORY_STOP_HEADROOM_BYTES), and fails only the 4x
+       requirement. */
+    REQUIRE(start_custom_runtime_page_heavy(
         &navigation, budget, &browser, "https://large-compile.test/",
-        empty_page, 8, 16u * MIB, 4u * MIB));
+        empty_page, 9u * MIB, 8, 16u * MIB, 4u * MIB,
+        SCRIPT_HEAVY_POLICY_RUN, NULL, NULL));
     navigation_ready = true;
     REQUIRE(evaluate(&navigation, append_scripts, "<append-large>"));
     size_t advances = 0;
@@ -2202,4 +2207,113 @@ cleanup:
         ok = false;
     }
     return ok;
+}
+
+/* A page on a fixed 8 MiB heap inserts a script whose completed response
+   the realm cannot take for `refusals` turns
+   (TilefinchTestFaults.refuse_dynamic_script_takes), first holding all but
+   about 1 MiB of what it obtains when `exhausted`. */
+typedef struct {
+    bool turns_ok;
+    bool refusals_used;
+    bool realm_alive;
+    bool memory_stopped;
+    bool page_loaded;
+    bool late_ran;
+} RefusedTakeOutcome;
+
+static bool run_refused_take(Budget *budget, unsigned refusals,
+                             bool exhausted, RefusedTakeOutcome *outcome)
+{
+    const char *test_name = "a refused response take";
+    static const char empty_page[] =
+        "<!doctype html><head></head><body></body>";
+    static const char late_source[] = "globalThis.pocSummary='late:ran';";
+    static const char append[] =
+        "const late=document.createElement('script');late.src='/late.js';"
+        "document.head.appendChild(late);"
+        "globalThis.pocSummary='late:pending';";
+    ScriptReplayRecord records[] = {{
+        .url = "https://refused-take.test/late.js", .source = late_source
+    }};
+    char directory[128] = {0}, error[256] = {0}, hold[96];
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool fixture_ready = false, replaying = false;
+    bool browser_ready = false, navigation_ready = false, ok = true;
+    memset(outcome, 0, sizeof(*outcome));
+
+    REQUIRE(write_replay_fixture(directory, records, 1));
+    fixture_ready = true;
+    REQUIRE(fetch_trace_replay_begin(directory, error, sizeof(error)));
+    replaying = true;
+    REQUIRE(browser_session_init(&browser, budget, 256u * 1024u));
+    browser_ready = true;
+    REQUIRE(start_custom_runtime_page(
+        &navigation, budget, &browser, "https://refused-take.test/",
+        empty_page, 8, 64u * 1024u, 32u * 1024u));
+    navigation_ready = true;
+    if (exhausted) {
+        (void) script_runtime_collect_and_trim(navigation.page.runtime);
+        size_t obtainable =
+            script_runtime_heap_obtainable(navigation.page.runtime);
+        REQUIRE(obtainable > 2u * MIB);
+        snprintf(hold, sizeof(hold), "globalThis.hold=new ArrayBuffer(%zu)",
+                 obtainable - 1u * MIB);
+        REQUIRE(evaluate(&navigation, hold, "<hold>"));
+    }
+    REQUIRE(evaluate(&navigation, append, "<append-late>"));
+    tilefinch_test_faults()->refuse_dynamic_script_takes = refusals;
+    outcome->turns_ok = true;
+    for (unsigned tick = 0; tick < 16u; tick++)
+        if (!navigation_advance_runtime(&navigation, 1, 1))
+            outcome->turns_ok = false;
+    outcome->refusals_used =
+        tilefinch_test_faults()->refuse_dynamic_script_takes < refusals;
+    outcome->memory_stopped = navigation.page.script_memory_limited;
+    outcome->realm_alive = navigation.page.runtime != NULL
+        && !outcome->memory_stopped;
+    outcome->page_loaded = navigation.page.loaded;
+    outcome->late_ran =
+        strcmp(navigation.page.script_result.summary, "late:ran") == 0;
+
+cleanup:
+    tilefinch_test_faults()->refuse_dynamic_script_takes = 0;
+    if (navigation_ready) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    if (replaying) fetch_trace_end();
+    if (fixture_ready) remove_replay_fixture(directory, 1);
+    if (budget->current != 0) {
+        fprintf(stderr, "%s leaked %zu owned bytes\n", test_name,
+                budget->current);
+        ok = false;
+    }
+    return ok;
+}
+
+/* A completed inserted script the realm cannot take for memory waits for a
+   later turn: refused once, the page keeps its realm and the script runs.
+   Refused on every turn of a page out of memory, the memory stop rule
+   judges the refusal and stops the realm; the page stays loaded and every
+   turn succeeds. Before, the refused 16 KB response envelope failed the
+   scheduler tick, and the visit with it ("JavaScript scheduler tick
+   failed"), discarding a page already rendered. */
+static bool test_refused_response_take_keeps_visit(Budget *budget)
+{
+    RefusedTakeOutcome once = {0}, always = {0};
+    bool ok = run_refused_take(budget, 1u, false, &once)
+        && run_refused_take(budget, UINT_MAX, true, &always);
+    bool retried = ok && once.turns_ok && once.refusals_used
+        && once.realm_alive && once.late_ran;
+    bool stopped = ok && always.turns_ok && always.refusals_used
+        && always.memory_stopped && always.page_loaded && !always.late_ran;
+    if (!retried || !stopped)
+        fprintf(stderr,
+                "refused response take ok=%d once: turns=%d used=%d "
+                "alive=%d ran=%d; always: turns=%d used=%d stopped=%d "
+                "loaded=%d ran=%d\n",
+                ok, once.turns_ok, once.refusals_used, once.realm_alive,
+                once.late_ran, always.turns_ok, always.refusals_used,
+                always.memory_stopped, always.page_loaded, always.late_ran);
+    return retried && stopped;
 }

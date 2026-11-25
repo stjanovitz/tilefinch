@@ -676,7 +676,9 @@ full reset only when a root cannot be named.
 Invalidation is scoped by what the sheet's rules can read: a change restyles
 the elements whose matching it can alter (siblings and `:has()` anchors
 included) and nothing else, and a journal whose every change stays inside
-content that renders nothing skips the relayout altogether. Retained computed
+content that renders nothing, or that left the tree as it was (content
+inserted and removed again in the same turn), skips the relayout altogether.
+Retained computed
 styles live in a table that grows to cover a whole document-order walk,
 because a smaller LRU table evicts each entry before the next build reaches
 it. Each scoping rule and its exclusions are in
@@ -689,6 +691,19 @@ stacking contexts, transforms, clipping, fixed and sticky geometry, and focus
 metadata. The renderer rasterizes 128×128 RGB565 tiles on demand and keeps a
 bounded spatial index, so scrolling costs work in proportion to the visible
 content, not the document's length.
+
+Tiles paint pictures kept encoded from two small decoded-picture caches,
+one at the source size and one at the painted size. A picture too large for
+either is decoded once per paint pass and held until the pass ends, not
+decoded again for every tile it covers. A pass is one call's tiles (a frame,
+a run of paint-ahead, a streaming-preview fill step), or the page's frame job
+across its bounded slices until the frame is done; nothing is held while
+other page work runs between calls. Only one is held: it is freed before any
+other decode or memory-dependent paint decision, so those are made as in a
+pass that never held it, and the Budget's reclaim hook frees it first when an
+allocation needs the room. Only the engine's tile caches that hook reaches
+hold one (`HeldImageDecode` and `tile_cache_hold_decodes` in
+`include/tilefinch/render.h`).
 
 Unsupported motion resolves to one coherent static presentation: final
 visibility and opacity are kept, scroll-linked transforms flatten, and

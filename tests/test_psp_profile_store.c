@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "tilefinch/budget.h"
@@ -62,9 +63,44 @@ static int test_failed_forget_preserves_policy(void)
     return 0;
 }
 
+static int test_history_delete_save_failure(void)
+{
+    char directory[] = "/tmp/tilefinch-history-delete-XXXXXX";
+    CHECK(mkdtemp(directory) != NULL);
+    char path[160];
+    snprintf(path, sizeof(path), "%s/profile.cfg", directory);
+    Budget budget;
+    budget_init(&budget, 2u * 1024u * 1024u);
+    BrowserProfile *profile = browser_profile_create(&budget);
+    BrowserProfile *restart = browser_profile_create(&budget);
+    const char *url = "https://history.example.test/";
+    browser_profile_set_history_enabled(profile, true);
+    CHECK(profile != NULL && restart != NULL
+          && browser_profile_record_history(profile, url, "Visit")
+          && browser_profile_save(profile, path));
+    PspProfileStore store;
+    psp_profile_store_init(&store, profile, path);
+    CHECK(browser_profile_forget_history(profile, url));
+    tilefinch_test_faults()->replace_file_fail_install = true;
+    CHECK(!psp_profile_store_commit_edit(&store, 123)
+          && store.dirty && browser_profile_history_count(profile) == 0
+          && browser_profile_load(restart, path)
+          && browser_profile_history_count(restart) == 1);
+    bool attempted = false;
+    CHECK(psp_profile_store_flush_due(&store, 223, 100, false, &attempted)
+          && attempted && !store.dirty && browser_profile_load(restart, path)
+          && browser_profile_history_count(restart) == 0);
+    remove_generations(path);
+    browser_profile_destroy(restart);
+    browser_profile_destroy(profile);
+    CHECK(budget.current == 0 && rmdir(directory) == 0);
+    return 0;
+}
+
 int main(void)
 {
     CHECK(test_failed_forget_preserves_policy() == 0);
+    CHECK(test_history_delete_save_failure() == 0);
     Budget budget;
     budget_init(&budget, 2u * 1024u * 1024u);
     BrowserProfile *profile = browser_profile_create(&budget);
@@ -192,6 +228,24 @@ int main(void)
     CHECK(loaded != NULL);
     CHECK(browser_profile_load(loaded, path));
     CHECK(browser_profile_ui_scale(loaded) == 1);
+    browser_profile_destroy(loaded);
+    /* A primary boot could not read blocks the store's saves until a
+       retry finds it gone; the backup this run loaded from stays. */
+    CHECK(browser_profile_save(profile, path) && chmod(path, 0) == 0);
+    loaded = browser_profile_create(&budget);
+    bool loaded_from_backup = loaded != NULL
+        && browser_profile_load(loaded, path);
+    PspProfileStore unread;
+    psp_profile_store_init(&unread, loaded, path);
+    browser_profile_set_ui_scale(loaded, 2);
+    psp_profile_store_mark_dirty(&unread, 1u);
+    bool refused = loaded_from_backup && !psp_profile_store_flush(&unread)
+        && unread.dirty;
+    CHECK(chmod(path, 0600) == 0);
+    char backup[200];
+    snprintf(backup, sizeof(backup), "%s.bak", path);
+    CHECK(refused && remove(path) == 0 && psp_profile_store_flush(&unread)
+          && !unread.dirty && file_exists(path) && file_exists(backup));
     remove_generations(path);
     browser_profile_destroy(loaded);
     browser_profile_destroy(profile);

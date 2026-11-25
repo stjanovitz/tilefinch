@@ -11,7 +11,11 @@ globalThis.__tilefinchInstallWorker = (
   creatorSecureContext,
   creatorURL,
   trustedEvent,
+  /* dom.js's private share, for the timer cancel, the crypto-scope stop
+     and, once IndexedDB loads, a worker's own IndexedDB factory. */
+  share,
 ) => {
+  const { stopCryptoScope, cancelTimer } = share;
   /* Dispatch passes Event's phase numbers (1 capturing, 2 at target,
      3 bubbling) as literals instead of reading them from the global Event,
      which a page can replace. */
@@ -29,6 +33,12 @@ globalThis.__tilefinchInstallWorker = (
        abort and give their signals with AbortController's own methods. */
     abortController: abortWith, controllerSignal, signalReason } =
     globalThis.__tilefinchEventInterfaces;
+  /* WebIDL: postMessage's message argument is required. */
+  const requireMessage = (count, owner) => {
+    if (!count)
+      throw new TypeError(
+        `Failed to execute 'postMessage' on '${owner}': 1 argument required, but only 0 present.`);
+  };
   const blobForURL = globalThis.__tilefinchBlobForURL,
     trustedString = globalThis.__tilefinchTrustedString,
     workerIntrinsics = globalThis.__tilefinchWorkerIntrinsics,
@@ -64,19 +74,22 @@ globalThis.__tilefinchInstallWorker = (
     normalizeTimerDelay = globalThis.__tilefinchNormalizeTimerDelay,
     scheduleTask = globalThis.__tilefinchScheduleTask,
     scheduleOwnedTimer = globalThis.__tilefinchScheduleOwnedTimer,
-    cancelTimer = globalThis.__tilefinchCancelTimer,
     createWorkerPerformance = globalThis.__tilefinchCreateWorkerPerformance,
     createTrustedTypesRealm =
       globalThis.__tilefinchCreateTrustedTypesRealm,
     createWorkerXHR = globalThis.__tilefinchCreateWorkerXHR,
     abortXHRForWorker = globalThis.__tilefinchAbortXHRForWorker,
-    abortFileReaderForWorker =
-      globalThis.__tilefinchAbortFileReaderForWorker,
+    /* FileReader and IndexedDB are lazy modules: each publishes its abort
+       hook when it loads, and a worker that has used neither holds none. */
+    abortFileReaderForWorker = (reader) => {
+      const abort = globalThis.__tilefinchAbortFileReaderForWorker;
+      return typeof abort === "function" ? abort(reader) : false;
+    },
     abortIndexedDBForWorker = (database) => {
       const abort = globalThis.__tilefinchAbortIndexedDBForWorker;
       return typeof abort === "function" ? abort(database) : false;
     },
-    blobTextForWorker = globalThis.__tilefinchBlobTextForWorker,
+    blobTextForWorker = globalThis.__tilefinchBlobText,
     closeWebSocketForWorker =
       globalThis.__tilefinchCloseWebSocketForWorker,
     ownerNavigator = globalThis.navigator,
@@ -112,6 +125,7 @@ globalThis.__tilefinchInstallWorker = (
     typeof invokeEventTargetCheckpointed !== "function" ||
     typeof createWorkerCrypto !== "function" ||
     typeof setCryptoBufferNormalizer !== "function" ||
+    typeof stopCryptoScope !== "function" ||
     typeof normalizeTimerDelay !== "function" ||
     typeof scheduleTask !== "function" ||
     typeof scheduleOwnedTimer !== "function" ||
@@ -128,22 +142,6 @@ globalThis.__tilefinchInstallWorker = (
     throw new Error("Worker bootstrap is unavailable");
 
   const workerSourceForBlob = (blob) => workerIntrinsics.sourceForBlob(blob);
-  /* The bytes a worker's queued OPFS write snapshot holds, charged as
-     opfs.js charges the owner's: the clone is an owner-realm value, so a
-     buffer is told by its internal slot (the byteLength getters), never by
-     instanceof. */
-  const { ArrayBuffer: TrustedArrayBuffer, apply: trustedApply } = eventInterfaces,
-    bufferByteLength = getOwnPropertyDescriptor(
-      TrustedArrayBuffer.prototype, "byteLength").get,
-    opfsWriteCharge = (value) => {
-      const data = value !== null && typeof value === "object" &&
-        !TrustedArrayBuffer.isView(value) && value.type === "write" ? value.data : value;
-      if (TrustedArrayBuffer.isView(data)) return data.byteLength;
-      if (typeof data === "string") return data.length * 2;
-      try { return trustedApply(bufferByteLength, data, []); } catch (_) {}
-      return typeof data?.size === "number" ? data.size : undefined;
-    };
-
   /* Dedicated workers share selected Web Platform constructors with their
      owner, but never the owner's arbitrary global properties.  Keep this
      list explicit: the worker realm has its own ECMAScript intrinsics, while
@@ -523,10 +521,13 @@ globalThis.__tilefinchInstallWorker = (
         ['HEADERS_RECEIVED',2],['LOADING',3],['DONE',4]]);
       root.XMLHttpRequest=WorkerXMLHttpRequest;
     }
-    {
-      const Base=root.FileReader,
-        register=root.__tilefinchRegisterWorkerFileReader;
-      delete root.__tilefinchRegisterWorkerFileReader;
+    /* FileReader is a lazy module: a worker whose owner could not load it
+       has none, and starts anyway. */
+    const BaseFileReader=root.FileReader,
+      registerFileReader=root.__tilefinchRegisterWorkerFileReader;
+    delete root.__tilefinchRegisterWorkerFileReader;
+    if(typeof BaseFileReader==='function'){
+      const Base=BaseFileReader,register=registerFileReader;
       function WorkerFileReader(...args){
         if(!new.target)throw new TypeError('constructor requires new');
         const reader=Reflect.construct(Base,args,new.target);
@@ -731,7 +732,6 @@ globalThis.__tilefinchInstallWorker = (
           }
           if(pending.size>=16)return;
           record={reported:false,timer:0};
-          pending.set(promise,record);
           record.timer=scheduleRejection(()=>{
             if(pending.get(promise)!==record)return;
             record.reported=true;
@@ -739,7 +739,7 @@ globalThis.__tilefinchInstallWorker = (
             root.dispatchEvent(new PromiseRejectionEvent(
               'unhandledrejection',{promise,reason}));
           },0);
-          if(!record.timer)pending.delete(promise);
+          if(record.timer)pending.set(promise,record);
         }
       });
     }
@@ -1022,7 +1022,7 @@ globalThis.__tilefinchInstallWorker = (
         entry.detail = options.detail;
         return appendWorkerPerformanceEntry(this, entry);
       }
-      measure(name, startOrOptions, endMark) {
+      measure(name, startOrOptions = undefined, endMark = undefined) {
         const state = workerPerformanceStates.get(this);
         if (!state) throw new TypeError("Illegal invocation");
         const timestamp = value => typeof value === "string"
@@ -1065,7 +1065,7 @@ globalThis.__tilefinchInstallWorker = (
         return sortWorkerPerformanceEntries(
           state.entries.filter(entry => entry.entryType === type));
       }
-      getEntriesByName(name, type) {
+      getEntriesByName(name, type = undefined) {
         const state = workerPerformanceStates.get(this);
         if (!state) throw new TypeError("Illegal invocation");
         name = String(name);
@@ -1181,7 +1181,7 @@ globalThis.__tilefinchInstallWorker = (
       });
   }
   globalThis.Worker = class Worker extends EventTarget {
-    constructor(url, options) {
+    constructor(url, options = undefined) {
       super();
       if (arguments.length > 1) workerProgress.constructorOptionArguments++;
       /* WebIDL string conversion is observable author code.  Snapshot it once
@@ -1291,6 +1291,7 @@ globalThis.__tilefinchInstallWorker = (
           opfsWriters: new Set(),
           children: new Set(),
           scope: null,
+          crypto: null,
           dispatchType: "",
           dispatchOwner: null,
           dispatchEvent: null,
@@ -1369,6 +1370,7 @@ globalThis.__tilefinchInstallWorker = (
       scope.WorkerNavigator = WorkerNavigator;
       scope.WorkerLocation = WorkerLocation;
       scope.postMessage = function (value) {
+        requireMessage(arguments.length, "DedicatedWorkerGlobalScope");
         if (!state.active) return;
         if (arguments.length > 1) workerProgress.outboundTransferArguments++;
         traceWorkerMessage("worker-to-owner", value);
@@ -1485,7 +1487,7 @@ globalThis.__tilefinchInstallWorker = (
           },
         });
       }
-      scope.crypto = createWorkerCrypto();
+      scope.crypto = state.crypto = createWorkerCrypto();
       scope.performance = createDedicatedWorkerPerformance();
       state.performanceObservers = workerPerformanceStates.get(scope.performance).observers;
       scope.Performance = WorkerPerformance;
@@ -2193,7 +2195,7 @@ globalThis.__tilefinchInstallWorker = (
                        not later when it forwards the write to the owner. */
                     try {
                       const copy = cloneWorkerValue(value, ownerIntrinsics);
-                      return Reflect.apply(localWrite, this, [copy, opfsWriteCharge(copy)]);
+                      return Reflect.apply(localWrite, this, [copy, owner._charge(copy)]);
                     } catch (error) {
                       return WorkerPromise.reject(error);
                     }
@@ -2417,7 +2419,9 @@ globalThis.__tilefinchInstallWorker = (
          An eagerly defined shared name resolves to the value hardening.js
          captured before the owner's script ran, so an owner that replaced
          XMLHttpRequest, WebSocket or Event, say, does not hand its own
-         constructor to the worker. Known gap: a lazily defined name
+         constructor to the worker. So do EventSource, FileReader, GPU and
+         WGSLLanguageFeatures: their lazy modules record their constructors
+         in that table as they load. Known gap: another lazily defined name
          (streams, IndexedDB, WebAssembly, Intl, ...) resolves to whatever
          the owner page has left at that global when the worker reads it;
          capturing those would need every lazy group's constructors
@@ -2528,7 +2532,20 @@ globalThis.__tilefinchInstallWorker = (
         state.webSockets.add(socket);
         addListener(socket, "close", () => state.webSockets.delete(socket));
       };
-      scope.__tilefinchGetOwnerIndexedDB = () => globalThis.indexedDB;
+      /* A factory of its own, so the values and keys its connections
+         read are built with the worker's constructors (indexeddb.js),
+         made through the share, never through a name the page can
+         replace. Reading indexedDB loads the module; a page that replaced
+         it before then gives its own. */
+      scope.__tilefinchGetOwnerIndexedDB = () => {
+        const own = () => share.workerIndexedDB?.(state.cloneIntrinsics);
+        let factory = own();
+        if (!factory) {
+          const owner = globalThis.indexedDB;
+          factory = own() || owner;
+        }
+        return factory;
+      };
       scope.__tilefinchOwnerGPU = ownerNavigator.gpu;
       scope.__tilefinchGPUBridge = workerIntrinsics;
       scope.__tilefinchRegisterWorkerIDBRequest = (request, tracksDatabase) => {
@@ -2689,6 +2706,7 @@ globalThis.__tilefinchInstallWorker = (
     postMessage(value) {
       const state = workerStates.get(this);
       if (!state) throw new TypeError("Illegal invocation");
+      requireMessage(arguments.length, "Worker");
       /* HTML silently discards messages posted after terminate(). The Worker
          object remains a valid EventTarget; termination is not an invocation
          or serialization error. */
@@ -2801,6 +2819,9 @@ globalThis.__tilefinchInstallWorker = (
         "Worker is terminated", "AbortError")); } catch (_) {}
     }
     state.opfsWriters.clear();
+    /* The stopped realm can no longer see its derivations settle. */
+    stopCryptoScope(state.crypto, false);
+    state.crypto = null;
     retireWorkerRealm(state);
     if (state.startTimer) {
       cancelTimer(state.startTimer);
@@ -2843,6 +2864,7 @@ globalThis.__tilefinchInstallWorker = (
     state.scope = null;
     /* Keep the owner EventTarget, not the stopped realm's constructors and
        global handlers. The private table has only the fixed handler slots. */
+    share.workerIndexedDB?.(state.cloneIntrinsics, true);
     state.cloneIntrinsics = null;
     for (const type of workerIntrinsics.keys(state.scopeHandlers)) {
       const slot = state.scopeHandlers[type];

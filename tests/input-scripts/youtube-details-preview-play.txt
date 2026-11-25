@@ -1,0 +1,21 @@
+# A delayed Details response is pending. The second Cross is Play, not
+# activation on a committed watch page. Back must restore the result list.
+wait 1
+mark first
+tap-live cross
+wait-live 1
+tap-live circle
+wait-page 6
+press 8 down
+tap right
+wait 1
+mark selected
+tap-live cross
+wait-live 3
+tap-live cross
+wait-live 150
+mark playing
+tap-live circle
+wait-page 12
+mark returned
+end

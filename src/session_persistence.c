@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #define PERSIST_HEADER_BYTES 36u
 #define PERSIST_VERSION_LEGACY UINT32_C(1)
@@ -79,6 +80,9 @@ struct BrowserSessionPersistenceLoad {
     BrowserSession *target;
     BrowserSession *staging;
     FILE *file;
+#ifndef __PSP__
+    FILE *rejected_primary;
+#endif
     BrowserSessionPersistenceLimits limits;
     BrowserSessionPersistenceMask requested_mask;
     BrowserSessionPersistenceMask stored_mask;
@@ -479,17 +483,35 @@ static void build_header(unsigned char header[PERSIST_HEADER_BYTES],
     put_u32(header + 32, (uint32_t) plan->storage_count);
 }
 
-/* The format version a snapshot file declares, or 0 when it is missing or
-   not a snapshot. */
-static uint32_t persist_file_version(const char *path)
+/* Missing files and clean short/non-snapshot headers have no version.
+   I/O refusal is different: replacing a file we could not inspect may
+   destroy a snapshot from a later release. */
+static bool persist_file_version(const char *path, uint32_t *version)
 {
+    *version = 0;
     FILE *file = fopen(path, "rb");
-    if (file == NULL) return 0;
+    if (file == NULL) return errno == ENOENT;
     unsigned char header[12];
-    bool read = fread(header, 1, sizeof(header), file) == sizeof(header);
-    (void) fclose(file);
-    return read && memcmp(header, persist_magic, sizeof(persist_magic)) == 0
-        ? get_u32(header + 8) : 0;
+    size_t read = fread(header, 1, sizeof(header), file);
+    bool ok = !ferror(file);
+    if (fclose(file) != 0 || !ok) return false;
+    if (read == sizeof(header) && memcmp(header, persist_magic, sizeof(persist_magic)) == 0)
+        *version = get_u32(header + 8);
+    return true;
+}
+
+static bool persist_file_missing(const char *path)
+{
+    struct stat status;
+    return stat(path, &status) != 0 && errno == ENOENT;
+}
+
+bool browser_session_persistence_can_save(const char *path, bool restore_unread)
+{
+    if (!restore_unread) return true;
+    char backup[PERSIST_PATH_BYTES];
+    return make_path(path, ".bak", backup) && persist_file_missing(path)
+        && persist_file_missing(backup);
 }
 
 BrowserSessionPersistenceStatus browser_session_persistence_planned_bytes(
@@ -544,10 +566,14 @@ BrowserSessionPersistenceStatus browser_session_persistence_save(
     /* Publishing rotates the primary into .bak and drops the old .bak (the
        latest data when the primary is unreadable). Neither may be a
        generation a later release wrote. */
-    uint32_t primary_version = persist_file_version(path);
-    if (primary_version > PERSIST_VERSION
-        || (primary_version < PERSIST_VERSION_LEGACY
-            && persist_file_version(backup) > PERSIST_VERSION))
+    uint32_t version;
+    if (!persist_file_version(path, &version))
+        return BROWSER_SESSION_PERSISTENCE_IO_ERROR;
+    if (version > PERSIST_VERSION)
+        return BROWSER_SESSION_PERSISTENCE_NEWER_FORMAT;
+    if (!persist_file_version(backup, &version))
+        return BROWSER_SESSION_PERSISTENCE_IO_ERROR;
+    if (version > PERSIST_VERSION)
         return BROWSER_SESSION_PERSISTENCE_NEWER_FORMAT;
     unsigned char header[PERSIST_HEADER_BYTES];
     build_header(header, &plan, sizing.bytes, sizing.hash);
@@ -559,16 +585,8 @@ BrowserSessionPersistenceStatus browser_session_persistence_save(
     };
     if (ok) ok = emit_payload(&writer, session, &plan)
         && writer.bytes == sizing.bytes && writer.hash == sizing.hash;
-    ok = fclose(file) == 0 && ok;
-    if (!ok) {
-        (void) remove(temporary);
-        return BROWSER_SESSION_PERSISTENCE_IO_ERROR;
-    }
-    if (!tilefinch_platform_replace_file(temporary, path, backup)) {
-        (void) remove(temporary);
-        return BROWSER_SESSION_PERSISTENCE_IO_ERROR;
-    }
-    return BROWSER_SESSION_PERSISTENCE_OK;
+    return tilefinch_platform_finish_file(file, ok, temporary, path, backup)
+        ? BROWSER_SESSION_PERSISTENCE_OK : BROWSER_SESSION_PERSISTENCE_IO_ERROR;
 }
 
 static bool http_field_value_valid(const char *value)
@@ -909,6 +927,14 @@ static bool async_handle_failure(BrowserSessionPersistenceLoad *load)
             || load->status == BROWSER_SESSION_PERSISTENCE_CORRUPT)) {
         load->primary_status = load->status;
         load->trying_backup = true;
+#ifndef __PSP__
+        /* Pin the rejected file's identity across subsequent pumps. A save
+           may publish a different inode at its old name meanwhile. */
+        if (load->primary_status == BROWSER_SESSION_PERSISTENCE_CORRUPT) {
+            load->rejected_primary = load->file;
+            load->file = NULL;
+        }
+#endif
         BrowserSessionPersistenceStatus backup_status =
             async_open_attempt(load, load->backup);
         load->status = backup_status;
@@ -921,6 +947,23 @@ static bool async_handle_failure(BrowserSessionPersistenceLoad *load)
     else
         load->phase = ASYNC_LOAD_FINISHED;
     return true;
+}
+
+static void retire_corrupt_primary(BrowserSessionPersistenceLoad *load)
+{
+    if (load->primary_status != BROWSER_SESSION_PERSISTENCE_CORRUPT) return;
+#ifndef __PSP__
+    struct stat rejected, named;
+    if (load->rejected_primary == NULL
+        || fstat(fileno(load->rejected_primary), &rejected) != 0
+        || stat(load->primary, &named) != 0
+        || rejected.st_ino == 0 || rejected.st_dev != named.st_dev
+        || rejected.st_ino != named.st_ino) return;
+#endif
+    /* The PSP frontend serializes same-path save/restore. On the host the
+       identity check also covers saves between pumps, but is not a lock
+       against arbitrary concurrent writers between stat and unlink. */
+    (void) remove(load->primary);
 }
 
 BrowserSessionPersistenceLoad *browser_session_persistence_load_begin(
@@ -1237,9 +1280,7 @@ BrowserSessionPersistenceLoadProgress browser_session_persistence_load_pump(
                 break;
             }
             commit_staging(load->target, load->staging, commit_mask);
-            if (load->trying_backup) {
-                (void) remove(load->primary);
-            }
+            if (load->trying_backup) retire_corrupt_primary(load);
             load->phase = ASYNC_LOAD_FINISHED;
             break;
         }
@@ -1267,6 +1308,9 @@ void browser_session_persistence_load_destroy(
     if (load == NULL || load->target == NULL) return;
     Budget *budget = load->target->budget;
     async_release_attempt(load);
+#ifndef __PSP__
+    if (load->rejected_primary != NULL) fclose(load->rejected_primary);
+#endif
     budget_free(budget, load);
 }
 

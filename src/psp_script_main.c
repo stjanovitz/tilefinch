@@ -553,7 +553,7 @@ static TILEFINCH_COLD_PATH void psp_entropy_setup(
 static TILEFINCH_COLD_PATH bool psp_save_site_data_on_exit(
     BrowserSession *session, const BrowserProfile *profile,
     bool persistent_site_data_available,
-    bool preserve_persisted_cache, bool preserve_persisted_storage,
+    bool cache_restore_unread, bool storage_restore_unread,
     const TilefinchInstallPaths *install_paths,
     const PspStoragePaths *storage, PspUiState *ui,
     const uint16_t *engine_frame)
@@ -561,13 +561,19 @@ static TILEFINCH_COLD_PATH bool psp_save_site_data_on_exit(
     bool saved = true;
     bool stick_full = false;
     unsigned cache_mb = browser_profile_persistent_cache_mb(profile);
-    bool cache_enabled = persistent_site_data_available && cache_mb != 0
-        && !preserve_persisted_cache;
-    bool storage_enabled =
+    bool cache_requested = persistent_site_data_available && cache_mb != 0;
+    bool storage_requested =
         persistent_site_data_available
         && browser_profile_site_data_allowed(profile)
-        && browser_profile_persist_local_storage(profile)
-        && !preserve_persisted_storage;
+        && browser_profile_persist_local_storage(profile);
+    bool preserve_persisted_cache = cache_requested
+        && !browser_session_persistence_can_save(
+            storage->persistent_cache, cache_restore_unread);
+    bool preserve_persisted_storage = storage_requested
+        && !browser_session_persistence_can_save(
+            storage->local_storage, storage_restore_unread);
+    bool cache_enabled = cache_requested && !preserve_persisted_cache;
+    bool storage_enabled = storage_requested && !preserve_persisted_storage;
     if (preserve_persisted_storage)
         printf("tilefinch-site-data: local-storage-save=skipped "
                "reason=restore-unread\n");
@@ -646,6 +652,9 @@ static void psp_site_data_restore_init(
 {
     if (restore == NULL) return;
     memset(restore, 0, sizeof(*restore));
+    /* A setting can enable saving later even when no restore runs at boot. */
+    restore->storage_restore_unread = true;
+    restore->cache_restore_cancelled_unread = true;
     restore->cache_enabled = cache_enabled;
     restore->cache_limits = psp_site_data_limits(cache_megabytes);
     restore->storage_limits = psp_site_data_limits(0);
@@ -687,8 +696,6 @@ static TILEFINCH_OUT_OF_LINE bool psp_site_data_restore_pump(
         if (restore->load == NULL) {
             printf("tilefinch-site-data: deferred-%s load=unavailable\n",
                    psp_site_data_restore_name(restore->phase));
-            if (restore->phase == PSP_SITE_DATA_RESTORE_LOCAL_STORAGE)
-                restore->storage_restore_unread = true;
             restore->phase = restore->phase
                     == PSP_SITE_DATA_RESTORE_LOCAL_STORAGE
                 && restore->cache_enabled
@@ -718,14 +725,12 @@ static TILEFINCH_OUT_OF_LINE bool psp_site_data_restore_pump(
         restore->pumps, restore->bytes_budgeted);
     restore->pumps = 0;
     restore->bytes_budgeted = 0;
-    if (completed == PSP_SITE_DATA_RESTORE_LOCAL_STORAGE
-        && browser_session_persistence_load_left_unread(status))
-        restore->storage_restore_unread = true;
-    /* A cache is only an optimization, but one a later release wrote is
-       kept for it instead of being rotated away by this release's save. */
-    if (completed == PSP_SITE_DATA_RESTORE_CACHE
-        && status == BROWSER_SESSION_PERSISTENCE_NEWER_FORMAT)
-        restore->cache_restore_cancelled_unread = true;
+    if (completed == PSP_SITE_DATA_RESTORE_LOCAL_STORAGE)
+        restore->storage_restore_unread =
+            browser_session_persistence_load_left_unread(status);
+    if (completed == PSP_SITE_DATA_RESTORE_CACHE)
+        restore->cache_restore_cancelled_unread =
+            browser_session_persistence_load_left_unread(status);
     restore->phase = completed == PSP_SITE_DATA_RESTORE_LOCAL_STORAGE
             && restore->cache_enabled
         ? PSP_SITE_DATA_RESTORE_CACHE : PSP_SITE_DATA_RESTORE_DONE;
@@ -772,9 +777,9 @@ static void psp_site_data_restore_cancel_mask(
     if (restore == NULL) return;
     if ((mask & BROWSER_SESSION_PERSIST_CACHE) != 0) {
         restore->cache_enabled = false;
-        /* An explicit clear intentionally retires the unread generation; a
-           newly populated live cache may be saved on exit. */
-        restore->cache_restore_cancelled_unread = false;
+        /* Exit may save a fresh snapshot after removal, but must not rotate
+           any generation a failed explicit clear left on disk. */
+        restore->cache_restore_cancelled_unread = true;
         if (restore->phase == PSP_SITE_DATA_RESTORE_CACHE) {
             browser_session_persistence_load_destroy(restore->load);
             restore->load = NULL;
@@ -782,8 +787,7 @@ static void psp_site_data_restore_cancel_mask(
         }
     }
     if ((mask & BROWSER_SESSION_PERSIST_LOCAL_STORAGE) != 0) {
-        /* Clearing local storage retires the unread snapshot too. */
-        restore->storage_restore_unread = false;
+        restore->storage_restore_unread = true;
         if (restore->phase == PSP_SITE_DATA_RESTORE_LOCAL_STORAGE) {
             browser_session_persistence_load_destroy(restore->load);
             restore->load = NULL;
@@ -2036,6 +2040,9 @@ static TILEFINCH_OUT_OF_LINE void psp_wait_before_interactive_input(
                 && media_playback_wait_video_ready(media->playback, 16667u);
             if (!ready_waited) sceDisplayWaitVblankStart();
         }
+    } else if (media->first_frame_opened_us
+               && psp_media_first_picture_poll(media, sceKernelGetSystemTimeWide())) {
+        (void)sceKernelDelayThread(PSP_MEDIA_FULLSCREEN_POLL_YIELD_US);
     } else if (page_work_waiting) {
         (void) sceKernelDelayThread(PSP_PAGE_TASK_YIELD_US);
     } else if (canvas_wait_us != 0) {
@@ -2962,6 +2969,46 @@ static TILEFINCH_OUT_OF_LINE uint32_t psp_canvas_followup_wait(PspLoop *loop)
     return wait_us;
 }
 
+enum { LOAD_INPUT_PENDING, LOAD_INPUT_CANCELLED, LOAD_INPUT_CONFIRM_DETAILS };
+static TILEFINCH_OUT_OF_LINE unsigned psp_loop_loading_input(
+    PspLoop *loop, PspAppFrameState *frame, PspUiInput *input, bool forwarded)
+{
+    PspUiState *ui = &loop->app.process->presentation.ui;
+    if (ui->screen == PSP_UI_SCREEN_PAGE) {
+        if (input->pressed & PSP_UI_BUTTON_CANCEL) {
+            psp_loop_cancel_navigation(loop, frame);
+            input->pressed &= ~PSP_UI_BUTTON_CANCEL;
+            return LOAD_INPUT_CANCELLED;
+        }
+        if (input->pressed == PSP_UI_BUTTON_CONFIRM && !loop->app.browser->media.ui.visible
+            && ui->toast_kind == PSP_UI_TOAST_VIDEO_DETAILS && ui->toast_frames
+            && !ui->cursor_visible) return LOAD_INPUT_CONFIRM_DETAILS;
+    }
+    if (!forwarded) {
+        /* Unsupervised loads accept only their own Cancel/Play controls. */
+        psp_ui_suspend_page_input(ui);
+        input->pressed = input->held = 0;
+    }
+    return LOAD_INPUT_PENDING;
+}
+
+/* The owner, never the input supervisor, retires the Details navigation
+   and opens the selected result through the ordinary native-player route.
+   Keep the large ControllerAction off the common frame's stack. */
+static TILEFINCH_OUT_OF_LINE bool psp_loop_play_details_preview(PspLoop *loop, PspAppFrameState *frame)
+{
+    PspApp *app = &loop->app;
+    ControllerAction action;
+    if (!browser_engine_youtube_preview_play(app->browser->engine, &action)) return false;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    printf("tilefinch-details-preview: play-before-commit\n");
+#endif
+    psp_loop_cancel_navigation(loop, frame);
+    (void)psp_engine_views_refresh(app->views, app->browser->engine);
+    psp_app_route_controller_action(app, frame, app->views->frame, &action);
+    return true;
+}
+
 /* One frame of the interactive loop: input, dispatch, navigation, page
    work, render and present, then the post-present pumps. The order of
    those steps is load-bearing (frame pumps admit work by position).
@@ -3309,24 +3356,11 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_frame(PspLoop *loop)
         color_mode_visual_changed || power_auto_visual_changed;
     bool navigation_pending =
         browser_engine_navigation_pending(browser->engine);
-    if (navigation_pending
-        && process->presentation.ui.screen == PSP_UI_SCREEN_PAGE
-        && (input.pressed & PSP_UI_BUTTON_CANCEL) != 0) {
-        psp_loop_cancel_navigation(loop, &frame);
+    unsigned load_input = navigation_pending
+        ? psp_loop_loading_input(loop, &frame, &input, loading_page_input) : LOAD_INPUT_PENDING;
+    if (load_input == LOAD_INPUT_CANCELLED) {
         navigation_pending = false;
         navigation_visual_changed = true;
-        input.pressed &= ~PSP_UI_BUTTON_CANCEL;
-    }
-    if (navigation_pending && !loading_page_input) {
-        /* Without a callback supervisor to receive button edges, the
-           candidate navigation's own loop polls Circle; nothing else
-           may race it. The analog cursor remains chrome-local and
-           responsive; its page event is suppressed below until the
-           candidate reaches a terminal state. (A supervised load
-           forwards presses for the loading page instead.) */
-        psp_ui_suspend_page_input(&process->presentation.ui);
-        input.pressed = 0;
-        input.held = 0;
     }
     bool cursor_feedback_presented = false;
     uint8_t cursor_shape_before_dispatch = process->presentation.ui.cursor_shape;
@@ -3340,6 +3374,12 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_frame(PspLoop *loop)
         media_visual_changed = psp_loop_media_input(loop, &input);
     } else {
         intent = psp_ui_update(&process->presentation.ui, &input);
+        if (load_input == LOAD_INPUT_CONFIRM_DETAILS && !reader_shortcut && intent.action == PSP_UI_ACTION_ACTIVATE
+            && psp_loop_play_details_preview(loop, &frame)) {
+            intent.action = PSP_UI_ACTION_NONE;
+            navigation_pending = false;
+            navigation_visual_changed = true;
+        }
         if (reader_shortcut) {
             intent = (PspUiIntent) {
                 .action = PSP_UI_ACTION_TOGGLE_READER,
@@ -4394,6 +4434,11 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_home_preconnect(
         && psp_network_lifecycle_ready(
             network_lifecycle)
         && network->status == PSP_NETWORK_READY;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    /* An offline harness run (boot.cfg validation_preconnect=0). */
+    home_ready = home_ready
+        && !psp_boot_config_validation_preconnect_disabled();
+#endif
     const char *preconnect_url =
         home_ready
             ? psp_home_target_url(
@@ -4902,6 +4947,12 @@ static TILEFINCH_OUT_OF_LINE void psp_loop_report_network_warmup(
                        "selection=%u url=%s\n",
                        (unsigned) process->presentation.ui.home_selection,
                        url == NULL ? "-" : url);
+                if (url != NULL
+                    && psp_boot_config_validation_preconnect_disabled()) {
+                    printf("tilefinch-preconnect: event=disabled "
+                           "source=boot-config\n");
+                    url = NULL;
+                }
 #endif
                 uint32_t key = url == NULL ? 0u
                     : fetch_preconnect_tile_key(url);
@@ -5391,6 +5442,10 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_pump_navigation(
         (int) navigation_metrics.completion_per_mille);
     uint64_t now_us =
         (uint64_t) sceKernelGetSystemTimeWide();
+    /* The stall watchdog also counts the parser's own work, which runs on
+       after the transport has delivered the bytes it parses. */
+    size_t watchdog_units = navigation_metrics.load.progress_units
+        + navigation_metrics.load.parser_progress_units;
     if (site_data_waiting) {
         /* Deferred localStorage is part of boot recovery, not network
            progress. Start the one-minute navigation watchdog only once
@@ -5403,14 +5458,13 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_pump_navigation(
                != interactive->navigation_job_started_us) {
         psp_navigation_watchdog_start(
             &interactive->navigation_watchdog,
-            interactive->navigation_job_started_us,
-            navigation_metrics.load.progress_units);
+            interactive->navigation_job_started_us, watchdog_units);
     }
     if (navigation_status == BROWSER_NAVIGATION_JOB_PENDING
         && interactive->navigation_job_started_us != 0
         && psp_navigation_watchdog_expired(
                &interactive->navigation_watchdog, now_us,
-               navigation_metrics.load.progress_units)) {
+               watchdog_units)) {
         browser_engine_cancel_navigation(
             browser->engine, "PSP navigation watchdog expired");
         navigation_status =
@@ -6019,8 +6073,8 @@ static TILEFINCH_COLD_PATH void psp_site_data_load_direct_boot(
         bool loaded = psp_site_data_load(
             session, storage->persistent_cache,
             BROWSER_SESSION_PERSIST_CACHE, &limits, &status);
-        if (status == BROWSER_SESSION_PERSISTENCE_NEWER_FORMAT)
-            restore->cache_restore_cancelled_unread = true;
+        restore->cache_restore_cancelled_unread =
+            browser_session_persistence_load_left_unread(status);
         printf("tilefinch-site-data: disk-cache=%uMB load=%s\n",
                cache_mb, loaded ? "ok" : "empty");
     }
@@ -6031,8 +6085,8 @@ static TILEFINCH_COLD_PATH void psp_site_data_load_direct_boot(
         bool loaded = psp_site_data_load(
             session, storage->local_storage,
             BROWSER_SESSION_PERSIST_LOCAL_STORAGE, &limits, &status);
-        if (browser_session_persistence_load_left_unread(status))
-            restore->storage_restore_unread = true;
+        restore->storage_restore_unread =
+            browser_session_persistence_load_left_unread(status);
         printf("tilefinch-site-data: local-storage load=%s\n",
                loaded ? "ok" : "empty");
     }
@@ -6164,6 +6218,7 @@ int main(int argc, char *argv[])
         .retire_frame = psp_platform_retire_frame,
         .log_message = psp_log_message,
         .page_dialog = psp_page_dialog_show,
+        .confirm_draft_loss = psp_confirm_draft_loss,
     };
     psp_media_capture_install(&services);
     tilefinch_platform_set_services(&services);
@@ -6185,6 +6240,14 @@ int main(int argc, char *argv[])
     psp_preload_validation_ca_bundle(&process.install_paths);
 #endif
 
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    {
+        /* Boot self-test of the aliased scanf core
+           (src/psp_newlib_shims.c); the PPSSPP runners report it. */
+        void tilefinch_scanf_check(void);
+        tilefinch_scanf_check();
+    }
+#endif
     printf("tilefinch-validation: version=3 persistent=%d "
            "crash-journal=%d operation-input=redacted "
            "exception-handler=%s/0x%08x "
@@ -6627,7 +6690,7 @@ int main(int argc, char *argv[])
     psp_refresh_page_color_mode(&process.presentation.ui);
     (void) psp_engine_settings_boot(
         browser.profile, browser.engine, &process.presentation.ui);
-    psp_app_youtube_login_boot(&process, &browser);
+    const char *youtube_login_notice = psp_app_youtube_login_boot(&process, &browser);
     (void) psp_set_presentation_css(
         browser.engine, &process.presentation.ui, browser.profile, false, startup_url,
         process.presentation.ui.page_font_percent, false);
@@ -6963,12 +7026,20 @@ report:
                     : "READY - SELECT OPENS MENU",
                 initial_error_page ? 300 : 240);
         }
+        /* Said once, over the readiness toast: this run's changes to an
+           unread profile or tab session stay unsaved. */
+        const char *unread_notice =
+            psp_tabs_unread_notice(browser.profile, browser.tabs);
+        if (unread_notice != NULL)
+            psp_ui_show_status(&process.presentation.ui, unread_notice, 360);
         const NavigationEntry *media_entry = navigation_current(engine_views.navigation);
         psp_media_prepare_route(
             &browser.media, media_entry == NULL ? NULL : media_entry->url,
             engine_views.navigation->generation);
         psp_boot_resume_download(browser.profile, &browser.offline_store,
                                   &process.presentation.ui);
+        if (youtube_login_notice != NULL)
+            psp_ui_show_status(&process.presentation.ui, youtube_login_notice, 360);
 
         printf("tilefinch-psp-script: frame-hash=%016llx ui-state=%zuB\n",
                (unsigned long long)

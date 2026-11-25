@@ -126,8 +126,10 @@ against the version argument.
 
 Release builds of the JavaScript engine use profile feedback (PGO); daily
 development builds do not. The profile is valid only for the exact engine
-sources, headers, compiler and flags it was trained on, so train it from the
-release commit, after the changelog commit:
+sources, headers, compiler and flags it was trained on, and only for builds
+configured from the checkout path it was trained from, so train it from the
+release commit, after the changelog commit, in the checkout that cuts the
+release:
 
 ```sh
 cmake --preset psp -B build-pgo-gen -DTILEFINCH_ALLOW_BUILD_DIR=ON \
@@ -149,8 +151,38 @@ The training journey's own settings do not change shipping defaults or user
 settings. Pass the directory to the cut script with `--quickjs-pgo
 build-pgo-profile`; configure refuses a profile whose fingerprint does not
 match the engine being built, because a stale profile makes the engine
-larger and slower than none. `--no-quickjs-pgo` builds without it, as a
-deliberate choice.
+larger and slower than none. The training script also records the
+instrumented build's source directory as `source-dir=` in the profile's
+`PROVENANCE`, and configure refuses the profile when this build is
+configured from any other path, naming both paths. GCC's per-function
+profile checks hash each engine source's path as the compiler is given it,
+so another checkout, or the same folder reached through a symlink, would
+otherwise fail the engine compile with about two thousand
+`coverage-mismatch` and `missing-profile` errors. Train in the checkout that
+builds, or build from the checkout that trained. A profile whose
+`PROVENANCE` has no `source-dir=` (trained before the script recorded it)
+is accepted with a configure warning that the folder cannot be checked.
+`--no-quickjs-pgo` builds without a profile, as a deliberate choice. The
+options added only when a profile is used, such as `-fno-unroll-loops`
+([JavaScript runtime](engineering/JS_RUNTIME.md#build)), are not part of the
+fingerprint, so changing them needs no retrain.
+
+Then check that the profile does not grow the image:
+
+```sh
+scripts/check-quickjs-pgo-size.sh build-pgo-profile
+```
+
+It builds a shipping tree with the profile and one without it under
+`build-pgo-size/`, and fails unless the profiled `.text` is at most both the
+shipping `.text` limit and the `.text` without a profile. Run it after every
+retrain, and whenever a merge touches `third_party/quickjs`, the engine
+patches or the engine flags (in `cmake/TilefinchDependencies.cmake`). A
+failure means profile feedback grew the engine: limit the pass that grew it
+in the PGO-use options, or release with `--no-quickjs-pgo`. With
+`--trees PGO_TREE BASE_TREE` it compares two shipping trees that are already
+built. The cut script's own build enforces only the limit, through the
+ordinary `.text` ratchet.
 
 ## Step 3 — run the cut script
 

@@ -40,9 +40,10 @@ typedef struct {
 
 struct BrowserProfile {
     Budget *budget;
-    /* A newer on-disk profile may still exist. Backup/default settings
-       are readable in this session, but must not replace it. */
-    bool save_blocked;
+    /* A newer on-disk profile may still exist (PROFILE_UNREAD_* bits).
+       Backup/default settings are readable in this session, but must not
+       replace it. */
+    uint8_t unread;
     unsigned ui_scale;
     unsigned page_font_percent;
     unsigned page_zoom_percent;
@@ -963,7 +964,7 @@ bool browser_profile_save_fingerprinted(
     BrowserProfileFingerprint *written)
 {
     if (written != NULL) *written = (BrowserProfileFingerprint) {0};
-    if (profile == NULL || profile->save_blocked
+    if (profile == NULL || profile->unread != 0
         || path == NULL || path[0] == '\0') return false;
     char temporary[1200], backup[1200];
     int length = snprintf(temporary, sizeof(temporary), "%s.tmp", path);
@@ -989,17 +990,10 @@ bool browser_profile_save_fingerprinted(
             && fwrite(footer, 1, (size_t) footer_length, file)
                    == (size_t) footer_length;
     }
-    ok = fclose(file) == 0 && ok;
-    if (!ok) {
-        remove(temporary);
+    if (!tilefinch_platform_finish_file(file, ok, temporary, path, backup))
         return false;
-    }
-    if (tilefinch_platform_replace_file(temporary, path, backup)) {
-        if (written != NULL) *written = body;
-        return true;
-    }
-    remove(temporary);
-    return false;
+    if (written != NULL) *written = body;
+    return true;
 }
 
 bool browser_profile_save(const BrowserProfile *profile, const char *path)
@@ -1014,8 +1008,17 @@ typedef enum {
     PROFILE_READ_UNAVAILABLE
 } ProfileRead;
 
+/* Which generation could not be read; KEEP: one read intact later but was
+   never adopted, so this run must not replace it. */
+enum {
+    PROFILE_UNREAD_PRIMARY = 1u, PROFILE_UNREAD_BACKUP = 2u,
+    PROFILE_UNREAD_KEEP = 4u
+};
+
+/* adopt false only classifies the file and leaves *profile alone. */
 static ProfileRead profile_load_internal(
-    BrowserProfile *profile, const char *path, bool load_allowed_sites)
+    BrowserProfile *profile, const char *path, bool load_allowed_sites,
+    bool adopt)
 {
     FILE *file = fopen(path, "rb");
     if (file == NULL) return errno == ENOENT
@@ -1625,7 +1628,7 @@ static ProfileRead profile_load_internal(
     bool read_ok = !ferror(file);
     bool closed = fclose(file) == 0;
     bool ok = closed && header && complete && footer_seen && read_ok;
-    if (ok) {
+    if (ok && adopt) {
         /* Builds before Compact became the default always wrote Detailed
            into MEDIA field 5, so it is a choice only once YTRESULTS says so;
            without it the profile moves to Compact. */
@@ -1639,29 +1642,73 @@ static ProfileRead profile_load_internal(
         ? PROFILE_READ_DAMAGED : PROFILE_READ_UNAVAILABLE;
 }
 
+static bool profile_backup_path(char backup[1200], const char *path)
+{
+    int length = snprintf(backup, 1200, "%s.bak", path);
+    return length >= 0 && length < 1200;
+}
+
 static bool profile_load_with_backup(
     BrowserProfile *profile, const char *path, bool load_allowed_sites)
 {
     if (profile == NULL || path == NULL || path[0] == '\0') return false;
-    ProfileRead primary = profile_load_internal(profile, path, load_allowed_sites);
+    ProfileRead primary = profile_load_internal(
+        profile, path, load_allowed_sites, true);
     if (primary == PROFILE_READ_OK) return true;
-    profile->save_blocked = primary == PROFILE_READ_UNAVAILABLE;
+    profile->unread = primary == PROFILE_READ_UNAVAILABLE
+        ? PROFILE_UNREAD_PRIMARY : 0u;
     char backup[1200];
-    int length = snprintf(backup, sizeof(backup), "%s.bak", path);
-    if (length < 0 || (size_t) length >= sizeof(backup)) return false;
-    ProfileRead restored = profile_load_internal(profile, backup, load_allowed_sites);
+    if (!profile_backup_path(backup, path)) return false;
+    ProfileRead restored = profile_load_internal(
+        profile, backup, load_allowed_sites, true);
     /*
      * The backup carried the settings. Drop a primary that was read and
      * does not parse so the next save's rotation cannot promote it over the
      * recovered generation. One that only failed to open or read (a
      * transient card error) may be the newer, valid generation: keep both
-     * copies and refuse writes until a fresh load establishes the winner.
+     * copies and refuse writes until a fresh load establishes the winner,
+     * or browser_profile_recheck_unread finds nothing left to lose.
      */
-    profile->save_blocked = primary == PROFILE_READ_UNAVAILABLE
-        || restored == PROFILE_READ_UNAVAILABLE;
+    profile->unread = (uint8_t) (
+        (primary == PROFILE_READ_UNAVAILABLE ? PROFILE_UNREAD_PRIMARY : 0u)
+        | (restored == PROFILE_READ_UNAVAILABLE ? PROFILE_UNREAD_BACKUP
+                                                : 0u));
     if (primary == PROFILE_READ_DAMAGED && restored == PROFILE_READ_OK
-        && remove(path) != 0 && errno != ENOENT) profile->save_blocked = true;
+        && remove(path) != 0 && errno != ENOENT)
+        profile->unread |= PROFILE_UNREAD_PRIMARY;
     return restored == PROFILE_READ_OK;
+}
+
+bool browser_profile_save_blocked(const BrowserProfile *profile)
+{
+    return profile != NULL && profile->unread != 0;
+}
+
+bool browser_profile_recheck_unread(
+    BrowserProfile *profile, const char *path)
+{
+    if (profile == NULL || path == NULL || path[0] == '\0') return false;
+    char backup[1200];
+    if ((profile->unread & PROFILE_UNREAD_KEEP) != 0
+        || !profile_backup_path(backup, path)) return profile->unread == 0;
+    for (unsigned bit = PROFILE_UNREAD_PRIMARY;
+         bit <= PROFILE_UNREAD_BACKUP; bit <<= 1) {
+        if ((profile->unread & bit) == 0) continue;
+        const char *file = bit == PROFILE_UNREAD_PRIMARY ? path : backup;
+        ProfileRead read = profile_load_internal(profile, file, true, false);
+        if (read == PROFILE_READ_OK) {
+            profile->unread = PROFILE_UNREAD_KEEP;
+            return false;
+        }
+        /* A damaged primary goes, as at load, so a rotation cannot promote
+           it over the backup. */
+        if (read == PROFILE_READ_MISSING
+            || (read == PROFILE_READ_DAMAGED
+                && (bit == PROFILE_UNREAD_BACKUP || remove(file) == 0
+                    || errno == ENOENT)))
+            profile->unread &= (uint8_t) ~bit;
+    }
+    return profile->unread == 0;
 }
 
 bool browser_profile_load(BrowserProfile *profile, const char *path)
@@ -3255,8 +3302,9 @@ const BrowserProfilePage *browser_profile_history(
 
 /*
  * Forgetting one address. History is a recency-ordered list, so an entry is
- * removed by closing the gap rather than tombstoning it; the file is rewritten
- * whole on save, so nothing survives the removal on disk either.
+ * removed by closing the gap rather than tombstoning it. On a successful
+ * save the new primary omits it; the earlier generation may still be in
+ * the profile's recovery backup.
  */
 bool browser_profile_forget_history(BrowserProfile *profile, const char *url)
 {
@@ -3512,14 +3560,7 @@ bool browser_recovery_save(
         && fputs(encoded, file) >= 0
         && tilefinch_platform_file_printf(
                file, "\t%d\t%08x\n", scroll_y, (unsigned) checksum) > 0;
-    ok = fclose(file) == 0 && ok;
-    if (!ok) {
-        remove(temporary);
-        return false;
-    }
-    if (tilefinch_platform_replace_file(temporary, path, NULL)) return true;
-    remove(temporary);
-    return false;
+    return tilefinch_platform_finish_file(file, ok, temporary, path, NULL);
 }
 
 bool browser_recovery_load(
@@ -3575,7 +3616,15 @@ bool browser_recovery_load(
 bool browser_recovery_clear(const char *path)
 {
     if (path == NULL || path[0] == '\0') return false;
-    return remove(path) == 0;
+    char sidecar[1200];
+    static const char *const suffixes[] = {".tmp", ".old"};
+    bool cleared = remove(path) == 0 || errno == ENOENT;
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+        int written = snprintf(sidecar, sizeof(sidecar), "%s%s", path, suffixes[i]);
+        if (written < 0 || (size_t) written >= sizeof(sidecar)) return false;
+        cleared = (remove(sidecar) == 0 || errno == ENOENT) && cleared;
+    }
+    return cleared;
 }
 
 static bool profile_html_reserve(ProfileHtml *html, size_t addition)

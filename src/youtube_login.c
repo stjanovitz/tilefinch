@@ -64,24 +64,31 @@ static FILE *open_file(const char *path, bool writing)
     if (file == NULL) close(fd);
     return file;
 }
-static bool temporary_path(const char *path, char temporary[LOGIN_PATH])
+static bool login_sidecar_path(const char *path, const char *suffix,
+                               char sidecar[LOGIN_PATH])
 {
     if (path == NULL || path[0] == '\0') return false;
-    int n = snprintf(temporary, LOGIN_PATH, "%s.tmp", path);
+    int n = snprintf(sidecar, LOGIN_PATH, "%s%s", path, suffix);
     return n > 0 && (size_t) n < LOGIN_PATH;
 }
 bool youtube_login_remove(const char *path)
 {
     char temporary[LOGIN_PATH];
-    if (!temporary_path(path, temporary)) return false;
+    if (!login_sidecar_path(path, ".tmp", temporary)) return false;
     bool okay = remove(path) == 0 || errno == ENOENT;
+    okay = (remove(temporary) == 0 || errno == ENOENT) && okay;
+    if (!login_sidecar_path(path, ".old", temporary)) return false;
     return (remove(temporary) == 0 || errno == ENOENT) && okay;
 }
 bool youtube_login_save(const BrowserSession *session, const char *path, int64_t now)
 {
     char temporary[LOGIN_PATH];
     if (session == NULL || !session->site_data_allowed || now < 0
-        || !temporary_path(path, temporary)) return false;
+        || !login_sidecar_path(path, ".old", temporary)) return false;
+    /* Clean up any aside an older build left on FAT, even if this save
+       later fails. Never publish a new credential alongside a stale copy. */
+    if (remove(temporary) != 0 && errno != ENOENT) return false;
+    if (!login_sidecar_path(path, ".tmp", temporary)) return false;
     size_t size = LOGIN_HEADER, count = 0;
     for (size_t i = 0; i < BROWSER_COOKIE_ENTRIES; i++) {
         const BrowserCookieEntry *c = &session->cookies[i];
@@ -120,7 +127,7 @@ bool youtube_login_save(const BrowserSession *session, const char *path, int64_t
     /* No backup: no copy of credentials may survive sign-out. Where FAT
        refuses to replace the old file it is removed first; a power loss
        there loses the saved login, never the live session. */
-    if (okay) okay = tilefinch_platform_replace_file(temporary, path, NULL);
+    if (okay) okay = tilefinch_platform_replace_file_no_copy(temporary, path);
     if (file != NULL && !okay) (void) remove(temporary);
     wipe(buffer, size); budget_free(session->budget, buffer);
     return okay;
@@ -226,8 +233,9 @@ bool youtube_login_load(BrowserSession *session, const char *path, int64_t now,
         /* The verified file can never be restored. Remove it, so the
            refusal is reported once rather than on every start, and no
            unusable credentials stay on the Memory Stick. */
-        (void) youtube_login_remove(path);
-        if (status != NULL) *status = YOUTUBE_LOGIN_COOKIE_TOO_LARGE;
+        bool removed = youtube_login_remove(path);
+        if (status != NULL) *status = removed ? YOUTUBE_LOGIN_COOKIE_TOO_LARGE
+            : YOUTUBE_LOGIN_COOKIE_TOO_LARGE_CLEANUP_FAILED;
     }
     return okay;
 }

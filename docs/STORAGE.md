@@ -62,6 +62,13 @@ each file below names the one it uses.
   with the higher generation. This is the strongest discipline and guards the
   update state machine.
 
+Writers with a disposable staging file hand the open stream and write result
+to `tilefinch_platform_finish_file`. It checks the stream and close before
+publishing, and discards only the stage on failure. Writers that must retain
+their stage for retry use `tilefinch_platform_replace_file` directly. A
+missing stage must not consume a good backup, and an I/O error must not be
+treated as permission to remove an existing generation.
+
 A rename must name two entries of one directory. The PSP firmware's
 `rename()` reports success for a target in another directory but leaves the
 file in the source directory under the target's name, and PPSSPP does the
@@ -97,9 +104,9 @@ background version checks leave them alone.
 
 | Path | Writer | Size bound | Evicted by | Discipline |
 |---|---|---|---|---|
-| `profile.cfg` (+`.bak`) | `browser_profile.c` | ~0.5 MB per generation (100 history + 32 bookmarks + 16 resume points, every field length-capped); typically a few KB | replaced on every save | backup rotation; the loader falls back to `.bak` when the primary is missing, unreadable or unparsable, and then removes an unparsable primary; one that only failed to open or read is kept and the next save rotates it into `.bak` |
+| `profile.cfg` (+`.bak`) | `browser_profile.c` | ~0.5 MB per generation (100 history + 32 bookmarks + 16 resume points, every field length-capped); typically a few KB | replaced on every save | backup rotation; the loader falls back to `.bak` when the primary is missing, unreadable or unparsable, and then removes an unparsable primary; while a generation only failed to open or read, saves are refused (boot shows `SETTINGS UNREADABLE - NOT SAVING`) and each refused save reads it again: once it is gone or damaged saving resumes, and if it reads intact it is kept for the next boot and this run's changes are not saved |
 | `recovery.cfg` | `browser_profile.c` | one checksummed line (≤ ~3.2 KB) | cleared on clean navigation state; ignored if checksum fails | tmp + remove + rename |
-| `tabs-session.bin` (+`.bak`) | `browser_tabs.c` | ≤ ~82 KB per generation (5 tabs × 16 KB payload + headers) | rewritten at exit; removed when "restore last page" is off | backup rotation; restore falls back to `.bak` |
+| `tabs-session.bin` (+`.bak`) | `browser_tabs.c` | ≤ ~82 KB per generation (5 tabs × 16 KB payload + headers) | rewritten at exit; removed when "restore last page" is off | backup rotation; restore falls back to `.bak`; a session that could not be read is never saved over (boot shows `LAST TABS UNREADABLE - NOT SAVING`): each refused save reads it again, saving resumes once it is gone or invalid, and one that reads intact is kept for the next boot |
 | `tab-hibernation.bin` | `browser_tabs.c` | ≤ 16 KB + 16 B header | removed on rehydrate, on disabling hibernation, and at clean exit | tmp + remove + rename |
 | `http-cache.bin` (+`.bak`) | `session_persistence.c` | ≤ 5 MB per generation (payload further capped by the 1/2/4 MB cache setting) | user setting 0 removes it; "clear cache" removes it | backup rotation; a torn primary is removed after `.bak` recovery |
 | `local-storage.bin` (+`.bak`) | `session_persistence.c` | ≤ 5 MB per generation | disabling the setting removes it; "clear local storage" removes it | backup rotation, as above |
@@ -535,14 +542,14 @@ and never persisted.
 |---|---|---|---|---|
 | `library.bin` (+`.bak`) | `offline_library.c` | ≤ 32 KB | never (12-item index) | backup rotation; loader tries primary, `.tmp`, then `.bak` |
 | `library.bin.recovered` | `offline_library.c` | 9 bytes (`%08x\n`) | deleted by the load whose complete sweep finds no unlisted file at or below its ID | written before the index that relies on it, only after a damaged newer generation forced recovery from an older one (not when `.tmp` is loaded because the primary is missing); unlisted files of IDs up to the recorded one are kept and those IDs are not reused; orphans above it are swept; an unparsable marker triggers a rescan for the highest ID |
-| `<id>.article.html` (+`.bak`) | `offline_library.c` | ≤ 1 MB each | user delete; replaced when the same URL is saved again | backup rotation; length + FNV checksum verified on read |
+| `<id>.article.html` (+`.bak`) | `offline_library.c` | ≤ 1 MB each | user delete; replaced when the same URL is saved again | backup rotation; length + FNV checksum verified on read; a storage read error stops replacement |
 | `<id>.app.html`, `<id>.app.pack`, `<id>.app.icon` | `offline_library.c` | ≤ 1 MB markup + 1.5 MiB/32 same-origin responses + 1 MiB optional source-bound classic-script bytecode + 160 KiB pack metadata + 1 KiB icon | user delete or reinstall | each generation has a fresh id; lengths and FNV checksums gate restore, compiler-ABI mismatch falls back to retained source, and the index publishes before the prior generation is removed; while an app runs, a precompiled script's source is read back from `.app.pack` on demand and verified against a 64-bit FNV hash taken at launch; Library → Saved → Recompile (after an update changed the compiler) writes a complete new generation the same way and removes the old one only after the index names the new one |
 | `<id>.video.mp4`, `<id>.audio.mp4` | `offline_download.c` | ≤ 512 MB per stream | user delete | `.part` renamed into place after exact-length ranged download |
 | `<id>.video.part`, `<id>.audio.part` | `offline_download.c` | ≤ stream size | resumed, or reclaimed by the orphan sweep | append-only; size re-validated against the index on load |
-| `<id>.video.identity` | `offline_download.c` | 32 bytes | removed once the item is Ready; user delete; orphan sweep | SHA-256 of the encoded representation (provider object ID and revision, else the exact media URL); a resume appends only when it matches. A download without one (begun on 0.1.52) resumes when the index's lengths, itags and split flag match, and then gets one |
+| `<id>.video.identity` | `offline_download.c` | 32 bytes | removed once the item is Ready; user delete; orphan sweep | SHA-256 of the encoded representation (provider object ID and revision, else the exact media URL); a resume appends only when it matches. A download without one (begun on 0.1.52) resumes when the index's lengths, itags and split flag match, and then gets one. A storage error checking the receipt or payload pauses without discarding the existing bytes |
 | `<id>-<stored name>` | `file_download.c` | ≤ 512 MiB each | explicit Delete | published only after a completed, flushed HTTPS stream; the stored name is printable ASCII (below) |
 | `<id>.file.gone` | `offline_library.c` | one filename | removed when Delete finishes, or by the next load's sweep | written and flushed before the index drops the item |
-| `<id>.file.part`, `<id>.file.meta` (+`.tmp`) | `file_download.c` | ≤ 512 MiB body + bounded URL/validator | explicit Delete; orphan metadata/partials swept | matching If-Range and Content-Range and the same final URL (query ignored under a strong ETag) required for append; no cookies/passwords |
+| `<id>.file.part`, `<id>.file.meta` (+`.tmp`) | `file_download.c` | ≤ 512 MiB body + bounded URL/validator | explicit Delete; orphan metadata/partials swept | matching If-Range and Content-Range and the same final URL (including query, excluding fragment) required for append; no cookies/passwords |
 | `PSP/GAME/.tilefinch-unpack-<id>/` | `zip_install.c` | ≤ 256 MiB, 512 entries | cancelled/failed attempt cleanup; manual USB cleanup after power loss | created exclusively after native Install confirmation; complete CRC-checked tree renamed once |
 | `PSP/GAME/<app>/` | `zip_install.c` | ≤ 256 MiB installed data, 64 managed installations | confirmed Installed homebrew removal or manual USB cleanup | no overwrite, automatic execution, firmware changes or plugin activation; source ZIP retained |
 | `PSP/GAME/<app>/.tilefinch-homebrew` | `zip_install.c` | 80 bytes, or 208 with a title | successful app removal | checked folder name/local ID, no URL or credentials; independent of the ZIP's library record; kept through interrupted removal |
@@ -557,7 +564,8 @@ deletes recognized library-named files whose id is not in the index, so parts
 and articles stranded by a power cut between file publication and index
 promotion are reclaimed lazily. Files it does not recognize are never touched.
 A load that has to correct the index (an interrupted download reset to
-paused, a missing file marked failed, a recovery from `.tmp` or `.bak`) uses
+paused, a confirmed missing or incomplete file marked failed, a recovery
+from `.tmp` or `.bak`) uses
 the corrected index even when it cannot be written, as on a full or
 write-protected card, so saved items still open and can be deleted to free
 space; the next `offline_library_load()` or change writes it. After a

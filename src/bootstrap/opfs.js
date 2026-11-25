@@ -190,6 +190,18 @@
       state.position = position;
     },
     writerTruncate = (state, size) => resize(state, size),
+    /* The bytes a queued write holds, for its stream's queue: a command's
+       data, never its seek or truncate number. A Worker's facade charges its
+       own queue through the writer's _charge, the same rule. */
+    writeCharge = (value) => {
+      const data = value !== null && typeof value === "object" &&
+        !(value instanceof ArrayBuffer) && !ArrayBuffer.isView(value) &&
+        !(value instanceof Blob) ? value.type === "write" ? value.data : null
+        : value;
+      return data instanceof ArrayBuffer || ArrayBuffer.isView(data)
+        ? data.byteLength : typeof data === "string" ? data.length * 2
+        : typeof data?.size === "number" ? data.size : 64;
+    },
     prepareWrite = (value) => {
       let position;
       if (value && typeof value === "object" && !(value instanceof Blob)
@@ -206,8 +218,7 @@
       const bytes = value instanceof ArrayBuffer || ArrayBuffer.isView(value)
         ? mutableBytesFor(value) : null;
       const data = bytes || (value instanceof Blob ? value : String(value)),
-        charge = bytes ? bytes.byteLength
-          : typeof data === "string" ? data.length * 2 : data.size;
+        charge = writeCharge(data);
       /* Check the bounded file size before making a defensive copy. Blobs
          and strings are immutable; their bytes needn't be staged twice. */
       if ((typeof data === "string" ? data.length : charge) > FILE_LIMIT)
@@ -424,6 +435,7 @@
         catch (error) { chunk = { error }; }
         return writeChunk(this, chunk, chunk.charge ?? 64);
       }});
+      defineProperty(this, "_charge", { value: writeCharge });
     }
     write(value) {
       if (this.locked)

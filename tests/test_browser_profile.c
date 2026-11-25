@@ -1262,6 +1262,36 @@ int main(void)
     CHECK(browser_profile_remove_bookmark(profile, "https://recent.example/bookmark")
           && browser_profile_save(profile, torn_path)
           && browser_profile_save(profile, torn_path));
+    /* A refused save reads the unread generation again. While it stays
+       unreadable, or once it reads intact without being adopted, saving is
+       refused; once it is confirmed absent saving resumes, keeping the
+       backup this run loaded from. */
+    CHECK(chmod(torn_path, 0) == 0);
+    BrowserProfile *unread = browser_profile_create(&budget);
+    bool unread_refused = unread != NULL
+        && browser_profile_load(unread, torn_path)
+        && browser_profile_save_blocked(unread)
+        && !browser_profile_recheck_unread(unread, torn_path)
+        && browser_profile_save_blocked(unread)
+        && !browser_profile_save(unread, torn_path);
+    CHECK(chmod(torn_path, 0600) == 0);
+    CHECK(unread_refused && remove(torn_path) == 0
+          && browser_profile_recheck_unread(unread, torn_path)
+          && !browser_profile_save_blocked(unread)
+          && browser_profile_save(unread, torn_path)
+          && file_present(torn_backup));
+    browser_profile_destroy(unread);
+    CHECK(browser_profile_save(profile, torn_path));
+    unread = browser_profile_create(&budget);
+    CHECK(unread != NULL);
+    budget_inject_failure_after(&budget, 0);
+    CHECK(browser_profile_load(unread, torn_path)
+          && browser_profile_save_blocked(unread)
+          && !browser_profile_recheck_unread(unread, torn_path)
+          && !browser_profile_save(unread, torn_path)
+          && !browser_profile_recheck_unread(unread, torn_path)
+          && browser_profile_save_blocked(unread));
+    browser_profile_destroy(unread);
     /* A syntactically valid prefix without its terminating newline is a torn
        primary too. It must not be accepted with defaulted-away tail records
        while a complete backup is available. */
@@ -1320,7 +1350,14 @@ int main(void)
           && fclose(corrupt) == 0);
     CHECK(!browser_recovery_load(recovery_path, &checkpoint)
           && checkpoint.url[0] == '\0');
-    CHECK(browser_recovery_clear(recovery_path));
+    char recovery_temporary[170], recovery_aside[170];
+    snprintf(recovery_temporary, sizeof(recovery_temporary), "%s.tmp", recovery_path);
+    snprintf(recovery_aside, sizeof(recovery_aside), "%s.old", recovery_path);
+    CHECK(browser_recovery_save(recovery_temporary, "https://example.test/", 1)
+          && browser_recovery_save(recovery_aside, "https://example.test/", 2)
+          && browser_recovery_clear(recovery_path)
+          && !file_present(recovery_temporary) && !file_present(recovery_aside)
+          && browser_recovery_clear(recovery_path));
 
     remove(path);
     CHECK(browser_profile_set_reader_site_always(

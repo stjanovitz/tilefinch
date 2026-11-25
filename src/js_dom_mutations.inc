@@ -479,6 +479,27 @@ static void bridge_mutation_overflow_root(ScriptMutationJournal *journal,
     bridge_mutation_overflow_add(journal, root);
 }
 
+/* ScriptMutationRecord.inside_insert for a write to connected `node` now:
+   the earliest record that inserted detached content holding it. */
+static uint16_t bridge_mutation_inside_insert(
+    const ScriptMutationJournal *journal, const lxb_dom_node_t *node)
+{
+    const lxb_dom_node_t *ancestors[64];
+    size_t depth = 0;
+    for (const lxb_dom_node_t *at = node; at != NULL; at = at->parent) {
+        if (at->type == LXB_DOM_NODE_TYPE_DOCUMENT) break;
+        if (depth == 64) return 0;
+        ancestors[depth++] = at;
+    }
+    for (size_t i = 0; i < journal->count; i++) {
+        const ScriptMutationRecord *record = &journal->records[i];
+        if (!record->inserted_from_detached || record->node == NULL) continue;
+        for (size_t at = 0; at < depth; at++)
+            if (ancestors[at] == record->node) return (uint16_t) (i + 1u);
+    }
+    return 0;
+}
+
 static void bridge_mutation_journal_append(
     DomBridge *bridge, ScriptMutationKind kind, lxb_dom_node_t *node,
     const char *attribute, size_t attribute_length,
@@ -489,8 +510,11 @@ static void bridge_mutation_journal_append(
     if (journal == NULL) return;
     if (has_serial != 0) {
         if (journal->has_serial == 0) journal->has_serial = has_serial;
-        else if (journal->has_serial != has_serial)
+        else if (journal->has_serial != has_serial) {
+            /* Records already applied used the old build's entries. */
             journal->has_serial_mixed = true;
+            journal->reuse_cache = NULL;
+        }
     }
     for (size_t reverse = journal->count; reverse != 0; reverse--) {
         ScriptMutationRecord *record = &journal->records[reverse - 1];
@@ -498,6 +522,11 @@ static void bridge_mutation_journal_append(
                 record, kind, node, attribute, attribute_length)) {
             record->keeps_images =
                 record->keeps_images && bridge->mutation_keeps_images;
+            record->reuse_applied = false;
+            if (record->inside_insert != 0
+                && bridge_mutation_inside_insert(journal, node)
+                       != record->inside_insert)
+                record->inside_insert = 0;
             record->relational |= relational;
             record->sheet_settled = false;
             record->has_entries |= has_serial == 0 ? UINT64_MAX : has_entries;
@@ -556,7 +585,10 @@ static void bridge_mutation_journal_append(
         journal->conservative_resource_scan = true;
         return;
     }
+    uint16_t inside_insert = node == NULL ? 0
+        : bridge_mutation_inside_insert(journal, node);
     ScriptMutationRecord *record = &journal->records[journal->count++];
+    record->inside_insert = inside_insert;
     record->kind = kind;
     record->node = node;
     record->relational = relational;
@@ -565,6 +597,8 @@ static void bridge_mutation_journal_append(
     record->sheet_settled = false;
     record->scope = NULL;
     record->removed_last = false;
+    record->reuse_seen = false;
+    record->reuse_applied = false;
     record->keeps_images = bridge->mutation_keeps_images;
     size_t copy_length = attribute == NULL ? 0 : attribute_length;
     if (copy_length >= sizeof(record->attribute)) {
@@ -644,6 +678,10 @@ static void bridge_mutated_summarized(
     if (bridge_mutation_moves_form_controls(kind, attribute,
                                             attribute_length))
         bridge->dom_structure_version++;
+    if (kind != SCRIPT_MUTATION_ATTRIBUTE
+        && kind != SCRIPT_MUTATION_INLINE_STYLE
+        && kind != SCRIPT_MUTATION_CANVAS)
+        bridge->tree_version++;
     /* Mutating a detached construction tree cannot affect layout or the
        connected resource graph. Its eventual insertion is represented by
        one child-list record over the complete subtree. Besides avoiding

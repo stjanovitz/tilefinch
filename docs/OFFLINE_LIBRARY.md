@@ -21,7 +21,8 @@ it makes no network request.
 - An article is capped at 1 MiB on disk, and the published file's length and
   checksum are verified before it is parsed again.
 - Saving the same source URL again replaces its library entry instead of
-  taking another slot.
+  taking another slot. If the previous snapshot cannot be read because of
+  a storage error, the save stops without replacing it.
 - The writer checks free space first, records the save date, writes small
   chunks, and checks for Circle between them, so a slow Memory Stick does not
   make the browser chrome unresponsive.
@@ -232,7 +233,9 @@ in-progress record to Paused and reconciles the file sizes, so Resume
 fetches a fresh, expiring YouTube URL and continues from the saved byte
 offset. The saved bytes are kept only when the fresh URL names the same
 encoded video (`<id>.video.identity`); a re-encoded video starts again from
-zero. A download paused on 0.1.52, which kept no such record, continues when
+zero. If the storage cannot read the record or check the files, the
+download stays paused and keeps the saved bytes for another attempt.
+A download paused on 0.1.52, which kept no such record, continues when
 the video's format and lengths are unchanged.
 
 **Menu → Settings → Video → Resume saves** is off by default. When it is on,
@@ -285,11 +288,11 @@ transport ring has a fixed size, whatever the file size. A completed stream is
 flushed and its completed length recorded before publication.
 
 Resume requires a matching strong ETag or Last-Modified validator, an exact
-Content-Range, and the same final address after redirects. Under a strong
-ETag only the scheme, host and path must match, so a signed download link
-that redirects with a new signature and expiry on each try still resumes;
-under a Last-Modified date the whole address, query included, must match. A
-`.file.meta` written by 0.1.52 has no address record, so that file restarts.
+Content-Range, and the same final address after redirects, including its
+query but not its fragment. A changed query can select a different file
+even when the ETag is unchanged. If a signed redirect changes, Retry starts
+the download over. Older partial downloads whose receipts did not bind the
+whole address also restart; completed files are unaffected.
 A server that returns a fresh complete response starts
 over safely rather than appending it. Without a validator, Retry restarts the
 file. HTML responses without an explicit attachment disposition, HTTP errors,
@@ -343,8 +346,9 @@ checked too. Files are written beneath a newly created private staging folder
 and published by one final directory rename. Cancellation or a normal failure
 attempts to remove only this attempt's staging files and retains the ZIP. A
 power cut may leave `.tilefinch-unpack-<id>` under `PSP/GAME`; it is
-deliberately not deleted automatically. Remove that unfinished staging folder
-through USB before retrying the same item. Deleting the download does not
+deliberately not deleted automatically. Retrying the same item can use one
+spare folder (`.tilefinch-unpack-<id>-retry`). If both are occupied, inspect
+them through USB before clearing an unfinished attempt. Deleting the download does not
 uninstall a game.
 
 **Downloads → Installed homebrew** lists the folders installed by Tilefinch,
@@ -389,9 +393,10 @@ matching previous payload until the new index is durable,
 and article reads accept that backup only when its recorded length and
 checksum match the active index. Article payloads are corruption-checked;
 media chunks require an exact HTTPS response length and completed files must
-match their provider metadata length before opening. These files are not
-encrypted. Anyone with the Memory Stick can read saved articles, titles,
-source URLs, and video files. Deleting an item removes its published, backup,
+match their provider metadata length before opening. A temporary storage
+error when checking a completed download does not mark it failed. These
+files are not encrypted. Anyone with the Memory Stick can read saved
+articles, titles, source URLs, and video files. Deleting an item removes its published, backup,
 temporary, and partial payloads after the index update succeeds.
 
 Offline saves are user-initiated. Ordinary pages cannot silently invoke the

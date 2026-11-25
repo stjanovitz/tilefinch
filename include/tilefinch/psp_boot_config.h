@@ -402,6 +402,12 @@ bool psp_boot_config_automation_requires_engine_first(
    successful load sets it and psp_boot_config_disable_automation clears it.
    Default 0. */
 bool psp_boot_config_validation_js_heap_detail(void);
+/* Validation only: boot.cfg `validation_preconnect=0` turns the speculative
+   HOME preconnect off (docs/engineering/PSP_TRANSPORT.md), so a harness run
+   on native HOME without a trace never reaches the provider tile's host.
+   Same storage and lifetime as validation_js_heap_detail. Default 1 (on, the
+   shipping behaviour). */
+bool psp_boot_config_validation_preconnect_disabled(void);
 #endif
 
 #endif

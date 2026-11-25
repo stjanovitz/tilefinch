@@ -799,6 +799,15 @@ static void navigation_stream_try_pre_eof_preview(
                session->budget, 96u * 1024u, 512u * 1024u)) {
         stream->preview_layout_reuse =
             layout_reuse_cache_create(session->budget);
+        layout_reuse_cache_mark_streaming_preview(
+            stream->preview_layout_reuse);
+        /* The parser keeps adding to what it styles. */
+        if (!layout_reuse_cache_follow_parser(
+                stream->preview_layout_reuse,
+                lxb_dom_interface_node(document->html))) {
+            layout_reuse_cache_destroy(stream->preview_layout_reuse);
+            stream->preview_layout_reuse = NULL;
+        }
     }
     preview_policy_attempt_started(
         &stream->preview_policy, &decision, stream->parsed_body_bytes);
@@ -843,6 +852,9 @@ static void navigation_stream_try_pre_eof_preview(
     bool truncated = false;
     uint64_t layout_started = navigation_now_us();
     tilefinch_platform_trace_step("preview-layout");
+    /* Where the parser inserts next: the path the cache follows. */
+    layout_reuse_cache_parser_at(stream->preview_layout_reuse,
+                                 document_parser_current_node(stream->parser));
     bool built = layout_build_context_preview(
         &preview, session->budget, document,
         &stream->blocking_stylesheet, stream->fonts,

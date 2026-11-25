@@ -948,6 +948,8 @@ typedef struct {
        cross sizing. Fits the existing alignment padding. */
     uint8_t unresolved_descendant_height : 1;
     uint8_t scroll_rtl : 1;
+    /* overflow-y:hidden: scripts may scroll the box, the reader may not. */
+    uint8_t scroll_hidden_y : 1;
 } LayoutNodeBox;
 
 typedef struct LayoutUntransformedBox LayoutUntransformedBox;
@@ -1145,6 +1147,9 @@ typedef struct {
     /* Of text_measure_hits, the shaped widths of whole Arabic words that
        intrinsic sizing took instead of shaping the word's node. */
     size_t text_measure_shaped_hits;
+    /* Builds of a cache following a streaming parse that found content
+       the parser added since the previous one (layout_reuse_cache_follow_parser). */
+    size_t parser_growths;
 } LayoutReuseStats;
 
 /* Exclusive flow attribution; native placement includes unclassified flow
@@ -1220,6 +1225,7 @@ typedef struct {
     /* Inline subtrees scanned for a possible direction change (each one a
        walk of the block's inline content). */
     uint64_t bidi_subtree_scans;
+    uint32_t bidi_prepare_nodes; /* host/validation: nodes in the document preflight */
     uint64_t bidi_us;
     size_t bidi_peak_transient_bytes;
     int first_coordinate_clamp_y;
@@ -1332,6 +1338,13 @@ typedef struct LayoutDocument {
     /* Fixed-image paint publication is valid only against this exact DOM
        and cascade. No image-table pointer is retained across its growth. */
     uint64_t image_content_generation;
+    /* The reuse cache build that produced this layout, when every element
+       style it resolved stayed in the cache (layout_reuse_proof_*); 0
+       otherwise. */
+    uint32_t reuse_serial;
+    /* With reuse_serial: the image table's state it was laid out with
+       (images_layout_fingerprint). */
+    uint32_t image_fingerprint;
     uint64_t image_style_generation;
     uint64_t image_sheet_generation;
     size_t image_resource_count;
@@ -1553,15 +1566,32 @@ size_t layout_reuse_cache_reclaim_styles(LayoutReuseCache *cache);
    released. */
 size_t layout_reuse_cache_yield_text_measures(LayoutReuseCache *cache);
 void layout_reuse_cache_reset(LayoutReuseCache *cache);
+/* Moves whenever the cache drops its entries wholesale (a reset, a changed
+   sheet, fonts or viewport) or is rebound to a moved sheet: invalidations
+   applied before an epoch change are moot or must be applied again. No
+   two caches share an epoch. */
+uint64_t layout_reuse_cache_epoch(const LayoutReuseCache *cache);
 /* Allow the cache to retain each element's exact matched author rules across
    builds (and across the image traversal), sized for a whole document. Only
    the committed page cache opts in: its DOM mutations are journaled, so the
    invalidation applied to retained computed styles also covers the lists. */
 void layout_reuse_cache_enable_retained_matches(LayoutReuseCache *cache);
+/* Marks the cache as a streaming preview's until the page adopts it
+   (layout_reuse_cache_enable_retained_matches clears the mark): the
+   invalidation verifier counts what such a cache serves apart from its
+   bar. Host builds only. */
+#ifndef TILEFINCH_NO_TRACE
+void layout_reuse_cache_mark_streaming_preview(LayoutReuseCache *cache);
+#else
+#define layout_reuse_cache_mark_streaming_preview(cache) ((void) (cache))
+#endif
 /* Builds using this cache record their unresolved external visuals in
    LayoutDocument.visual_priority_targets, as bounded previews do. */
 void layout_reuse_cache_record_unresolved_visuals(LayoutReuseCache *cache,
                                                   bool record);
+/* Bracket background extension of already-published screens. An awaited
+   extension may reuse a result but must not pay to collect a new one. */
+void layout_reuse_cache_set_extending(LayoutReuseCache *cache, bool extending);
 /* A journaled class/id attribute change on `node` whose changed tokens are
    `changed_tokens` (from stylesheet_attribute_change_tokens; NULL keeps the
    conservative subtree path). Retained computed styles are invalidated as
@@ -1597,6 +1627,12 @@ void layout_reuse_cache_note_stylesheet_appended_keeping_styles(
 void layout_reuse_cache_drop_styles_within(LayoutReuseCache *cache,
                                            lxb_dom_node_t *const *roots,
                                            size_t count);
+/* Discards the retained computed styles of the elements carrying one of
+   `keys` (subject keys, stylesheet_rules_subject_keys; sorted in place):
+   the only elements rules with those subjects can match. Their
+   descendants re-key off their new styles. */
+void layout_reuse_cache_drop_styles_carrying(LayoutReuseCache *cache,
+                                             uint32_t *keys, size_t count);
 /* Attach the cache's retained matched-rule table to `sheet` for the caller's
    own style resolutions (pseudo-element styles resolved outside
    layout_reuse_cache_resolve_style); returns the previous attachment. */
@@ -1656,6 +1692,64 @@ bool layout_reuse_cache_node_retirement(const LayoutReuseCache *cache);
    caller's, through the ordinary scoped invalidation. */
 void layout_reuse_cache_retire_subtree(LayoutReuseCache *cache,
                                        const lxb_dom_node_t *root);
+/* The cache serves builds of a document a streaming parser is still
+   adding to. `root` is the Document node, which outlives the cache: the
+   record of what the parser had added is only ever reached from it. Each
+   build first restyles what arrived since the previous one, as a script
+   append after the last sibling would (styles, :has() answers,
+   measurements); a change the parser makes anywhere else on the path to
+   its current node (foster parenting, the adoption agency) restyles below
+   it. False when the bounded record cannot be allocated: the cache must
+   then not serve a later build of the growing document. */
+bool layout_reuse_cache_follow_parser(LayoutReuseCache *cache,
+                                      lxb_dom_node_t *root);
+/* The parser's current node (document_parser_current_node), handed over
+   just before a build of the growing document: that build records the path
+   to it. Without one, the build records the document's last-child chain. */
+void layout_reuse_cache_parser_at(LayoutReuseCache *cache,
+                                  lxb_dom_node_t *current);
+/* The parse finished: the next build (layout_reuse_cache_prepare), or
+   style read before one, restyles what arrived since the last build, then
+   the cache stops following. The work waits for that build because the
+   commit often adds rules first, and a new sheet generation clears the
+   styles it would have restyled. */
+void layout_reuse_cache_settle_parser(LayoutReuseCache *cache);
+
+/* Geometry read proofs: whether the layout a script reads still holds after
+   journaled writes, without a build. The cache vouches for the last build
+   that stored every element style it resolved (LayoutDocument.reuse_serial,
+   until an entry is lost other than by a proof). `begin` opens a proof for
+   `layout` (false when the cache does not vouch for it); while it is open
+   every entry the invalidations drop is kept as a row, and nothing new is
+   stored. `finish` re-resolves the rows root first and holds when each
+   either equals its row (same values, same parent), computes display:none
+   both before and now, lies inside a display:none ancestor now, or left
+   the document; equal rows go back into the cache. It always closes the
+   proof; a failed one leaves the cache as invalidation alone would. */
+typedef enum {
+    LAYOUT_REUSE_PROOF_HOLDS = 0,
+    LAYOUT_REUSE_PROOF_NOT_COVERED,
+    LAYOUT_REUSE_PROOF_OVERFLOW,
+    LAYOUT_REUSE_PROOF_RESET,
+    LAYOUT_REUSE_PROOF_DIFFERS,
+    LAYOUT_REUSE_PROOF_PSEUDO,
+    LAYOUT_REUSE_PROOF_PATH
+} LayoutReuseProofOutcome;
+bool layout_reuse_proof_begin(LayoutReuseCache *cache,
+                              const LayoutDocument *layout);
+LayoutReuseProofOutcome layout_reuse_proof_finish(
+    LayoutReuseCache *cache, const Stylesheet *sheet, const FontSet *fonts);
+/* Whether the cache vouches for `layout` (a proof could begin). */
+bool layout_reuse_proof_covers(const LayoutReuseCache *cache,
+                               const LayoutDocument *layout);
+/* Whether the open proof re-checks `node`'s own style and pseudo-elements
+   (a row or held row names it). */
+bool layout_reuse_proof_checks(const LayoutReuseCache *cache,
+                               const lxb_dom_node_t *node);
+/* Closes an open proof without verifying it (the caller refused it). */
+void layout_reuse_proof_abort(LayoutReuseCache *cache);
+/* Brackets a freed subtree's retirement: its entries are no loss. */
+void layout_reuse_proof_retiring(LayoutReuseCache *cache, bool retiring);
 /* `node` was inserted, removed or moved, or its child list changed, and
    every freed node already left the cache: invalidate the parent scope,
    plus the elements whose :has()-dependent matches the change can move. */
@@ -1729,6 +1823,11 @@ bool layout_tree_change_has_inert(
 void layout_reuse_cache_invalidate_node_scoped(
     LayoutReuseCache *cache, lxb_dom_node_t *node,
     bool text_or_structure_sensitive);
+/* `root` (detached) changed where no connected element could see it:
+   drop the subtree's own styles, retained match lists and measurements,
+   with no relational or structural invalidation outside it. */
+void layout_reuse_cache_invalidate_detached(LayoutReuseCache *cache,
+                                            lxb_dom_node_t *root);
 /* A non-semantic attribute with no selector dependency preserves computed
    styles. Generated content may still read attr(), so measurements of this
    subtree and its ancestors must be invalidated. */
@@ -1841,6 +1940,13 @@ const LayoutInlineFragment *layout_inline_fragment_first(
     const LayoutDocument *layout, const lxb_dom_node_t *node);
 const LayoutInlineFragment *layout_inline_fragment_next(
     const LayoutDocument *layout, const LayoutInlineFragment *fragment);
+/* The layout's inline fragments in the order they were recorded: index
+   `at` of layout_inline_fragment_count. An element whose fragments were
+   dropped at the table's limit leaves entries no lookup reaches; callers
+   wanting only live ones check layout_inline_fragment_first. */
+size_t layout_inline_fragment_count(const LayoutDocument *layout);
+const LayoutInlineFragment *layout_inline_fragment_at(
+    const LayoutDocument *layout, size_t at);
 /* Every inline element of the layout has its fragments: none were dropped
    at the table's limit or for memory, and recording was on (a script realm
    holds the document). Only then does an element without fragments have no
@@ -1909,6 +2015,14 @@ bool layout_background_raster_size(
     int area_width, int area_height, int scale_numerator,
     int scale_denominator, int source_width, int source_height,
     int *width, int *height);
+/* The border box a style declares in pixels: a fixed width and height
+   (reference is the percentage basis of calc() terms), with the padding
+   and border inside them or none at all. False when layout alone decides
+   it. A masked box waiting for its mask is not laid out, so this is the
+   size its mask will paint in. */
+bool layout_declared_box_size(const Stylesheet *sheet,
+                              const ComputedStyle *style, int reference,
+                              int *width, int *height);
 /* The face a DRAW_TEXT command measures and paints with. Measurement and
    paint both resolve through here so they always agree on the face. */
 const FontFace *draw_command_face(const LayoutDocument *layout,

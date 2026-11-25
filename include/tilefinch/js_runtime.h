@@ -931,6 +931,22 @@ typedef struct {
        of the journal's plan build (`has_serial`) the writes coalesced here
        can move, so layout notes only those; UINT64_MAX when unknown. */
     uint64_t has_entries;
+    /* Set by the layout reuse cache's owner: a geometry build applied this
+       record while its node was in the document, so the cache holds styles
+       resolved with that content present. Content that turns out to be
+       transient (inserted and removed within the turn) still owes the
+       removal's invalidation, once. */
+    bool reuse_seen;
+    /* Set by the same owner when it applied this record to the journal's
+       `reuse_cache`; cleared here when a later write coalesces into the
+       record or rewrites its scope, so only that record is applied again. */
+    bool reuse_applied;
+    /* 1 + the index of a record that inserted detached content which held
+       this record's node at every write coalesced here (0 when none, or
+       when the writes were not all inside the same insertion). Once that
+       insertion is transient, these writes changed content no connected
+       element can still see (navigation_reuse_detached_only). */
+    uint16_t inside_insert;
 } ScriptMutationRecord;
 
 typedef struct {
@@ -969,6 +985,13 @@ typedef struct {
     bool image_reveal_possible;
     bool conservative_resource_scan;
     bool relational_selector_sensitive;
+    /* The layout reuse cache, at the epoch (layout_reuse_cache_epoch), that
+       the records marked reuse_applied were applied to; NULL when none,
+       and cleared when the plan builds mix. Geometry builds part way
+       through the turn and the turn's relayout then apply each record
+       once. Zeroed with the journal when it is consumed. */
+    const LayoutReuseCache *reuse_cache;
+    uint64_t reuse_epoch;
 } ScriptMutationJournal;
 
 /* A record's exact changed tokens, or NULL when it has none. */
@@ -1133,13 +1156,18 @@ typedef enum {
     /* Author-visible transformed execution began and then failed. */
     SCRIPT_LAZY_EVALUATION_FAILED
 } ScriptLazyEvaluation;
+#define SCRIPT_FRAME_MESSAGE_BYTE_LIMIT 65536u
+/* A nonempty private byte sidecar is borrowed only for this call. Copy it
+   before re-entering script, which can invalidate a sender's typed array. */
 typedef bool (*ScriptPostMessageCallback)(void *opaque,
                                           ScriptRuntime *source,
                                           long target_frame_handle,
                                           const char *json,
                                           const char *target_origin,
                                           const char *task_kind,
-                                          uint64_t task_sequence);
+                                          uint64_t task_sequence,
+                                          const uint8_t *key_bytes,
+                                          size_t key_length);
 /* CSSOM View and getComputedStyle() are synchronous APIs. Embedders with a
    staged parser/layout pipeline provide this narrowly scoped callback so a
    read after author mutation can flush style and layout without re-entering
@@ -1462,6 +1490,11 @@ typedef enum {
 size_t script_runtime_collect_and_trim_phase(
     ScriptRuntime *runtime, ScriptRuntimeCollectPhase phase);
 size_t script_runtime_collect_and_trim(ScriptRuntime *runtime);
+/* An idle realm gives its garbage back to the page Budget for another realm
+   of the page: once its heap has grown an amortized step since its last
+   collection, one collection and then its cached pool blocks. Returns the
+   Budget bytes freed. Call only between the realm's tasks. */
+size_t script_runtime_collect_idle(ScriptRuntime *runtime);
 /* Remaining active QuickJS heap allowance. Unlike the browser Budget this
    excludes allocator cache capacity and reflects JS_SetMemoryLimit(). */
 size_t script_runtime_heap_remaining(const ScriptRuntime *runtime);
@@ -1520,7 +1553,8 @@ void script_runtime_refresh_result(ScriptRuntime *runtime,
                                    ScriptResult *result);
 size_t script_runtime_heap_rejections(const ScriptRuntime *runtime);
 /* Monotonic: the heap rejections above plus allocations the limit admitted
-   but the shared page Budget refused. Either one throws "out of memory". */
+   but the shared page Budget refused (either one throws "out of memory"),
+   and the page Budget's refusals of a response the realm had to take. */
 size_t script_runtime_allocation_refusals(const ScriptRuntime *runtime);
 /* HTML's map of preloaded resources, for classic scripts: keeps the
    completed response of the document's <link rel=preload as=script> under
@@ -1538,11 +1572,14 @@ size_t script_runtime_allocation_refusals(const ScriptRuntime *runtime);
    navigation holds for the map before the realm exists. HTML sets no
    bound; login.live.com's bundle is 1.02 MiB. */
 #define SCRIPT_PRELOADED_SCRIPT_BYTE_LIMIT (2u * 1024u * 1024u)
+/* csp_policies, here and below: how many of the document's CSP policies
+   existed when the preload's request was made. A policy a later <meta>
+   adds never saw its URL or redirects, so no consumer takes it then. */
 bool script_runtime_offer_preloaded_script(
     ScriptRuntime *runtime, const char *url, TilefinchRequestMode mode,
     TilefinchCredentialsMode credentials, const char *integrity,
     BrowserSharedBody *body, size_t length, const char *response_url,
-    const char *content_type);
+    const char *content_type, uint8_t csp_policies);
 /* Takes over the navigation's in-flight preload request_id on scheduler,
    which must outlive the realm: the key gets a pending entry that its
    first consumer waits for, as HTML's "consume a preloaded resource" does
@@ -1552,7 +1589,38 @@ bool script_runtime_adopt_preload_request(
     ScriptRuntime *runtime, struct FetchScheduler *scheduler,
     uint64_t request_id, const char *url, TilefinchRequestMode mode,
     TilefinchCredentialsMode credentials, uint8_t csp_grant,
-    const char *integrity);
+    uint8_t csp_policies, const char *integrity);
+/* The same for a module preload (<link rel=modulepreload>, the scanner's
+   <script type=module src>): a CORS request the navigation made with
+   initiator_url and top_level_url, taken only when initiator_url has this
+   realm's document origin (a same-document URL change keeps it) and
+   top_level_url is its top-level URL: Sec-Fetch-Site, cookies and the
+   module HTTP cache key depend on those alone. The first module fetch with
+   the same key takes the request (script_runtime_take_module_preload). */
+bool script_runtime_adopt_module_preload_request(
+    ScriptRuntime *runtime, struct FetchScheduler *scheduler,
+    uint64_t request_id, const char *url,
+    TilefinchCredentialsMode credentials, uint8_t csp_grant,
+    uint8_t csp_policies, const char *integrity, const char *initiator_url,
+    const char *top_level_url);
+/* A parser-inserted module script's or an import's use of an adopted
+   module preload still in flight: the request id, on *scheduler, that the
+   caller now owns (to wait for and take, its response checked as the
+   fetch's own), of the entry with key url, mode "cors" and credentials,
+   whose integrity metadata is the fetch's (integrity[0..integrity_length),
+   none for none) and whose CSP grant admits nothing csp_grant would not;
+   0 for none (also when its request is gone). A completed one is in the
+   module HTTP cache unless it was redirected. */
+uint64_t script_runtime_take_module_preload(
+    ScriptRuntime *runtime, const char *url,
+    TilefinchCredentialsMode credentials, const char *integrity,
+    size_t integrity_length, uint8_t csp_grant,
+    struct FetchScheduler **scheduler);
+/* Whether an import with this key would take one (without taking it):
+   the module prefetcher leaves its URL to that request. */
+bool script_runtime_module_preload_pending(
+    ScriptRuntime *runtime, const char *url,
+    TilefinchCredentialsMode credentials, uint8_t csp_grant);
 /* Cancels and drops the adopted requests still in flight; before the
    realm is retired while their scheduler lives on. */
 void script_runtime_cancel_preload_requests(ScriptRuntime *runtime);
@@ -1584,7 +1652,8 @@ void script_runtime_preloaded_response_release(
 size_t script_runtime_release_preloaded_scripts(ScriptRuntime *runtime,
                                                 size_t needed);
 /* Before a script is refused for memory: the releases the heap growth hook
-   makes before it refuses growth (optional caches, then the cached bodies
+   makes before it refuses growth (optional caches, then the image responses
+   the realm parked for adoption (fetch_scheduler_park), the cached bodies
    of classic scripts, unconsumed preload responses, and, with
    `include_store`, function text no uncompiled function needs), until about
    `needed` more Budget bytes are free. The body of a running script is
@@ -1634,11 +1703,14 @@ size_t script_runtime_heap_reachable(const ScriptRuntime *runtime,
    the heap an allocation could actually obtain now. Dynamic-script
    admission decides on it (it never counted that text). */
 size_t script_runtime_heap_obtainable(const ScriptRuntime *runtime);
-/* Whether a script error's text is what QuickJS leaves when an allocation
-   was refused: "InternalError: out of memory", or "null" when even that
-   error object could not be allocated (JS_ThrowOutOfMemory). A page can
-   throw either itself, so callers believe it only after a heap rejection. */
-bool script_error_reports_out_of_memory(const char *error);
+/* The memory stop rule's reclaim (navigation_judge_realm_memory): give
+   the page Budget back what admission reclaims (optional caches, script
+   bodies, preloaded scripts, stored function text), then the session's
+   cached responses, until `wanted` bytes of usable heap are backed. Only
+   when that much can actually be backed by more page Budget; the realm's
+   hard heap ceiling cannot be reclaimed. */
+void script_runtime_reclaim_heap_headroom(ScriptRuntime *runtime,
+                                          size_t wanted);
 /* Deferred classic bytecode stores (js_module_loader.c). One idle turn:
    serializes the oldest queued compile into the session's classic table;
    returns whether a queued store was handled. Only between scripts, from
@@ -2065,6 +2137,13 @@ bool script_runtime_dispatch_message(ScriptRuntime *runtime,
                                      const char *source_origin,
                                      long source_frame_handle,
                                      ScriptResult *result);
+bool script_runtime_dispatch_message_with_keys(ScriptRuntime *runtime,
+                                               const char *json,
+                                               const char *source_origin,
+                                               long source_frame_handle,
+                                               const uint8_t *key_bytes,
+                                               size_t key_length,
+                                               ScriptResult *result);
 /* True only after a connected author mutation committed but the native
    document-index refresh failed. The incumbent layout may then contain stale
    DOM pointers and must not remain published. */
@@ -2515,20 +2594,23 @@ bool script_runtime_has_pending_media_request(const ScriptRuntime *runtime);
 bool script_runtime_update_media_state(
     ScriptRuntime *runtime, int64_t node_handle, ScriptMediaState state,
     double current_time, double duration);
-/* The url-encoded entry list page script's last form submission sends,
+/* The encoded entry list page script's last form submission sends,
    after `formdata` listeners ran, in a budget allocation the caller frees.
-   NONE when script built none (a multipart form, or building it failed).
-   REFUSED when it exists but cannot be held (over maximum_length, or out of
-   memory): the caller must not fall back to native control state, which
-   holds the stale markup values script replaced. Clears it. */
+   NONE when no script body is pending. REFUSED when serialization failed
+   or the body cannot be held: the caller must not fall back to native state, which
+   holds the stale markup values script replaced. Clears the selected slot;
+   the in-progress native dispatch is independent of any queued script submit. */
 typedef enum {
     SCRIPT_FORM_BODY_NONE = 0,
     SCRIPT_FORM_BODY_TAKEN,
-    SCRIPT_FORM_BODY_REFUSED
+    SCRIPT_FORM_BODY_REFUSED,
+    SCRIPT_FORM_BODY_BINARY
 } ScriptFormBodyTake;
 ScriptFormBodyTake script_runtime_take_form_submission_body(
-    ScriptRuntime *runtime, Budget *budget, size_t maximum_length,
+    ScriptRuntime *runtime, bool native_dispatch, Budget *budget, size_t maximum_length,
     char **output, size_t *length);
+void script_runtime_clear_form_submission_body(
+    ScriptRuntime *runtime, bool native_dispatch);
 /* Consumes the successful default action of form.submit()/requestSubmit().
    The returned nodes belong to the current document and remain valid only
    until the caller starts another navigation. */
@@ -2616,10 +2698,17 @@ bool script_runtime_flush_geometry_layout(ScriptRuntime *runtime,
    the build. It may instead prove that the pending journal leaves all
    committed geometry unchanged when geometry_unchanged is non-NULL; this
    does not adopt stale paint or consume
-   the journal. Neither the callback nor the build may run author code. */
+   the journal. Neither the callback nor the build may run author code. The
+   owner may mark the records it applied (ScriptMutationRecord.reuse_seen);
+   nothing else in the journal changes. */
 typedef LayoutReuseCache *(*ScriptGeometryReuseCallback)(
-    void *opaque, const ScriptMutationJournal *mutations,
+    void *opaque, ScriptMutationJournal *mutations,
     bool *geometry_unchanged);
+/* The layout script's geometry reads answer from (the published layout or
+   a snapshot), or NULL: what a ScriptGeometryReuseCallback's proof that
+   geometry is unchanged must hold for. */
+const LayoutDocument *script_runtime_geometry_reading(
+    const ScriptRuntime *runtime);
 /* The budget refused a build using the lent cache. The owner gives the cache
    up so the build can run once more without it. May be NULL. */
 typedef void (*ScriptGeometryReuseRelease)(void *opaque);
@@ -2633,6 +2722,13 @@ bool script_runtime_flush_geometry_layout_reuse(
 const char *script_runtime_geometry_adoption_state(
     const ScriptRuntime *runtime, const ViewportContext *viewport);
 #endif
+/* The owner kept its published layout for the turn's mutations: they
+   changed nothing it renders. A geometry snapshot script built part way
+   through the turn, before later writes (a measurement probe removed
+   again), describes a tree that no longer exists; it is dropped, and reads
+   answer from the published layout again. A snapshot still current for the
+   DOM stays for adoption. */
+void script_runtime_keep_published_layout(ScriptRuntime *runtime);
 /* Owner-only move of a current complete geometry snapshot. The caller must
    exclude resource-changing journals; failure leaves the snapshot owned by
    the runtime. No author work runs during the move. */

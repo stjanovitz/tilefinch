@@ -234,6 +234,36 @@ static bool navigation_adopted_sheet_mentions(lxb_dom_node_t *node,
     return css != NULL && navigation_css_mentions(css, length, word);
 }
 
+/* Whether a <style> element's text holds no at-rule besides @media and
+   @supports, read as one run: its rules then reach only the elements their
+   selectors match. Keyframes, @font-face, @import, layers and the rest can
+   change what elements no new selector names resolve. */
+static bool navigation_style_text_selector_only(lxb_dom_node_t *node)
+{
+    size_t length = 0;
+    const char *css = document_cssom_sheet_text(node, &length);
+    if (css == NULL) {
+        lxb_dom_node_t *child = node->first_child;
+        if (child == NULL) return true;
+        if (child->next != NULL) return false;
+        css = document_text_data(child, &length);
+        if (css == NULL) return false;
+    }
+    for (size_t at = 0; at < length; at++) {
+        if (css[at] != '@') continue;
+        size_t rest = length - at - 1u;
+        if (!(rest >= 5 && strncasecmp(css + at + 1u, "media", 5) == 0)
+            && !(rest >= 8 && strncasecmp(css + at + 1u, "supports", 8) == 0))
+            return false;
+    }
+    return true;
+}
+
+/* A <style> step's appended rules restyle only the elements carrying their
+   subjects' keys (layout_reuse_cache_drop_styles_carrying) when they leave
+   the parse context as it was. A StyleX-sized append keys a few hundred. */
+#define NAVIGATION_STYLE_APPEND_KEY_LIMIT 256u
+
 /* Where the rules an in-place style change added or took out can reach:
    the whole document, or only the subtrees of these shadow hosts. A
    constructed sheet adopted by shadow roots alone (none of its rules
@@ -479,6 +509,19 @@ static bool navigation_remove_adopted_sources(
     return true;
 }
 
+static bool navigation_journal_inserted(void *context,
+                                        const lxb_dom_node_t *node);
+
+/* Whether `node` is, or is inside, a subtree the journal inserted from
+   outside the document: no part of it was a source the sheet parsed. */
+static bool navigation_journal_inserted_within(
+    const ScriptMutationJournal *mutations, const lxb_dom_node_t *node)
+{
+    for (const lxb_dom_node_t *at = node; at != NULL; at = at->parent)
+        if (navigation_journal_inserted((void *) mutations, at)) return true;
+    return false;
+}
+
 /* `images_rebuilt`: this relayout re-derives the whole image table anyway,
    so image elements the journal cannot account for are not a reason to
    refuse. `for_read`: a script read is installing the change ahead of the
@@ -505,7 +548,16 @@ static bool navigation_try_append_style_sources(
         || (mutations->image_rebuild_required && !images_rebuilt))
         return navigation_style_append_refused("journal");
     Stylesheet *sheet = &session->page.stylesheet;
-    if (sheet->style_sources_bounded_out || sheet->count == 0)
+    /* Past the table's bound the sheet still parsed every document source
+       in order, but recorded only the first ones (and none it inserted
+       since). A source the journal inserted goes in front of the recorded
+       source that next follows it, or at the tail when none does, as a
+       fresh build would order it; any other source change rebuilds. */
+    bool bounded = sheet->style_sources_bounded_out
+        && sheet->style_source_count == STYLE_SOURCE_NODE_LIMIT
+        && sheet->scopes.adopted_source_count == 0
+        && sheet->scopes.shadow_scope_count == 0;
+    if ((sheet->style_sources_bounded_out && !bounded) || sheet->count == 0)
         return navigation_style_append_refused("sources unknown");
     const lxb_dom_node_t *previous_adopted[64];
     size_t previous_count = sheet->scopes.adopted_source_count;
@@ -530,6 +582,7 @@ static bool navigation_try_append_style_sources(
            here since (a freed node is looked at again below). */
         if (record->sheet_settled && node != NULL) continue;
         if (node == NULL) {
+            if (bounded) return navigation_style_append_refused("bounded");
             /* Freed since. A freed source bounded the sheet's sources out
                (navigation_retire_subtree); what it left must not be one. */
             precise = false;
@@ -551,7 +604,11 @@ static bool navigation_try_append_style_sources(
             owner = navigation_style_owner(record->scope);
         if (owner != NULL) {
             /* Content or attributes of an already ingested <style>. */
-            if (stylesheet_style_source_known(sheet, owner))
+            if (stylesheet_style_source_known(sheet, owner)
+                || (bounded
+                    && (!navigation_node_connected(owner)
+                        || !navigation_journal_inserted_within(mutations,
+                                                               owner))))
                 return navigation_style_append_refused("known style changed");
             if (!navigation_node_connected(owner)) {
                 precise = false;
@@ -567,7 +624,11 @@ static bool navigation_try_append_style_sources(
             /* A link whose sheet is applied cannot change or leave without
                taking its rules along. Any other link holds no rule. */
             if (stylesheet_style_source_known(sheet, node)
-                || navigation_link_url_applied(session, node))
+                || navigation_link_url_applied(session, node)
+                || (bounded
+                    && (!navigation_node_connected(node)
+                        || !navigation_journal_inserted_within(mutations,
+                                                               node))))
                 return navigation_style_append_refused("applied link changed");
             if (record->kind != SCRIPT_MUTATION_ATTRIBUTE
                 && record->kind != SCRIPT_MUTATION_INLINE_STYLE
@@ -586,6 +647,10 @@ static bool navigation_try_append_style_sources(
         case SCRIPT_MUTATION_INNER_HTML:
             if (record->kind != SCRIPT_MUTATION_CHILD_LIST
                 || !record->inserted_from_detached) precise = false;
+            /* Past the bound nothing proves a removed or moved subtree
+               held no source. */
+            if (bounded && (!precise || !navigation_node_connected(node)))
+                return navigation_style_append_refused("bounded");
             /* A removal leaves no candidate; the document walk below proves
                no ingested source went with it. */
             if (!navigation_node_connected(node)) continue;
@@ -599,6 +664,7 @@ static bool navigation_try_append_style_sources(
         case SCRIPT_MUTATION_TEXT:
             break;
         case SCRIPT_MUTATION_UNKNOWN:
+            if (bounded) return navigation_style_append_refused("bounded");
             precise = false;
             break;
         default:
@@ -621,6 +687,7 @@ static bool navigation_try_append_style_sources(
     lxb_dom_node_t *ordered[ORDERED_LIMIT];
     size_t after[ORDERED_LIMIT];
     size_t found = 0, seen = 0, steps = 0;
+    bool pending = false;
     for (lxb_dom_node_t *at = root; at != NULL;
          at = navigation_document_order_next(at, root)) {
         if (++steps > ORDER_WALK_LIMIT)
@@ -628,9 +695,19 @@ static bool navigation_try_append_style_sources(
         if (at->type != LXB_DOM_NODE_TYPE_ELEMENT
             || (at->local_name != LXB_TAG_STYLE
                 && at->local_name != LXB_TAG_LINK)) continue;
-        if (seen < sheet->style_source_count
-            && sheet->style_source_nodes[seen] == at) {
+        bool recorded = seen < sheet->style_source_count
+            && sheet->style_source_nodes[seen] == at;
+        if (pending && !recorded && navigation_is_style_source_candidate(at)) {
+            /* The next source after a candidate must be recorded (where
+               the candidate's rules then go) or another candidate. */
+            bool candidate = false;
+            for (size_t k = 0; k < count && !candidate; k++)
+                candidate = candidates[k] == at;
+            if (!candidate) return navigation_style_append_refused("bounded");
+        }
+        if (recorded) {
             seen++;
+            pending = false;
             continue;
         }
         if (stylesheet_style_source_known(sheet, at))
@@ -640,6 +717,7 @@ static bool navigation_try_append_style_sources(
             ordered[found] = at;
             after[found] = seen;
             found++;
+            pending = bounded;
             break;
         }
     }
@@ -657,7 +735,7 @@ static bool navigation_try_append_style_sources(
     size_t tier_count = document_adopted_sheets_active(
         &session->page.document, tier, tier_revisions,
         DOCUMENT_ADOPTED_TIER_LIMIT);
-    if (tier_count == SIZE_MAX)
+    if (tier_count == SIZE_MAX || (bounded && tier_count != 0))
         return navigation_style_append_refused("adopted bound");
     /* Held sources the tier dropped or reordered leave the sheet first;
        the reordered ones are then inserted again below like new ones. */
@@ -734,6 +812,12 @@ static bool navigation_try_append_style_sources(
     size_t appended_total = 0, appended_sources = 0;
     lxb_dom_node_t *discovered[ORDERED_LIMIT];
     size_t discovered_count = 0;
+    /* The styles the layout reuse cache drops: those within `layout_scope`
+       (the removed and appended adopted sources' hosts, or everything) and
+       those of the elements carrying `keys`. */
+    NavigationStyleImageScope layout_scope = *image_scope;
+    uint32_t keys[NAVIGATION_STYLE_APPEND_KEY_LIMIT];
+    size_t key_count = 0;
     for (size_t k = 0; k < found; k++) {
         lxb_dom_node_t *node = ordered[k];
         bool style = node_name_is(node, "style");
@@ -759,6 +843,7 @@ static bool navigation_try_append_style_sources(
             adopted ? candidate_revisions[k] : 0
         };
         uint64_t load_before = session->performance.style_append_load_us;
+        size_t transitions_before = sheet->transition_rule_count;
         uint64_t step_started = navigation_now_us();
         /* A constructed sheet goes through the builders' own path
            (stylesheet_add_adopted_sheet): exempt from style-src, recorded
@@ -802,10 +887,25 @@ static bool navigation_try_append_style_sources(
            table below is rebuilt; anything else may reach any element. A
            plain sheet (checked there) moves the parse context only by the
            sizes of the intern pools, which leaves the styles kept outside
-           its hosts as they are. */
-        if (!adopted || step.appended_bounded_out)
+           its hosts as they are. A <style> whose rules leave the parse
+           context and the transition rules as they were, and whose
+           subjects each carry a key, restyles only the elements carrying
+           those keys; images may still appear anywhere. */
+        bool keyed = !adopted && style && step_valid && !step.context_changed
+            && !layout_scope.whole_document
+            && sheet->transition_rule_count == transitions_before
+            && navigation_style_text_selector_only(node)
+            && stylesheet_rules_subject_keys(
+                   sheet, step.appended, step.appended_count, keys,
+                   NAVIGATION_STYLE_APPEND_KEY_LIMIT, &key_count);
+        if (step.cascade_unchanged) {
+            /* Nothing a style reads changed: no style or image moves. */
+        } else if (!adopted || step.appended_bounded_out) {
             image_scope->whole_document = true;
-        else discovered[discovered_count++] = node;
+            if (!keyed) layout_scope.whole_document = true;
+        } else {
+            discovered[discovered_count++] = node;
+        }
         session->performance.style_append_discovery_us +=
             navigation_now_us() - discovery_started;
         context_changed = context_changed || step.context_changed;
@@ -857,18 +957,25 @@ static bool navigation_try_append_style_sources(
             removed, removed_count, rescoped,
             DOCUMENT_ADOPTION_ROOT_LIMIT, &rescoped_count,
             &rescoped_everything)) rescoped_everything = true;
-    for (size_t k = 0; k < discovered_count; k++)
+    for (size_t k = 0; k < discovered_count; k++) {
         navigation_style_image_scope_add_source(image_scope, sheet,
                                                 discovered[k]);
+        navigation_style_image_scope_add_source(&layout_scope, sheet,
+                                                discovered[k]);
+    }
     navigation_drop_computed_styles(session, image_scope, rescoped,
                                     rescoped_count, rescoped_everything);
     if (session->page.layout_reuse != NULL) {
         /* The notes above kept every computed style: drop those the
-           changed rules can reach. */
+           changed rules can reach. The image pass still walks the whole
+           document after a keyed step, on the styles kept. */
         layout_reuse_cache_drop_styles_within(
             session->page.layout_reuse,
-            image_scope->whole_document ? NULL : image_scope->hosts,
-            image_scope->count);
+            layout_scope.whole_document ? NULL : layout_scope.hosts,
+            layout_scope.count);
+        if (!layout_scope.whole_document)
+            layout_reuse_cache_drop_styles_carrying(
+                session->page.layout_reuse, keys, key_count);
         if (rescoped_everything) {
             layout_reuse_cache_reset(session->page.layout_reuse);
         } else {

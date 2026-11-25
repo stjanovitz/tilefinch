@@ -371,6 +371,8 @@ void psp_collections_sync_ui(
             stale |= UINT32_C(1) << at;
     }
     bool held = psp_presentation_fence_acquire();
+    uint32_t armed_id = ui->collections_section == (unsigned) section
+        ? psp_ui_collections_armed_offline_id(ui) : 0;
     memset(surface, 0, sizeof(*surface));
     surface->view.section = (uint8_t) section;
     size_t rows = 0;
@@ -416,6 +418,7 @@ void psp_collections_sync_ui(
                     surface->download_detail[rows];
             }
             surface->view.rows[rows].deletable = true;
+            surface->view.rows[rows].offline_id = item->id;
             surface->view.rows[rows].offline_state = (uint8_t) item->state;
             const char *state = psp_collections_offline_state(item->state);
             if (item->state == OFFLINE_ITEM_DOWNLOADING) {
@@ -476,7 +479,6 @@ void psp_collections_sync_ui(
                     &surface->view.rows[rows],
                     item->content_bytes + item->audio_bytes);
             }
-            surface->id[rows] = item->id;
             rows++;
         }
         if (is_downloads && offline_store != NULL && offline_store->game_directory != NULL
@@ -487,7 +489,7 @@ void psp_collections_sync_ui(
             surface->view.rows[rows].title = tilefinch_ui_logical_text("Installed homebrew");
             surface->view.rows[rows].detail = tilefinch_ui_text("Manage apps installed by Tilefinch");
             surface->view.rows[rows].offline_state = UINT8_MAX; /* Navigation, not a transfer. */
-            surface->id[rows++] = 0;
+            rows++;
         }
     } else if (section == PSP_UI_COLLECTION_BOOKMARKS) {
         surface->view.empty_message = "NO BOOKMARKS YET";
@@ -504,7 +506,6 @@ void psp_collections_sync_ui(
             /* Removing a bookmark is a page verb, not a list verb: the menu
                owns add/remove so one row cannot mean two things. */
             surface->view.rows[rows].deletable = false;
-            surface->id[rows] = (uint32_t) at;
             rows++;
         }
     } else if (section == PSP_UI_COLLECTION_HISTORY) {
@@ -524,7 +525,6 @@ void psp_collections_sync_ui(
                 snprintf(surface->view.rows[rows].trailing,
                          sizeof(surface->view.rows[rows].trailing),
                          "%u VISITS", (unsigned) page->visits);
-            surface->id[rows] = (uint32_t) at;
             rows++;
         }
     } else {
@@ -539,7 +539,7 @@ void psp_collections_sync_ui(
         rows = 1u;
     }
     surface->view.count = (uint16_t) rows;
-    psp_ui_set_collections(ui, &surface->view);
+    psp_ui_refresh_collections(ui, &surface->view, armed_id);
     psp_presentation_fence_release(held);
 }
 
@@ -639,8 +639,8 @@ void psp_app_collection_activate(
         || app->process->presentation.ui.collections_section
             == PSP_UI_COLLECTION_DOWNLOADS) {
         uint32_t selected_id =
-            app->process->presentation.collections_surface.id[
-                intent->list_index];
+            app->process->presentation.collections_surface.view.rows[
+                intent->list_index].offline_id;
         const OfflineLibraryItem *selected_item =
             offline_library_find(
                 &app->browser->offline_store.library, selected_id);
@@ -816,13 +816,15 @@ void psp_app_tab_request(
         ? BROWSER_PROFILE_HOMEPAGE_URL
         : TILEFINCH_HOMEPAGE_URL;
     char destination[NAVIGATION_URL_LIMIT] = {0};
+    unsigned before_draft = psp_draft_stays();
     PspTabRequestResult result = psp_tabs_request(
-        tabs, app->views->navigation,
+        tabs, engine,
         psp_tabs_document_visible(&app->process->presentation.ui),
         intent->action,
         intent->tab_index, homepage_url,
         tab_hibernation_path, &app->interactive->tab_transition, destination);
     if (result != PSP_TAB_REQUEST_REFUSED
+        && result != PSP_TAB_REQUEST_CAPTURE_FAILED
         && result != PSP_TAB_REQUEST_HIBERNATION_FAILED) {
         if (intent->action == PSP_UI_ACTION_CLOSE_TAB)
             psp_tabs_remove_thumbnail(
@@ -832,7 +834,10 @@ void psp_app_tab_request(
                 &app->process->presentation.tab_view,
                 browser_tabs_active_index(tabs));
     }
-    if (result == PSP_TAB_REQUEST_HIBERNATION_FAILED) {
+    if (result == PSP_TAB_REQUEST_CAPTURE_FAILED) {
+        psp_ui_show_status(&app->process->presentation.ui,
+                           psp_draft_stays() != before_draft ? "CANCELLED" : "TAB COULD NOT OPEN", 240);
+    } else if (result == PSP_TAB_REQUEST_HIBERNATION_FAILED) {
         psp_tabs_sync_ui(&app->process->presentation.ui, tabs, &app->process->presentation.tab_view);
         psp_ui_show_status(
             &app->process->presentation.ui, "HIBERNATED TAB COULD NOT OPEN", 240);
@@ -863,7 +868,7 @@ void psp_app_tab_request(
         PspUiCollectionSection legacy_section = tab_route.section;
         if (tab_open == PSP_LOCAL_OPEN_NATIVE_HOME) {
             bool opened = psp_tabs_finish_native_home(
-                tabs, &app->interactive->tab_transition,
+                tabs, engine, &app->interactive->tab_transition,
                 browser_profile_tab_hibernation_enabled(profile),
                 tab_hibernation_path);
             /* The tab transition has to settle first, so this arm

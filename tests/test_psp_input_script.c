@@ -515,6 +515,20 @@ static bool test_stepper(void)
     CHECK(!psp_input_script_advance(&script, &input, 0, false));
     CHECK(script.stalled && !script.reached_end);
 
+    /* With a host clock the limit is busy time, counted in nominal 16 ms
+       frames: a supervisor polling every 8 ms must not halve it. */
+    CHECK(psp_input_script_parse(
+        &script, "tap cross\nend\n", "inline", record_warning, NULL));
+    script.stall_limit = 4;
+    script.now_us = 1000000u;
+    for (size_t at = 0; at < 8u; at++) {
+        CHECK(psp_input_script_advance(&script, &input, 0, false));
+        script.now_us += 8000u;
+    }
+    CHECK(!script.stalled);
+    CHECK(!psp_input_script_advance(&script, &input, 0, false));
+    CHECK(script.stalled && !script.reached_end);
+
     /* Marks fire once, on the first frame of their step. */
     CHECK(psp_input_script_parse(
         &script, "mark here\nwait 2\n", "inline", record_warning, NULL));

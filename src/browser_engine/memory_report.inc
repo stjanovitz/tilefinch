@@ -362,11 +362,14 @@ static void memory_report_resource_and_session(const BrowserEngine *engine,
         &engine->render, &engine->candidate_render,
         &engine->provisional_renders[0], &engine->provisional_renders[1]
     };
-    for (size_t c = 0; c < sizeof(caches) / sizeof(caches[0]); c++)
+    for (size_t c = 0; c < sizeof(caches) / sizeof(caches[0]); c++) {
         for (size_t i = 0; i < TILEFINCH_IMAGE_CACHE_ENTRIES; i++)
             render_decoded += memory_report_charge_in(
                 caches[c]->decoded_images[i].pixels,
                 BUDGET_CATEGORY_RESOURCE);
+        render_decoded += memory_report_charge_in(
+            caches[c]->held_image.pixels, BUDGET_CATEGORY_RESOURCE);
+    }
 
     BudgetConcurrentPoolMetrics curl = {0};
     bool curl_live = fetch_curl_pool_metrics(&curl);

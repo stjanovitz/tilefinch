@@ -55,7 +55,10 @@ void browser_session_persistence_limits_default(
 /*
  * save() retains the newest reusable cache entries that fit the requested
  * snapshot ceiling, writes path.tmp completely, closes it, and then rotates
- * it over path while retaining the prior valid generation at path.bak.
+ * it over path while retaining the previous primary at path.bak. It checks
+ * both versions, but does not revalidate the old primary's payload. Callers
+ * preserving an existing snapshot should restore first so a verified backup
+ * can be recovered without rotating an unread or corrupt primary over it.
  * load() stages every requested category under the session Budget and changes
  * the live session only after the complete file and checksum validate.
  */
@@ -68,9 +71,13 @@ BrowserSessionPersistenceStatus browser_session_persistence_load(
     BrowserSessionPersistenceMask mask,
     const BrowserSessionPersistenceLimits *limits);
 
+/* An unread or skipped restore may save a new snapshot only when neither
+ * durable generation exists. An inaccessible file is not known absent. */
+bool browser_session_persistence_can_save(const char *path, bool restore_unread);
+
 /*
- * Incremental counterpart to load(). The loader keeps one file open and
- * reads at most maximum_bytes per pump. Restored objects remain in a staging
+ * Incremental counterpart to load(). The loader reads one snapshot at a
+ * time, at most maximum_bytes per pump. Restored objects remain in a staging
  * session until the complete payload, record counts, and checksum validate;
  * cancellation or failure therefore leaves the live session unchanged.
  *
@@ -81,6 +88,9 @@ BrowserSessionPersistenceStatus browser_session_persistence_load(
  * pauses without reading/publishing while that temporary partition is active,
  * and resumes into the ordinary session after sign-in closes. Terminal load
  * results remain terminal even if a portal subsequently opens.
+ * Callers must serialize file mutations from other threads or processes.
+ * The PSP frontend also finishes or cancels a same-path load before saving
+ * or clearing its file.
  */
 /* The size of the file a save of MASK would write now, header included,
    counted without writing or hashing (a free-space preflight). The save

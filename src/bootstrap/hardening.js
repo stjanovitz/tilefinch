@@ -9,6 +9,27 @@
   /* Set by the host for host and validation realms only; the probes it
      enabled are published by now. */
   deleteProperty(globalThis, "__tilefinchTestProbes");
+  /* The ensure natives of the lazy modules whose eager consumer loads
+     them itself (all but traversal hand it a factory on the global): every
+     consumer captured its own while the bootstrap ran. A page that could
+     call one would choose when the module loads, and could replace a
+     factory it parked on a name the page created first, which stays
+     shared, before the consumer reads it (see Interface snapshot in
+     docs/engineering/JS_RUNTIME.md). */
+  /* The constructors EventSource, FileReader and WebGPU's modules publish
+     (below), for the table a Worker reads shared names from: loaded on
+     the first read through these, never through a page's global. */
+  const lateEnsure = { __proto__: null,
+      EventSource: globalThis.__tilefinchEnsureEventSourceBootstrap,
+      FileReader: globalThis.__tilefinchEnsureFileReaderBootstrap,
+      GPU: globalThis.__tilefinchEnsureGPUBootstrap,
+      WGSLLanguageFeatures: globalThis.__tilefinchEnsureGPUBootstrap },
+    late = { __proto__: null };
+  for (const name of ["Shadow", "Documents", "Forms", "Traversal", "Rule",
+    "FrameClone", "Geometry", "Validation", "DetachedDocuments",
+    "DOMAttributes", "SubtleCrypto", "Multiplayer", "GPU", "EventSource",
+    "FileReader"])
+    deleteProperty(globalThis, "__tilefinchEnsure" + name + "Bootstrap");
   /* Every bootstrap module captured the trusted-event share (dom.js); the
      lazy modules get its event creator, brand check and interfaces from
      the globals published below. */
@@ -121,12 +142,12 @@
     "Navigator", "Document", "Node", "Element", "HTMLElement",
     "HTMLCanvasElement", "ShadowRoot", "StorageManager",
     "AbortController", "AbortSignal", "BroadcastChannel", "Crypto",
-    "CustomEvent", "DOMRect", "EventSource", "File", "FileList", "FileReader",
-    "FormData", "GPU", "MessageChannel", "MessagePort", "NavigatorUAData",
+    "CustomEvent", "DOMRect", "File", "FileList", "FormData",
+    "MessageChannel", "MessagePort", "NavigatorUAData",
     "NetworkInformation", "PerformanceMark", "PerformanceMeasure",
     "PerformanceObserverEntryList", "PerformanceResourceTiming",
-    "PermissionStatus", "Permissions", "SubtleCrypto",
-    "WGSLLanguageFeatures", "WebSocket", "XMLHttpRequest",
+    "PermissionStatus", "Permissions", "SubtleCrypto", "WebSocket",
+    "XMLHttpRequest",
     "XMLHttpRequestEventTarget", "XMLHttpRequestUpload", "console",
     "Error", "TypeError", "RangeError", "SyntaxError", "Promise", "Map",
     "Set", "WeakMap", "WeakSet", "WeakRef", "Proxy", "Array", "ArrayBuffer",
@@ -138,6 +159,24 @@
     const value = getDescriptor(globalThis, name)?.value;
     if (value !== undefined) captured[name] = value;
   }
+  /* A load through one of these leaves a global the page deleted before
+     the first read deleted; a failed load reads undefined. */
+  for (const name in lateEnsure)
+    defineProperty(captured, name, {
+      __proto__: null, enumerable: true,
+      get() {
+        if (late[name] === undefined) {
+          const ensure = lateEnsure[name], gone = { __proto__: null };
+          let count = 0;
+          for (const other in lateEnsure)
+            if (lateEnsure[other] === ensure && !getDescriptor(globalThis, other))
+              gone[count++] = other;
+          try { ensure(); } catch (_) {}
+          while (count) deleteProperty(globalThis, gone[--count]);
+        }
+        return late[name];
+      },
+    });
   captured.addListener = Function.call.bind(
     eventTargetPrototype.addEventListener);
   captured.removeListener = Function.call.bind(
@@ -169,27 +208,52 @@
      it as its first statement: the host hands each load one claim
      (__tilefinchLazyLoading), so page code that runs while the module
      loads gets none, and a publisher works only while its load lasts.
-     The indices are the host's LazyBootstrapFeature values. */
-  const lazyLoading = globalThis.__tilefinchLazyLoading;
+     The indices are the host's LazyBootstrapFeature values. A hook with a
+     sink is no global: its publisher hands it to the eager module's setter,
+     captured here (dom.js's for the traversal module's NodeIterator
+     hooks), so a page can neither call the setter nor read the hooks. */
+  const lazyLoading = globalThis.__tilefinchLazyLoading,
+    sinks = { __proto__: null,
+      __tilefinchNodeIteratorHooks: globalThis.__tilefinchSetNodeIteratorHooks,
+      __tilefinchIndexedDBKeySizeReader: globalThis.__tilefinchSetIndexedDBKeySizeReader,
+      __tilefinchDOMAttributesFactory: globalThis.__tilefinchSetDOMAttributesFactory,
+      __tilefinchEventSourceInterface: (value) => { late.EventSource = value; },
+      __tilefinchFileReaderInterface: (value) => { late.FileReader = value; },
+      __tilefinchGPUHooks: ((setGPUHooks) => (hooks) => {
+        setGPUHooks(hooks);
+        late.GPU = hooks.GPU;
+        late.WGSLLanguageFeatures = hooks.WGSLLanguageFeatures;
+      })(globalThis.__tilefinchSetGPUHooks) };
   deleteProperty(globalThis, "__tilefinchLazyLoading");
+  deleteProperty(globalThis, "__tilefinchSetNodeIteratorHooks");
+  deleteProperty(globalThis, "__tilefinchSetDOMAttributesFactory");
+  deleteProperty(globalThis, "__tilefinchSetIndexedDBKeySizeReader");
+  deleteProperty(globalThis, "__tilefinchSetGPUHooks");
   if (typeof lazyLoading === "function") {
     const hooks = { __proto__: null }, owner = { __proto__: null },
       features = [
         [0, "CanvasAttributeChanged", "CanvasConnected", "CanvasDimension",
           "CanvasReadbackState", "FlushCanvasSurfaces", "SetCanvasDimension"],
-        [1, "AbortIndexedDBForWorker"],
+        [1, "AbortIndexedDBForWorker", "IndexedDBKeySizeReader"],
         [2, "BeginMotionObservation", "MotionRecheck", "MotionTreeChanged",
           "TransitionsDirty", "WatchTransitions"],
         [5, "CreateWebGLContext", "FlushWebGLSurfaces", "WebGLConnected",
           "WebGLMethods", "WebGLReadback", "WebGLResize"],
         [7, "CloneWasmModule"],
+        [11, "NodeIteratorHooks"],
         [19, "WebGLInterfaces"],
+        [23, "DOMAttributesFactory"],
+        [25, "DeliverEventSource", "EventSourceInterface"],
+        [26, "AbortFileReaderForWorker", "FileReaderInterface"],
+        [27, "DeliverMultiplayer"],
+        [28, "GPUHooks"],
       ];
     for (let group = 0; group < features.length; group++)
       for (let at = 1; at < features[group].length; at++) {
         const name = "__tilefinch" + features[group][at];
         if (getDescriptor(globalThis, name)) continue;
         owner[name] = features[group][0];
+        if (sinks[name]) continue;
         defineProperty(globalThis, name, {
           __proto__: null, configurable: false, enumerable: false,
           get: () => hooks[name], set() {},
@@ -199,7 +263,10 @@
       const feature = lazyLoading();
       return feature < 0 ? null : (name, value) => {
         if (owner[name] === feature && hooks[name] === undefined
-            && lazyLoading(feature)) hooks[name] = value;
+            && lazyLoading(feature)) {
+          hooks[name] = value;
+          sinks[name]?.(value);
+        }
       };
     };
   }

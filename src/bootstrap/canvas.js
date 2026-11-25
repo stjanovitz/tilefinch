@@ -2715,7 +2715,7 @@
     translate(x, y) {
       this.transform(1, 0, 0, 1, Number(x), Number(y));
     }
-    scale(x, y = x) {
+    scale(x, y) {
       this.transform(Number(x), 0, 0, Number(y), 0, 0);
     }
     rotate(angle) {
@@ -2743,7 +2743,7 @@
         fontBoundingBoxDescent: descent,
       };
     }
-    fillText(text, x, y, maximumWidth) {
+    fillText(text, x, y, maximumWidth = undefined) {
       text = String(text).slice(0, 256);
       const state = stateFor(this.canvas),
         metrics = this.measureText(text),
@@ -2804,7 +2804,7 @@
           } : { kind: 1, args }))
         scheduleCanvasCommit(state, paintDamage(state, dirty));
     }
-    strokeText(text, x, y, maximumWidth) {
+    strokeText(text, x, y, maximumWidth = undefined) {
       text = String(text).slice(0, 256);
       const state = stateFor(this.canvas),
         metrics = this.measureText(text),
@@ -2849,7 +2849,9 @@
           queuePaintCommand(state, { kind: 1, args }))
         scheduleCanvasCommit(state, paintDamage(state, dirty));
     }
-    drawImage(source, ...arguments_) {
+    /* Web IDL length 3: the shortest overload (image, dx, dy). */
+    drawImage(source, _dx, _dy) {
+      const arguments_ = Array.prototype.slice.call(arguments, 1);
       /* sourceState.pixels is a clean script buffer or a number naming
          unclean pixels (a tainted canvas or cross-origin image by handle,
          an unclean ImageBitmap by store id), which only natives read. */
@@ -3018,8 +3020,9 @@
     createConicGradient(startAngle, x, y) {
       return new CanvasGradient("conic", [startAngle, x, y]);
     }
-    createPattern(source, repetition = "repeat") {
-      repetition = repetition === "" ? "repeat" : String(repetition);
+    createPattern(source, repetition) {
+      repetition = repetition === undefined || repetition === ""
+        ? "repeat" : String(repetition);
       if (!["repeat", "repeat-x", "repeat-y", "no-repeat"].includes(repetition))
         throw new DOMException("Invalid pattern repetition", "SyntaxError");
       let retained = source, native = null;

@@ -613,6 +613,91 @@ static int test_unresolved_mask_keeps_transparent_geometry(Budget *budget)
     return 0;
 }
 
+/* A gradient mask on a box with no background only fades the box's
+   content (CSS Masking 3); the box has nothing of its own to paint. A
+   bar chart decorating a hero (an inset:0 z-index:0 cover whose chart
+   fades out at the bottom) painted its text color through the mask as a
+   dark band under the hero's content. A masked box with a background
+   still paints that background through the mask. */
+static int test_gradient_mask_without_background_paints_nothing(
+    Budget *budget)
+{
+    enum { WIDTH = 64, HEIGHT = 72 };
+    static const char page[] =
+        "<!doctype html><style>html,body{margin:0;padding:0;"
+        "background:#fff;color:#1b1c1e}"
+        "#hero{position:relative}"
+        "#layer{position:absolute;inset:0;z-index:0;overflow:hidden;"
+        "background:#edeff3}"
+        "#chart{position:absolute;left:0;right:0;bottom:8px;height:40px;"
+        "display:flex;align-items:flex-end;gap:5px;overflow:hidden;"
+        "mask-image:linear-gradient(to bottom,#000 80%,transparent)}"
+        ".bar{width:2px;flex-shrink:0;height:50%;"
+        "background-image:linear-gradient(to bottom,#0533ff,transparent)}"
+        "#content{position:relative;z-index:10;height:60px}"
+        "#icon{width:8px;height:8px;background:#ff0000;"
+        "mask-image:linear-gradient(#000,transparent)}"
+        "</style><body><div id=hero><div id=layer><div id=chart>"
+        "<span class=bar></span><span class=bar></span>"
+        "<span class=bar></span></div></div><div id=content></div></div>"
+        "<div id=icon></div></body>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    TileCache cache = {0};
+    uint16_t *frame = NULL;
+    CHECK(document_parse(&document, budget, page, strlen(page), 23)
+          && stylesheet_build(&sheet, budget, &document, WIDTH)
+          && layout_build(&layout, budget, &document, &sheet,
+                          NULL, NULL, WIDTH));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    const LayoutNodeBox *chart = layout_box_for_node(
+        &layout, find_id(root, "chart"));
+    CHECK(chart != NULL && chart->x == 0 && chart->y == 12
+          && chart->width == WIDTH && chart->height == 40);
+    bool text_color_fill = false;
+    bool icon_mask_fill = false;
+    size_t bar_gradients = 0;
+    for (size_t i = 0; i < layout.count; i++) {
+        const DrawCommand *command = &layout.commands[i];
+        if (command->type != DRAW_FILL_RECT) continue;
+        if (command->color == 0x1b1c1e) text_color_fill = true;
+        if (command->color == 0xff0000
+            && (command->image_fit & LAYOUT_FILL_GRADIENT_AS_MASK) != 0)
+            icon_mask_fill = true;
+        if ((command->image_fit & LAYOUT_FILL_GRADIENT_AS_MASK) == 0
+            && command->width == 2
+            && draw_command_fill_gradient(command, NULL))
+            bar_gradients++;
+    }
+    if (text_color_fill || !icon_mask_fill || bar_gradients != 3) {
+        fprintf(stderr, "gradient mask: text-color fill %d icon %d "
+                "bars %zu\n", text_color_fill, icon_mask_fill,
+                bar_gradients);
+    }
+    CHECK(!text_color_fill && icon_mask_fill && bar_gradients == 3);
+
+    frame = budget_malloc(budget, WIDTH * HEIGHT * sizeof(*frame));
+    CHECK(frame != NULL && tile_cache_init(&cache, budget, &layout, 4)
+          && tile_cache_set_frame(&cache, frame, WIDTH * HEIGHT)
+          && tile_cache_render_frame(&cache, 0, WIDTH, HEIGHT, NULL));
+    /* Between the bars and above them the hero's light surface shows. */
+    uint16_t gap = frame[(size_t) 15 * WIDTH + 4];
+    uint16_t above_bars = frame[(size_t) 20 * WIDTH + 30];
+    if (((gap >> 11) & 0x1fu) < 24u || ((above_bars >> 11) & 0x1fu) < 24u)
+        fprintf(stderr, "gradient mask raster gap %04x above %04x\n",
+                gap, above_bars);
+    CHECK(((gap >> 11) & 0x1fu) >= 24u
+          && ((above_bars >> 11) & 0x1fu) >= 24u);
+    tile_cache_destroy(&cache);
+    budget_free(budget, frame);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
 static int test_retained_paint_stack_addresses_are_stable(Budget *budget)
 {
     size_t baseline = budget->current;

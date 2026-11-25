@@ -1583,6 +1583,7 @@ RenderCanvasFrameResult tile_cache_render_canvas_frame_fast(
     cache->presented_scroll_valid = true;
     cache->canvas_paint_pending = false;
     memset(&cache->frame_work, 0, sizeof(cache->frame_work));
+    (void) held_image_release(cache);
     uint64_t elapsed = render_now_us() - started;
     cache->canvas_fast_frames++;
     cache->canvas_fast_us += elapsed;

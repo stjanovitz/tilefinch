@@ -37,6 +37,240 @@ async function fileFixture(run) {
   finally { await root.removeEntry('bounded-regression'); }
 }
 const cases = {
+  async positionedCursorCanMoveInLaterRequest() {
+    return await withDatabase(async db => {
+      const moved = [];
+      for (const method of ['continue', 'advance', 'continuePrimaryKey']) {
+        const indexed = method === 'continuePrimaryKey';
+        const tx = db.transaction(indexed ? 'inline' : 'out'), done = finishedTransaction(tx),
+          store = tx.objectStore(indexed ? 'inline' : 'out');
+        moved.push(await new Promise(resolve => {
+          const r = (indexed ? store.index('color') : store).openCursor();
+          let turns = 0, first;
+          r.onsuccess = () => {
+            if (++turns > 1) {
+              resolve(r.result === first && r.result.primaryKey === (indexed ? 2 : 3));
+              return;
+            }
+            first = r.result;
+            store.get(1).onsuccess = () => {
+              store.get(1).onsuccess = () => {
+                try {
+                  if (indexed) first.continuePrimaryKey('a', 2);
+                  else if (method === 'advance') first.advance(1);
+                  else first.continue();
+                } catch (_) { resolve(false); }
+              };
+            };
+          };
+        }));
+        await done;
+      }
+      return moved.every(Boolean);
+    });
+  },
+  async cursorAdvanceEnforcesUnsignedLongConversion() {
+    return await withDatabase(async db => {
+      const move = async (count, expected) => {
+        const tx = db.transaction('out'), done = finishedTransaction(tx);
+        const moved = await new Promise(resolve => {
+          const r = tx.objectStore('out').openCursor();
+          let first = true;
+          r.onsuccess = () => {
+            if (!first) { resolve(r.result?.key === expected); return; }
+            first = false;
+            try { r.result.advance(count); }
+            catch (error) { resolve(error.name === expected && r.readyState === 'done'); }
+          };
+        });
+        await done;
+        return moved;
+      };
+      for (const count of [.9, -1.9, 4294967296, 1n, NaN]) {
+        if (!(await move(count, 'TypeError'))) return false;
+      }
+      return await move(1.9, 3) && await move('1.9', 3) && await move(4294967295.9, undefined);
+    });
+  },
+  async writeCloneBlocksReentrantWritesAndPreservesAbort() {
+    return await withDatabase(async db => {
+      const stats = globalThis.__tilefinchIndexedDBStats;
+      const tx = db.transaction('out', 'readwrite'), done = finishedTransaction(tx),
+        store = tx.objectStore('out');
+      const before = stats.requests;
+      const sentinel = {};
+      let nestedPut = false, nestedDelete = false, nestedCommit = false;
+      const cloned = store.add({ get field() {
+        nestedPut = expectThrow(() => store.put('nested', 9), 'TransactionInactiveError');
+        nestedCommit = expectThrow(() => tx.commit(), 'InvalidStateError');
+        return 'copied';
+      } }, 2);
+      let storeThrewSentinel = false;
+      try {
+        store.put({ get field() {
+          nestedDelete = expectThrow(() => store.delete(1), 'TransactionInactiveError');
+          throw sentinel;
+        } }, 1);
+      } catch (error) { storeThrewSentinel = error === sentinel; }
+      const badStoreValue = expectThrow(() => store.put(() => {}, 1), 'DataCloneError');
+      const afterThrow = store.put('after throw', 3);
+      await Promise.all([request(cloned), request(afterThrow), done]);
+      const exactlyTwoWrites = stats.requests === before + 2;
+      let cursorThrewSentinel = false, badCursorValue = false, rolledBack = true;
+      for (const useCursor of [false, true]) {
+        const aborting = db.transaction('out', 'readwrite'),
+          abortStore = aborting.objectStore('out');
+        let nested = false, afterAbort = false, pending = false, errorBeforeAbort = false;
+        const aborted = await new Promise(resolve => {
+          aborting.onabort = () => resolve(errorBeforeAbort);
+          aborting.oncomplete = () => resolve(false);
+          const opening = abortStore.openCursor(1);
+          opening.onsuccess = () => {
+            const cursor = opening.result, prior = abortStore.put('rollback me', 7);
+            prior.onsuccess = () => {
+              const write = value => useCursor ? cursor.update(value) : abortStore.put(value, 1);
+              if (useCursor) {
+                try { write({ get field() { throw sentinel; } }); }
+                catch (error) { cursorThrewSentinel = error === sentinel; }
+                badCursorValue = expectThrow(() => write(() => {}), 'DataCloneError');
+              }
+              try {
+                const rejected = write({ get field() {
+                  nested = expectThrow(() => cursor.delete(), 'TransactionInactiveError');
+                  aborting.abort();
+                  return 'cannot commit';
+                } });
+                pending = rejected.readyState === 'pending' && rejected.transaction === aborting
+                  && rejected.source === (useCursor ? cursor : abortStore);
+                rejected.onerror = () => {
+                  errorBeforeAbort = rejected.readyState === 'done' && rejected.error.name === 'AbortError';
+                };
+              } catch (_) { /* A synchronous failure is not the async result. */ }
+              afterAbort = expectThrow(() => abortStore.put('too late', 4), 'TransactionInactiveError');
+            };
+          };
+        });
+        rolledBack = rolledBack && aborted && nested && afterAbort && pending;
+      }
+      const verify = db.transaction('out').objectStore('out');
+      const [keys, values] = await Promise.all([request(verify.getAllKeys()), request(verify.getAll())]);
+      return nestedPut && nestedDelete && nestedCommit && storeThrewSentinel &&
+        cursorThrewSentinel && badStoreValue && badCursorValue && exactlyTwoWrites &&
+        rolledBack && keys.join() === '1,2,3' &&
+        values[0] === 'one' && values[1].field === 'copied' && values[2] === 'after throw';
+    });
+  },
+  async storeAndCursorWritesRespectTransactionState() {
+    return await withDatabase(async db => {
+      let cloned = 0;
+      const value = { get item() { ++cloned; return 'changed'; } };
+      const rejects = (store, cursor, error) => {
+        const stats = globalThis.__tilefinchIndexedDBStats, before = stats.requests;
+        const state = [
+          () => store.put(value, 1), () => store.delete(1),
+          () => cursor.update(value), () => cursor.delete(),
+        ].map(write => expectThrow(write, error)).every(Boolean);
+        const arity = [
+          () => store.add(), () => store.put(), () => store.delete(), () => cursor.update(),
+        ].map(write => expectThrow(write, 'TypeError')).every(Boolean);
+        return state && arity && stats.requests === before;
+      };
+      const read = db.transaction('out'), readDone = finishedTransaction(read),
+        readStore = read.objectStore('out');
+      let readCursor;
+      const readOnly = await new Promise(resolve => {
+        const r = readStore.openCursor(1);
+        r.onsuccess = () => {
+          readCursor = r.result;
+          const keys = readStore.openKeyCursor(1);
+          keys.onsuccess = () => {
+            const keyCursor = keys.result;
+            if (!keyCursor) return;
+            keyCursor.continue();
+            resolve(rejects(readStore, readCursor, 'ReadOnlyError') &&
+              rejects(readStore, keyCursor, 'ReadOnlyError'));
+          };
+        };
+      });
+      await readDone;
+      const finished = rejects(readStore, readCursor, 'TransactionInactiveError');
+      const abortedTx = db.transaction('out', 'readwrite'),
+        abortedStore = abortedTx.objectStore('out');
+      let abortedCursor, duringAbort;
+      await new Promise(resolve => {
+        abortedTx.onabort = resolve;
+        const r = abortedStore.openCursor(1);
+        r.onsuccess = () => {
+          abortedCursor = r.result;
+          abortedTx.abort();
+          duringAbort = rejects(abortedStore, abortedCursor, 'TransactionInactiveError');
+        };
+      });
+      const afterAbort = rejects(abortedStore, abortedCursor, 'TransactionInactiveError');
+      const verify = db.transaction('out').objectStore('out');
+      const [keys, values] = await Promise.all([request(verify.getAllKeys()), request(verify.getAll())]);
+      return readOnly && finished && duringAbort && afterAbort && !cloned &&
+        keys.join() === '1,3' && values.join() === 'one,three';
+    });
+  },
+  async positionedCursorRemainsWritableInLaterRequest() {
+    return await withDatabase(async db => {
+      const tx = db.transaction('out', 'readwrite'), done = finishedTransaction(tx),
+        store = tx.objectStore('out');
+      const writes = new Promise(resolve => {
+        const opening = store.openCursor(1);
+        opening.onsuccess = () => {
+          const cursor = opening.result;
+          // Queue two store events so the cursor's own keep-alive task runs
+          // before the second event reactivates this same transaction.
+          store.get(1).onsuccess = () => {
+            store.get(3).onsuccess = () => {
+              try {
+                const update = cursor.update(undefined), deletion = cursor.delete();
+                resolve(Promise.all([request(update), request(deletion),
+                  update.source === cursor && deletion.source === cursor]));
+              }
+              catch (_) { resolve(null); }
+            };
+          };
+        };
+      });
+      const result = await writes;
+      await done;
+      const values = await request(db.transaction('out').objectStore('out').getAll());
+      return result !== null && result[0] === 1 && result[2] && values.join() === 'three';
+    });
+  },
+  async indexCursorWritesRollbackWithTheirTransaction() {
+    return await withDatabase(async db => {
+      const tx = db.transaction('inline', 'readwrite'), store = tx.objectStore('inline');
+      let updated = false, deleted = false, seenChanged = false;
+      await new Promise(resolve => {
+        tx.onabort = resolve;
+        tx.oncomplete = resolve;
+        const open = store.index('color').openCursor('a');
+        open.onsuccess = () => {
+          const cursor = open.result;
+          const update = cursor.update({id:1,color:'changed'});
+          update.onsuccess = () => {
+            updated = update.source === cursor && update.result === 1;
+            const read = store.get(1);
+            read.onsuccess = () => {
+              seenChanged = read.result.color === 'changed';
+              const deletion = cursor.delete();
+              deletion.onsuccess = () => {
+                deleted = deletion.source === cursor && deletion.result === undefined;
+                tx.abort();
+              };
+            };
+          };
+        };
+      });
+      const verify = db.transaction('inline').objectStore('inline');
+      const [record, keys] = await Promise.all([request(verify.get(1)), request(verify.getAllKeys())]);
+      return updated && deleted && seenChanged && record.color === 'a' && keys.join() === '1,2,3';
+    });
+  },
   async rejectsSeparateInlineKeyWithoutOverwriting() {
     return await withDatabase(async db => {
       const tx = db.transaction('inline','readwrite'), done = finishedTransaction(tx);
@@ -314,6 +548,127 @@ const cases = {
       return expectThrow(() => s.getAll(null,-1),'TypeError') &&
         expectThrow(() => s.index('color').getAllKeys(null,Infinity),'TypeError');
     });
+  },
+  /* A worker reads values back built with its own constructors. */
+  async workerReadsValuesInItsOwnRealm() {
+    const source = "const q=r=>new Promise((y,n)=>{r.onsuccess=()=>y(r.result);" +
+      "r.onerror=()=>n(r.error)});(async()=>{const o=indexedDB.open('worker-realm',1);" +
+      "o.onupgradeneeded=()=>o.result.createObjectStore('s');const db=await q(o)," +
+      "b=new Uint8Array([1,2,3]).buffer,d=new Date(5),m=new Map([[1,new Set([2])]]);" +
+      "await q(db.transaction('s','readwrite').objectStore('s').put({u:new Uint8Array(b)," +
+      "b,v:new DataView(b,1),d,m,l:new Blob(['x']),a:[1],e:new RangeError('r')},1));" +
+      "const s=db.transaction('s').objectStore('s'),[g,c]=await Promise.all(" +
+      "[q(s.get(1)),q(s.openCursor())]),r=[];for(const x of [g,c.value])" +
+      "r.push(x instanceof Object&&x.u instanceof Uint8Array&&x.u.join()==='1,2,3'&&" +
+      "x.b instanceof ArrayBuffer&&x.b.byteLength===3&&x.v instanceof DataView&&" +
+      "x.v.getUint8(0)===2&&x.d instanceof Date&&+x.d===5&&x.m instanceof Map&&" +
+      "x.m.get(1)instanceof Set&&x.m.get(1).has(2)&&x.l instanceof Blob&&" +
+      "await x.l.text()==='x'&&x.a instanceof Array&&x.e instanceof RangeError);" +
+      "db.close();postMessage(r.join())})().catch(e=>postMessage(e.name+':'+e.message))";
+    const url = URL.createObjectURL(new Blob([source])), worker = new Worker(url);
+    try {
+      return await new Promise(resolve => {
+        worker.onmessage = event => resolve(event.data);
+        worker.onerror = () => resolve(false);
+      }) === 'true,true';
+    } finally {
+      worker.terminate(); URL.revokeObjectURL(url);
+      await request(indexedDB.deleteDatabase('worker-realm'));
+    }
+  },
+  /* A worker's Date, binary and array keys are keys as the page's are,
+     sort as the page's do, and read back as the worker's own objects. */
+  async workerKeysAreItsOwn() {
+    const describe = "const d=k=>k instanceof Date?'D'+(+k):k instanceof ArrayBuffer?" +
+      "'B'+new Uint8Array(k).join('.'):Array.isArray(k)&&k instanceof Array?" +
+      "'['+k.map(d).join(',')+']':typeof k+k;";
+    const source = describe + "const q=r=>new Promise((y,n)=>{r.onsuccess=()=>" +
+      "y(r.result);r.onerror=()=>n(r.error)});(async()=>{const o=indexedDB.open(" +
+      "'worker-keys',1);o.onupgradeneeded=()=>o.result.createObjectStore('s');" +
+      "const db=await q(o),u=a=>new Uint8Array(a),keys=['x',new Date(5),3," +
+      "u([2,1]).buffer,u([1,3]),new DataView(u([0,7,9]).buffer,1)," +
+      "[1,[new Date(2),u([4])]]],w=db.transaction('s','readwrite').objectStore('s')," +
+      "put=[];for(const k of keys)put.push(d(await q(w.put(1,k))));" +
+      "const s=db.transaction('s').objectStore('s'),all=(await q(s.getAllKeys()))" +
+      ".map(d),seen=[],c=s.openCursor();await new Promise(y=>c.onsuccess=()=>{" +
+      "if(!c.result)return y();seen.push(d(c.result.key)+'='+d(c.result.primaryKey));" +
+      "c.result.continue()});const range=IDBKeyRange.bound(new Date(0),new Date(9))," +
+      "found=d(await q(s.getKey(range))),cmp=[indexedDB.cmp(new Date(1),new Date(2))," +
+      "indexedDB.cmp(u([1]).buffer,new DataView(u([0]).buffer)),indexedDB.cmp([new Date(1)]," +
+      "[new Date(1)]),indexedDB.cmp(new Date(1),u([1]))].join();db.close();" +
+      "postMessage([put.join(),all.join(),seen.join(),found+d(range.lower)+" +
+      "d(range.upper),cmp].join('|'))})().catch(e=>postMessage(e.name+':'+e.message))";
+    const url = URL.createObjectURL(new Blob([source])), worker = new Worker(url);
+    try {
+      const heard = await new Promise(resolve => {
+        worker.onmessage = event => resolve(event.data);
+        worker.onerror = () => resolve('worker error');
+      });
+      const d = k => k instanceof Date ? 'D' + (+k) : k instanceof ArrayBuffer ?
+        'B' + new Uint8Array(k).join('.') : Array.isArray(k) && k instanceof Array ?
+        '[' + k.map(d).join(',') + ']' : typeof k + k;
+      const db = await request(indexedDB.open('worker-keys'));
+      const page = (await request(db.transaction('s').objectStore('s').getAllKeys()))
+        .map(d).join();
+      db.close();
+      const sorted = ['number3', 'D5', 'stringx', 'B1.3', 'B2.1', 'B7.9',
+        '[number1,[D2,B4]]'];
+      return heard === ['stringx,D5,number3,B2.1,B1.3,B7.9,[number1,[D2,B4]]',
+        sorted.join(), sorted.map(k => k + '=' + k).join(), 'D5D0D9',
+        '-1,1,0,-1'].join('|') && page === sorted.join();
+    } finally {
+      worker.terminate(); URL.revokeObjectURL(url);
+      await request(indexedDB.deleteDatabase('worker-keys'));
+    }
+  },
+  /* A worker's factory comes from the browser alone: a page's
+     IDBFactory.prototype.constructor is never called with the worker's
+     constructors, new IDBFactory(reader) ignores a page's reader, and
+     nothing the page passes replaces the constructors a worker's
+     IDBKeyRange bounds are built with. */
+  async workerFactoryTakesNoReader() {
+    const proto = IDBFactory.prototype,
+      saved = Object.getOwnPropertyDescriptor(proto, 'constructor');
+    let leaked = null, ran = 0;
+    const Fake = function () { ran++; return new Date(0); };
+    proto.constructor = function (reader) { leaked = reader; };
+    const source = "const q=r=>new Promise((y,n)=>{r.onsuccess=()=>y(r.result);" +
+      "r.onerror=()=>n(r.error)});onmessage=async()=>{const o=indexedDB.open(" +
+      "'worker-reader',1);o.onupgradeneeded=()=>o.result.createObjectStore('s');" +
+      "const db=await q(o),t=()=>db.transaction('s','readwrite').objectStore('s');" +
+      "await q(t().put(new Date(4),new Date(3)));const key=await q(t().getKey(" +
+      "new Date(3))),value=await q(t().get(new Date(3))),lower=IDBKeyRange." +
+      "lowerBound(new Date(7)).lower;db.close();postMessage([key instanceof Date" +
+      "&&+key,value instanceof Date&&+value,lower instanceof Date&&+lower].join())}";
+    const url = URL.createObjectURL(new Blob([source])), worker = new Worker(url),
+      ask = () => new Promise(resolve => {
+        worker.onmessage = event => resolve(event.data);
+        worker.onerror = () => resolve('worker error');
+        worker.postMessage(0);
+      });
+    try {
+      const first = await ask();
+      const fakes = { Array, Object, Date: Fake, Uint8Array: Fake,
+        ArrayBuffer: Fake, Map: Fake, Set: Fake };
+      if (leaked) try { new IDBFactory({ ...leaked, Date: Fake }); } catch (_) {}
+      const factory = new IDBFactory(fakes), opening = factory.open('page-reader', 1);
+      opening.onupgradeneeded = () => opening.result.createObjectStore('s');
+      const db = await request(opening),
+        store = () => db.transaction('s', 'readwrite').objectStore('s');
+      await request(store().put(new Date(4), 1));
+      const value = await request(store().get(1)),
+        keys = await request(store().getAllKeys());
+      db.close();
+      const second = await ask();
+      return leaked === null && ran === 0 && first === '3,4,7'
+        && second === '3,4,7' && value instanceof Date && +value === 4
+        && keys.join() === '1';
+    } finally {
+      Object.defineProperty(proto, 'constructor', saved);
+      worker.terminate(); URL.revokeObjectURL(url);
+      await request(indexedDB.deleteDatabase('worker-reader'));
+      await request(indexedDB.deleteDatabase('page-reader'));
+    }
   },
   datalistAssociationTracksLiveIds() {
     const box = item('<div><input list=x><datalist id=x></datalist></div>'),

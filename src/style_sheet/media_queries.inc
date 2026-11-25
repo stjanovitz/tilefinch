@@ -18,6 +18,8 @@ typedef struct {
     int width, height;
     /* What vw/vh resolve against: always the viewport. */
     int viewport_width, viewport_height;
+    /* The screen in CSS pixels (device-width, device-height). */
+    int device_width, device_height;
     /* Size container features (width, height, inline-size, block-size,
        aspect-ratio, orientation) instead of media features. */
     bool container;
@@ -98,12 +100,17 @@ static bool media_dimension(MediaEvaluation *evaluation, const char *text,
     trim(&text, &length);
     /* A size container's axes are its inline and block sizes; the device
        features exist only for media. */
-    const char *wide = evaluation->container ? "inline-size" : "device-width";
-    const char *tall = evaluation->container ? "block-size" : "device-height";
-    if (span_case_equal(text, length, "width") || span_case_equal(text, length, wide))
+    bool container = evaluation->container;
+    if (span_case_equal(text, length, "width")
+        || (container && span_case_equal(text, length, "inline-size")))
         *value = evaluation->width;
-    else if (span_case_equal(text, length, "height") || span_case_equal(text, length, tall))
+    else if (span_case_equal(text, length, "height")
+             || (container && span_case_equal(text, length, "block-size")))
         *value = evaluation->height;
+    else if (!container && span_case_equal(text, length, "device-width"))
+        *value = evaluation->device_width;
+    else if (!container && span_case_equal(text, length, "device-height"))
+        *value = evaluation->device_height;
     else return false;
     return true;
 }
@@ -116,15 +123,18 @@ static bool media_compare(double left, const char *operator, size_t length,
         : length == 2 ? left >= right : left > right;
 }
 
-/* The ratio feature: aspect-ratio, plus device-aspect-ratio for media. The
-   queried box's own ratio is width / height. */
+/* The ratio feature: aspect-ratio (the queried box's width / height), plus
+   device-aspect-ratio (the screen's) for media; `size` receives the two. */
 static bool media_ratio_feature(const MediaEvaluation *evaluation,
-                                const char *text, size_t length)
+                                const char *text, size_t length,
+                                double size[2])
 {
     trim(&text, &length);
-    return span_case_equal(text, length, "aspect-ratio")
-        || (!evaluation->container
-            && span_case_equal(text, length, "device-aspect-ratio"));
+    bool device = !evaluation->container
+        && span_case_equal(text, length, "device-aspect-ratio");
+    size[0] = device ? evaluation->device_width : evaluation->width;
+    size[1] = device ? evaluation->device_height : evaluation->height;
+    return device || span_case_equal(text, length, "aspect-ratio");
 }
 
 /* <ratio> = <number [0,inf]> [ / <number (0,inf]> ]? */
@@ -178,10 +188,11 @@ static MediaTruth media_feature(MediaEvaluation *evaluation, const char *text,
     if (count) {
         size_t starts[3], ends[3];
         bool ratio = false;
+        double size[2];
         for (size_t i = 0, start = 0; i <= count; i++) {
             starts[i] = start;
             ends[i] = i < count ? operators[i] : length;
-            ratio |= media_ratio_feature(evaluation, text + starts[i], ends[i] - starts[i]);
+            ratio |= media_ratio_feature(evaluation, text + starts[i], ends[i] - starts[i], size);
             start = i < count ? ends[i] + sizes[i] : ends[i];
         }
         /* Each operand is a fraction: lengths over 1, ratios as written, and
@@ -193,10 +204,10 @@ static MediaTruth media_feature(MediaEvaluation *evaluation, const char *text,
             size_t operand_length = ends[i] - starts[i];
             denominators[i] = 1;
             if (ratio) {
-                features[i] = media_ratio_feature(evaluation, operand, operand_length);
+                features[i] = media_ratio_feature(evaluation, operand, operand_length, size);
                 if (features[i]) {
-                    numerators[i] = evaluation->width;
-                    denominators[i] = evaluation->height;
+                    numerators[i] = size[0];
+                    denominators[i] = size[1];
                 } else if (!media_ratio(operand, operand_length,
                                         &numerators[i], &denominators[i]))
                     return MEDIA_UNKNOWN;
@@ -221,26 +232,32 @@ static MediaTruth media_feature(MediaEvaluation *evaluation, const char *text,
     size_t value_length = colon == NULL ? 0 : length - (size_t) (value - text);
     trim(&value, &value_length);
     int relation = 0;
+    /* WebKit's prefixed -webkit-[min-|max-]device-pixel-ratio is the
+       resolution in dppx, as a number. */
+    bool webkit = name_length > 8 && span_case_equal(name, 8, "-webkit-");
+    if (webkit) { name += 8; name_length -= 8; }
     if (name_length > 4 && (span_case_equal(name, 4, "min-") || span_case_equal(name, 4, "max-"))) {
         relation = tolower((unsigned char) name[1]) == 'i' ? 1 : -1;
         name += 4; name_length -= 4;
     }
-    double actual, wanted;
+    if (webkit && !span_case_equal(name, name_length, "device-pixel-ratio"))
+        return MEDIA_UNKNOWN;
+    double actual, wanted, size[2];
     bool match = false;
     if (media_dimension(evaluation, name, name_length, &actual)) {
         if (colon == NULL) match = actual != 0 && !relation;
         else if (!media_length(evaluation, value, value_length, &wanted)) return MEDIA_UNKNOWN;
         else match = relation > 0 ? actual >= wanted : relation < 0 ? actual <= wanted : actual == wanted;
-    } else if (media_ratio_feature(evaluation, name, name_length)) {
+    } else if (media_ratio_feature(evaluation, name, name_length, size)) {
         double numerator, denominator;
         if (!media_ratio(value, value_length, &numerator, &denominator)) return MEDIA_UNKNOWN;
-        actual = evaluation->width * denominator;
-        wanted = evaluation->height * numerator;
+        actual = size[0] * denominator;
+        wanted = size[1] * numerator;
         match = relation > 0 ? actual >= wanted : relation < 0 ? actual <= wanted : actual == wanted;
     } else if (evaluation->container
                && !span_case_equal(name, name_length, "orientation")) {
         return MEDIA_UNKNOWN;
-    } else if (span_case_equal(name, name_length, "resolution")) {
+    } else if (webkit || span_case_equal(name, name_length, "resolution")) {
         if (colon == NULL) return !relation && evaluation->resolution != 0
             ? MEDIA_TRUE : MEDIA_FALSE;
         char buffer[64];
@@ -248,7 +265,8 @@ static MediaTruth media_feature(MediaEvaluation *evaluation, const char *text,
         memcpy(buffer, value, value_length); buffer[value_length] = 0;
         char *end; wanted = strtod(buffer, &end);
         if (end == buffer || !isfinite(wanted) || wanted < 0) return MEDIA_UNKNOWN;
-        if (!strcasecmp(end, "dpi")) wanted /= 96;
+        if (webkit) { if (*end) return MEDIA_UNKNOWN; }
+        else if (!strcasecmp(end, "dpi")) wanted /= 96;
         else if (!strcasecmp(end, "dpcm")) wanted *= 2.54 / 96;
         else if (strcasecmp(end, "dppx") && strcasecmp(end, "x")) return MEDIA_UNKNOWN;
         actual = evaluation->resolution;
@@ -270,7 +288,8 @@ static MediaTruth media_feature(MediaEvaluation *evaluation, const char *text,
         if (relation) return MEDIA_UNKNOWN;
         /* Discrete features: the device's value (computed for orientation
            and the color scheme) and every value the feature defines. */
-        enum { MEDIA_VALUE_FIXED, MEDIA_VALUE_ORIENTATION, MEDIA_VALUE_SCHEME };
+        enum { MEDIA_VALUE_FIXED, MEDIA_VALUE_ORIENTATION, MEDIA_VALUE_SCHEME,
+               MEDIA_VALUE_SCRIPTING };
         static const struct {
             const char *name, *alias;
             unsigned char value_kind;
@@ -289,6 +308,15 @@ static MediaTruth media_feature(MediaEvaluation *evaluation, const char *text,
              "no-preference less more custom"},
             {"forced-colors", NULL, MEDIA_VALUE_FIXED, "none", "none active"},
             {"color-gamut", NULL, MEDIA_VALUE_FIXED, "srgb", "srgb p3 rec2020"},
+            {"scripting", NULL, MEDIA_VALUE_SCRIPTING, NULL,
+             "none initial-only enabled"},
+            {"display-mode", NULL, MEDIA_VALUE_FIXED, "browser",
+             "fullscreen standalone minimal-ui browser picture-in-picture"},
+            {"update", NULL, MEDIA_VALUE_FIXED, "fast", "none slow fast"},
+            {"dynamic-range", "video-dynamic-range", MEDIA_VALUE_FIXED,
+             "standard", "standard high"},
+            {"inverted-colors", NULL, MEDIA_VALUE_FIXED, "none",
+             "none inverted"},
         };
         size_t feature = 0;
         const size_t feature_count = sizeof(features) / sizeof(features[0]);
@@ -308,6 +336,10 @@ static MediaTruth media_feature(MediaEvaluation *evaluation, const char *text,
             expected = evaluation->width > evaluation->height ? "landscape" : "portrait";
         else if (features[feature].value_kind == MEDIA_VALUE_SCHEME)
             expected = stylesheet_prefers_dark_color_scheme() ? "dark" : "light";
+        else if (features[feature].value_kind == MEDIA_VALUE_SCRIPTING)
+            /* A page drawn with scripts off renders its <noscript>. */
+            expected = evaluation->sheet != NULL
+                && evaluation->sheet->noscript_rendered ? "none" : "enabled";
         if (colon) {
             const char *alternatives = features[feature].alternatives;
             bool known = false;
@@ -452,7 +484,8 @@ static bool media_evaluate_list(MediaEvaluation *evaluation, const char *text,
 }
 
 static bool media_evaluate(const Stylesheet *sheet, const char *text, size_t length,
-                           double resolution, int width, int height)
+                           double resolution, int width, int height,
+                           int device_width, int device_height)
 {
     if (!text || length > MEDIA_LIST_TEXT_LIMIT) return false;
     const char *content = text; size_t content_length = length; trim(&content, &content_length);
@@ -460,7 +493,9 @@ static bool media_evaluate(const Stylesheet *sheet, const char *text, size_t len
     MediaEvaluation evaluation = {.sheet = sheet, .resolution = resolution,
                                   .width = width, .height = height,
                                   .viewport_width = width,
-                                  .viewport_height = height};
+                                  .viewport_height = height,
+                                  .device_width = device_width,
+                                  .device_height = device_height};
     return media_evaluate_list(&evaluation, text, length);
 }
 

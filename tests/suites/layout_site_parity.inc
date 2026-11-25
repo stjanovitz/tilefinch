@@ -628,9 +628,12 @@ static int test_parity_flexible_grid_minimum(void)
         "grid-template-columns:repeat(4,1fr);gap:24px;overflow-x:auto}"
         ".strip>div{min-width:204px;height:40px}"
         "#shrink{grid-template-columns:repeat(4,minmax(0,1fr))}"
+        "#floor{display:grid;grid-template-columns:minmax(10%,1fr) "
+        "minmax(12.5%,2fr) minmax(0.25%,1fr)}"
         "</style><body><div class=strip><div id=a>A</div><div id=b>B</div>"
         "<div>C</div><div>D</div></div><div class=strip id=shrink>"
-        "<div id=c>E</div><div id=d>F</div><div>G</div><div>H</div></div></body>";
+        "<div id=c>E</div><div id=d>F</div><div>G</div><div>H</div></div>"
+        "<div id=floor><div>I</div></div></body>";
     ParityPage page;
     CHECK(parity_page_load(&page, html));
     const LayoutNodeBox *a = parity_box(&page, "a");
@@ -650,6 +653,16 @@ static int test_parity_flexible_grid_minimum(void)
         &page.sheet, &shrink_style, false, tracks, sizeof(tracks)));
     CHECK(strcmp(tracks,
         "minmax(0px,1fr) minmax(0px,1fr) minmax(0px,1fr) minmax(0px,1fr)") == 0);
+    /* Percentage floors serialize as percentages do: no trailing zeros. */
+    ComputedStyle floor_style = style_for_node(
+        &page.sheet, find_id(lxb_dom_interface_node(page.document.html),
+                             "floor"), NULL);
+    CHECK(stylesheet_serialize_grid_template_tracks(
+        &page.sheet, &floor_style, false, tracks, sizeof(tracks)));
+    if (strcmp(tracks, "minmax(10%,1fr) minmax(12.5%,2fr) minmax(0.25%,1fr)"))
+        fprintf(stderr, "percent floors: %s\n", tracks);
+    CHECK(strcmp(tracks,
+        "minmax(10%,1fr) minmax(12.5%,2fr) minmax(0.25%,1fr)") == 0);
     CHECK(parity_page_destroy(&page));
     return 0;
 }

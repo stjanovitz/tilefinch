@@ -167,7 +167,7 @@ static uint64_t trace_body_hash_v1(const char *body, size_t length)
    time from `buffer` (a 4 KiB stack buffer when none is supplied). */
 static bool trace_open_body_hash_buffer(FILE *file, size_t length,
                                         uint64_t *hash, unsigned char *buffer,
-                                        size_t capacity)
+                                        size_t capacity, size_t *cancel_offset)
 {
     if (file == NULL || hash == NULL) return false;
     unsigned char local[4096];
@@ -179,6 +179,12 @@ static bool trace_open_body_hash_buffer(FILE *file, size_t length,
     uint64_t value = trace_body_hash("", 0);
     bool ok = true;
     while (remaining != 0) {
+        if (cancel_offset != NULL && length > 32u * 1024u
+            && !tilefinch_platform_cooperate("fetch-replay-verify", length - remaining)) {
+            *cancel_offset = length - remaining;
+            ok = false;
+            break;
+        }
         size_t wanted = remaining < capacity ? remaining : capacity;
         if (fread(buffer, 1, wanted, file) != wanted) {
             ok = false;
@@ -197,7 +203,7 @@ static bool trace_open_body_hash_buffer(FILE *file, size_t length,
 
 static bool trace_open_body_hash(FILE *file, size_t length, uint64_t *hash)
 {
-    return trace_open_body_hash_buffer(file, length, hash, NULL, 0);
+    return trace_open_body_hash_buffer(file, length, hash, NULL, 0, NULL);
 }
 
 static bool trace_file_body_hash(const char *path, size_t length,
@@ -1082,5 +1088,6 @@ typedef struct {
 typedef enum {
     TRACE_REPLAY_RECORD_NO_MATCH = 0,
     TRACE_REPLAY_RECORD_MATCHED,
+    TRACE_REPLAY_RECORD_INTERRUPTED,
     TRACE_REPLAY_RECORD_INVALID
 } TraceReplayRecordStatus;

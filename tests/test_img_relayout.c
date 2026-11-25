@@ -339,8 +339,15 @@ static bool test_forced_layout_adopted_when_table_unchanged(void)
     CHECK(open_page("",
                     "<div id=box><img id=bad src='" BROKEN "'></div>", 400, ""));
     LayoutReuseStats before = {0}, after = {0};
+    /* A div already displays as block. If the cache can prove its box is
+       unchanged, that read legitimately skips the build; there is then
+       nothing to adopt. Require a different measured height as well. */
+    size_t builds = navigation.page.script_result.geometry_snapshot_builds;
     CHECK(evaluate("(()=>{const b=document.getElementById('box');"
-                   "b.style.display='block';return b.offsetHeight})()"));
+                   "b.style.cssText='display:block;height:29px';"
+                   "globalThis.pocSummary=String(b.offsetHeight)})()"));
+    CHECK(strcmp(navigation.page.script_result.summary, "29") == 0
+          && navigation.page.script_result.geometry_snapshot_builds == builds + 1);
     CHECK(script_runtime_consume_relayout(navigation.page.runtime));
     layout_reuse_cache_stats(navigation.page.layout_reuse, &before);
     CHECK(navigation_relayout(&navigation));

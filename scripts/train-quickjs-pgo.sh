@@ -12,11 +12,13 @@
 # --bench-weight W the engine micro-benchmark is also run and merged at
 # weight W (0 < W; the journey weighs 1). The merged .gcda files and a
 # PROVENANCE file land in OUT_DIR, ready for
-# -DPSP_BROWSER_QUICKJS_PGO_USE=OUT_DIR. The caller owns any lock that
-# serializes PPSSPP runs on the machine.
+# -DPSP_BROWSER_QUICKJS_PGO_USE=OUT_DIR. PROVENANCE records the engine
+# fingerprint and the instrumented build's source directory, since the
+# profile applies only to builds configured from that path. The caller owns
+# any lock that serializes PPSSPP runs on the machine.
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-[ "$#" -ge 3 ] || { sed -n '2,19p' "$0" >&2; exit 2; }
+[ "$#" -ge 3 ] || { sed -n '2,18p' "$0" >&2; exit 2; }
 build=$(CDPATH= cd -- "$1" && pwd)
 out=$2
 corpus=$(CDPATH= cd -- "$3" && pwd)
@@ -35,6 +37,11 @@ grep -q '^PSP_BROWSER_QUICKJS_PGO_GENERATE:BOOL=ON$' "$build/CMakeCache.txt" || 
 grep -q '^PSP_BROWSER_EXECUTION_CENSUS:BOOL=OFF$' "$build/CMakeCache.txt" || {
     echo "Disable PSP_BROWSER_EXECUTION_CENSUS for a shipping-compatible PGO profile" >&2
     exit 2; }
+# GCC's profile checks hash each engine source's path as the compiler was
+# given it: record the folder the instrumented build compiled from.
+source_dir=$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "$build/CMakeCache.txt")
+[ -n "$source_dir" ] || {
+    echo "$build records no source directory (CMAKE_HOME_DIRECTORY)" >&2; exit 2; }
 trace="$corpus/chatgpt-ask-send76"
 [ -d "$trace" ] || { echo "missing trace $trace" >&2; exit 2; }
 work="$build/pgo-training"
@@ -80,6 +87,7 @@ fingerprint=$(sed -n 's/^TILEFINCH_QUICKJS_PGO_FINGERPRINT:INTERNAL=//p' \
 [ -n "$fingerprint" ] || { echo "no engine fingerprint in $build" >&2; exit 1; }
 {
     echo "fingerprint=$fingerprint"
+    echo "source-dir=$source_dir"
     echo "commit=$(git -C "$root" rev-parse HEAD)"
     echo "trace=chatgpt-ask-send76"
     echo "bench-weight=${bench_weight:-0}"

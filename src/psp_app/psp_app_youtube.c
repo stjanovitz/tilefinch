@@ -10,19 +10,20 @@
 #include "tilefinch/youtube_lite.h"
 #include <time.h>
 
-void psp_app_youtube_login_boot(PspProcessResources *process, PspBrowserResources *browser)
+const char *psp_app_youtube_login_boot(PspProcessResources *process, PspBrowserResources *browser)
 {
-    if (browser_profile_youtube_login_policy(browser->profile) == YOUTUBE_LOGIN_NEVER) {
-        (void) youtube_login_remove(process->storage.youtube_login);
-        return;
-    }
+    if (browser_profile_youtube_login_policy(browser->profile) == YOUTUBE_LOGIN_NEVER)
+        return youtube_login_remove(process->storage.youtube_login)
+            ? NULL : "SAVED LOGIN COULD NOT BE REMOVED";
     YoutubeLoginLoadStatus status = YOUTUBE_LOGIN_NOT_LOADED;
     if (youtube_login_load(browser->session,
             process->storage.youtube_login, (int64_t) time(NULL), &status))
         browser->youtube_login_restored_identity = youtube_lite_session_login_identity(browser->session);
     else if (status == YOUTUBE_LOGIN_COOKIE_TOO_LARGE)
-        psp_ui_show_status(&process->presentation.ui,
-            "SAVED YOUTUBE LOGIN UNUSABLE - SIGN IN AGAIN", 240);
+        return "SAVED YOUTUBE LOGIN UNUSABLE - SIGN IN AGAIN";
+    else if (status == YOUTUBE_LOGIN_COOKIE_TOO_LARGE_CLEANUP_FAILED)
+        return "UNUSABLE YOUTUBE LOGIN COULD NOT BE REMOVED";
+    return NULL;
 }
 
 bool psp_app_youtube_login_clear(PspApp *app)
@@ -90,12 +91,13 @@ bool psp_app_youtube_login_poll(PspApp *app)
         /* A sign-out the user did not ask for says who did it. A saved login
            that stays is rejected and removed again on the next start. The
            user's own Sign out is confirmed, unless a saved login stays. */
-        if (events & BROWSER_YOUTUBE_LOGIN_REJECTED)
+        if (!removed)
+            psp_ui_show_status(&app->process->presentation.ui,
+                "SIGNED OUT - SAVED LOGIN COULD NOT BE REMOVED", 300);
+        else if (events & BROWSER_YOUTUBE_LOGIN_REJECTED)
             psp_ui_show_status(&app->process->presentation.ui,
                 "SIGNED OUT BY YOUTUBE", 300);
-        else psp_ui_show_status(&app->process->presentation.ui, removed
-            ? "SIGNED OUT" : "SIGNED OUT - SAVED LOGIN COULD NOT BE REMOVED",
-            removed ? 180 : 300);
+        else psp_ui_show_status(&app->process->presentation.ui, "SIGNED OUT", 180);
         changed = true;
     }
     if (events & BROWSER_YOUTUBE_LOGIN_VERIFIED) {

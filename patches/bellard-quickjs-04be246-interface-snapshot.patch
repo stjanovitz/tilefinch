@@ -98,17 +98,34 @@
      uint8_t extensible : 1;
      uint8_t free_mark : 1; /* only used when freeing objects with cycles */
      uint8_t platform_prototype : 1; /* a Web IDL interface prototype object */
-@@ -1320,7 +1377,14 @@
+@@ -1320,7 +1377,31 @@
      /* count the number of weak references to this object. The object
         structure is freed only if header.ref_count = 0 and
         weakref_count = 0 */
 -    uint32_t weakref_count; 
-+    uint32_t weakref_count : 30;
++    uint32_t weakref_count : 14;
++    /* Web IDL receiver checks: on an object, a platform layer
++       (JS_MarkPlatformLayer); on a function, a member a platform layer
++       held when it was marked. */
++    uint32_t platform_layer : 1;
++    /* Web IDL receiver checks: for an interface prototype object, its
++       interface's id (1 and up, JS_PLATFORM_INTERFACE_LIMIT at most); for
++       an interface member, the id of the interface whose instances it
++       accepts, or 0 for any platform object. 0 for any other object. */
++    uint32_t platform_interface : 10;
++    /* Web IDL: the fewest arguments a call of this function needs
++       (JS_SetRequiredArguments); 0 for any other function. */
++    uint32_t required_args : 4;
++    /* Web IDL: a promise-returning operation (JS_SetPromiseOperation),
++       whose failed receiver and argument checks reject instead of
++       throwing. */
++    uint32_t promise_operation : 1;
 +    /* Tilefinch interface snapshot: an interface object marked by
 +       JS_SnapshotInterfaces(); and one author code has changed since, whose
 +       properties as browser code still reads them are its twin's. They
-+       share the weak count's word: the two flag bytes above are full, and
-+       a third would grow every object by one JSValue alignment step. */
++       and the Web IDL fields share the weak count's word: the two flag
++       bytes above are full, and a third would grow every object by one
++       JSValue alignment step. */
 +    uint32_t snap_member : 1;
 +    uint32_t has_twin : 1;
      JSShape *shape; /* prototype and property names + flag */
@@ -124,7 +141,7 @@
              uint8_t cproto;
              int16_t magic;
          } cfunc;
-@@ -1389,6 +1456,10 @@
+@@ -1389,6 +1456,14 @@
          JSGlobalObject global_object;
      } u;
  };
@@ -132,6 +149,10 @@
 +/* Every page object pays for a field added here. */
 +_Static_assert(sizeof(JSObject) <= (sizeof(void *) == 4 ? 40 : 64),
 +               "JSObject grew");
++/* A weak reference count that reaches this stays there: the object's
++   structure is then kept for the runtime's lifetime. */
++#define JS_WEAKREF_COUNT_MAX ((1u << 14) - 1)
++#define JS_PLATFORM_INTERFACE_LIMIT ((1u << 10) - 1)
  
  typedef struct JSMapRecord {
      int ref_count; /* used during enumeration to avoid freeing the record */
@@ -2240,13 +2261,15 @@
      if (bc_get_u8(s, &v8))
          goto fail;
      bc.js_mode = v8;
-@@ -61089,6 +62864,8 @@
+@@ -61089,6 +62864,9 @@
  {
      if (JS_VALUE_GET_TAG(val) == JS_TAG_OBJECT) {
          JSObject *p = JS_VALUE_GET_OBJ(val);
-+        /* a 30-bit field: it shares its word with the snapshot's flags */
-+        assert(p->weakref_count < (1u << 30) - 1);
-         p->weakref_count++;
++        /* a 14-bit field: it shares its word with the Web IDL fields and
++           the snapshot's flags, and saturates (js_weakref_free) */
++        if (p->weakref_count < JS_WEAKREF_COUNT_MAX)
+-        p->weakref_count++;
++            p->weakref_count++;
      } else if (JS_VALUE_GET_TAG(val) == JS_TAG_SYMBOL) {
          JSString *p = JS_VALUE_GET_STRING(val);
 @@ -62692,6 +64469,7 @@

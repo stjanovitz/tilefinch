@@ -428,6 +428,54 @@ static int test_unwritable_index_still_opens(Budget *budget, const char *root)
     return 0;
 }
 
+static int test_unavailable_download_keeps_ready(Budget *budget, const char *root)
+{
+    char directory[200], final[400], held[440], video[400], error[256];
+    snprintf(directory, sizeof(directory), "%s/payload-stat", root);
+    OfflineLibrary library;
+    offline_library_init(&library, budget, directory);
+    uint32_t id = 0, video_id = 0;
+    CHECK(offline_library_load(&library)
+          && file_download_enqueue(&library, "https://files.test/report.pdf",
+                                   NULL, &id, error, sizeof(error))
+          && file_download_path(&library, id, final, sizeof(final))
+          && offline_library_enqueue_youtube(
+              &library, "https://www.youtube.com/watch?v=TFTEST00001", "Video",
+              &video_id, error, sizeof(error))
+          && offline_library_item_path(&library, video_id, ".video.mp4",
+                                       video, sizeof(video)));
+    OfflineLibraryItem *item = offline_library_find_mutable(&library, id);
+    item->state = OFFLINE_ITEM_READY;
+    item->content_bytes = item->downloaded_bytes = 5;
+    item = offline_library_find_mutable(&library, video_id);
+    item->state = OFFLINE_ITEM_READY;
+    item->content_bytes = item->downloaded_bytes = 5;
+    snprintf(held, sizeof(held), "%s.held", final);
+    /* A symlink loop returns ELOOP, not proof of absence. */
+    CHECK(offline_library_save(&library)
+          && write_whole(held, (const unsigned char *) "ready", 5)
+          && symlink(final, final) == 0 && symlink(video, video) == 0);
+    OfflineLibrary loaded;
+    offline_library_init(&loaded, budget, directory);
+    CHECK(offline_library_load(&loaded)
+          && offline_library_find(&loaded, id)->state == OFFLINE_ITEM_READY
+          && offline_library_find(&loaded, video_id)->state == OFFLINE_ITEM_READY
+          && offline_library_find(&loaded, video_id)->downloaded_bytes == 5);
+    CHECK(unlink(final) == 0 && rename(held, final) == 0
+          && unlink(video) == 0
+          && write_whole(video, (const unsigned char *) "ready", 5));
+    offline_library_init(&loaded, budget, directory);
+    CHECK(offline_library_load(&loaded)
+          && offline_library_find(&loaded, id)->state == OFFLINE_ITEM_READY
+          && offline_library_find(&loaded, video_id)->state == OFFLINE_ITEM_READY);
+    CHECK(unlink(final) == 0 && unlink(video) == 0);
+    offline_library_init(&loaded, budget, directory);
+    CHECK(offline_library_load(&loaded)
+          && offline_library_find(&loaded, id)->state == OFFLINE_ITEM_FAILED
+          && offline_library_find(&loaded, video_id)->state == OFFLINE_ITEM_FAILED);
+    return 0;
+}
+
 /* IS-09: a removed download whose published file outlives the index save
    (a power cut between the two) is finished by the next load. */
 static int test_removed_download_is_finished(Budget *budget, const char *root)
@@ -556,6 +604,7 @@ int main(void)
         || test_save_read_refusal_keeps_staged_index(&budget, p2_root) != 0
         || test_newer_index_is_left_alone(&budget, p2_root) != 0
         || test_unwritable_index_still_opens(&budget, p2_root) != 0
+        || test_unavailable_download_keeps_ready(&budget, p2_root) != 0
         || test_removed_download_is_finished(&budget, p2_root) != 0
         || test_icon_refill_keeps_listed_icons(&budget, p2_root) != 0)
         return 1;
@@ -566,7 +615,8 @@ int main(void)
         "<link rel=manifest href=/app.webmanifest>"
         "<nav>Do not save me</nav>"
         "<main><h1>Heading</h1><aside>Also do not save me</aside>"
-        "<p>One &amp; two.</p><script>hidden()</script><p>Three.</p></main>";
+        "<p>One &amp; two.</p><script>hidden()</script><p>Three.</p></main>"
+        "<section><p>Outside the Reader subtree</p></section>";
     CHECK(document_parse(&document, &budget, page, sizeof(page) - 1u, 4096));
     size_t manifest_href_length = 0;
     const char *manifest_href = document_web_app_manifest_href(
@@ -596,7 +646,8 @@ int main(void)
           && strstr(html, "One &amp; two") != NULL
           && strstr(html, "hidden()") == NULL
           && strstr(html, "Do not save me") == NULL
-          && strstr(html, "Also do not save me") == NULL);
+          && strstr(html, "Also do not save me") == NULL
+          && strstr(html, "Outside the Reader subtree") == NULL);
     CHECK(offline_library_find(&library, article_id)->saved_at_unix != 0);
     budget_free(&budget, html);
 
@@ -786,6 +837,14 @@ int main(void)
               article_backup, sizeof(article_backup)));
     (void) unlink(article_backup);
     CHECK(rename(article_path, article_backup) == 0);
+    CHECK(symlink(article_path, article_path) == 0
+          && !offline_library_save_article(
+              &loaded, &document, "https://example.test/article", NULL,
+              error, sizeof(error))
+          && strstr(error, "prior article could not be read") != NULL);
+    struct stat article_status;
+    CHECK(lstat(article_path, &article_status) == 0
+          && S_ISLNK(article_status.st_mode) && unlink(article_path) == 0);
     html = NULL;
     html_length = 0;
     CHECK(offline_library_read_article(

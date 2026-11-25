@@ -277,6 +277,9 @@ typedef struct {
     bool module_cors_validated;
     bool module_cors_redirect_origin_tainted;
     bool module_javascript_mime_validated;
+    /* The decoded_image_pixels copy is of an SVG with no natural size
+       (ImageResource.no_natural_size). Kept last, in the tail padding. */
+    bool decoded_image_no_natural_size;
 } BrowserCacheEntry;
 
 typedef enum {
@@ -1396,6 +1399,7 @@ typedef struct {
     int source_height;
     int width;
     int height;
+    bool no_natural_size;
 } BrowserDecodedImage;
 /* Acquires a decoded target only from the exact partition-authorized image
    response supplied by source/source_length. The returned lease must be
@@ -1420,7 +1424,7 @@ bool browser_session_decoded_image_put(
     const TilefinchRequestContext *request_context,
     const unsigned char *source, size_t source_length,
     BrowserSharedBody *pixels, int source_width, int source_height,
-    int width, int height);
+    int width, int height, bool no_natural_size);
 bool browser_session_cache_put_http_shared(
     BrowserSession *session, const char *url, BrowserSharedBody *body,
     const char *etag, const char *last_modified, const char *content_type,
@@ -1492,6 +1496,10 @@ size_t browser_session_cache_reclaim(BrowserSession *session,
    browser_session_cache_release_script_bodies() could release now. */
 size_t browser_session_admission_reclaimable_bytes(
     const BrowserSession *session);
+/* At most what browser_session_cache_reclaim() could free now: the parts
+   of cached responses no one else holds, compiled scripts and site-adapter
+   documents (SIZE_MAX while a deferred app's bytecode is cached). */
+size_t browser_session_cache_reclaimable_bytes(const BrowserSession *session);
 size_t browser_session_cache_release_script_bodies(BrowserSession *session,
                                                    size_t target_bytes);
 /* Evicts older HTTP entries until a bounded working set can be inserted

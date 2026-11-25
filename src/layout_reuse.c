@@ -12,6 +12,19 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef TILEFINCH_NO_TRACE
+#include "layout_reuse_verify.inc"
+#endif
+
+static void layout_reuse_parser_release(LayoutReuseCache *cache);
+static void layout_reuse_parser_retire(LayoutReuseCache *cache,
+                                       const lxb_dom_node_t *root);
+static void layout_reuse_parser_advance(LayoutReuseCache *cache,
+                                        bool keeps_styles);
+static void layout_reuse_parser_settle_for_read(LayoutReuseCache *cache,
+                                                const Stylesheet *sheet,
+                                                const FontSet *fonts);
+
 void layout_reuse_clear_counters(LayoutReuseCache *cache)
 {
     if (cache == NULL) return;
@@ -34,7 +47,17 @@ static uint64_t layout_style_parent_hash(const ComputedStyle *style)
     size_t length = style == NULL ? 0 : sizeof(*style);
     while (length >= sizeof(uint32_t)) {
         uint32_t word = 0;
+#if defined(__GNUC__) || defined(__clang__)
+        /* A style starts word-aligned and we advance one word at a time.
+           Keep the alias-safe native-endian load inline: the size-optimized
+           PSP build otherwise calls libc once per four bytes of style. */
+        _Static_assert(_Alignof(ComputedStyle) >= _Alignof(uint32_t),
+                       "style words must be aligned");
+        __builtin_memcpy(&word, __builtin_assume_aligned(bytes, _Alignof(uint32_t)),
+                         sizeof(word));
+#else
         memcpy(&word, bytes, sizeof(word));
+#endif
         low = (low ^ word) * UINT32_C(16777619);
         high = (high ^ (word + UINT32_C(0x9e3779b9)))
                * UINT32_C(2246822519);
@@ -77,11 +100,15 @@ static void layout_reuse_release_payload(LayoutReuseCache *cache,
     cache->style_payload_free = (uint16_t) (index + 1u);
 }
 
+static int layout_key_compare(const void *left, const void *right);
+
 static void layout_reuse_drop_style(LayoutReuseCache *cache,
                                      LayoutReuseStyleEntry *entry)
 {
-    if (entry->node != NULL)
+    if (entry->node != NULL) {
+        layout_reuse_proof_note_drop(cache, entry);
         layout_reuse_release_payload(cache, entry->payload);
+    }
     memset(entry, 0, sizeof(*entry));
 }
 
@@ -160,11 +187,14 @@ static void layout_reuse_clear_styles(LayoutReuseCache *cache)
     cache->style_payload_count = 0;
     cache->style_payload_free = 0;
     cache->style_payload_refused = false;
+    /* Held rows' payloads are gone with the rest. */
+    cache->proof_held_count = 0;
 }
 
 static void layout_reuse_clear_entries(LayoutReuseCache *cache)
 {
     if (cache == NULL) return;
+    cache->epoch++;
     layout_reuse_clear_counters(cache);
     layout_reuse_clear_styles(cache);
     style_retained_matches_clear(cache->matches);
@@ -214,6 +244,9 @@ void layout_reuse_container_state_changed(LayoutReuseCache *cache)
 
 LayoutReuseCache *layout_reuse_cache_create(Budget *budget)
 {
+    /* Each cache's epochs start in a range of their own, so a cache
+       allocated where a destroyed one lived never repeats its epoch. */
+    static uint32_t created;
     if (budget == NULL) return NULL;
     LayoutReuseCache *cache = budget_calloc(budget, 1, sizeof(*cache));
     if (cache == NULL) return NULL;
@@ -226,6 +259,7 @@ LayoutReuseCache *layout_reuse_cache_create(Budget *budget)
     cache->budget = budget;
     cache->style_mask = LAYOUT_REUSE_STYLE_CAPACITY - 1u;
     cache->structure_entries = UINT64_MAX;
+    cache->epoch = (uint64_t) ++created << 32;
     cache->stats.retained_bytes = sizeof(*cache)
         + LAYOUT_REUSE_STYLE_CAPACITY * sizeof(*cache->styles);
     return cache;
@@ -300,13 +334,18 @@ size_t layout_reuse_cache_reclaim_styles(LayoutReuseCache *cache)
     /* Run measurements are as optional as resolved values, and resume
        with them. */
     released += layout_text_measure_release(cache);
+    released += layout_bidi_forget_absence(cache);
     return released;
 }
 
 void layout_reuse_cache_destroy(LayoutReuseCache *cache)
 {
     if (cache == NULL) return;
+#ifndef TILEFINCH_NO_TRACE
+    layout_verify_summary();
+#endif
     Budget *budget = cache->budget;
+    (void) layout_bidi_forget_absence(cache);
     layout_reuse_clear_counters(cache);
     if (cache->table_rows != NULL) {
         budget_free(budget, cache->table_rows);
@@ -319,6 +358,7 @@ void layout_reuse_cache_destroy(LayoutReuseCache *cache)
     budget_free(budget, cache->identity_names);
     budget_free(budget, cache->structural_rules);
     (void) layout_text_measure_release(cache);
+    layout_reuse_parser_release(cache);
     memset(cache, 0, sizeof(*cache));
     budget_free(budget, cache);
 }
@@ -326,6 +366,7 @@ void layout_reuse_cache_destroy(LayoutReuseCache *cache)
 void layout_reuse_cache_reset(LayoutReuseCache *cache)
 {
     if (cache == NULL) return;
+    (void) layout_bidi_forget_absence(cache);
     layout_reuse_clear_entries(cache);
     cache->sheet = NULL;
     cache->sheet_generation = 0;
@@ -355,8 +396,17 @@ static bool layout_reuse_empty_reaches_siblings(
 
 void layout_reuse_cache_enable_retained_matches(LayoutReuseCache *cache)
 {
-    if (cache != NULL) cache->matches_enabled = true;
+    if (cache == NULL) return;
+    cache->matches_enabled = true;
+    cache->streaming_preview = false;
 }
+
+#ifndef TILEFINCH_NO_TRACE
+void layout_reuse_cache_mark_streaming_preview(LayoutReuseCache *cache)
+{
+    if (cache != NULL) cache->streaming_preview = true;
+}
+#endif
 
 void layout_reuse_cache_record_unresolved_visuals(LayoutReuseCache *cache,
                                                   bool record)
@@ -366,6 +416,11 @@ void layout_reuse_cache_record_unresolved_visuals(LayoutReuseCache *cache,
 
 static void layout_reuse_drop_styles_within(LayoutReuseCache *cache,
                                             lxb_dom_node_t *scope);
+
+void layout_reuse_cache_set_extending(LayoutReuseCache *cache, bool extending)
+{
+    if (cache != NULL) cache->extending = extending;
+}
 
 static void layout_reuse_note_stylesheet_appended(
     LayoutReuseCache *cache, const Stylesheet *sheet, const uint16_t *remap,
@@ -456,6 +511,20 @@ void layout_reuse_cache_drop_styles_within(LayoutReuseCache *cache,
     }
     for (size_t i = 0; i < count; i++)
         if (roots[i] != NULL) layout_reuse_drop_styles_within(cache, roots[i]);
+}
+
+void layout_reuse_cache_drop_styles_carrying(LayoutReuseCache *cache,
+                                             uint32_t *keys, size_t count)
+{
+    if (cache == NULL || count == 0) return;
+    qsort(keys, count, sizeof(*keys), layout_key_compare);
+    for (size_t i = 0; i <= cache->style_mask; i++) {
+        LayoutReuseStyleEntry *entry = &cache->styles[i];
+        if (entry->node != NULL
+            && entry->node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && style_element_carries_any_key(entry->node, keys, count))
+            layout_reuse_drop_style(cache, entry);
+    }
 }
 
 void layout_reuse_cache_begin_font_publication(LayoutReuseCache *cache)
@@ -686,6 +755,12 @@ void layout_reuse_cache_rebind_stylesheet(
        current generation here can silently bless stale entries when the
        source sheet was rebuilt between preview and adoption. */
     cache->sheet = replacement;
+    cache->epoch++;
+}
+
+uint64_t layout_reuse_cache_epoch(const LayoutReuseCache *cache)
+{
+    return cache == NULL ? 0 : cache->epoch;
 }
 
 /* One element's own cached styles and lists; its descendants re-key off
@@ -746,34 +821,95 @@ static void layout_reuse_drop_subtree(LayoutReuseCache *cache,
 
 #define LAYOUT_REUSE_SHALLOW_CHILD_LIMIT 512u
 
-/* Whether a change to `parent`'s child list can restyle descendants of
-   its children (LayoutReuseCache.structure): a current child, or the one
-   that left (`removed`, NULL when unknown), carries a key of a sibling
-   test that reaches descendants. */
-static bool layout_reuse_structure_deep(const LayoutReuseCache *cache,
-                                        const lxb_dom_node_t *parent,
-                                        const lxb_dom_node_t *removed,
-                                        bool removed_unknown)
+/* What a change to `parent`'s child list can restyle below its children
+   (LayoutReuseCache.structure): nothing, the elements carrying one of
+   `subjects` (the selectors whose sibling test a current child, or the one
+   that left, `removed`, NULL when unknown, can concern), or, `whole`, the
+   entire subtree. */
+typedef struct {
+    bool whole;
+    size_t count;
+    uint32_t subjects[STYLE_STRUCTURE_KEY_LIMIT];
+} LayoutStructureReach;
+
+static void layout_structure_reach_add(LayoutStructureReach *reach,
+                                       uint32_t subject)
+{
+    if (subject == 0) {
+        reach->whole = true;
+        return;
+    }
+    for (size_t i = 0; i < reach->count; i++)
+        if (reach->subjects[i] == subject) return;
+    reach->subjects[reach->count++] = subject;
+}
+
+static bool layout_reuse_structure_reach(const LayoutReuseCache *cache,
+                                         const lxb_dom_node_t *parent,
+                                         const lxb_dom_node_t *removed,
+                                         bool removed_unknown,
+                                         LayoutStructureReach *reach)
 {
     const StyleStructureKeys *keys = &cache->structure;
+    reach->whole = false;
+    reach->count = 0;
     if (!keys->reaches) return false;
-    if (keys->any) return true;
-    for (size_t i = 0; i < keys->count; i++) {
+    if (keys->any) {
+        reach->whole = true;
+        return true;
+    }
+    bool matched[STYLE_STRUCTURE_KEY_LIMIT] = {false};
+    for (size_t i = 0; i < keys->count && !reach->whole; i++) {
         if (!keys->predecessor[i]) continue;
         if (removed_unknown
-            || style_element_carries_key(removed, keys->keys[i]))
-            return true;
-    }
-    size_t children = 0;
-    for (const lxb_dom_node_t *child = parent->first_child; child != NULL;
-         child = child->next) {
-        if (child->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
-        if (++children > LAYOUT_REUSE_SHALLOW_CHILD_LIMIT) return true;
-        for (size_t i = 0; i < keys->count; i++) {
-            if (style_element_carries_key(child, keys->keys[i])) return true;
+            || style_element_carries_key(removed, keys->keys[i])) {
+            matched[i] = true;
+            layout_structure_reach_add(reach, keys->subjects[i]);
         }
     }
-    return false;
+    size_t children = 0;
+    for (const lxb_dom_node_t *child = parent->first_child;
+         child != NULL && !reach->whole; child = child->next) {
+        if (child->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
+        if (++children > LAYOUT_REUSE_SHALLOW_CHILD_LIMIT) {
+            reach->whole = true;
+            break;
+        }
+        /* One pass over the child's own keys first: most children carry
+           none of these. */
+        if (!style_element_carries_any_key_unsorted(child, keys->keys,
+                                                    keys->count)) continue;
+        for (size_t i = 0; i < keys->count && !reach->whole; i++) {
+            if (matched[i]
+                || !style_element_carries_key(child, keys->keys[i]))
+                continue;
+            matched[i] = true;
+            layout_structure_reach_add(reach, keys->subjects[i]);
+        }
+    }
+    return reach->whole || reach->count != 0;
+}
+
+/* Below `scope` (not itself), every cached style of an element carrying
+   one of `reach`'s subject keys: the only ones its selectors can restyle;
+   the rest re-key off their parents' styles. */
+static void layout_reuse_drop_subjects_within(
+    LayoutReuseCache *cache, lxb_dom_node_t *scope,
+    const LayoutStructureReach *reach, bool include_matches)
+{
+    lxb_dom_node_t *at = scope->first_child;
+    while (at != NULL) {
+        if (at->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && style_element_carries_any_key_unsorted(at, reach->subjects,
+                                                      reach->count))
+            layout_reuse_drop_element(cache, at, include_matches);
+        if (at->first_child != NULL) {
+            at = at->first_child;
+            continue;
+        }
+        while (at != scope && at->next == NULL) at = at->parent;
+        at = at == scope ? NULL : at->next;
+    }
 }
 
 /* `parent`'s children changed: `changed` is a child inserted or moved in
@@ -898,11 +1034,13 @@ static void layout_reuse_invalidate_child_list(
        structural test in the sheet, every sibling does. */
     bool elements = !appended && cache->selector_has_structure
         && (changed == NULL || changed->type == LXB_DOM_NODE_TYPE_ELEMENT);
+    LayoutStructureReach reach = {0};
     if (parent->parent != NULL
         && layout_reuse_empty_reaches_siblings(cache, parent)) {
         layout_reuse_drop_subtree(cache, parent->parent, include_matches);
-    } else if (elements && layout_reuse_structure_deep(
-                   cache, parent, removed, removed_unknown)) {
+    } else if (elements && layout_reuse_structure_reach(
+                   cache, parent, removed, removed_unknown, &reach)
+               && reach.whole) {
         layout_reuse_drop_subtree(cache, parent, include_matches);
     } else {
         layout_reuse_drop_element(cache, parent, include_matches);
@@ -919,6 +1057,9 @@ static void layout_reuse_invalidate_child_list(
         layout_reuse_drop_structural_readers(cache, parent);
         if (changed != NULL && changed->type == LXB_DOM_NODE_TYPE_ELEMENT)
             layout_reuse_drop_subtree(cache, changed, include_matches);
+        if (reach.count != 0)
+            layout_reuse_drop_subjects_within(cache, parent, &reach,
+                                              include_matches);
     }
     layout_reuse_cache_invalidate_measurements(cache, parent);
 }
@@ -937,11 +1078,14 @@ static void layout_reuse_invalidate_scoped_internal(
     lxb_dom_node_t *style_scope = node;
     if ((text_or_structure_sensitive || cache->selector_has_structure)
         && node->parent != NULL) style_scope = node->parent;
+    LayoutStructureReach reach = {0};
     if (!text_or_structure_sensitive && style_scope != node
         && style_scope->type == LXB_DOM_NODE_TYPE_ELEMENT
-        && !layout_reuse_structure_deep(cache, style_scope, NULL, false)) {
+        && !(layout_reuse_structure_reach(cache, style_scope, NULL, false,
+                                          &reach) && reach.whole)) {
         /* An attribute read by sibling tests restyles the siblings, and
-           the node's own subtree. */
+           the node's own subtree (and, through a sibling test reaching
+           descendants, its selectors' subjects). */
         layout_reuse_drop_subtree(cache, node, include_matches);
         size_t children = 0;
         for (lxb_dom_node_t *child = style_scope->first_child;
@@ -956,6 +1100,9 @@ static void layout_reuse_invalidate_scoped_internal(
         }
         layout_reuse_drop_element(cache, style_scope, include_matches);
         layout_reuse_drop_structural_readers(cache, style_scope);
+        if (reach.count != 0)
+            layout_reuse_drop_subjects_within(cache, style_scope, &reach,
+                                              include_matches);
     } else {
         layout_reuse_drop_subtree(cache, style_scope, include_matches);
     }
@@ -995,6 +1142,18 @@ void layout_reuse_cache_invalidate_measurements(
     }
     layout_reuse_clear_counters(cache);
     layout_reuse_drop_measurements(cache, node);
+    cache->stats.scoped_invalidations++;
+}
+
+void layout_reuse_cache_invalidate_detached(LayoutReuseCache *cache,
+                                            lxb_dom_node_t *root)
+{
+    if (cache == NULL || root == NULL) {
+        layout_reuse_cache_reset(cache);
+        return;
+    }
+    layout_reuse_drop_subtree(cache, root, true);
+    layout_reuse_drop_measurements(cache, root);
     cache->stats.scoped_invalidations++;
 }
 
@@ -1556,10 +1715,16 @@ bool layout_reuse_cache_node_retirement(const LayoutReuseCache *cache)
     return cache != NULL && cache->node_retirement;
 }
 
+static bool layout_reuse_proof_hold(LayoutReuseCache *cache,
+                                    const LayoutReuseStyleEntry *entry);
+static void layout_reuse_proof_unhold(LayoutReuseCache *cache,
+                                      const lxb_dom_node_t *node);
+
 void layout_reuse_cache_retire_subtree(LayoutReuseCache *cache,
                                        const lxb_dom_node_t *root)
 {
     if (cache == NULL || root == NULL) return;
+    layout_reuse_parser_retire(cache, root);
     /* Computed-style reads also retain text/comment nodes. Retire every
        node kind before destruction, including single textContent children. */
     lxb_dom_node_t *scope = (lxb_dom_node_t *) root;
@@ -1587,6 +1752,9 @@ void layout_reuse_cache_retire_subtree(LayoutReuseCache *cache,
             memset(entry, 0, sizeof(*entry));
         }
     }
+    for (size_t i = cache->proof_held_count; i-- > 0;)
+        if (layout_node_is_within(cache->proof_held[i].node, scope))
+            layout_reuse_proof_unhold(cache, cache->proof_held[i].node);
     style_retained_matches_forget_subtree(cache->matches, scope);
     style_has_pending_retire(&cache->has_pending, scope);
     /* A pending token invalidation must not name a node about to die. */
@@ -1679,17 +1847,60 @@ void layout_reuse_cache_invalidate_node(LayoutReuseCache *cache,
 /* Longer journal names may be truncated prefixes (and coalesce). */
 #define LAYOUT_REUSE_PROPERTY_NAME_LIMIT 31u
 
+/* Element kinds for the attributes below. */
+enum {
+    LAYOUT_KIND_CONTROL = 1u,  /* form controls, their containers, labels */
+    LAYOUT_KIND_LIST = 2u,
+    LAYOUT_KIND_TABLE = 4u,
+    LAYOUT_KIND_LINK = 8u,     /* a, area, link, base */
+    LAYOUT_KIND_EMBED = 16u,   /* frames, objects, media, map, slot, meta,
+                                  script, style */
+    LAYOUT_KIND_ANY = 0xffu
+};
+
+static unsigned layout_element_kind(const lxb_dom_node_t *node)
+{
+    switch (node->local_name) {
+    case LXB_TAG_INPUT: case LXB_TAG_BUTTON: case LXB_TAG_SELECT:
+    case LXB_TAG_TEXTAREA: case LXB_TAG_OPTION: case LXB_TAG_OPTGROUP:
+    case LXB_TAG_FIELDSET: case LXB_TAG_LEGEND: case LXB_TAG_FORM:
+    case LXB_TAG_LABEL: case LXB_TAG_OUTPUT: case LXB_TAG_METER:
+    case LXB_TAG_PROGRESS: case LXB_TAG_DATALIST: case LXB_TAG_DATA:
+        return LAYOUT_KIND_CONTROL;
+    case LXB_TAG_OL: case LXB_TAG_UL: case LXB_TAG_MENU: case LXB_TAG_LI:
+        return LAYOUT_KIND_LIST;
+    case LXB_TAG_TABLE: case LXB_TAG_CAPTION: case LXB_TAG_COLGROUP:
+    case LXB_TAG_COL: case LXB_TAG_TBODY: case LXB_TAG_THEAD:
+    case LXB_TAG_TFOOT: case LXB_TAG_TR: case LXB_TAG_TD: case LXB_TAG_TH:
+        return LAYOUT_KIND_TABLE;
+    case LXB_TAG_A: case LXB_TAG_AREA: case LXB_TAG_LINK: case LXB_TAG_BASE:
+        return LAYOUT_KIND_LINK;
+    case LXB_TAG_IFRAME: case LXB_TAG_FRAME: case LXB_TAG_OBJECT:
+    case LXB_TAG_EMBED: case LXB_TAG_PARAM: case LXB_TAG_IMG:
+    case LXB_TAG_MAP: case LXB_TAG_SLOT: case LXB_TAG_META:
+    case LXB_TAG_AUDIO: case LXB_TAG_VIDEO: case LXB_TAG_SOURCE:
+    case LXB_TAG_SCRIPT: case LXB_TAG_STYLE:
+        return LAYOUT_KIND_EMBED;
+    default:
+        return 0;
+    }
+}
+
 /* Attributes the style resolver or a pseudo-class reads without an
    attribute selector naming them, which a selector can then read on
    elements other than its subject (`input:checked + label`), or which the
    resolver reads on other elements: form-control state and validity
    (fieldset/optgroup/select disabling, option display, :checked,
-   :required, :read-only, :placeholder-shown, :default, :in-range...),
-   links, popovers and dialogs, direction and language, a details
-   element's open state (its children), table presentation (cells read
-   the table), and the navigation roles and ARIA states a custom element's
-   fallbacks look up. */
-static bool layout_attribute_reaches_other_elements(const char *name)
+   :required), list numbering (li value, ol start), links, popovers and
+   dialogs (:open reads any element's open), direction and language, a
+   details element's open state (its children), table presentation (cells
+   read the table, the table reads its cells' spans), and the navigation
+   roles and ARIA states a custom element's fallbacks look up. Each holds
+   only on the element kinds `kinds` names: on any other element the
+   attribute is visible to selectors that name it and to its own cascade,
+   like any other attribute. */
+static bool layout_attribute_reaches_other_elements(const lxb_dom_node_t *node,
+                                                    const char *name)
 {
     static const char *const names[] = {
         "disabled", "multiple", "selected", "dir", "lang", "open", "role",
@@ -1702,9 +1913,41 @@ static bool layout_attribute_reaches_other_elements(const char *name)
         "aria-disabled", "aria-current", "aria-pressed", "for", "list",
         "size", "span", "colspan", "rowspan", "start", "reversed",
     };
+#define C LAYOUT_KIND_CONTROL
+#define L LAYOUT_KIND_LIST
+#define T LAYOUT_KIND_TABLE
+#define H LAYOUT_KIND_LINK
+#define E LAYOUT_KIND_EMBED
+#define ANY LAYOUT_KIND_ANY
+    static const unsigned char kinds[sizeof(names) / sizeof(names[0])] = {
+        C | H | E, C, C, ANY, ANY, ANY, ANY,
+        ANY, ANY, ANY, ANY, ANY, ANY,
+        ANY, ANY, ANY, C, C,
+        C, C, C | L | E, C | L | H | E, C | H | E, C, C,
+        C, C, C, C, C, H,
+        ANY, ANY, ANY, ANY, E,
+        ANY, ANY, ANY, ANY,
+        ANY, ANY, ANY, C, C,
+        C, T, T, T, L, L,
+    };
+#undef ANY
+#undef E
+#undef H
+#undef T
+#undef L
+#undef C
     if (strncmp(name, "data-tilefinch", 14) == 0) return true;
+    unsigned kind = LAYOUT_KIND_ANY;
+#ifndef TILEFINCH_NO_TRACE
+    static int by_kind = -1;
+    if (by_kind < 0)
+        by_kind = getenv("TILEFINCH_DISABLE_ATTRIBUTE_REACH_BY_KIND") == NULL;
+    if (by_kind)
+#endif
+    kind = layout_element_kind(node);
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
-        if (strcmp(name, names[i]) == 0) return true;
+        if (strcmp(name, names[i]) == 0)
+            return kinds[i] == LAYOUT_KIND_ANY || (kinds[i] & kind) != 0;
     }
     return false;
 }
@@ -1725,7 +1968,7 @@ void layout_reuse_cache_invalidate_own_attribute(
     if (length == 0 || length >= LAYOUT_REUSE_PROPERTY_NAME_LIMIT
         || strcmp(attribute, "class") == 0 || strcmp(attribute, "id") == 0
         || strcmp(attribute, "style") == 0 || cache->sheet == NULL
-        || layout_attribute_reaches_other_elements(attribute)) {
+        || layout_attribute_reaches_other_elements(node, attribute)) {
         layout_reuse_cache_invalidate_node_scoped(cache, node, false);
         return;
     }
@@ -2124,11 +2367,8 @@ static bool layout_reuse_empty_reaches_siblings(
 {
     if (!cache->selector_has_empty || element == NULL) return false;
     if (cache->empty_any) return true;
-    for (size_t i = 0; i < cache->empty_key_count; i++) {
-        if (style_element_carries_key(element, cache->empty_keys[i]))
-            return true;
-    }
-    return false;
+    return style_element_carries_any_key_unsorted(
+        element, cache->empty_keys, cache->empty_key_count);
 }
 
 
@@ -2407,14 +2647,29 @@ static void layout_hidden_facts_scan(const Stylesheet *sheet,
     memset(trailing, 0, sizeof(*trailing));
     memset(has_arguments, 0, sizeof(*has_arguments));
     size_t count = sheet->count + sheet->custom_rule_count;
+    /* The facts each rule keeps (filled here once per rule): only the
+       selectors these scans read are read again. */
+    Stylesheet *rules = (Stylesheet *) sheet;
     for (size_t i = 0; i < count; i++) {
-        const char *selector = i < sheet->count
-            ? sheet->rules[i].selector
-            : sheet->custom_rules[i - sheet->count].selector;
-        if (selector == NULL || strchr(selector, ':') == NULL) continue;
+        const char *selector;
+        uint8_t facts;
+        if (i < sheet->count) {
+            selector = sheet->rules[i].selector;
+            facts = style_rule_selector_facts(&rules->rules[i]);
+        } else {
+            StyleCustomRule *rule = &rules->custom_rules[i - sheet->count];
+            selector = rule->selector;
+            if (i != sheet->count) style_custom_rule_facts_from(rule, rule - 1);
+            facts = style_custom_rule_selector_facts(rule);
+        }
+        if (selector == NULL
+            || (facts & (STYLE_SELECTOR_FACTS_TRAILING
+                         | STYLE_SELECTOR_FACTS_HAS_ANY_CASE)) == 0) continue;
         size_t length = strlen(selector);
-        style_selector_trailing_keys(selector, length, trailing);
-        style_selector_has_argument_keys(selector, length, has_arguments);
+        if ((facts & STYLE_SELECTOR_FACTS_TRAILING) != 0)
+            style_selector_trailing_keys(selector, length, trailing);
+        if ((facts & STYLE_SELECTOR_FACTS_HAS_ANY_CASE) != 0)
+            style_selector_has_argument_keys(selector, length, has_arguments);
     }
 }
 
@@ -2455,6 +2710,18 @@ static bool layout_sheet_facts(LayoutReuseCache *cache,
 }
 
 /* Whether an element sibling after `node` existed before this turn. */
+/* style_trailing_keys_reach_* for one of several siblings under `parent`:
+   the parent half is asked once (`*ancestors` starts at -1). */
+static bool layout_trailing_reach(const StyleTrailingKeys *keys,
+                                  const lxb_dom_node_t *sibling,
+                                  const lxb_dom_node_t *parent,
+                                  int *ancestors)
+{
+    if (*ancestors < 0)
+        *ancestors = style_trailing_keys_reach_parent(keys, parent) ? 1 : 0;
+    return *ancestors != 0 || style_trailing_keys_reach_sibling(keys, sibling);
+}
+
 static bool layout_later_sibling_existed(
     const lxb_dom_node_t *node,
     bool (*is_new)(void *context, const lxb_dom_node_t *node),
@@ -2488,12 +2755,14 @@ bool layout_insertion_reaches_siblings(
     /* Earlier siblings keep their indices from the start; only tests
        counting from the end can see the new last sibling. */
     size_t siblings = 0;
+    int ancestors = -1;
     for (const lxb_dom_node_t *earlier = node->prev; earlier != NULL;
          earlier = earlier->prev) {
         if (earlier->type != LXB_DOM_NODE_TYPE_ELEMENT
             || is_new(context, earlier)) continue;
         if (++siblings > LAYOUT_REUSE_SHALLOW_CHILD_LIMIT
-            || style_trailing_keys_reach(facts.trailing, earlier, parent))
+            || layout_trailing_reach(facts.trailing, earlier, parent,
+                                     &ancestors))
             return true;
     }
     return false;
@@ -2511,12 +2780,14 @@ void layout_reuse_cache_invalidate_removed_last(LayoutReuseCache *cache,
     bool kept = cache != NULL && parent != NULL
         && layout_sheet_facts(cache, sheet, &facts);
     size_t siblings = 0;
+    int ancestors = -1;
     for (lxb_dom_node_t *child = kept && facts.structure
              ? parent->first_child : NULL;
          child != NULL; child = child->next) {
         if (child->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
         if (++siblings > LAYOUT_REUSE_SHALLOW_CHILD_LIMIT
-            || style_trailing_keys_reach(facts.trailing, child, parent)) {
+            || layout_trailing_reach(facts.trailing, child, parent,
+                                     &ancestors)) {
             kept = false;
             break;
         }
@@ -2574,6 +2845,8 @@ bool layout_tree_change_has_inert(
         entries, serial);
 }
 
+#include "layout_reuse_parser.inc"
+
 void layout_reuse_cache_expect_elements(LayoutReuseCache *cache,
                                         size_t elements)
 {
@@ -2589,6 +2862,9 @@ void layout_reuse_cache_prepare(LayoutReuseCache *cache,
                                 int viewport_width)
 {
     if (cache == NULL) return;
+#ifndef TILEFINCH_NO_TRACE
+    layout_verify_summary();
+#endif
     layout_reuse_cache_flush_invalidations(cache);
     if (cache->style_pressure_trimmed
         && !budget_pressure_required(cache->budget,
@@ -2624,6 +2900,14 @@ void layout_reuse_cache_prepare(LayoutReuseCache *cache,
 #endif
         cache->matches = style_retained_matches_create(cache->budget);
     }
+    /* What a parse still running added since the last build. A :has()
+       note it cannot bound resets the cache, which the test below then
+       sees. */
+    layout_reuse_parser_advance(
+        cache, cache->sheet == sheet
+                   && cache->sheet_generation == sheet_generation
+                   && cache->fonts == fonts
+                   && cache->viewport_width == viewport_width);
     if (cache->sheet == sheet
         && cache->sheet_generation == sheet_generation
         && cache->fonts == fonts
@@ -2710,7 +2994,9 @@ static void layout_reuse_style_put_hashed(LayoutReuseCache *cache,
                                           bool container_dependent,
                                           uint64_t variable_reads)
 {
-    if (cache == NULL || node == NULL || style == NULL) return;
+    /* An open geometry proof keeps the entries as the proof found them. */
+    if (cache == NULL || node == NULL || style == NULL || cache->proof_active)
+        return;
     size_t home = layout_pointer_hash(node)
                   & cache->style_mask;
     size_t replacement = home;
@@ -2727,18 +3013,47 @@ static void layout_reuse_style_put_hashed(LayoutReuseCache *cache,
             replacement = slot;
         }
     }
-    if (cache->styles[replacement].node != NULL
-        && cache->styles[replacement].node != node) {
-        if (cache->font_publication_active) return;
+    LayoutReuseStyleEntry *old = &cache->styles[replacement];
+    /* Whether the build under way (or the last one) resolved it. */
+    bool used = old->stamp > cache->style_build_clock;
+    if (old->node != NULL && old->node != node) {
+        if (cache->font_publication_active) {
+            cache->proof_build_lost = true;
+            cache->proof_coverage = 0;
+            return;
+        }
         /* At the hard ceiling, a document-order scan must not evict the
            entries it has just used. A cyclic walk larger than this table
            otherwise loses almost every hit on every subsequent build.
            Decline optional admission; the freshly resolved style remains
            authoritative in the current build. Old, unused entries can
            still be replaced, and existing-node updates remain allowed. */
-        if (cache->style_mask + 1u == LAYOUT_REUSE_STYLE_CAPACITY_LIMIT
-            && cache->styles[replacement].stamp > cache->style_build_clock)
-            return;
+        bool decline = cache->style_mask + 1u
+                == LAYOUT_REUSE_STYLE_CAPACITY_LIMIT && used;
+        /* Either way the build's layout uses a style the table does not
+           keep: geometry proofs hold it apart, or lose coverage. */
+        bool held = cache->proof_building && !decline
+            && (!used || layout_reuse_proof_hold(cache, old));
+        if (decline) {
+            uint16_t payload = 0;
+            held = cache->proof_building
+                && layout_reuse_share_payload(cache, style, &payload);
+            if (held) {
+                LayoutReuseStyleEntry entry = {
+                    .node = node, .parent_hash = parent_hash,
+                    .payload = payload, .variable_reads = variable_reads,
+                    .dependent = font_dependent
+                        ? LAYOUT_REUSE_FONT_DEPENDENT : 0u
+                };
+                held = layout_reuse_proof_hold(cache, &entry);
+                layout_reuse_release_payload(cache, payload);
+            }
+        }
+        if (used && !held) {
+            cache->proof_build_lost = true;
+            cache->proof_coverage = 0;
+        }
+        if (decline) return;
         cache->style_shortfall++;
 #ifndef TILEFINCH_NO_TRACE
         cache->stats.style_evictions++;
@@ -2748,9 +3063,20 @@ static void layout_reuse_style_put_hashed(LayoutReuseCache *cache,
        its payload. Refused, the slot would describe the wrong values. */
     uint16_t payload = 0;
     bool shared = layout_reuse_share_payload(cache, style, &payload);
-    if (cache->styles[replacement].node != NULL)
-        layout_reuse_drop_style(cache, &cache->styles[replacement]);
-    if (!shared) return;
+    if (old->node != NULL) {
+        /* Re-resolved to the very values it held, or another element's
+           entry (held above when the layout used it): nothing is lost. */
+        cache->proof_quiet = old->node != node
+            || (shared && old->payload == payload);
+        layout_reuse_drop_style(cache, old);
+        cache->proof_quiet = false;
+    }
+    if (!shared) {
+        cache->proof_build_lost = true;
+        cache->proof_coverage = 0;
+        return;
+    }
+    if (cache->proof_held_count != 0) layout_reuse_proof_unhold(cache, node);
     size_t inline_length = 0;
     const char *inline_style = document_attribute(node, "style",
                                                   &inline_length);
@@ -2863,12 +3189,23 @@ void layout_reuse_note_pseudo(LayoutReuseCache *cache,
                               const ComputedStyle *parent,
                               const ComputedStyle *result)
 {
-    if (cache == NULL || sheet == NULL || cache->sheet != sheet
-        || node == NULL || parent == NULL || pseudo == PSEUDO_NONE) return;
+    if (cache == NULL || node == NULL || parent == NULL
+        || pseudo == PSEUDO_NONE) return;
+    if (sheet == NULL || cache->sheet != sheet) {
+        if (cache->proof_building) cache->proof_build_lost = true;
+        return;
+    }
     LayoutReuseStyleEntry *entry = layout_reuse_entry_for(cache, node);
-    if (entry == NULL
-        || memcmp(&layout_reuse_payload(cache, entry->payload)->style,
-                  parent, sizeof(*parent)) != 0)
+    for (size_t i = 0; entry == NULL && i < cache->proof_held_count; i++)
+        if (cache->proof_held[i].node == node) entry = &cache->proof_held[i];
+    if (entry == NULL) {
+        /* The layout read a pseudo-element no entry describes. */
+        if (cache->proof_building) cache->proof_build_lost = true;
+        return;
+    }
+    entry->pseudo_resolved |= (uint8_t) (1u << pseudo);
+    if (memcmp(&layout_reuse_payload(cache, entry->payload)->style,
+               parent, sizeof(*parent)) != 0)
         return;
     uint8_t bit = (uint8_t) (1u << pseudo);
     /* A custom property can change what it generates without restyling
@@ -2887,22 +3224,367 @@ bool layout_reuse_cache_resolve_style(LayoutReuseCache *cache,
                                       ComputedStyle *result)
 {
     if (result == NULL) return false;
+    if (cache != NULL && cache->parser_settling)
+        layout_reuse_parser_settle_for_read(cache, sheet, fonts);
     uint64_t parent_hash = cache == NULL
         ? 0 : layout_style_parent_hash(parent);
     if (layout_reuse_style_get_hashed(
-            cache, node, parent_hash, result)) return true;
+            cache, node, parent_hash, result)) {
+#ifndef TILEFINCH_NO_TRACE
+        layout_verify_served(cache, sheet, fonts, node, parent, result, true);
+#endif
+        return true;
+    }
     bool font_dependent = false;
     /* The resolution records the custom properties it reads (the focus
        probe's resolutions included: a superset is safe). */
     if (sheet != NULL) ((Stylesheet *) sheet)->variable_read_names = 0;
     uint32_t consults = style_container_consults(sheet);
+    StyleRetainedMatches *matches =
+        cache != NULL && cache->sheet == sheet ? cache->matches : NULL;
     layout_resolve_canonical_style(
         sheet, fonts, stylesheet_web_font_set(sheet),
-        node, parent, result, &font_dependent,
-        cache != NULL && cache->sheet == sheet ? cache->matches : NULL);
+        node, parent, result, &font_dependent, matches);
     layout_reuse_style_put_hashed(
         cache, node, parent_hash, result, font_dependent,
         style_container_consults(sheet) != consults,
         sheet == NULL ? 0 : sheet->variable_read_names);
+#ifndef TILEFINCH_NO_TRACE
+    if (matches != NULL)
+        layout_verify_served(cache, sheet, fonts, node, parent, result, false);
+#endif
     return false;
+}
+
+/* Geometry read proofs (tilefinch/layout.h, layout_reuse_proof_*).
+
+   A script that writes and then reads geometry forces a whole-document
+   build, even when the writes changed nothing the layout it reads was built
+   from. The cache can say so: every element style that build resolved is
+   held by an entry (proof_coverage), invalidation drops the entries of
+   exactly the elements whose style a write can change, and while a proof
+   is open those drops are kept as rows. Re-resolving the rows then tells
+   whether any style the layout used moved. The caller answers for the rest
+   of what layout reads from the DOM (record kinds, attribute names). */
+
+void layout_reuse_proof_note_drop(LayoutReuseCache *cache,
+                                  const LayoutReuseStyleEntry *entry)
+{
+    if (cache->proof_quiet) return;
+    if (!cache->proof_active) {
+        /* A build replaces entries with its own resolutions; anything else
+           that drops one leaves its element without the style the covered
+           layout used. */
+        if (!cache->proof_building) cache->proof_coverage = 0;
+        return;
+    }
+    /* The first drop holds what the covered layout used. */
+    for (size_t i = 0; i < cache->proof_row_count; i++)
+        if (cache->proof_rows[i].node == entry->node) return;
+    if (cache->proof_row_count == LAYOUT_REUSE_PROOF_ROW_LIMIT) {
+        cache->proof_overflow = true;
+        return;
+    }
+    layout_reuse_payload(cache, entry->payload)->references++;
+    cache->proof_rows[cache->proof_row_count++] = *entry;
+}
+
+/* Keeps `entry` (taking a payload reference) as the style the covered
+   layout used for its element; false when the held rows are full. */
+static bool layout_reuse_proof_hold(LayoutReuseCache *cache,
+                                    const LayoutReuseStyleEntry *entry)
+{
+    layout_reuse_proof_unhold(cache, entry->node);
+    if (cache->proof_held_count == LAYOUT_REUSE_PROOF_HELD_LIMIT)
+        return false;
+    layout_reuse_payload(cache, entry->payload)->references++;
+    cache->proof_held[cache->proof_held_count++] = *entry;
+    return true;
+}
+
+static void layout_reuse_proof_unhold(LayoutReuseCache *cache,
+                                      const lxb_dom_node_t *node)
+{
+    for (size_t i = 0; i < cache->proof_held_count; i++) {
+        if (cache->proof_held[i].node != node) continue;
+        layout_reuse_release_payload(cache, cache->proof_held[i].payload);
+        cache->proof_held[i] =
+            cache->proof_held[--cache->proof_held_count];
+        return;
+    }
+}
+
+uint32_t layout_reuse_proof_build_begin(LayoutReuseCache *cache)
+{
+    /* Serials are unique across caches, so a layout never names a build
+       of another. */
+    static uint32_t serials;
+    if (cache == NULL) return 0;
+    if (++serials == 0) serials = 1;
+    cache->proof_build_serial = serials;
+    for (size_t i = 0; i < cache->proof_held_count; i++)
+        layout_reuse_release_payload(cache, cache->proof_held[i].payload);
+    cache->proof_held_count = 0;
+    cache->proof_building = true;
+    cache->proof_build_lost = false;
+    cache->proof_coverage = 0;
+    return serials;
+}
+
+uint32_t layout_reuse_proof_build_end(LayoutReuseCache *cache,
+                                      uint32_t serial, bool complete)
+{
+    if (cache == NULL || serial == 0 || cache->proof_build_serial != serial)
+        return 0;
+    cache->proof_building = false;
+    /* A truncated build left styles unresolved; a trimmed table or a font
+       publication may have declined to store some. */
+    if (!complete || cache->proof_build_lost || cache->style_pressure_trimmed
+        || cache->font_publication_active) return 0;
+    cache->proof_coverage = serial;
+    cache->proof_coverage_epoch = cache->epoch;
+    return serial;
+}
+
+bool layout_reuse_proof_covers(const LayoutReuseCache *cache,
+                               const LayoutDocument *layout)
+{
+    return cache != NULL && layout != NULL && !cache->proof_active
+        && layout->reuse_serial != 0
+        && cache->proof_coverage == layout->reuse_serial
+        && cache->proof_coverage_epoch == cache->epoch
+        && !cache->style_pressure_trimmed;
+}
+
+bool layout_reuse_proof_checks(const LayoutReuseCache *cache,
+                               const lxb_dom_node_t *node)
+{
+    for (size_t i = 0; i < cache->proof_row_count; i++)
+        if (cache->proof_rows[i].node == node) return true;
+    for (size_t i = 0; i < cache->proof_held_count; i++)
+        if (cache->proof_held[i].node == node) return true;
+    return false;
+}
+
+bool layout_reuse_proof_begin(LayoutReuseCache *cache,
+                              const LayoutDocument *layout)
+{
+    if (!layout_reuse_proof_covers(cache, layout)) return false;
+    cache->proof_active = true;
+    cache->proof_overflow = false;
+    cache->proof_row_count = 0;
+    cache->proof_epoch = cache->epoch;
+    return true;
+}
+
+void layout_reuse_proof_retiring(LayoutReuseCache *cache, bool retiring)
+{
+    if (cache == NULL) return;
+    /* A freed node is outside the document: its entry is no loss. A row
+       may name it, though, and is never read again. */
+    if (retiring && cache->proof_active) cache->proof_overflow = true;
+    cache->proof_quiet = retiring;
+}
+
+/* Elements whose content reaches the page without boxes of its own (see
+   navigation_hidden_content_escapes): display:none says nothing for them. */
+static bool layout_reuse_proof_escapes(const lxb_dom_node_t *element)
+{
+    switch (element->local_name) {
+    case LXB_TAG_HEAD: case LXB_TAG_SVG: case LXB_TAG_SELECT:
+    case LXB_TAG_DATALIST: case LXB_TAG_OPTION: case LXB_TAG_OPTGROUP:
+    case LXB_TAG_VIDEO: case LXB_TAG_AUDIO: case LXB_TAG_PICTURE:
+    case LXB_TAG_OBJECT: case LXB_TAG_EMBED: case LXB_TAG_MAP:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* `node`'s style under `parent`, from the cache or resolved (nothing is
+   stored while a proof is open). */
+static void layout_reuse_proof_resolve(LayoutReuseCache *cache,
+                                       const Stylesheet *sheet,
+                                       const FontSet *fonts,
+                                       lxb_dom_node_t *node,
+                                       const ComputedStyle *parent,
+                                       ComputedStyle *style,
+                                       bool *font_dependent)
+{
+    *font_dependent = false;
+    if (layout_reuse_style_get_hashed(cache, node,
+            layout_style_parent_hash(parent), style)) return;
+    ((Stylesheet *) sheet)->variable_read_names = 0;
+    layout_resolve_canonical_style(
+        sheet, fonts, stylesheet_web_font_set(sheet), node, parent, style,
+        font_dependent, cache->sheet == sheet ? cache->matches : NULL);
+}
+
+typedef enum {
+    PROOF_ROW_RESTORE,   /* equal: back into the cache */
+    PROOF_ROW_UNBOXED,   /* hidden inside, or detached: no box before or now */
+    PROOF_ROW_NONE_BOTH  /* display:none before and now: its entry is gone */
+} LayoutReuseProofRowState;
+
+static LayoutReuseProofOutcome layout_reuse_proof_row(
+    LayoutReuseCache *cache, const Stylesheet *sheet, const FontSet *fonts,
+    LayoutReuseStyleEntry *row, LayoutReuseProofRowState *state)
+{
+    lxb_dom_node_t *path[64];
+    size_t count = 0;
+    lxb_dom_node_t *at = row->node;
+    for (; at != NULL && at->type != LXB_DOM_NODE_TYPE_DOCUMENT;
+         at = at->parent) {
+        /* Layout resolves text nodes' styles too, under their parent's. */
+        if ((at->type != LXB_DOM_NODE_TYPE_ELEMENT
+             && (at != row->node || at->type != LXB_DOM_NODE_TYPE_TEXT))
+            || count == sizeof(path) / sizeof(path[0]))
+            return LAYOUT_REUSE_PROOF_PATH;
+        path[count++] = at;
+    }
+    /* Out of the document: the journal's records answer for its removal. */
+    if (at == NULL) { *state = PROOF_ROW_UNBOXED; return LAYOUT_REUSE_PROOF_HOLDS; }
+    ComputedStyle parent = layout_initial_root_style(), style;
+    bool escape = false, font_dependent = false;
+    while (count > 1) {
+        lxb_dom_node_t *ancestor = path[--count];
+        escape = escape || layout_reuse_proof_escapes(ancestor);
+        layout_reuse_proof_resolve(cache, sheet, fonts, ancestor, &parent,
+                                   &style, &font_dependent);
+        /* Nothing under it has a box, before (its own row, if any, says
+           whether it was hidden then) or now. */
+        if (style.display == DISPLAY_NONE && !escape) {
+            *state = PROOF_ROW_UNBOXED;
+            return LAYOUT_REUSE_PROOF_HOLDS;
+        }
+        parent = style;
+    }
+    lxb_dom_node_t *node = row->node;
+    escape = escape || layout_reuse_proof_escapes(node);
+    ((Stylesheet *) sheet)->variable_read_names = 0;
+    layout_resolve_canonical_style(
+        sheet, fonts, stylesheet_web_font_set(sheet), node, &parent, &style,
+        &font_dependent, cache->sheet == sheet ? cache->matches : NULL);
+    uint64_t reads = sheet->variable_read_names;
+    const ComputedStyle *before =
+        &layout_reuse_payload(cache, row->payload)->style;
+    if (before->display == DISPLAY_NONE && style.display == DISPLAY_NONE
+        && !escape) {
+        *state = PROOF_ROW_NONE_BOTH;
+        return LAYOUT_REUSE_PROOF_HOLDS;
+    }
+    if (row->parent_hash != layout_style_parent_hash(&parent)
+        || memcmp(before, &style, sizeof(style)) != 0)
+        return LAYOUT_REUSE_PROOF_DIFFERS;
+    /* Its pseudo-elements: absent before (the entry noted it) and now.
+       Placeholders are resolved apart from the cache. */
+    if (node->type == LXB_DOM_NODE_TYPE_ELEMENT
+        && (node->local_name == LXB_TAG_INPUT
+            || node->local_name == LXB_TAG_TEXTAREA))
+        return LAYOUT_REUSE_PROOF_PSEUDO;
+    for (PseudoElement pseudo = PSEUDO_BEFORE;
+         node->type == LXB_DOM_NODE_TYPE_ELEMENT && pseudo <= PSEUDO_AFTER;
+         pseudo++) {
+        /* No build read it while the entry stood: the layout has none. */
+        if (!style_pseudo_may_generate(sheet, pseudo)
+            || (row->pseudo_resolved & (1u << pseudo)) == 0) continue;
+        if ((row->pseudo_absent & (1u << pseudo)) == 0)
+            return LAYOUT_REUSE_PROOF_PSEUDO;
+        ((Stylesheet *) sheet)->variable_read_names = 0;
+        ComputedStyle generated =
+            style_for_layout_pseudo(sheet, node, pseudo, &style);
+        if (generated.generated_content || sheet->variable_read_names != 0)
+            return LAYOUT_REUSE_PROOF_PSEUDO;
+    }
+    /* A superset of the names read is safe; so is the font flag. */
+    row->variable_reads |= reads;
+    if (font_dependent) row->dependent |= LAYOUT_REUSE_FONT_DEPENDENT;
+    *state = PROOF_ROW_RESTORE;
+    return LAYOUT_REUSE_PROOF_HOLDS;
+}
+
+/* An equal row's entry goes back where a store would put it; false when
+   its probe window filled meanwhile. */
+static bool layout_reuse_proof_restore(LayoutReuseCache *cache,
+                                       const LayoutReuseStyleEntry *row)
+{
+    size_t home = layout_pointer_hash(row->node) & cache->style_mask;
+    for (size_t probe = 0; probe < 8; probe++) {
+        LayoutReuseStyleEntry *slot =
+            &cache->styles[(home + probe) & cache->style_mask];
+        if (slot->node != NULL) continue;
+        *slot = *row;
+        size_t length = 0;
+        const char *inline_style = document_attribute(row->node, "style",
+                                                      &length);
+        slot->inline_variables = inline_style == NULL ? 0
+            : stylesheet_inline_custom_property_bits(inline_style, length);
+        slot->stamp = ++cache->clock;
+        return true;
+    }
+    return false;
+}
+
+static LayoutReuseProofOutcome layout_reuse_proof_close(
+    LayoutReuseCache *cache, const Stylesheet *sheet, const FontSet *fonts,
+    bool verify)
+{
+    if (cache == NULL || !cache->proof_active)
+        return LAYOUT_REUSE_PROOF_NOT_COVERED;
+    /* Rows are re-resolved with stores still declined; the cache may not
+       reach the sheet the rows were resolved against. */
+    size_t rows = cache->proof_row_count;
+    LayoutReuseProofOutcome outcome = LAYOUT_REUSE_PROOF_HOLDS;
+    uint8_t states[LAYOUT_REUSE_PROOF_ROW_LIMIT];
+    if (cache->epoch != cache->proof_epoch || cache->style_pressure_trimmed) {
+        /* The table and its payloads were cleared: no row is valid. */
+        cache->proof_active = false;
+        cache->proof_row_count = 0;
+        cache->proof_coverage = 0;
+        return LAYOUT_REUSE_PROOF_RESET;
+    }
+    if (!verify) outcome = LAYOUT_REUSE_PROOF_DIFFERS;
+    else if (cache->proof_overflow) outcome = LAYOUT_REUSE_PROOF_OVERFLOW;
+    else if (sheet == NULL || cache->sheet != sheet)
+        outcome = LAYOUT_REUSE_PROOF_NOT_COVERED;
+    for (size_t i = 0; outcome == LAYOUT_REUSE_PROOF_HOLDS && i < rows; i++) {
+        LayoutReuseProofRowState state = PROOF_ROW_UNBOXED;
+        outcome = layout_reuse_proof_row(cache, sheet, fonts,
+                                         &cache->proof_rows[i], &state);
+        states[i] = (uint8_t) state;
+    }
+    for (size_t i = 0; outcome == LAYOUT_REUSE_PROOF_HOLDS
+                       && i < cache->proof_held_count; i++) {
+        LayoutReuseProofRowState state = PROOF_ROW_UNBOXED;
+        outcome = layout_reuse_proof_row(cache, sheet, fonts,
+                                         &cache->proof_held[i], &state);
+    }
+    cache->proof_active = false;
+    bool covered = outcome == LAYOUT_REUSE_PROOF_HOLDS;
+    for (size_t i = 0; i < rows; i++) {
+        const LayoutReuseStyleEntry *row = &cache->proof_rows[i];
+        bool equal = outcome == LAYOUT_REUSE_PROOF_HOLDS
+            && states[i] == PROOF_ROW_RESTORE;
+        /* The row's reference moves to the entry. */
+        if (equal && layout_reuse_proof_restore(cache, row)) continue;
+        /* The layout keeps a style the cache no longer holds. */
+        if (equal ? !layout_reuse_proof_hold(cache, row)
+                  : outcome != LAYOUT_REUSE_PROOF_HOLDS
+                        || states[i] != PROOF_ROW_UNBOXED) covered = false;
+        layout_reuse_release_payload(cache, row->payload);
+    }
+    cache->proof_row_count = 0;
+    if (!covered) cache->proof_coverage = 0;
+    return outcome;
+}
+
+LayoutReuseProofOutcome layout_reuse_proof_finish(
+    LayoutReuseCache *cache, const Stylesheet *sheet, const FontSet *fonts)
+{
+    return layout_reuse_proof_close(cache, sheet, fonts, true);
+}
+
+void layout_reuse_proof_abort(LayoutReuseCache *cache)
+{
+    (void) layout_reuse_proof_close(cache, NULL, NULL, false);
 }

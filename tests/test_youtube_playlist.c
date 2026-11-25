@@ -19,11 +19,82 @@ static void make_page(YoutubePlaylistPage *p, size_t first, size_t count, bool m
         "https://www.youtube.com/playlist?list=PLfixture&tilefinch_base=%zu", first + count);
 }
 
+static bool cache_playlist_page(BrowserSession *session, const char *request,
+                                const YoutubePlaylistPage *page)
+{
+    TilefinchRequestContext authority = {
+        .target_url = "https://m.youtube.com/playlist?list=PLfixture",
+        .top_level_url = request, .method = "GET",
+        .mode = TILEFINCH_REQUEST_MODE_NAVIGATE,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .destination = TILEFINCH_DESTINATION_DOCUMENT,
+        .top_level_navigation = true, .user_activated = true
+    };
+    return browser_session_site_adapter_document_cache_put(session,
+        "youtube-playlist-facts", request, 0, &authority, page,
+        sizeof(*page), 0, 1, 200, "", "", tilefinch_platform_monotonic_time_ns());
+}
+
+static int test_no_progress_queue(Budget *budget, BrowserSession *session,
+                                  const char *root, bool retry)
+{
+    static const char a[] = "https://www.youtube.com/playlist?list=PLfixture"
+        "&tilefinch_base=1&tilefinch_offset=0&tilefinch_row=12&tilefinch_token=nextA";
+    static const char b[] = "https://www.youtube.com/playlist?list=PLfixture"
+        "&tilefinch_base=1&tilefinch_offset=0&tilefinch_row=24&tilefinch_token=nextB";
+    static const char c[] = "https://www.youtube.com/playlist?list=PLfixture"
+        "&tilefinch_base=1&tilefinch_offset=0&tilefinch_row=36&tilefinch_token=nextC";
+    YoutubePlaylistPage page; make_page(&page, 0, 1, false);
+    snprintf(page.next_url, sizeof(page.next_url), "%s", a);
+    YoutubePlaylistQueue *q = youtube_playlist_begin(budget, session, root, 0, true, NULL);
+    char video[128];
+    CHECK(q && youtube_playlist_accept_page(q, &page)
+        && youtube_playlist_take_video(q, video, sizeof(video)));
+    CHECK(youtube_playlist_step(q, 1));
+    make_page(&page, 1, 0, false);
+    snprintf(page.next_url, sizeof(page.next_url), "%s", b);
+    CHECK(cache_playlist_page(session, a, &page));
+    snprintf(page.next_url, sizeof(page.next_url), "%s", a);
+    CHECK(cache_playlist_page(session, b, &page));
+    for (unsigned i = 0; i < 3u && !youtube_playlist_failed(q); i++)
+        CHECK(youtube_playlist_pump(q, NULL));
+    CHECK(youtube_playlist_failed(q) && youtube_playlist_can_retry(q)
+        && !youtube_playlist_loading(q) && !youtube_playlist_take_video(q, video, sizeof(video)));
+    CHECK(!strcmp(youtube_playlist_error(q), "Playlist continuation did not advance"));
+
+    /* The provider can recover on retry or reselection, even if its first
+       continuation is unchanged and two pages still have no playable entries. */
+    if (retry) youtube_playlist_retry(q);
+    else {
+        CHECK(youtube_playlist_select(q, 0) && youtube_playlist_take_video(q, video, sizeof(video)));
+        CHECK(youtube_playlist_step(q, 1));
+    }
+    snprintf(page.next_url, sizeof(page.next_url), "%s", b);
+    CHECK(cache_playlist_page(session, a, &page));
+    snprintf(page.next_url, sizeof(page.next_url), "%s", c);
+    CHECK(cache_playlist_page(session, b, &page));
+    for (unsigned i = 0; i < 2u; i++)
+        CHECK(youtube_playlist_loading(q) && youtube_playlist_pump(q, NULL));
+    /* Only two cached facts pages fit at the same time. */
+    make_page(&page, 1, 1, false);
+    CHECK(cache_playlist_page(session, c, &page));
+    CHECK(youtube_playlist_loading(q) && youtube_playlist_pump(q, NULL));
+    CHECK(youtube_playlist_take_video(q, video, sizeof(video))
+        && strstr(video, "TFTEST00001") && youtube_playlist_position(q) == 1);
+    youtube_playlist_destroy(q);
+    browser_session_site_adapter_document_cache_remove(session, "youtube-playlist-facts", a);
+    browser_session_site_adapter_document_cache_remove(session, "youtube-playlist-facts", b);
+    browser_session_site_adapter_document_cache_remove(session, "youtube-playlist-facts", c);
+    return 0;
+}
+
 int main(void)
 {
     Budget budget; budget_init(&budget, 8u * 1024u * 1024u);
     BrowserSession session; CHECK(browser_session_init(&session, &budget, 256u * 1024u));
     const char *url = "https://www.youtube.com/playlist?list=PLfixture";
+    CHECK(test_no_progress_queue(&budget, &session, url, true) == 0);
+    CHECK(test_no_progress_queue(&budget, &session, url, false) == 0);
     size_t before_queue = budget.current;
     YoutubePlaylistQueue *q = youtube_playlist_begin(&budget, &session, url, 10, false, "TFTEST00010");
     CHECK(q && youtube_playlist_loading(q));
@@ -144,17 +215,7 @@ int main(void)
     youtube_playlist_retry(q);
     make_page(&page, 12, 1, false);
     const char *request = "https://www.youtube.com/playlist?list=PLfixture&tilefinch_base=12";
-    TilefinchRequestContext retry_authority = {
-        .target_url = "https://m.youtube.com/playlist?list=PLfixture",
-        .top_level_url = request, .method = "GET",
-        .mode = TILEFINCH_REQUEST_MODE_NAVIGATE,
-        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
-        .destination = TILEFINCH_DESTINATION_DOCUMENT,
-        .top_level_navigation = true, .user_activated = true
-    };
-    CHECK(browser_session_site_adapter_document_cache_put(&session,
-        "youtube-playlist-facts", request, 0, &retry_authority, &page,
-        sizeof(page), 0, 1, 200, "", "", tilefinch_platform_monotonic_time_ns()));
+    CHECK(cache_playlist_page(&session, request, &page));
     CHECK(youtube_playlist_should_pump(q, false)
         && youtube_playlist_pump(q, NULL)
         && !youtube_playlist_should_pump(q, false)

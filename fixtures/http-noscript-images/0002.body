@@ -1,0 +1,5 @@
+<!doctype html><style>html,body{margin:0}img,div{display:block;width:40px;height:20px}</style><body>
+<p>Placeholders</p>
+<img id=c alt="" data-later=/c1.svg><noscript><img src=/c-fallback.svg></noscript>
+<div id=e></div><noscript><img src=/e-fallback.svg></noscript>
+<script>addEventListener('load',()=>setTimeout(()=>{const c=document.getElementById('c');c.src=c.dataset.later;const i=document.createElement('img');i.src='/c2.svg';document.getElementById('e').appendChild(i)},500))</script>

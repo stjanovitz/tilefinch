@@ -57,9 +57,6 @@ static bool presentational_nonnegative_pixels(lxb_dom_node_t *node,
     return true;
 }
 
-static bool style_element_name_is(const char *name, size_t length,
-                                  const char *wanted);
-
 static bool style_input_is_push_button(lxb_dom_node_t *node)
 {
     size_t length = 0;
@@ -80,13 +77,26 @@ static bool style_input_has_special_appearance(lxb_dom_node_t *node)
                || (length == 5 && strncasecmp(value, "range", 5) == 0));
 }
 
+/* Where the modern-properties pass reads retained declarations: `node`
+   (NULL for a node no rule or style attribute can reach), and the gate
+   bits of names no rule that can select it declares
+   (style_retained_gate_absent_bits; 0 when unknown). */
+typedef struct {
+    lxb_dom_node_t *node;
+    uint64_t absent;
+} StyleModernLookup;
+
 static bool retained_modern_value(const Stylesheet *sheet,
-                                  lxb_dom_node_t *node,
+                                  const StyleModernLookup *lookup,
                                   const char *name,
                                   char output[STYLE_RETAINED_VALUE_CAPACITY])
 {
+    if (lookup->node == NULL) return false;
+    size_t length = strlen(name);
+    if ((lookup->absent & style_retained_gate_name_bit(name, length)) != 0)
+        return false;
     return style_retained_property_value(
-        sheet, node, name, strlen(name), output,
+        sheet, lookup->node, name, length, output,
         STYLE_RETAINED_VALUE_CAPACITY);
 }
 
@@ -235,8 +245,11 @@ static unsigned modern_logical_corner(const ComputedStyle *style,
     return 3u;
 }
 
+/* `lookup` says where retained declarations are read; the inherited and
+   initial parts run whatever it finds. */
 static void style_apply_modern_properties(const Stylesheet *sheet,
                                           lxb_dom_node_t *node,
+                                          const StyleModernLookup *lookup,
                                           const ComputedStyle *parent,
                                           ComputedStyle *style,
                                           bool root_element)
@@ -255,7 +268,7 @@ static void style_apply_modern_properties(const Stylesheet *sheet,
     if ((mask & STYLE_MODERN_TYPOGRAPHY) != 0) {
         uint8_t typography = sheet->modern_typography_mask;
         if ((typography & STYLE_MODERN_TYPOGRAPHY_HYPHENS) != 0
-            && retained_modern_value(sheet, node, "hyphens", value)) {
+            && retained_modern_value(sheet, lookup, "hyphens", value)) {
             if (modern_keyword(value, "none")) {
                 style->word_break_mode |= STYLE_HYPHENS_NONE;
             } else if (modern_keyword(value, "manual")
@@ -265,7 +278,7 @@ static void style_apply_modern_properties(const Stylesheet *sheet,
             }
         }
         if ((typography & STYLE_MODERN_TYPOGRAPHY_KERNING) != 0
-            && retained_modern_value(sheet, node, "font-kerning", value)) {
+            && retained_modern_value(sheet, lookup, "font-kerning", value)) {
             if (modern_keyword(value, "none")
                 || modern_keyword(value, "optimizeSpeed")) {
                 style->word_break_mode |= STYLE_FONT_KERNING_NONE;
@@ -276,7 +289,7 @@ static void style_apply_modern_properties(const Stylesheet *sheet,
             }
         }
         if ((typography & STYLE_MODERN_TYPOGRAPHY_TEXT_RENDERING) != 0
-            && retained_modern_value(sheet, node, "text-rendering", value)) {
+            && retained_modern_value(sheet, lookup, "text-rendering", value)) {
             if (modern_keyword(value, "optimizeSpeed")) {
                 style->word_break_mode |= STYLE_FONT_KERNING_NONE;
             } else if (modern_keyword(value, "optimizeLegibility")
@@ -287,7 +300,7 @@ static void style_apply_modern_properties(const Stylesheet *sheet,
         unsigned tab_size = parent == NULL
             ? 8u : computed_style_tab_size(parent);
         if ((typography & STYLE_MODERN_TYPOGRAPHY_TAB_SIZE) != 0
-            && retained_modern_value(sheet, node, "tab-size", value)) {
+            && retained_modern_value(sheet, lookup, "tab-size", value)) {
             char *end = NULL;
             unsigned long parsed = strtoul(value, &end, 10);
             if (end != value && *end == '\0') {
@@ -306,7 +319,7 @@ static void style_apply_modern_properties(const Stylesheet *sheet,
 
     if ((mask & STYLE_MODERN_MIX_BLEND) != 0) {
         unsigned mode = STYLE_MIX_BLEND_NORMAL;
-        if (retained_modern_value(sheet, node, "mix-blend-mode", value)) {
+        if (retained_modern_value(sheet, lookup, "mix-blend-mode", value)) {
             if (modern_keyword(value, "multiply")) {
                 mode = STYLE_MIX_BLEND_MULTIPLY;
             } else if (modern_keyword(value, "screen")) {
@@ -322,7 +335,7 @@ static void style_apply_modern_properties(const Stylesheet *sheet,
     if ((mask & STYLE_MODERN_BACKDROP_FILTER) != 0) {
         /* -webkit-backdrop-filter is retained under this name. */
         bool found = retained_modern_value(
-            sheet, node, "backdrop-filter", value);
+            sheet, lookup, "backdrop-filter", value);
         unsigned radius = 0;
         if (found) {
             const char *blur = strstr(value, "blur(");
@@ -350,7 +363,7 @@ static void style_apply_modern_properties(const Stylesheet *sheet,
            the computed `auto`; keep that distinction for the interaction
            policy rather than baking it into every descendant. */
         StyleUserSelect mode = STYLE_USER_SELECT_AUTO;
-        if (retained_modern_value(sheet, node, "user-select", value)) {
+        if (retained_modern_value(sheet, lookup, "user-select", value)) {
             if (modern_keyword(value, "auto")) mode = STYLE_USER_SELECT_AUTO;
             else if (modern_keyword(value, "text")) mode = STYLE_USER_SELECT_TEXT;
             else if (modern_keyword(value, "none")) mode = STYLE_USER_SELECT_NONE;
@@ -368,9 +381,9 @@ static void style_apply_modern_properties(const Stylesheet *sheet,
         StyleTextWrap mode = parent == NULL ? STYLE_TEXT_WRAP_NORMAL
             : computed_style_text_wrap(parent);
         bool found = retained_modern_value(
-            sheet, node, "text-wrap-style", value);
+            sheet, lookup, "text-wrap-style", value);
         if (!found) found = retained_modern_value(
-            sheet, node, "text-wrap", value);
+            sheet, lookup, "text-wrap", value);
         if (found) {
             if (modern_keyword(value, "balance")) mode = STYLE_TEXT_WRAP_BALANCE;
             else if (modern_keyword(value, "pretty")) mode = STYLE_TEXT_WRAP_PRETTY;
@@ -388,7 +401,7 @@ static void style_apply_modern_properties(const Stylesheet *sheet,
             | ((mode << STYLE_TEXT_WRAP_SHIFT) & STYLE_TEXT_WRAP_MASK));
     }
     if ((mask & STYLE_MODERN_TOUCH_ACTION) != 0
-        && retained_modern_value(sheet, node, "touch-action", value)) {
+        && retained_modern_value(sheet, lookup, "touch-action", value)) {
         style->touch_action = modern_keyword(value, "none")
             ? STYLE_TOUCH_ACTION_NONE
             : (modern_keyword(value, "pan-x") ? STYLE_TOUCH_ACTION_PAN_X
@@ -396,7 +409,7 @@ static void style_apply_modern_properties(const Stylesheet *sheet,
                                                    : STYLE_TOUCH_ACTION_AUTO));
     }
     if ((mask & STYLE_MODERN_RESIZE) != 0
-        && retained_modern_value(sheet, node, "resize", value)) {
+        && retained_modern_value(sheet, lookup, "resize", value)) {
         style->resize_mode = modern_keyword(value, "both")
             ? STYLE_RESIZE_BOTH
             : ((modern_keyword(value, "horizontal")
@@ -407,7 +420,7 @@ static void style_apply_modern_properties(const Stylesheet *sheet,
                   ? STYLE_RESIZE_VERTICAL : STYLE_RESIZE_NONE));
     }
     if ((mask & STYLE_MODERN_ISOLATION) != 0
-        && retained_modern_value(sheet, node, "isolation", value)) {
+        && retained_modern_value(sheet, lookup, "isolation", value)) {
         if (modern_keyword(value, "isolate")) {
             style->overflow_wrap |= STYLE_ISOLATION_ISOLATE;
         } else if (modern_keyword(value, "auto")
@@ -416,7 +429,7 @@ static void style_apply_modern_properties(const Stylesheet *sheet,
         }
     }
     if ((mask & STYLE_MODERN_TRANSLATE) != 0
-        && retained_modern_value(sheet, node, "translate", value)
+        && retained_modern_value(sheet, lookup, "translate", value)
         && !modern_keyword(value, "none")) {
         const char *cursor = value;
         int x = 0, y = 0;
@@ -450,7 +463,7 @@ static void style_apply_modern_properties(const Stylesheet *sheet,
         }
     }
     if ((mask & STYLE_MODERN_SCALE) != 0
-        && retained_modern_value(sheet, node, "scale", value)) {
+        && retained_modern_value(sheet, lookup, "scale", value)) {
         uint16_t scale = 16384;
         if (style_scale_value_q14(value, &scale)) {
             unsigned combined = (unsigned) style->transform_scale_q14 * scale
@@ -466,7 +479,7 @@ static void style_apply_modern_properties(const Stylesheet *sheet,
        face gives unsupported 3D scenes one stable, visible 2D state instead
        of dropping the entire declaration block. No per-node state is needed. */
     if ((mask & STYLE_MODERN_COLOR_SCHEME) != 0 && root_element
-        && retained_modern_value(sheet, node, "color-scheme", value)
+        && retained_modern_value(sheet, lookup, "color-scheme", value)
         && modern_keyword(value, "dark")) {
         if (!style->has_background) {
             style->background = UINT32_C(0x121212);
@@ -479,9 +492,9 @@ static void style_apply_modern_properties(const Stylesheet *sheet,
     }
     if ((mask & STYLE_MODERN_BORDER_IMAGE) != 0) {
         bool found = retained_modern_value(
-            sheet, node, "border-image-source", value);
+            sheet, lookup, "border-image-source", value);
         if (!found) found = retained_modern_value(
-            sheet, node, "border-image", value);
+            sheet, lookup, "border-image", value);
         if (found) {
             size_t gradient_length = strlen(value);
             const char *open = strchr(value, '(');
@@ -513,7 +526,7 @@ static void style_apply_modern_properties(const Stylesheet *sheet,
         }
     }
     if ((mask & STYLE_MODERN_ROTATE) != 0
-        && retained_modern_value(sheet, node, "rotate", value)) {
+        && retained_modern_value(sheet, lookup, "rotate", value)) {
         uint8_t quadrants = 0;
         if (style_rotate_value_quadrants(value, &quadrants)) {
             style->individual_rotate_quadrants = (uint8_t) (
@@ -527,7 +540,7 @@ static void style_apply_modern_properties(const Stylesheet *sheet,
             "border-end-start-radius", "border-end-end-radius"
         };
         for (unsigned logical = 0; logical < 4; logical++) {
-            if (!retained_modern_value(sheet, node, names[logical], value)) {
+            if (!retained_modern_value(sheet, lookup, names[logical], value)) {
                 continue;
             }
             int radius = 0;
@@ -546,7 +559,7 @@ static void style_apply_modern_properties(const Stylesheet *sheet,
         unsigned percent = parent != NULL && parent->font_size_unit != 0u
             ? (unsigned) parent->font_size_unit - 1u : 100u;
         bool active = parent != NULL && parent->font_size_unit != 0u;
-        if (retained_modern_value(sheet, node, "text-size-adjust", value)) {
+        if (retained_modern_value(sheet, lookup, "text-size-adjust", value)) {
             if (modern_keyword(value, "auto")
                 || modern_keyword(value, "none")
                 || modern_keyword(value, "initial")) {
@@ -668,11 +681,13 @@ static void apply_presentational_attributes(const Stylesheet *sheet,
                                             lxb_dom_node_t *node,
                                             ComputedStyle *style)
 {
-    size_t node_name_length = 0;
-    const char *node_name = document_element_name(
-        node, &node_name_length);
-#define PRESENTATION_TAG_IS(wanted) \
-    style_element_name_is(node_name, node_name_length, (wanted))
+    lxb_tag_id_t tag = node->local_name;
+    /* These common attribute lists cannot contain a presentation hint.
+       A cell can still inherit cellpadding from its table. */
+    const lxb_dom_element_t *element = lxb_dom_interface_element(node);
+    if (tag != LXB_TAG_TD && tag != LXB_TAG_TH
+        && (element->first_attr == NULL || (element->first_attr == element->last_attr
+            && element->first_attr == element->attr_class))) return;
     size_t length = 0;
     /* UA rule [hidden] { display: none } -- mobile section togglers can
        collapse article sections purely via the hidden
@@ -689,7 +704,7 @@ static void apply_presentational_attributes(const Stylesheet *sheet,
         style->background_alpha = 255;
         style->has_background = true;
     }
-    value = document_attribute(node, PRESENTATION_TAG_IS("body")
+    value = document_attribute(node, tag == LXB_TAG_BODY
                                ? "text" : "color",
                                &length);
     if (value != NULL && style_parse_color(sheet, value, length, &color)) {
@@ -704,26 +719,26 @@ static void apply_presentational_attributes(const Stylesheet *sheet,
        140px flex container and pushed its checkbox out of the 65px frame.
        SVG width/height are SVG presentation attributes and take CSS
        lengths. */
-    bool replaced = PRESENTATION_TAG_IS("img")
-                    || PRESENTATION_TAG_IS("iframe")
-                    || PRESENTATION_TAG_IS("embed")
-                    || PRESENTATION_TAG_IS("object")
-                    || PRESENTATION_TAG_IS("video")
-                    || PRESENTATION_TAG_IS("canvas")
-                    || PRESENTATION_TAG_IS("input");
-    bool svg = PRESENTATION_TAG_IS("svg");
-    bool cell = PRESENTATION_TAG_IS("td") || PRESENTATION_TAG_IS("th");
+    bool replaced = tag == LXB_TAG_IMG
+                    || tag == LXB_TAG_IFRAME
+                    || tag == LXB_TAG_EMBED
+                    || tag == LXB_TAG_OBJECT
+                    || tag == LXB_TAG_VIDEO
+                    || tag == LXB_TAG_CANVAS
+                    || tag == LXB_TAG_INPUT;
+    bool svg = tag == LXB_TAG_SVG;
+    bool cell = tag == LXB_TAG_TD || tag == LXB_TAG_TH;
     bool width_mapped = replaced || svg || cell
-                        || PRESENTATION_TAG_IS("table")
-                        || PRESENTATION_TAG_IS("col")
-                        || PRESENTATION_TAG_IS("colgroup")
-                        || PRESENTATION_TAG_IS("hr");
+                        || tag == LXB_TAG_TABLE
+                        || tag == LXB_TAG_COL
+                        || tag == LXB_TAG_COLGROUP
+                        || tag == LXB_TAG_HR;
     bool height_mapped = replaced || svg || cell
-                         || PRESENTATION_TAG_IS("table")
-                         || PRESENTATION_TAG_IS("tr")
-                         || PRESENTATION_TAG_IS("thead")
-                         || PRESENTATION_TAG_IS("tbody")
-                         || PRESENTATION_TAG_IS("tfoot");
+                         || tag == LXB_TAG_TABLE
+                         || tag == LXB_TAG_TR
+                         || tag == LXB_TAG_THEAD
+                         || tag == LXB_TAG_TBODY
+                         || tag == LXB_TAG_TFOOT;
     value = width_mapped ? document_attribute(node, "width", &length) : NULL;
     if (value != NULL && length != 0) {
         style->width = svg
@@ -768,12 +783,12 @@ static void apply_presentational_attributes(const Stylesheet *sheet,
             }
         }
     }
-    bool table_vertical_hint = PRESENTATION_TAG_IS("thead")
-                               || PRESENTATION_TAG_IS("tbody")
-                               || PRESENTATION_TAG_IS("tfoot")
-                               || PRESENTATION_TAG_IS("tr")
-                               || PRESENTATION_TAG_IS("td")
-                               || PRESENTATION_TAG_IS("th");
+    bool table_vertical_hint = tag == LXB_TAG_THEAD
+                               || tag == LXB_TAG_TBODY
+                               || tag == LXB_TAG_TFOOT
+                               || tag == LXB_TAG_TR
+                               || tag == LXB_TAG_TD
+                               || tag == LXB_TAG_TH;
     value = table_vertical_hint
             ? document_attribute(node, "valign", &length) : NULL;
     if (value != NULL) {
@@ -787,7 +802,7 @@ static void apply_presentational_attributes(const Stylesheet *sheet,
             style->vertical_align = VERTICAL_BASELINE;
         }
     }
-    if (PRESENTATION_TAG_IS("td") || PRESENTATION_TAG_IS("th")) {
+    if (cell) {
         for (lxb_dom_node_t *ancestor = node->parent;
              ancestor != NULL; ancestor = ancestor->parent) {
             if (!style_tag_is(ancestor, "table")) continue;
@@ -802,64 +817,25 @@ static void apply_presentational_attributes(const Stylesheet *sheet,
             break;
         }
     }
-#undef PRESENTATION_TAG_IS
 }
 
-static bool style_element_name_is(const char *name, size_t length,
-                                  const char *wanted)
+/* Lexbor interns built-in local names at parse and element creation time. */
+static bool style_element_is_ua_block(lxb_tag_id_t tag)
 {
-    size_t wanted_length = strlen(wanted);
-    return name != NULL && length == wanted_length
-        && memcmp(name, wanted, length) == 0;
-}
-
-static bool style_element_is_ua_block(const char *name, size_t length)
-{
-    if (name == NULL) return false;
-    switch (length) {
-        case 1:
-            return name[0] == 'p';
-        case 2:
-            return (name[0] == 'h' && name[1] >= '1' && name[1] <= '6')
-                || style_element_name_is(name, length, "ul")
-                || style_element_name_is(name, length, "ol")
-                || style_element_name_is(name, length, "li")
-                || style_element_name_is(name, length, "hr")
-                || style_element_name_is(name, length, "dl")
-                || style_element_name_is(name, length, "dt")
-                || style_element_name_is(name, length, "dd");
-        case 3:
-            return style_element_name_is(name, length, "nav")
-                || style_element_name_is(name, length, "div")
-                || style_element_name_is(name, length, "pre")
-                || style_element_name_is(name, length, "dir");
-        case 4:
-            return style_element_name_is(name, length, "menu")
-                || style_element_name_is(name, length, "html")
-                || style_element_name_is(name, length, "body")
-                || style_element_name_is(name, length, "main")
-                || style_element_name_is(name, length, "form");
-        case 5:
-            return style_element_name_is(name, length, "aside");
-        case 6:
-            return style_element_name_is(name, length, "header")
-                || style_element_name_is(name, length, "footer")
-                || style_element_name_is(name, length, "figure")
-                || style_element_name_is(name, length, "legend")
-                || style_element_name_is(name, length, "center");
-        case 7:
-            return style_element_name_is(name, length, "section")
-                || style_element_name_is(name, length, "address")
-                || style_element_name_is(name, length, "article")
-                || style_element_name_is(name, length, "details")
-                || style_element_name_is(name, length, "summary");
-        case 8:
-            return style_element_name_is(name, length, "fieldset");
-        case 10:
-            return style_element_name_is(name, length, "figcaption")
-                || style_element_name_is(name, length, "blockquote");
-        default:
-            return false;
+    switch (tag) {
+    case LXB_TAG_P: case LXB_TAG_H1: case LXB_TAG_H2: case LXB_TAG_H3:
+    case LXB_TAG_H4: case LXB_TAG_H5: case LXB_TAG_H6: case LXB_TAG_UL:
+    case LXB_TAG_OL: case LXB_TAG_LI: case LXB_TAG_HR: case LXB_TAG_DL:
+    case LXB_TAG_DT: case LXB_TAG_DD: case LXB_TAG_NAV: case LXB_TAG_DIV:
+    case LXB_TAG_PRE: case LXB_TAG_DIR: case LXB_TAG_MENU: case LXB_TAG_HTML:
+    case LXB_TAG_BODY: case LXB_TAG_MAIN: case LXB_TAG_FORM: case LXB_TAG_ASIDE:
+    case LXB_TAG_HEADER: case LXB_TAG_FOOTER: case LXB_TAG_FIGURE: case LXB_TAG_LEGEND:
+    case LXB_TAG_CENTER: case LXB_TAG_SECTION: case LXB_TAG_ADDRESS: case LXB_TAG_ARTICLE:
+    case LXB_TAG_DETAILS: case LXB_TAG_SUMMARY: case LXB_TAG_FIELDSET:
+    case LXB_TAG_FIGCAPTION: case LXB_TAG_BLOCKQUOTE:
+        return true;
+    default:
+        return false;
     }
 }
 
@@ -883,13 +859,10 @@ static void inherit_text_shadow(const Stylesheet *sheet,
     }
 }
 
-static bool style_element_is_ua_list(const char *name, size_t length)
+static bool style_element_is_ua_list(lxb_tag_id_t tag)
 {
-    return style_element_name_is(name, length, "ul")
-        || style_element_name_is(name, length, "ol")
-        || style_element_name_is(name, length, "menu")
-        || style_element_name_is(name, length, "dir")
-        || style_element_name_is(name, length, "dl");
+    return tag == LXB_TAG_UL || tag == LXB_TAG_OL || tag == LXB_TAG_MENU
+        || tag == LXB_TAG_DIR || tag == LXB_TAG_DL;
 }
 
 /* HTML's UA sheet drops the block margins of a list nested anywhere inside
@@ -901,9 +874,7 @@ static bool style_ua_list_is_nested(lxb_dom_node_t *node)
          ancestor != NULL && depth < 256u;
          ancestor = ancestor->parent, depth++) {
         if (ancestor->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
-        size_t length = 0;
-        const char *name = document_element_name(ancestor, &length);
-        if (style_element_is_ua_list(name, length)) return true;
+        if (style_element_is_ua_list(ancestor->local_name)) return true;
     }
     return false;
 }
@@ -994,14 +965,11 @@ static ComputedStyle default_style(const Stylesheet *sheet,
                                    lxb_dom_node_t *node,
                                    const ComputedStyle *parent)
 {
-    size_t node_name_length = 0;
-    const char *node_name = document_element_name(
-        node, &node_name_length);
-#define NODE_TAG_IS(wanted) \
-    style_element_name_is(node_name, node_name_length, (wanted))
+    lxb_tag_id_t tag = node != NULL && node->type == LXB_DOM_NODE_TYPE_ELEMENT
+        ? node->local_name : LXB_TAG__UNDEF;
     ComputedStyle style = style_initial_inherited(sheet, parent);
-    if (NODE_TAG_IS("input") || NODE_TAG_IS("textarea")
-        || NODE_TAG_IS("select") || NODE_TAG_IS("button")) {
+    if (tag == LXB_TAG_INPUT || tag == LXB_TAG_TEXTAREA
+        || tag == LXB_TAG_SELECT || tag == LXB_TAG_BUTTON) {
         style.appearance = APPEARANCE_AUTO;
     }
     if (parent != NULL) {
@@ -1016,17 +984,17 @@ static ComputedStyle default_style(const Stylesheet *sheet,
             }
         }
     }
-    if (style_element_is_ua_block(node_name, node_name_length)) {
+    if (style_element_is_ua_block(tag)) {
         style.display = DISPLAY_BLOCK;
-        style.list_item = NODE_TAG_IS("li");
+        style.list_item = tag == LXB_TAG_LI;
     }
-    if (NODE_TAG_IS("pre")) {
+    if (tag == LXB_TAG_PRE) {
         style.white_space_mode = WHITE_SPACE_PRE;
     }
-    if (NODE_TAG_IS("option") && !option_is_displayed_by_default(sheet, node)) {
+    if (tag == LXB_TAG_OPTION && !option_is_displayed_by_default(sheet, node)) {
         style.display = DISPLAY_NONE;
     }
-    if (NODE_TAG_IS("table")) {
+    if (tag == LXB_TAG_TABLE) {
         style.display = DISPLAY_TABLE;
         style.box_sizing_border_box = true;
         /* Browser UA styles reset the inherited alignment established by the
@@ -1035,7 +1003,7 @@ static ComputedStyle default_style(const Stylesheet *sheet,
            otherwise. */
         style.text_align = TEXT_ALIGN_START;
     }
-    if (NODE_TAG_IS("dialog")) {
+    if (tag == LXB_TAG_DIALOG) {
         bool open = lxb_dom_element_has_attribute(
             lxb_dom_interface_element(node),
             (const lxb_char_t *) "open", 4);
@@ -1064,7 +1032,7 @@ static ComputedStyle default_style(const Stylesheet *sheet,
     bool popover = element_node && lxb_dom_element_has_attribute(
         lxb_dom_interface_element(node),
         (const lxb_char_t *) "popover", 7);
-    bool popover_open = element_node && lxb_dom_element_has_attribute(
+    bool popover_open = popover && lxb_dom_element_has_attribute(
         lxb_dom_interface_element(node),
         (const lxb_char_t *) "data-tilefinch-popover-open",
         sizeof("data-tilefinch-popover-open") - 1);
@@ -1080,26 +1048,26 @@ static ComputedStyle default_style(const Stylesheet *sheet,
             style.z_index = 10001;
         }
     }
-    if (NODE_TAG_IS("caption")) {
+    if (tag == LXB_TAG_CAPTION) {
         style.display = DISPLAY_BLOCK;
     }
-    if (NODE_TAG_IS("thead") || NODE_TAG_IS("tbody")
-        || NODE_TAG_IS("tfoot")) {
-        style.display = NODE_TAG_IS("thead") ? DISPLAY_TABLE_HEADER_GROUP
-                        : (NODE_TAG_IS("tfoot")
+    if (tag == LXB_TAG_THEAD || tag == LXB_TAG_TBODY
+        || tag == LXB_TAG_TFOOT) {
+        style.display = tag == LXB_TAG_THEAD ? DISPLAY_TABLE_HEADER_GROUP
+                        : (tag == LXB_TAG_TFOOT
                            ? DISPLAY_TABLE_FOOTER_GROUP
                            : DISPLAY_TABLE_ROW_GROUP);
-        style.order = NODE_TAG_IS("thead") ? -100000
-                      : (NODE_TAG_IS("tfoot") ? 100000 : 0);
+        style.order = tag == LXB_TAG_THEAD ? -100000
+                      : (tag == LXB_TAG_TFOOT ? 100000 : 0);
         /* The HTML UA sheet centers table-row groups on the block axis.
            These nodes are flattened during layout, so retain the used value
            for the row and cell styles resolved through that flat ancestry. */
         style.vertical_align = VERTICAL_MIDDLE;
     }
-    if (NODE_TAG_IS("colgroup") || NODE_TAG_IS("col")) {
+    if (tag == LXB_TAG_COLGROUP || tag == LXB_TAG_COL) {
         style.display = DISPLAY_TABLE_COLUMN;
     }
-    if (NODE_TAG_IS("tr")) {
+    if (tag == LXB_TAG_TR) {
         style.display = DISPLAY_TABLE_ROW;
         /* vertical-align itself is not inherited.  The HTML UA sheet makes
            row and cell boxes inherit it explicitly from their table
@@ -1120,31 +1088,31 @@ static ComputedStyle default_style(const Stylesheet *sheet,
             }
         }
     }
-    if (NODE_TAG_IS("td") || NODE_TAG_IS("th")) {
+    if (tag == LXB_TAG_TD || tag == LXB_TAG_TH) {
         style.display = DISPLAY_TABLE_CELL;
         if (parent != NULL) style.vertical_align = parent->vertical_align;
     }
-    if (NODE_TAG_IS("slot")) {
+    if (tag == LXB_TAG_SLOT) {
         /* HTML's UA sheet: a slot generates no box; its assigned nodes (or
            fallback content) take its place in the flat tree. */
         style.display = DISPLAY_CONTENTS;
     }
-    if (NODE_TAG_IS("button")) {
+    if (tag == LXB_TAG_BUTTON) {
         /* Replaced form controls are atomic inline-level boxes in the UA
            display sheet.  Treating them as ordinary inline containers lets
            large text indents and positioned icons leak into surrounding
            line layout. */
         style.display = DISPLAY_INLINE_BLOCK;
     }
-    if (NODE_TAG_IS("video") || NODE_TAG_IS("audio")
-        || NODE_TAG_IS("canvas")
-        || NODE_TAG_IS("iframe")) {
+    if (tag == LXB_TAG_VIDEO || tag == LXB_TAG_AUDIO
+        || tag == LXB_TAG_CANVAS
+        || tag == LXB_TAG_IFRAME) {
         /* Both are replaced inline-level elements.  Hiding video in the
            historical UA defaults also hid its poster and made intrinsic
            media sizing impossible before playback began. */
         style.display = DISPLAY_INLINE_BLOCK;
     }
-    if (NODE_TAG_IS("audio")) {
+    if (tag == LXB_TAG_AUDIO) {
         bool controls = lxb_dom_element_has_attribute(
             lxb_dom_interface_element(node),
             (const lxb_char_t *) "controls", 8);
@@ -1161,24 +1129,24 @@ static ComputedStyle default_style(const Stylesheet *sheet,
             }
         }
     }
-    if (NODE_TAG_IS("input") || NODE_TAG_IS("textarea")
-        || NODE_TAG_IS("select") || NODE_TAG_IS("button")) {
+    if (tag == LXB_TAG_INPUT || tag == LXB_TAG_TEXTAREA
+        || tag == LXB_TAG_SELECT || tag == LXB_TAG_BUTTON) {
         style.box_sizing_border_box = true;
     }
-    if (NODE_TAG_IS("script") || NODE_TAG_IS("style")
-        || NODE_TAG_IS("head") || NODE_TAG_IS("meta")
-        || NODE_TAG_IS("link") || NODE_TAG_IS("title")
-        || NODE_TAG_IS("source")
-        || (NODE_TAG_IS("noscript")
+    if (tag == LXB_TAG_SCRIPT || tag == LXB_TAG_STYLE
+        || tag == LXB_TAG_HEAD || tag == LXB_TAG_META
+        || tag == LXB_TAG_LINK || tag == LXB_TAG_TITLE
+        || tag == LXB_TAG_SOURCE
+        || (tag == LXB_TAG_NOSCRIPT
             && (sheet == NULL || !sheet->noscript_rendered))) {
         style.display = DISPLAY_NONE;
     }
     /* The HTML UA sheet gives body an 8px margin, not padding.  Keeping the
        two distinct matters when an author resets body margin to let page
        backgrounds and full-bleed headers reach the viewport edge. */
-    if (NODE_TAG_IS("body")) style.margin = (StyleEdges) {8, 8, 8, 8};
-    if (NODE_TAG_IS("input") || NODE_TAG_IS("textarea")
-        || NODE_TAG_IS("select") || NODE_TAG_IS("button")) {
+    if (tag == LXB_TAG_BODY) style.margin = (StyleEdges) {8, 8, 8, 8};
+    if (tag == LXB_TAG_INPUT || tag == LXB_TAG_TEXTAREA
+        || tag == LXB_TAG_SELECT || tag == LXB_TAG_BUTTON) {
         style.padding = (StyleEdges) {
             .top = 1, .right = 2, .bottom = 1, .left = 2
         };
@@ -1199,15 +1167,15 @@ static ComputedStyle default_style(const Stylesheet *sheet,
         style.line_height = 0;
         style.line_height_factor = 0;
     }
-    if (NODE_TAG_IS("button")
-        || (NODE_TAG_IS("input") && style_input_is_push_button(node))) {
+    if (tag == LXB_TAG_BUTTON
+        || (tag == LXB_TAG_INPUT && style_input_is_push_button(node))) {
         /* input[type=submit|button|reset] shares the button face and its
            1px 6px padding (HTML 15.5.x, Chromium's UA sheet). */
         style.background = 0xefefef;
         style.padding.left = 6;
         style.padding.right = 6;
     }
-    if (NODE_TAG_IS("select")) {
+    if (tag == LXB_TAG_SELECT) {
         /* Reserve the native menulist affordance without changing authored
            padding once the author cascade runs. */
         style.padding.right = 20;
@@ -1215,7 +1183,7 @@ static ComputedStyle default_style(const Stylesheet *sheet,
            is also the layout path that paints its drop-down affordance. */
         style.display = DISPLAY_INLINE_BLOCK;
     }
-    if (NODE_TAG_IS("input") && style_input_has_special_appearance(node)) {
+    if (tag == LXB_TAG_INPUT && style_input_has_special_appearance(node)) {
         /* Toggle/range appearance paints its own shell. Generic text-field
            borders around that shell produce the familiar tiny boxed slider
            seen when these controls become flex/grid items. */
@@ -1223,8 +1191,8 @@ static ComputedStyle default_style(const Stylesheet *sheet,
         style.border = (StyleEdges) {0, 0, 0, 0};
         style.has_background = false;
     }
-    if ((NODE_TAG_IS("input") || NODE_TAG_IS("textarea")
-         || NODE_TAG_IS("select") || NODE_TAG_IS("button"))
+    if ((tag == LXB_TAG_INPUT || tag == LXB_TAG_TEXTAREA
+         || tag == LXB_TAG_SELECT || tag == LXB_TAG_BUTTON)
         && lxb_dom_element_has_attribute(
                lxb_dom_interface_element(node),
                (const lxb_char_t *) "disabled", 8)) {
@@ -1234,13 +1202,13 @@ static ComputedStyle default_style(const Stylesheet *sheet,
        block-end form margin.  Standards and limited-quirks documents do
        not.  Keep an unresolved sentinel until this form's own font size has
        cascaded; any author margin declaration replaces it normally. */
-    if (NODE_TAG_IS("form") && node != NULL
+    if (tag == LXB_TAG_FORM && node != NULL
         && node->owner_document != NULL
         && node->owner_document->compat_mode
                == LXB_DOM_DOCUMENT_CMODE_QUIRKS) {
         style.margin.bottom = STYLE_LENGTH_NONE;
     }
-    if (NODE_TAG_IS("li")) {
+    if (tag == LXB_TAG_LI) {
         style.margin = (StyleEdges) {0, 0, 0, 0};
     }
     /* HTML 15.3.7/15.3.8: lists get one em of block spacing (none when
@@ -1249,19 +1217,19 @@ static ComputedStyle default_style(const Stylesheet *sheet,
        figure indent by a 40px margin. Sentinels let author margins win and
        resolve against the element's final font size. */
     bool ua_rtl = (style.filter_code & STYLE_DIRECTION_RTL) != 0;
-    if (style_element_is_ua_list(node_name, node_name_length)) {
+    if (style_element_is_ua_list(tag)) {
         if (!style_ua_list_is_nested(node)) {
             style.margin.top = STYLE_LENGTH_NONE;
             style.margin.bottom = STYLE_LENGTH_NONE;
         }
-        if (!NODE_TAG_IS("dl")) {
+        if (tag != LXB_TAG_DL) {
             if (ua_rtl) style.padding.right = 40;
             else style.padding.left = 40;
         }
-    } else if (NODE_TAG_IS("dd")) {
+    } else if (tag == LXB_TAG_DD) {
         if (ua_rtl) style.margin.right = 40;
         else style.margin.left = 40;
-    } else if (NODE_TAG_IS("blockquote") || NODE_TAG_IS("figure")) {
+    } else if (tag == LXB_TAG_BLOCKQUOTE || tag == LXB_TAG_FIGURE) {
         style.margin = (StyleEdges) {
             .top = STYLE_LENGTH_NONE, .right = 40,
             .bottom = STYLE_LENGTH_NONE, .left = 40
@@ -1270,7 +1238,7 @@ static ComputedStyle default_style(const Stylesheet *sheet,
     /* UA spacing for paragraphs and headings is block-axis spacing.  Inline
        margins here would indent the element even when the author has made a
        full-width mobile content column. */
-    if (NODE_TAG_IS("p")) {
+    if (tag == LXB_TAG_P) {
         /* HTML's UA sheet gives paragraphs one em of block spacing.  Retain
            sentinels through the author cascade so an author margin still
            replaces them, then resolve against this paragraph's final font
@@ -1279,28 +1247,28 @@ static ComputedStyle default_style(const Stylesheet *sheet,
             .top = STYLE_LENGTH_NONE, .bottom = STYLE_LENGTH_NONE
         };
     }
-    if (NODE_TAG_IS("h1")) {
+    if (tag == LXB_TAG_H1) {
         style.font_scale = 3; style.font_size = 28;
         style.font_size_fraction = 0;
         style.font_weight = 700; style.font_bold = true;
         style.margin = (StyleEdges) {
             .top = STYLE_LENGTH_NONE, .bottom = STYLE_LENGTH_NONE};
     }
-    else if (NODE_TAG_IS("h2") || NODE_TAG_IS("h3")) {
+    else if (tag == LXB_TAG_H2 || tag == LXB_TAG_H3) {
         style.font_scale = 2; style.font_size = 20;
         style.font_size_fraction = 0;
         style.font_weight = 700; style.font_bold = true;
         style.margin = (StyleEdges) {
             .top = STYLE_LENGTH_NONE, .bottom = STYLE_LENGTH_NONE};
     }
-    if (NODE_TAG_IS("code") || NODE_TAG_IS("pre")) {
+    if (tag == LXB_TAG_CODE || tag == LXB_TAG_PRE) {
         style.font_family = FONT_MONOSPACE;
     }
-    if (NODE_TAG_IS("b") || NODE_TAG_IS("strong") || NODE_TAG_IS("th")) {
+    if (tag == LXB_TAG_B || tag == LXB_TAG_STRONG || tag == LXB_TAG_TH) {
         style.font_weight = 700;
         style.font_bold = true;
     }
-    if (NODE_TAG_IS("a")) {
+    if (tag == LXB_TAG_A) {
         size_t href_length = 0;
         if (document_attribute(node, "href", &href_length) != NULL) {
             /* The UA :link color is a declaration on the anchor, not an
@@ -1312,10 +1280,10 @@ static ComputedStyle default_style(const Stylesheet *sheet,
             style_set_text_underline(&style, true);
         }
     }
-    if (NODE_TAG_IS("center")) style.text_align = TEXT_ALIGN_CENTER;
-    if (NODE_TAG_IS("i") || NODE_TAG_IS("em")) style.font_italic = true;
-    if (NODE_TAG_IS("sup") || NODE_TAG_IS("sub")) {
-        style.vertical_align = NODE_TAG_IS("sup")
+    if (tag == LXB_TAG_CENTER) style.text_align = TEXT_ALIGN_CENTER;
+    if (tag == LXB_TAG_I || tag == LXB_TAG_EM) style.font_italic = true;
+    if (tag == LXB_TAG_SUP || tag == LXB_TAG_SUB) {
+        style.vertical_align = tag == LXB_TAG_SUP
                                ? VERTICAL_SUPER : VERTICAL_SUB;
         int fixed = computed_style_font_size_fixed(&style) * 3 / 4;
         if (fixed < 6 * 64) fixed = 6 * 64;
@@ -1323,7 +1291,6 @@ static ComputedStyle default_style(const Stylesheet *sheet,
             fixed, &style.font_size_fraction);
         style.font_scale = fixed >= 13 * 64 ? 2 : 1;
     }
-    #undef NODE_TAG_IS
     return style;
 }
 
@@ -1991,6 +1958,7 @@ static void style_apply_matching_ordered_range(const Stylesheet *sheet,
     }
 
     uint32_t previous = STYLE_RULE_INDEX_EMPTY;
+    int attribute_bits = -1;
     uint64_t ancestor_tokens = 0;
     bool ancestor_tokens_ready = false;
     for (;;) {
@@ -2018,6 +1986,13 @@ static void style_apply_matching_ordered_range(const Stylesheet *sheet,
         previous = candidate;
         mutable_sheet->rule_index_candidates++;
         TILEFINCH_WORK_ADD(style_rule_candidates, 1);
+        uint8_t alternatives = sheet->rule_filters == NULL ? 0
+            : sheet->rule_filters[candidate].attribute_alternatives;
+        if (alternatives != 0) {
+            if (attribute_bits < 0)
+                attribute_bits = style_subject_attribute_bits(node);
+            if (!(alternatives & attribute_bits)) continue;
+        }
         if (sheet->rule_filters != NULL
             && style_token_bloom_missing(
                 sheet->rule_filters[candidate].compound,
@@ -4030,10 +4005,28 @@ static ComputedStyle style_for_node_scoped(const Stylesheet *sheet,
     }
     resolve_font_size(&style, parent, root_element);
     if (sheet != NULL && sheet->modern_property_mask != 0) {
-        StyleRetainedGate gate = style_retained_gate_begin(sheet, node);
+        /* No rule selects a text node, and most elements carry no key of
+           a rule for most of these properties (the retained gate); those
+           lookups could only miss. A style attribute is read whatever the
+           gate says. */
+        StyleModernLookup lookup = {0};
+        StyleRetainedGate gate = {0};
+        bool gated = false;
+        if (node != NULL && node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+            lookup.node = node;
+            bool inline_style = style_inline_style_readable(sheet, node);
+            if (sheet->custom_rule_count == 0) {
+                if (!inline_style) lookup.node = NULL;
+            } else {
+                gate = style_retained_gate_begin(sheet, node);
+                gated = true;
+                if (!inline_style)
+                    lookup.absent = style_retained_gate_absent_bits(sheet, node);
+            }
+        }
         style_apply_modern_properties(
-            sheet, node, parent, &style, root_element);
-        style_retained_gate_end(sheet, gate);
+            sheet, node, &lookup, parent, &style, root_element);
+        if (gated) style_retained_gate_end(sheet, gate);
     }
     resolve_sizing_em_lengths(&style);
     resolve_overflow_clip_margin(&style);

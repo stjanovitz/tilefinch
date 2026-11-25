@@ -2,11 +2,16 @@
 // answers 200; /post (POST, after reading the body) answers 302 to
 // /target with a small body; /post-trailer does the same and ends the
 // redirect with a set-cookie trailer; /post-large sends a redirect body
-// over the client's 64 KiB drain bound; /target answers 200. Every response repeats the
-// same literal fields, so a client whose HPACK table falls out of step with
-// this encoder decodes wrong fields on the next stream. Each stream prints one
-// "stream SESSION ID METHOD PATH" line, so the driver can check that the
-// redirect hop really reused the connection.
+// over the client's 64 KiB drain bound; /target answers 200. /missing
+// answers 404 with no body (the HEADERS frame ends the stream),
+// /missing-body answers 404 with a body, and /fields answers 200 with a
+// set-cookie. Every response repeats the same literal fields, and the error
+// and /fields responses add an x-request-id whose value is new on every
+// stream (so each of those header blocks inserts into the HPACK table): a
+// client whose HPACK table falls out of step with this encoder decodes wrong
+// fields on the next stream. Each stream prints one
+// "stream SESSION ID METHOD PATH" line, so the driver can check that later
+// streams really reused the connection.
 "use strict";
 const fs = require("fs");
 const http2 = require("http2");
@@ -52,10 +57,29 @@ server.on("stream", (stream, headers) => {
     });
     return;
   }
+  const requestId = `r${stream.session.tilefinchId}-${stream.id}`;
+  if (path === "/missing" || path === "/missing-body") {
+    const missing = path === "/missing-body"
+      ? "<html><body>" + "Not found. ".repeat(300) + "</body></html>"
+      : "";
+    stream.respond({
+      ":status": 404,
+      ...fields(),
+      "x-request-id": requestId,
+      "set-cookie": `bucket=${requestId}; Path=/`,
+      "content-length": String(Buffer.byteLength(missing)),
+    }, { endStream: missing === "" });
+    if (missing !== "") stream.end(missing);
+    return;
+  }
   const body = `<!doctype html><p>${path}</p>`;
   stream.respond({
     ":status": 200,
     ...fields(),
+    ...(path === "/fields" ? {
+      "x-request-id": requestId,
+      "set-cookie": `seen=${requestId}; Path=/`,
+    } : {}),
     "content-length": String(Buffer.byteLength(body)),
   });
   stream.end(body);

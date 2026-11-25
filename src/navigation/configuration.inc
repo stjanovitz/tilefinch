@@ -538,13 +538,19 @@ typedef struct {
     TilefinchCredentialsMode credentials;
     /* The CSP grant the parser's element will carry (nonce, integrity). */
     uint8_t csp_grant;
+    /* The document's CSP policy count when the request was made: a policy
+       a later <meta> adds saw neither its URL nor its redirects. */
+    uint8_t csp_policies;
     bool launched;
     bool complete;
-    /* A classic script request in the document's map of preloaded
-       resources: a <link rel=preload as=script>, or the scanner's CORS
-       <script src> (which the HTTP cache cannot serve). Its completed
-       response goes to the map (script_runtime_offer_preloaded_script)
-       with the element's integrity metadata (NULL: none). */
+    /* A script request in the document's map of preloaded resources: a
+       <link rel=preload as=script>, or the scanner's CORS <script src>
+       (which the HTTP cache cannot serve). Its completed response goes to
+       the map (script_runtime_offer_preloaded_script) with the element's
+       integrity metadata (NULL: none). A module's (<link rel=modulepreload>,
+       a scanned <script type=module src>) completed response goes to the
+       module HTTP cache instead; one still in flight at the end of parsing
+       goes to the realm either way. */
     bool map_entry;
     char *integrity;
     /* Its authorized response when it completed before the realm existed,
@@ -564,7 +570,15 @@ _Static_assert(NAVIGATION_PRELOAD_LIMIT <= SCRIPT_PRELOADED_SCRIPT_LIMIT,
                "the map of preloaded scripts has room for every preload");
 #define NAVIGATION_PRELOAD_CONCURRENCY 2
 #define NAVIGATION_PRELOAD_SCAN_TAG_LIMIT 4096
-#define NAVIGATION_STYLESHEET_INPUT_LIMIT 64
+/* Stylesheet sources (<style>, <link rel=stylesheet>) the blocking sheet's
+   recorded inputs track, in a Budget array grown on demand. A document with
+   more is past what a continuation can prove unchanged: every changed
+   checkpoint then rebuilds the sheet. */
+#define NAVIGATION_STYLESHEET_INPUT_LIMIT 512
+/* Sources one append takes, an array of node pointers on the stack. A
+   checkpoint suffix longer than this rebuilds the sheet; a prepared append
+   (style_prepare.inc) takes its suffix in runs of this many. */
+#define NAVIGATION_STYLESHEET_SUFFIX_LIMIT 64
 
 typedef struct {
     lxb_dom_node_t *node;

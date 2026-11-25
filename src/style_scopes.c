@@ -211,6 +211,14 @@ static const StyleShadowScope *style_shadow_scope_for_order(
     return NULL;
 }
 
+const lxb_dom_node_t *style_shadow_scope_carrier(const Stylesheet *sheet,
+                                                unsigned order)
+{
+    const StyleShadowScope *scope = sheet->scopes.shadow_scope_count == 0
+        ? NULL : style_shadow_scope_for_order(sheet, order);
+    return scope == NULL ? NULL : scope->carrier;
+}
+
 bool style_subject_near_shadow_tree(const StyleMatchSubject *subject)
 {
     const lxb_dom_node_t *node = subject == NULL ? NULL : subject->node;

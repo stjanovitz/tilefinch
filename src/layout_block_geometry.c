@@ -133,6 +133,72 @@ void layout_block_set_paint_layer_object_position(
         style_object_position_encode(y_percent, y_offset));
 }
 
+bool layout_declared_box_size(const Stylesheet *sheet,
+                              const ComputedStyle *style, int reference,
+                              int *width, int *height)
+{
+    if (style == NULL || !style->has_width || style->width_percent
+        || computed_style_width_max_content(style)
+        || computed_style_width_min_content(style)
+        || !style->has_height || style->height_percent) return false;
+    bool edges = style->padding.top != 0 || style->padding.right != 0
+        || style->padding.bottom != 0 || style->padding.left != 0
+        || style->border.top != 0 || style->border.right != 0
+        || style->border.bottom != 0 || style->border.left != 0;
+    return (!edges || style->box_sizing_border_box)
+        && style_length_resolve(sheet, style->width, reference, width)
+        && style_length_resolve(sheet, style->height, reference, height)
+        && *width > 0 && *height > 0;
+}
+
+void layout_size_mask_visual(LayoutContext *context,
+                             ImagePriorityTarget *target,
+                             const ComputedStyle *style)
+{
+    if (context == NULL || target == NULL || style == NULL) return;
+    const StylePaintStack *paint = stylesheet_paint_stack(
+        context->sheet, computed_style_paint_stack_id(style));
+    int width = 0, height = 0;
+    if (paint == NULL || paint->mask_count != 1
+        || !layout_declared_box_size(context->sheet, style,
+                                     context->layout->viewport.css_width,
+                                     &width, &height)) return;
+    const StylePaintLayer *layer = &paint->masks[0];
+    target->display_width =
+        width > UINT16_MAX ? UINT16_MAX : (uint16_t) width;
+    target->display_height =
+        height > UINT16_MAX ? UINT16_MAX : (uint16_t) height;
+    target->background_size_width = layer->width;
+    target->background_size_height = layer->height;
+    target->background_size_flags = layer->flags;
+    target->background_fit = layer->fit;
+    target->background_sized = true;
+}
+
+void layout_image_auto_size(const ImageResource *image, int area_width,
+                            int area_height, int *width, int *height)
+{
+    int natural_width = image_resource_intrinsic_width(image);
+    int natural_height = image_resource_intrinsic_height(image);
+    *width = natural_width;
+    *height = natural_height;
+    if (image == NULL || !image->no_natural_size || natural_width <= 0
+        || natural_height <= 0 || area_width <= 0 || area_height <= 0)
+        return;
+    if ((int64_t) area_width * natural_height
+        <= (int64_t) area_height * natural_width) {
+        *width = area_width;
+        *height = layout_scale_dimension(area_width, natural_height,
+                                         natural_width);
+    } else {
+        *height = area_height;
+        *width = layout_scale_dimension(area_height, natural_width,
+                                        natural_height);
+    }
+    if (*width < 1) *width = 1;
+    if (*height < 1) *height = 1;
+}
+
 void layout_background_tile_size(unsigned flags, int width, int height,
                                  int area_width, int area_height,
                                  const ImageResource *image,
@@ -149,8 +215,8 @@ void layout_background_tile_size(unsigned flags, int width, int height,
     int natural_width = image_resource_intrinsic_width(image);
     int natural_height = image_resource_intrinsic_height(image);
     if (width_auto && height_auto) {
-        resolved_width = natural_width;
-        resolved_height = natural_height;
+        layout_image_auto_size(image, area_width, area_height,
+                               &resolved_width, &resolved_height);
     } else if (width_auto && resolved_height > 0 && natural_height > 0) {
         resolved_width = layout_scale_dimension(
             resolved_height, natural_width, natural_height);
@@ -287,8 +353,9 @@ void layout_block_size_paint_image_command(
         layout_block_set_paint_layer_object_position(command, layer);
         return;
     }
-    int natural_width = image_resource_intrinsic_width(image);
-    int natural_height = image_resource_intrinsic_height(image);
+    int natural_width = 0, natural_height = 0;
+    layout_image_auto_size(image, area_width, area_height,
+                           &natural_width, &natural_height);
     bool x_pixels =
         (layer->flags & STYLE_BACKGROUND_POSITION_PIXELS) != 0
         || (layer->position_edges
@@ -319,6 +386,9 @@ void layout_block_size_paint_image_command(
            : (tile_y ? LAYOUT_IMAGE_FIT_SPRITE_TILE_Y
                      : LAYOUT_IMAGE_FIT_SPRITE));
     draw_command_set_image_offset(command, offset_x, offset_y);
+    if (image->no_natural_size)
+        draw_command_set_image_sprite_size(command, natural_width,
+                                           natural_height);
 }
 
 

@@ -12,7 +12,8 @@ typedef enum {
        (BROWSER_COOKIE_HEADER_CAPACITY), so it could never be sent; the
        whole login is refused, the file is removed (so the refusal is
        reported once), and the user must sign in again. */
-    YOUTUBE_LOGIN_COOKIE_TOO_LARGE
+    YOUTUBE_LOGIN_COOKIE_TOO_LARGE,
+    YOUTUBE_LOGIN_COOKIE_TOO_LARGE_CLEANUP_FAILED
 } YoutubeLoginLoadStatus;
 /* Native consent only. Unencrypted session credentials; never passwords.
    No shutdown save. Load is startup-only and refuses a nonempty cookie jar.

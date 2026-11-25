@@ -1,4 +1,5 @@
 #include "tilefinch/file_download.h"
+#include "tilefinch/media_http.h"
 #include "tilefinch/psp_offline_store.h"
 #include "tilefinch/sha256.h"
 #include "tilefinch/platform.h"
@@ -19,10 +20,12 @@
 static const char *trace_url = URL;
 static const char *trace_effective_url;
 static const char *trace_last_modified;
+static unsigned trace_async_delay;
 
 /* Distinguishes two entities served at the same URL. */
 static unsigned entity_salt;
-static unsigned char byte_at(size_t index) { return (unsigned char) (index * 37u + 11u + entity_salt); }
+static const unsigned char *zip_bytes;
+static unsigned char byte_at(size_t index) { return zip_bytes ? zip_bytes[index] : (unsigned char) (index * 37u + 11u + entity_salt); }
 
 /* Synthetic response corpus, never an account or a live download. */
 static bool trace(const char *directory, size_t total, size_t offset,
@@ -43,7 +46,7 @@ static bool trace(const char *directory, size_t total, size_t offset,
     const char *content_type = extra != NULL && !strncmp(extra, "content-type: ", 14)
         ? extra + 14 : "application/zip";
     fprintf(file, "psp-http-trace=3\nmethod=GET\nurl=%s\nsuccess=1\n"
-        "async-delay-pumps=0\nexternal-cancel=0\ntransport-timeout=0\nerror=\n"
+        "async-delay-pumps=%u\nexternal-cancel=0\ntransport-timeout=0\nerror=\n"
         "request-body-length=0\nrequest-body-hash=cbf29ce484222325\n"
         "request-cookie-bytes=0\nrequest-extra-header-bytes=0\n"
         "request-send-client-hints=0\nrequest-send-low-client-hints=0\n"
@@ -52,7 +55,7 @@ static bool trace(const char *directory, size_t total, size_t offset,
         "content-type=%s\netag=%s\nlast-modified=%s\n"
         "response-header-count=%u\nset-cookie-count=0\n"
         "response-header-0=content-type: application/zip\n",
-        trace_url, status, total - offset,
+        trace_url, trace_async_delay, status, total - offset,
         trace_effective_url == NULL ? trace_url : trace_effective_url, content_type, etag,
         trace_last_modified == NULL ? "" : trace_last_modified,
         1u + (content_length ? 1u : 0u) + (extra != NULL ? 1u : 0u));
@@ -166,6 +169,7 @@ static bool transfers(const char *directory, const char *corpus)
 
     /* Pause, reload the index, then resume verified bytes with If-Range. */
     CHECK(file_download_enqueue(&library, URL, NULL, &id, error, sizeof(error)));
+    trace_effective_url = "https://cdn.example.test/get?file=a#first";
     CHECK(trace(corpus, 262144, 0, 200, "\"one\"", NULL, true));
     CHECK(offline_download_manager_start(&manager, id));
     OfflineDownloadSnapshot snapshot = {0};
@@ -180,6 +184,16 @@ static bool transfers(const char *directory, const char *corpus)
     offline_download_manager_destroy(&manager);
     library.loaded = false; CHECK(offline_library_load(&library));
     offline_download_manager_init(&manager, &budget, &session, &library);
+    /* If its receipt is temporarily unreadable, the manager must not start
+       an unconditioned GET which would overwrite the still-valid partial. */
+    char receipt[512], held[512];
+    CHECK(offline_library_item_path(&library, id, ".file.meta", receipt, sizeof(receipt)));
+    CHECK(offline_library_item_path(&library, id, ".held", held, sizeof(held)));
+    CHECK(rename(receipt, held) == 0 && mkdir(receipt, 0700) == 0);
+    CHECK(!offline_download_manager_start(&manager, id));
+    CHECK(offline_library_find(&library, id)->downloaded_bytes == offset);
+    CHECK(rmdir(receipt) == 0 && rename(held, receipt) == 0);
+    trace_effective_url = "https://cdn.example.test/get?file=a#second";
     char range[128]; snprintf(range, sizeof(range), "content-range: bytes %zu-262143/262144", offset);
     CHECK(trace(corpus, 262144, offset, 206, "\"one\"", range, true));
     CHECK(offline_download_manager_start(&manager, id) && complete(&manager));
@@ -211,11 +225,10 @@ static bool transfers(const char *directory, const char *corpus)
     CHECK(offline_download_manager_start(&manager, id) && complete(&manager));
     CHECK(exact_file(&library, id, 42) && offline_library_remove(&library, id));
 
-    /* A signed CDN redirect carries a new signature and expiry on every
-       attempt. Under the same strong ETag the same path is the same
-       resource, so the range is appended. */
+    /* Two representations selected by query can legitimately carry the
+       same strong tag. Never append the second one to the first. */
     CHECK(file_download_enqueue(&library, URL, NULL, &id, error, sizeof(error)));
-    trace_effective_url = "https://cdn.example.test/object-a?Expires=1&Signature=one";
+    trace_effective_url = "https://cdn.example.test/get?id=a";
     CHECK(trace(corpus, 262144, 0, 200, "\"signed\"", NULL, true));
     CHECK(offline_download_manager_start(&manager, id));
     for (unsigned i = 0; i < 20; i++) {
@@ -227,11 +240,16 @@ static bool transfers(const char *directory, const char *corpus)
     CHECK(offline_download_manager_pause(&manager, id)); fetch_trace_end();
     offset = (size_t) offline_library_find(&library, id)->downloaded_bytes;
     snprintf(range, sizeof(range), "content-range: bytes %zu-262143/262144", offset);
-    trace_effective_url = "https://cdn.example.test/object-a?Expires=2&Signature=two";
+    trace_effective_url = "https://cdn.example.test/get?id=b";
+    entity_salt = 1;
     CHECK(trace(corpus, 262144, offset, 206, "\"signed\"", range, true));
     CHECK(offline_download_manager_start(&manager, id) && complete(&manager));
-    CHECK(offline_library_find(&library, id)->state == OFFLINE_ITEM_READY);
+    CHECK(offline_library_find(&library, id)->state == OFFLINE_ITEM_PAUSED);
+    CHECK(offline_library_find(&library, id)->downloaded_bytes == offset);
+    CHECK(trace(corpus, 262144, 0, 200, "\"signed\"", NULL, true));
+    CHECK(offline_download_manager_start(&manager, id) && complete(&manager));
     CHECK(exact_file(&library, id, 262144) && offline_library_remove(&library, id));
+    entity_salt = 0;
 
     /* Files uploaded together share a Last-Modified date, and a query can
        name the file: with only a date the whole URL must match. */
@@ -320,6 +338,27 @@ static bool transfers(const char *directory, const char *corpus)
     CHECK(offline_library_find(&library, id)->state == OFFLINE_ITEM_READY);
     CHECK(offline_library_find(&library, id)->content_bytes == 262144u);
     CHECK(exact_file(&library, id, 262144) && access(part, F_OK) != 0);
+    CHECK(offline_library_remove(&library, id));
+
+    /* The previous format hashed only the redirect path for strong tags.
+       Even an exact-length 416 must not certify those legacy bytes. */
+    CHECK(file_download_enqueue(&library, URL, NULL, &id, error, sizeof(error)));
+    CHECK(trace(corpus, 262144, 0, 200, "\"one\"", NULL, true));
+    CHECK(offline_download_manager_start(&manager, id));
+    for (unsigned i = 0; i < 20; i++) {
+        (void) offline_download_manager_pump(&manager);
+        CHECK(offline_download_manager_snapshot(&manager, id, &snapshot));
+        if (snapshot.downloaded_bytes) break;
+    }
+    CHECK(offline_download_manager_pause(&manager, id)); fetch_trace_end();
+    offset = (size_t) offline_library_find(&library, id)->downloaded_bytes;
+    CHECK(offset > 0 && offline_library_item_path(&library, id, ".file.meta", receipt, sizeof(receipt)));
+    FILE *legacy = fopen(receipt, "r+b");
+    CHECK(legacy != NULL && fputs("TFDL02\n", legacy) >= 0 && fclose(legacy) == 0);
+    snprintf(range, sizeof(range), "content-range: bytes */%zu", offset);
+    CHECK(trace(corpus, offset, offset, 416, "\"one\"", range, true));
+    CHECK(offline_download_manager_start(&manager, id) && complete(&manager));
+    CHECK(offline_library_find(&library, id)->state == OFFLINE_ITEM_PAUSED);
     CHECK(offline_library_remove(&library, id));
 
     /* A 416 naming another length (or validator) restarts from zero. */
@@ -554,6 +593,79 @@ static bool confirmation(const char *directory, const char *corpus)
 /* Pressing X on a link: only a file-like address, or a same-origin link
    marked download, asks first. A folder-style address such as /settings/
    is a page, though its saved name would fall back to download.bin. */
+static bool remove_active_download(const char *directory, const char *corpus,
+                                   bool video, bool html)
+{
+    BrowserConfig config; browser_config_init(&config, NULL);
+    config.javascript.enabled = false; config.resources.enabled = false;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    PspOfflineStore store;
+    psp_offline_store_init(&store, browser_engine_budget(engine),
+                           browser_engine_session(engine), directory);
+    CHECK(offline_library_load(&store.library));
+    uint32_t id = 0;
+    YoutubeStream stream = {
+        .video_id = "TFTEST00012", .content_length = 262144, .itag = 18,
+        .media_url = "https://rr2.googlevideo.com/videoplayback?id=v",
+    };
+    char media_range[2048];
+    if (video) {
+        CHECK(offline_library_enqueue_youtube(&store.library,
+              "https://www.youtube.com/watch?v=TFTEST00012", "Video", &id,
+              error, sizeof(error)));
+        CHECK(media_http_build_range_url(stream.media_url, 0, 262143,
+                                         media_range, sizeof(media_range)));
+        trace_url = media_range;
+    } else {
+        CHECK(file_download_enqueue(&store.library, URL, NULL, &id, error,
+                                     sizeof(error)));
+    }
+    trace_async_delay = video ? 8u : 0u;
+    CHECK(trace(corpus, 262144, 0, video ? 206 : 200, "\"one\"",
+                video ? "content-range: bytes 0-262143/262144" : NULL, true));
+    trace_async_delay = 0;
+    trace_url = URL;
+    CHECK(offline_download_manager_start(&store.download, id));
+    if (video)
+        CHECK(offline_download_manager_adopt_resolved(&store.download, &stream));
+    for (unsigned i = 0; i < (video ? 2u : 3u); i++)
+        (void) psp_offline_store_pump(&store);
+    CHECK(offline_download_manager_active(&store.download, NULL)
+          && (!video || store.download.request_id != 0));
+    char part[512], final[512], receipt[512], url[100];
+    CHECK(offline_library_item_path(&store.library, id,
+              video ? ".video.part" : ".file.part", part, sizeof(part))
+          && offline_library_item_path(&store.library, id,
+              video ? ".video.identity" : ".file.meta", receipt, sizeof(receipt))
+          && (video ? offline_library_item_path(&store.library, id,
+                          ".video.mp4", final, sizeof(final))
+                    : file_download_path(&store.library, id, final, sizeof(final)))
+          && access(part, F_OK) == 0);
+    if (html) {
+        snprintf(url, sizeof(url), "https://tilefinch.local/offline/delete?id=%u",
+                 (unsigned) id);
+        CHECK(psp_offline_store_handle_url(&store, engine, NULL, url, NULL, false)
+              == PSP_OFFLINE_ROUTE_STATE_CHANGED);
+    } else {
+        CHECK(psp_offline_store_remove_item(&store, id));
+    }
+    for (unsigned i = 0; i < 20; i++) {
+        if (store.download.scheduler != NULL)
+            offline_download_pump_transfer(store.download.scheduler);
+        (void) psp_offline_store_pump(&store);
+    }
+    CHECK(!offline_download_manager_active(&store.download, NULL)
+          && offline_library_find(&store.library, id) == NULL
+          && access(part, F_OK) != 0 && access(final, F_OK) != 0
+          && access(receipt, F_OK) != 0);
+    fetch_trace_end();
+    psp_offline_store_destroy(&store);
+    browser_engine_destroy(engine);
+    return true;
+}
+
 static bool link_activation(void)
 {
     BrowserConfig config; browser_config_init(&config, NULL);
@@ -713,7 +825,7 @@ static bool responsiveness(const char *directory, const char *corpus)
     char error[128]; BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
     CHECK(engine);
     char html[16384]; size_t used = (size_t)snprintf(html, sizeof(html),
-        "<!doctype html><style>a{display:block;padding:8px}a:focus{background:#fc0}</style>");
+        "<!doctype html><style>a{display:block;padding:8px}a:nth-child(even){background:#ccc}a:focus{background:#fc0}</style>");
     for (unsigned i = 0; i < 100; i++) used += (size_t)snprintf(html+used, sizeof(html)-used,
         "<a href='/item%u'>Download test row %u</a>", i, i);
     CHECK(browser_engine_commit_html(engine, "https://downloads.example.test/catalog", html, used, true));
@@ -730,23 +842,43 @@ static bool responsiveness(const char *directory, const char *corpus)
     CHECK(file_download_enqueue(&store.library, URL, NULL, &id, error, sizeof(error)));
     CHECK(trace(corpus, 8u*1024u*1024u, 0, 200, "\"one\"", NULL, true));
     CHECK(offline_download_manager_start(&store.download, id));
+    static uint16_t before_final[480 * 272];
+    bool final_changed = false;
     for (; count < 1024 && offline_download_manager_active(&store.download, NULL); count++) {
         uint64_t before = store.library.items[0].downloaded_bytes;
+        bool near_end = before >= 8u*1024u*1024u - 32768u;
+        size_t pixels = 0;
+        if (near_end) {
+            const uint16_t *frame = browser_engine_framebuffer(engine, &pixels);
+            CHECK(frame && pixels == sizeof(before_final)/sizeof(before_final[0]));
+            memcpy(before_final, frame, sizeof(before_final));
+        }
         uint64_t press = tilefinch_platform_monotonic_time_us();
         (void) psp_offline_store_pump(&store);
         pumps[count] = tilefinch_platform_monotonic_time_us() - press;
         CHECK(store.library.items[0].downloaded_bytes - before <= 32768);
-        if (count % 2) {
+        if (store.library.items[0].state == OFFLINE_ITEM_READY) {
+            /* A scroll within the catalog must visibly move content. A focus
+               index alone is not evidence that a different frame was shown. */
+            CHECK(near_end && browser_engine_scroll_by(engine, -71));
+        } else if (count % 2) {
             CHECK(browser_engine_focus_move(engine, true));
         } else (void) browser_engine_scroll_by(engine, count % 4 ? -16 : 32);
         CHECK(browser_engine_render_frame(engine, NULL));
         response[count] = tilefinch_platform_monotonic_time_us() - press;
+        if (store.library.items[0].state == OFFLINE_ITEM_READY) {
+            const uint16_t *frame = browser_engine_framebuffer(engine, &pixels);
+            final_changed = frame && memcmp(before_final, frame, sizeof(before_final)) != 0;
+        }
     }
     CHECK(count && !offline_download_manager_active(&store.download, NULL));
-    CHECK(store.library.items[0].state == OFFLINE_ITEM_READY);
+    CHECK(store.library.items[0].state == OFFLINE_ITEM_READY && final_changed);
+    uint64_t publication_pump = pumps[count-1], publication_frame = response[count-1];
     timing("warm focus-to-frame, idle", baseline, 64);
     timing("download owner pump", pumps, count);
     timing("simulated press before pump -> focus/scroll frame ready", response, count);
+    printf("download publication: pump=%lluus press-to-frame=%lluus\n",
+        (unsigned long long)publication_pump, (unsigned long long)publication_frame);
     CHECK(offline_library_remove(&store.library, id));
     fetch_trace_end(); psp_offline_store_destroy(&store); browser_engine_destroy(engine);
     return true;
@@ -1086,8 +1218,54 @@ static bool arabic_transfer(const char *directory, const char *corpus)
     return true;
 }
 
+/* Invoked in separate processes by the storage restart journey. The first
+   process deliberately does not pause, close the writer or save its index. */
+static bool restart_package(const char *step, const char *root, const char *corpus, const char *zip)
+{
+    static unsigned char bytes[256 * 1024];
+    FILE *in = fopen(zip, "rb"); CHECK(in);
+    size_t total = fread(bytes, 1, sizeof(bytes), in);
+    CHECK(total > 65536 && total < sizeof(bytes) && feof(in) && !ferror(in) && !fclose(in));
+    zip_bytes = bytes;
+    Budget budget; budget_init(&budget, 4u * 1024u * 1024u);
+    BrowserSession session; CHECK(browser_session_init(&session, &budget, 65536));
+    OfflineLibrary library; offline_library_init(&library, &budget, root);
+    CHECK(offline_library_load(&library));
+    OfflineDownloadManager manager;
+    offline_download_manager_init(&manager, &budget, &session, &library);
+    uint32_t id = 0; char error[128];
+    if (!strcmp(step, "--interrupt-package")) {
+        CHECK(file_download_enqueue(&library, URL, NULL, &id, error, sizeof(error))
+              && trace(corpus, total, 0, 200, "\"zip\"", NULL, true)
+              && offline_download_manager_start(&manager, id));
+        for (unsigned i = 0; i < 64; i++) {
+            OfflineDownloadSnapshot s;
+            (void) offline_download_manager_pump(&manager);
+            CHECK(offline_download_manager_snapshot(&manager,id,&s));
+            if (s.active && s.downloaded_bytes >= 65536 && s.downloaded_bytes < total) _exit(0);
+        }
+        return false;
+    }
+    CHECK(library.count == 1);
+    id = library.items[0].id;
+    char part[512], range[96]; struct stat st;
+    CHECK(offline_library_item_path(&library,id,".file.part",part,sizeof(part))
+          && !stat(part,&st) && st.st_size > 0 && (size_t)st.st_size < total);
+    size_t offset = (size_t)st.st_size;
+    snprintf(range,sizeof(range),"content-range: bytes %zu-%zu/%zu",offset,total-1,total);
+    CHECK(trace(corpus,total,offset,206,"\"zip\"",range,true)
+          && offline_download_manager_start(&manager,id) && complete(&manager)
+          && library.items[0].state == OFFLINE_ITEM_READY && exact_file(&library,id,total));
+    offline_download_manager_destroy(&manager);
+    browser_session_destroy(&session);
+    CHECK(!budget.current);
+    return true;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 5 && (!strcmp(argv[1],"--interrupt-package") || !strcmp(argv[1],"--resume-package")))
+        return restart_package(argv[1],argv[2],argv[3],argv[4]) ? 0 : 1;
     char directory[] = "/tmp/tilefinch-file-test-XXXXXX";
     char corpus[] = "/tmp/tilefinch-file-trace-XXXXXX";
     if (mkdtemp(directory) == NULL || mkdtemp(corpus) == NULL) return 1;
@@ -1100,6 +1278,8 @@ int main(int argc, char **argv)
         : argc == 1 && filenames() && display_names(directory)
             && arabic_transfer(directory, corpus) && transfers(directory, corpus)
             && restart_speed(directory, corpus) && confirmation(directory, corpus)
+            && remove_active_download(directory, corpus, true, false)
+            && remove_active_download(directory, corpus, false, true)
             && link_activation() && extensionless_navigation(corpus)
             && audio_navigation(corpus);
     fetch_trace_end(); clean(directory); clean(corpus);

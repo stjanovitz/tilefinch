@@ -500,6 +500,203 @@ bool layout_scroll_node_chain(LayoutDocument *layout, lxb_dom_node_t *node,
     return changed;
 }
 
+/* Unpinning a tall pinned stack.
+
+   A small screen leaves little room under a page's fixed header: a stack
+   of fixed bars (header, search bar, toolbar) sized for a phone can cover
+   most of 272 pixels and leave a sliver to read through. When the
+   position:fixed bars pinned to the viewport edges cover more than half of
+   it, the stack is laid out as though position:absolute against the
+   initial containing block instead: each bar keeps the place it has at the
+   top of the document (or at the bottom of the first screen) and scrolls
+   away with the page, and page steps are no longer shortened by it.
+
+   Only viewport-fixed ranges count; sticky bars stick only inside their
+   container and leave with it. A bar is a range that spans at least half
+   the viewport width and is no taller than two thirds of the viewport
+   (taller ones are dialogs, menus or app shells, left alone), not bound to
+   a scrolling scene or a clip-path ancestor. A top stack starts with a bar
+   in the top quarter and grows by bars touching what it covers; the bottom
+   stack is its mirror image, as for page steps (controller.c). The top
+   stack is unpinned when both stacks together cover more than half the
+   viewport height; the bottom stack only when it alone does, since an
+   unpinned footer lands over the first screen's content. Once a stack was
+   unpinned on this page, it stays unpinned until it covers 40% or less, so
+   a page whose bars change size a little between relayouts does not flip.
+   The decision is made once per layout build, before any index is built
+   over the commands, so frames pay nothing for it. */
+enum {
+    UNPIN_TOP = 1u,
+    UNPIN_BOTTOM = 2u,
+    UNPIN_SPAN_SCAN = 4096u
+};
+
+static bool unpin_range_spans_width(const LayoutDocument *layout,
+                                    const FixedRange *range, int width)
+{
+    size_t end = range->command_end < layout->count
+        ? range->command_end : layout->count;
+    if (width <= 0 || end <= range->command_start) return false;
+    if (end - range->command_start > UNPIN_SPAN_SCAN) return true;
+    int left = INT_MAX, right = INT_MIN;
+    for (size_t i = range->command_start; i < end; i++) {
+        const DrawCommand *command = &layout->commands[i];
+        if (command->width <= 0 || command->height <= 0) continue;
+        if (command->x < left) left = command->x;
+        int command_right = layout_add_coordinate(command->x, command->width);
+        if (command_right > right) right = command_right;
+    }
+    if (left < 0) left = 0;
+    if (right > width) right = width;
+    return right > left && right - left >= width / 2;
+}
+
+static bool unpin_range_nested(const LayoutDocument *layout, size_t index)
+{
+    const FixedRange *inner = &layout->fixed_ranges[index];
+    for (size_t i = 0; i < layout->fixed_count; i++) {
+        const FixedRange *outer = &layout->fixed_ranges[i];
+        if (i != index && outer->command_start <= inner->command_start
+            && inner->command_end <= outer->command_end
+            && (outer->command_end - outer->command_start
+                > inner->command_end - inner->command_start || i < index))
+            return true;
+    }
+    return false;
+}
+
+/* Moves one fixed range's paint, regions, boxes and fragments by dy: what
+   layout_translate_range does for a range that ends the layout. */
+static void unpin_translate(LayoutDocument *layout, const FixedRange *range,
+                            int dy)
+{
+    size_t end = range->command_end < layout->count
+        ? range->command_end : layout->count;
+    for (size_t i = range->command_start; i < end; i++)
+        layout->commands[i].y = layout_add_coordinate(
+            layout->commands[i].y, dy);
+    for (size_t i = range->link_start;
+         i < range->link_end && i < layout->link_count; i++)
+        layout->links[i].y = layout_add_coordinate(layout->links[i].y, dy);
+    for (size_t i = range->control_start;
+         i < range->control_end && i < layout->control_count; i++)
+        layout->controls[i].y = layout_add_coordinate(
+            layout->controls[i].y, dy);
+    for (size_t i = 0; i < layout->node_box_count; i++) {
+        LayoutNodeBox *box = &layout->node_boxes[i];
+        if (box->command_start >= range->command_start
+            && box->command_start < end && box->command_end <= end) {
+            box->y = layout_add_coordinate(box->y, dy);
+            /* Exact for CSSOM, as it was while the range was fixed. */
+            box->cssom_geometry_authoritative = 1;
+        }
+    }
+    LayoutInlineFragments *fragments = layout->inline_fragments;
+    for (size_t i = 0; fragments != NULL && i < fragments->count; i++) {
+        LayoutInlineFragment *fragment = &fragments->entries[i];
+        if (fragment->command >= range->command_start
+            && fragment->command < end)
+            fragment->y = layout_add_coordinate(fragment->y, dy);
+    }
+    for (size_t i = 0; i < layout->sticky_count; i++) {
+        StickyRange *sticky = &layout->sticky_ranges[i];
+        if (sticky->command_start < range->command_start
+            || sticky->command_end > end) continue;
+        sticky->origin_y = layout_add_coordinate(sticky->origin_y, dy);
+        sticky->bottom_y = layout_add_coordinate(sticky->bottom_y, dy);
+    }
+}
+
+void layout_unpin_tall_fixed_stacks(LayoutDocument *layout,
+                                    int viewport_height, uint8_t *state)
+{
+    uint8_t previous = state == NULL ? 0u : *state;
+    if (state != NULL) *state = 0u;
+    if (layout == NULL || layout->fixed_count == 0 || viewport_height <= 0)
+        return;
+    size_t count = layout->fixed_count;
+    int tops[LAYOUT_FIXED_RANGE_LIMIT], bottoms[LAYOUT_FIXED_RANGE_LIMIT];
+    uint8_t edge[LAYOUT_FIXED_RANGE_LIMIT] = {0};
+    bool bar[LAYOUT_FIXED_RANGE_LIMIT] = {0};
+    for (size_t i = 0; i < count && i < LAYOUT_FIXED_RANGE_LIMIT; i++) {
+        const FixedRange *range = &layout->fixed_ranges[i];
+        tops[i] = range->from_bottom
+            ? viewport_height - range->inset - range->height : range->inset;
+        bottoms[i] = layout_add_coordinate(tops[i], range->height);
+        bar[i] = range->height > 0
+            && range->height <= viewport_height - viewport_height / 3
+            && range->scroll_end == INT_MAX && range->clip_node == NULL
+            && bottoms[i] > 0 && tops[i] < viewport_height
+            && !unpin_range_nested(layout, i)
+            && unpin_range_spans_width(layout, range, layout->width);
+    }
+    /* Each pass adds at least one bar or stops. */
+    int covered_top = 0, covered_from = viewport_height;
+    for (size_t pass = 0; pass < count; pass++) {
+        bool grew = false;
+        for (size_t i = 0; i < count; i++) {
+            if (!bar[i] || (edge[i] & UNPIN_TOP) != 0) continue;
+            if ((tops[i] <= viewport_height / 4 || tops[i] <= covered_top)
+                && bottoms[i] < viewport_height) {
+                edge[i] |= UNPIN_TOP;
+                if (bottoms[i] > covered_top) covered_top = bottoms[i];
+                grew = true;
+            }
+        }
+        if (!grew) break;
+    }
+    for (size_t pass = 0; pass < count; pass++) {
+        bool grew = false;
+        for (size_t i = 0; i < count; i++) {
+            if (!bar[i] || edge[i] != 0) continue;
+            if ((bottoms[i] >= viewport_height - viewport_height / 4
+                 || bottoms[i] >= covered_from)
+                && tops[i] > 0 && tops[i] >= covered_top) {
+                edge[i] |= UNPIN_BOTTOM;
+                if (tops[i] < covered_from) covered_from = tops[i];
+                grew = true;
+            }
+        }
+        if (!grew) break;
+    }
+    int covered_bottom = viewport_height - covered_from;
+    /* More than half, or more than 40% for a stack this page unpinned. */
+    int top_limit = (previous & UNPIN_TOP) != 0
+        ? viewport_height * 2 / 5 : viewport_height / 2;
+    int bottom_limit = (previous & UNPIN_BOTTOM) != 0
+        ? viewport_height * 2 / 5 : viewport_height / 2;
+    uint8_t unpin = 0u;
+    if (covered_top > 0 && covered_top + covered_bottom > top_limit)
+        unpin |= UNPIN_TOP;
+    if (covered_bottom > bottom_limit) unpin |= UNPIN_BOTTOM;
+    if (state != NULL) *state = unpin;
+    if (unpin == 0u) return;
+    for (size_t i = 0; i < count; i++) {
+        if ((edge[i] & unpin) == 0) continue;
+        unpin_translate(layout, &layout->fixed_ranges[i],
+                        layout_subtract_coordinate(
+                            tops[i], layout->fixed_ranges[i].origin_y));
+    }
+    /* Drop the unpinned ranges and those nested in them: their commands
+       are ordinary document paint now. */
+    bool dropped[LAYOUT_FIXED_RANGE_LIMIT] = {0};
+    for (size_t i = 0; i < count; i++) {
+        const FixedRange *range = &layout->fixed_ranges[i];
+        dropped[i] = (edge[i] & unpin) != 0;
+        for (size_t j = 0; !dropped[i] && j < count; j++) {
+            const FixedRange *outer = &layout->fixed_ranges[j];
+            dropped[i] = j != i && (edge[j] & unpin) != 0
+                && outer->command_start <= range->command_start
+                && range->command_end <= outer->command_end;
+        }
+    }
+    size_t kept = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (!dropped[i]) layout->fixed_ranges[kept++] = layout->fixed_ranges[i];
+    }
+    layout->fixed_count = kept;
+}
+
 static int snap_target_axis(int position, int size, int viewport,
                             int leading_padding, int trailing_padding,
                             int leading_margin, int trailing_margin,

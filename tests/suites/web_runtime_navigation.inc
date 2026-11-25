@@ -1032,7 +1032,7 @@
     CHECK(controller_action.type == CONTROLLER_ACTION_FORM_SUBMIT);
     CHECK(strcmp(controller_action.method, "GET") == 0);
     CHECK(strcmp(controller_action.url,
-                 "https://example.test/search/?q=&q=PSP") == 0);
+                 "https://example.test/search/?q=PSP") == 0);
     CHECK(controller_action.body_length == 0);
     CHECK(attribute_equals(runtime_status, "data-search-submit",
                            "SubmitEvent:true:true"));
@@ -1606,7 +1606,8 @@
         }
         /* Another module-sized block whose keyed rules do select existing
            elements (by class, id and tag): exactly their retained lists go,
-           decided through the hashed fast-key set, and they restyle. */
+           decided through the hashed fast-key set, and they restyle; the
+           elements carrying none of its keys keep their computed styles. */
         {
             LayoutReuseStats before = {0}, after = {0};
             layout_reuse_cache_stats(interactive.page.layout_reuse, &before);
@@ -1624,7 +1625,9 @@
                   && interactive.performance.mutation_style_appends == 3
                   && late_init_text_color(&interactive.page.layout, "late") == 0x123123
                   && late_init_text_color(&interactive.page.layout, "middle") == 0x555555
-                  && after.matched_hits > before.matched_hits + 200);
+                  && after.matched_misses - before.matched_misses <= 8
+                  && (after.style_misses - before.style_misses) * 8
+                         < after.style_hits - before.style_hits);
         }
         /* A stylesheet link is a new source too: it is inserted in place
            (this page loads without external resources, so like a rebuild it
@@ -2296,8 +2299,11 @@
         "try{document.createElement('div').attachInternals();}"
         "catch(e){ordinary=e.name==='NotSupportedError';}"
         "field.i.setValidity({valueMissing:true},'Required');"
-        "const invalid=!form.checkValidity()&&field.i.validationMessage==='Required';"
-        "field.i.setValidity({});field.setAttribute('disabled','');"
+        "const invalid=!form.checkValidity()&&field.i.validationMessage==='Required'"
+        "&&field.i.validity instanceof ValidityState&&field.i.validity.valueMissing"
+        "&&!field.i.validity.valid&&!field.i.validity.tooLong;"
+        "field.i.setValidity({});const cleared=field.i.validity.valid;"
+        "field.setAttribute('disabled','');"
         "field.removeAttribute('disabled');form.reset();"
         "const data=new FormData(form),"
         "source=new BroadcastChannel('component-api'),"
@@ -2305,7 +2311,7 @@
         "target.onmessage=event=>{const ok=event.isTrusted&&event.data.value===7"
         "&&field.i.form===form&&field.i.labels.length===1&&field.associated"
         "&&field.i.states.has('--ready')&&field.i.role==='textbox'"
-        "&&!field.hasAttribute('role')&&duplicate&&ordinary&&invalid"
+        "&&!field.hasAttribute('role')&&duplicate&&ordinary&&invalid&&cleared"
         "&&field.disabledHistory.join(',')==='true,false'&&field.resetSeen"
         "&&form.checkValidity()&&data.get('answer')==='42'"
         "&&form.elements.includes(field);document.getElementById('result')."
@@ -2998,6 +3004,73 @@
               && navigation_current(&session)->scroll_y == 266);
         navigation_destroy(&session);
         CHECK(budget.current == 0);
+    }
+    {
+        /* Fixed bars that together cover more than half the screen scroll
+           away with the page from their place at the top of the document,
+           and page steps move a full screen. A short header stays pinned
+           with the usual shorter step, and a bottom bar stays pinned unless
+           it alone covers more than half. */
+        puts("test: pinned bars covering most of the screen scroll away");
+        static const char shape[] =
+            "<!doctype html><meta name=viewport content='width=device-width'>"
+            "<style>body{margin:0}#tall{height:3000px}"
+            "#head,#tabs,#foot{position:fixed;left:0;right:0;"
+            "background:#c00}#head{top:0;height:%dpx}"
+            "#tabs{top:%dpx;height:%dpx}#foot{bottom:0;height:%dpx}"
+            "</style><body><div id=tall>Story</div><div id=head>Head</div>"
+            "<div id=tabs>Tabs</div><div id=foot>Foot</div>";
+        static const struct {
+            int head, tabs, foot;
+            int covered_top, covered_bottom, first, second;
+            bool tabs_in_document;
+        } cases[] = {
+            /* 60 + 90 = 150 of 272: unpinned, 238 = 272 - 272/8. */
+            {60, 90, 0, 0, 0, 238, 476, true},
+            /* A 40 px header: pinned, 232 visible less 29 overlap. */
+            {40, 0, 0, 40, 0, 203, 406, false},
+            /* 40 + 100 = 140: the header goes, the 100 px footer stays. */
+            {40, 0, 100, 0, 100, 151, 302, false},
+            /* A 140 px footer alone: unpinned too. */
+            {0, 0, 140, 0, 0, 238, 476, false},
+        };
+        for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); ++c) {
+            char page[1024];
+            snprintf(page, sizeof(page), shape, cases[c].head,
+                     cases[c].head, cases[c].tabs, cases[c].foot);
+            static NavigationSession session;
+            CHECK(navigation_init(&session, &budget, 2));
+            uint64_t generation = navigation_begin(&session);
+            CHECK(navigation_commit_html(&session, generation,
+                "https://page.test/tall-bars", page, strlen(page), 480,
+                NULL, NULL, true));
+            BrowserController controller;
+            CHECK(controller_init(&controller, &session));
+            int covered_top = -1, covered_bottom = -1;
+            controller_page_obstructions(&session.page.layout, 300, 480,
+                                         272, &covered_top, &covered_bottom);
+            if (covered_top != cases[c].covered_top
+                || covered_bottom != cases[c].covered_bottom) {
+                fprintf(stderr, "case %zu covered %d/%d\n", c, covered_top,
+                        covered_bottom);
+            }
+            CHECK(covered_top == cases[c].covered_top
+                  && covered_bottom == cases[c].covered_bottom);
+            const LayoutNodeBox *tabs = layout_box_for_node(
+                &session.page.layout,
+                find_id(lxb_dom_interface_node(session.page.document.html),
+                        "tabs"));
+            CHECK(!cases[c].tabs_in_document
+                  || (tabs != NULL && tabs->y == cases[c].head));
+            CHECK(controller_scroll_page(&controller, 1, 272)
+                  && navigation_current(&session)->scroll_y
+                         == cases[c].first);
+            CHECK(controller_scroll_page(&controller, 1, 272)
+                  && navigation_current(&session)->scroll_y
+                         == cases[c].second);
+            navigation_destroy(&session);
+            CHECK(budget.current == 0);
+        }
     }
     {
         puts("test: a clipped skip link becomes visible on first controller focus");

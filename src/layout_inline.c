@@ -1168,9 +1168,9 @@ static bool paint_pseudo_internal(LayoutContext *context, lxb_dom_node_t *node,
         : NULL;
     if (style.mask_image != NULL && style.mask_image[0] != '\0'
         && !image_resource_available(pseudo_mask)) {
-        layout_note_unresolved_external_visual(
+        layout_size_mask_visual(context, layout_note_unresolved_external_visual(
             context, node, style.mask_image, IMAGE_PRIORITY_KIND_MASK,
-            pseudo);
+            pseudo), &style);
     }
     if (style.background_image_kind == STYLE_BACKGROUND_IMAGE_URL
         && !image_resource_available(pseudo_background)) {
@@ -4554,6 +4554,29 @@ static bool inline_single_word(LayoutContext *context, lxb_dom_node_t *node,
     return true;
 }
 
+/* A replaced element with no size of its own (an <img> before its pixels
+   arrive) flows its alt text, or nothing. With nothing to flow it is still
+   a zero-size box at its place on the line, as in CSS: script geometry
+   (getBoundingClientRect, an IntersectionObserver target) answers there,
+   so a lazy loader observing a sizeless image sees it on screen. */
+static bool flow_unboxed_image(LayoutContext *context, LineState *line,
+                               lxb_dom_node_t *node,
+                               const ComputedStyle *style,
+                               const char *link_url, size_t link_url_length,
+                               lxb_dom_node_t *link_node)
+{
+    size_t alt_length = 0;
+    const char *alt = document_node_is_tag(node, LXB_TAG_IMG)
+        ? document_attribute(node, "alt", &alt_length) : NULL;
+    if (alt == NULL || alt_length == 0) {
+        layout_add_inline_fragment(line, node, line->x, line->y, 0, 0);
+        return true;
+    }
+    ComputedStyle alt_style = layout_alt_text_flow_style(style);
+    return flow_text(context, line, alt, alt_length, &alt_style,
+                     link_url, link_url_length, link_node);
+}
+
 static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
                              const ComputedStyle *parent, LineState *line,
                              const char *link_url, size_t link_url_length,
@@ -5284,13 +5307,8 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
             && !document_node_is_tag(node, LXB_TAG_AUDIO)
             && !canvas_element
             && !document_node_is_tag(node, LXB_TAG_IFRAME)) {
-            size_t alt_length = 0;
-            const char *alt = document_node_is_tag(node, LXB_TAG_IMG)
-                ? document_attribute(node, "alt", &alt_length) : NULL;
-            ComputedStyle alt_style = layout_alt_text_flow_style(&style);
-            return alt == NULL || alt_length == 0
-                   || flow_text(context, line, alt, alt_length, &alt_style,
-                                link_url, link_url_length, link_node);
+            return flow_unboxed_image(context, line, node, &style,
+                                      link_url, link_url_length, link_node);
         }
         /* The 300x150 video/iframe fallback is two independent default
            dimensions, not intrinsic media metadata or an aspect ratio. */
@@ -5349,13 +5367,8 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
             style.has_width, style.has_height, !fallback_dimensions,
             &width, &height);
         if ((width <= 0 && !zero_width_spacer) || height <= 0) {
-            size_t alt_length = 0;
-            const char *alt = document_node_is_tag(node, LXB_TAG_IMG)
-                ? document_attribute(node, "alt", &alt_length) : NULL;
-            ComputedStyle alt_style = layout_alt_text_flow_style(&style);
-            return alt == NULL || alt_length == 0
-                   || flow_text(context, line, alt, alt_length, &alt_style,
-                                link_url, link_url_length, link_node);
+            return flow_unboxed_image(context, line, node, &style,
+                                      link_url, link_url_length, link_node);
         }
         int available = line->right - line->start_x;
         int fixed_width = horizontal_edges + style.margin.left
@@ -5405,7 +5418,7 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
             if (layout_add_command(context->layout, background) == NULL) return false;
         }
         size_t image_command = context->layout->count;
-        bool fixed_image_slot = layout_fixed_image_slot(node, &style, parent);
+        bool fixed_image_slot = layout_fixed_image_slot(node, &style, parent, 0);
         if (image_available || fixed_image_slot) {
             int border_radius_code = stylesheet_border_radius_code(
                 context->sheet, &style);
@@ -5503,9 +5516,9 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
         : images_find_mask_node(context->images, node);
     if (style.mask_image != NULL && style.mask_image[0] != '\0'
         && !image_resource_available(mask)) {
-        layout_note_unresolved_external_visual(
+        layout_size_mask_visual(context, layout_note_unresolved_external_visual(
             context, node, style.mask_image, IMAGE_PRIORITY_KIND_MASK,
-            PSEUDO_NONE);
+            PSEUDO_NONE), &style);
     }
     if (image_resource_available(mask)) {
         int width = style.has_width && !style.width_max_content

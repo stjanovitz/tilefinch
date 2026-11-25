@@ -458,6 +458,7 @@ if(PSP)
             src/psp_media_buffering.c
             src/psp_media_open.c
             src/psp_media_retry.c
+            src/psp_media_resume.c
             src/psp_media_hls.c
             src/psp_hls_gzip.c
             src/psp_media_present_session.c
@@ -506,6 +507,16 @@ if(PSP)
         # the larger core in.
         target_link_options(psp-browser-script PRIVATE
             "LINKER:--defsym=_svfiprintf_r=_svfprintf_r")
+        # The same for scanf: tzset's siscanf is the only user of newlib's
+        # integer-only string scanner, and the browser's sscanf calls
+        # already link the full one. src/psp_newlib_shims.c defines the
+        # three helpers newlib keeps only in the integer scanner's member,
+        # so the alias does not pull that member in anyway. Two side
+        # effects: tzset's scan now runs in the full scanner's 744-byte
+        # stack frame instead of the integer one's 416, and any later
+        # siscanf caller gets floating-point conversions too.
+        target_link_options(psp-browser-script PRIVATE
+            "LINKER:--defsym=__ssvfiscanf_r=__ssvfscanf_r")
         if(TILEFINCH_PSP_VALIDATION_LOG)
             target_link_options(psp-browser-script PRIVATE
                 "LINKER:--defsym=_vfiprintf_r=_vfprintf_r")
@@ -755,12 +766,16 @@ if(PSP)
             # (2026-11-08) and 5,556,000 (2026-11-07).
             set(TILEFINCH_PSP_TEXT_LIMIT 6200000)
         else()
-            # Ordinary: user-approved 35 KiB increase for 0.1.53
-            # (2026-11-18). The profile-optimized ordinary and relocatable
-            # images measured 5,583,528 and 5,585,496 bytes respectively.
-            # Page-memory, download, cache and validation limits are unchanged.
-            set(TILEFINCH_PSP_TEXT_LIMIT 5585840)
+            # Ordinary: user-approved 5,620,000 bytes (2026-11-19) for the
+            # SubtleCrypto, conformance and stylesheet work; previously
+            # 5,585,840 for 0.1.53 (2026-11-18). Page-memory, download,
+            # cache and validation limits are unchanged.
+            set(TILEFINCH_PSP_TEXT_LIMIT 5620000)
         endif()
+        # Recorded before any override below, for
+        # scripts/check-quickjs-pgo-size.sh.
+        set(TILEFINCH_PSP_TEXT_RATCHET ${TILEFINCH_PSP_TEXT_LIMIT} CACHE INTERNAL
+            "Measured PSP .text ratchet for this build kind, before any override")
         # Local size experiments only (an engine built at -O2 under PPSSPP,
         # for instance): a build directory that sets this is over the
         # ratchet by construction and must never be shipped or baselined.
@@ -1008,10 +1023,11 @@ if(PSP)
             target_compile_definitions(psp-browser-script-dev-prx PRIVATE
                 TILEFINCH_PSP_BOOT_UNWRAPPED_SEMAPHORE=1)
         endif()
-        # The EBOOT's newlib printf aliases (see psp-browser-script above),
-        # so a host0: hardware run executes the same printf cores it does.
+        # The EBOOT's newlib printf and scanf aliases (see psp-browser-script
+        # above), so a host0: hardware run executes the same cores it does.
         target_link_options(psp-browser-script-dev-prx PRIVATE
-            "LINKER:--defsym=_svfiprintf_r=_svfprintf_r")
+            "LINKER:--defsym=_svfiprintf_r=_svfprintf_r"
+            "LINKER:--defsym=__ssvfiscanf_r=__ssvfscanf_r")
         if(TILEFINCH_PSP_VALIDATION_LOG)
             target_link_options(psp-browser-script-dev-prx PRIVATE
                 "LINKER:--defsym=_vfiprintf_r=_vfprintf_r")

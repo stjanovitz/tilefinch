@@ -143,9 +143,16 @@ validation log) count preparations, abandoned ones, pumps, and the longest
 step.
 
 Stylesheet suffixes preserve compiler/index state when the input order remains
-valid. `@font-face` discovery occurs during the CSS parse. Preview layout is
-skipped when the parsed prefix cannot affect visible pixels, and otherwise
-limits work to the viewport-relevant region before authoritative layout.
+valid. The blocking sheet records up to 512 sources (`<style>` and
+`<link rel=stylesheet>`); while they are an unchanged prefix of the document's
+sources, a checkpoint appends only the sources that follow, so a page with a
+`<style>` block before each of its many scripts compiles each block once. A
+checkpoint suffix of more than 64 sources rebuilds the sheet, and a prepared
+one appends in runs of 64. Past 512 sources, every checkpoint whose sources
+changed rebuilds the sheet. `@font-face` discovery occurs during the CSS
+parse. Preview layout is skipped when the parsed prefix cannot affect visible
+pixels, and otherwise limits work to the viewport-relevant region before
+authoritative layout.
 
 A laid-out preview paints only when its first screen would not be blank
 until images arrive:

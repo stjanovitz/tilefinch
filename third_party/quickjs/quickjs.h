@@ -380,6 +380,8 @@ void JS_SetMemoryLimit(JSRuntime *rt, size_t limit);
    yet to happen. Not thread-safe: a test arms it around one synchronous
    call. Absent from PSP builds. */
 void JS_TestRefuseAllocation(unsigned nth);
+/* Test lexical-limit refusal with a small ordinary program; zero restores it. */
+void JS_TestSetScopeLimit(unsigned limit);
 int JS_TestRefusalPending(void);
 #endif
 #ifdef CONFIG_TILEFINCH_EVAL_ROPE_TEST
@@ -418,6 +420,7 @@ void JS_MarkBrowserNative(JSContext *ctx, JSValueConst func);
 void JS_MarkBrowserFunction(JSContext *ctx, JSValueConst func);
 void *JS_EnterBrowserCode(JSContext *ctx);
 void JS_LeaveBrowserCode(JSContext *ctx, void *previous);
+JS_BOOL JS_IsAuthorCodeRunning(JSContext *ctx);
 void JS_GetSnapshotCounts(JSContext *ctx, uint32_t *pmembers, uint32_t *ptwins);
 JSContext *JS_DupContext(JSContext *ctx);
 void *JS_GetContextOpaque(JSContext *ctx);
@@ -1018,8 +1021,6 @@ void JS_SetHostPromiseRejectionTracker(JSRuntime *rt, JSHostPromiseRejectionTrac
 /* return != 0 if the JS code needs to be interrupted */
 typedef int JSInterruptHandler(JSRuntime *rt, void *opaque);
 void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque);
-/* if can_block is TRUE, Atomics.wait() can be used */
-void JS_SetCanBlock(JSRuntime *rt, JS_BOOL can_block);
 /* select which debug info is stripped from the compiled code */
 #define JS_STRIP_SOURCE (1 << 0) /* strip source code */
 #define JS_STRIP_DEBUG  (1 << 1) /* strip all debug info including source code */
@@ -1166,8 +1167,10 @@ const char *JS_ExecutionCensusName(unsigned zone);
 /* True while any JavaScript or native-function frame is active (Tilefinch). */
 int JS_IsStackActive(JSRuntime *rt);
 /* A weak reference to an object without a WeakRef object (Tilefinch DOM
-   handle table): JS_WeakTargetDeref gives the target (a new reference) or
-   undefined once it died; free each with JS_FreeWeakTarget. */
+   handle table): JS_NewWeakTarget returns JS_EXCEPTION if the object
+   cannot take another weak reference, or JS_UNDEFINED for a non-object.
+   JS_WeakTargetDeref gives the target (a new reference) or undefined
+   once it died; free each acquired weak reference with JS_FreeWeakTarget. */
 JSValue JS_NewWeakTarget(JSContext *ctx, JSValueConst obj);
 JSValue JS_WeakTargetDeref(JSContext *ctx, JSValueConst target);
 void JS_FreeWeakTarget(JSRuntime *rt, JSValue target);
@@ -1232,7 +1235,7 @@ int JS_ProfileForEachBytecode(JSRuntime *rt, JSProfileBytecodeFunc *cb,
 void JS_SetIsHTMLDDA(JSContext *ctx, JSValueConst obj);
 
 /* Web IDL receiver checks: a marked interface member throws a TypeError
-   ("Illegal invocation") unless its receiver has a marked interface
+   ("Illegal invocation") unless its receiver has its interface's marked
    prototype object on its prototype chain. See quickjs.c. */
 void JS_MarkPlatformInterface(JSContext *ctx, JSValueConst proto,
                               JS_BOOL lenient_handlers);
@@ -1243,6 +1246,19 @@ void JS_FreePlatformSnapshot(JSContext *ctx, JSPlatformSnapshot *snapshot);
 int JS_MarkPlatformInterfaces(JSContext *ctx, JSValueConst global,
                               const JSPlatformSnapshot *since);
 void JS_SetPlatformMember(JSContext *ctx, JSValueConst func, JS_BOOL enabled);
+void JS_SetPlatformMemberOf(JSContext *ctx, JSValueConst func,
+                            JSValueConst holder);
+/* obj is a platform layer: a receiver under it passes the check for a call
+   of a member it holds. For the host's own objects only. */
+void JS_MarkPlatformLayer(JSContext *ctx, JSValueConst obj);
+/* Web IDL argument count: a call or construction of func with fewer
+   arguments than its own `length` throws a TypeError ("N argument(s)
+   required, but only M present."). Returns the count, or -1. */
+int JS_SetRequiredArguments(JSContext *ctx, JSValueConst func);
+/* Web IDL promise operation: func's failed receiver check (undefined and
+   null receivers included) and argument count return a promise rejected
+   with the TypeError instead of throwing it. */
+void JS_SetPromiseOperation(JSContext *ctx, JSValueConst func);
 
 typedef struct JSModuleDef JSModuleDef;
 
@@ -1299,6 +1315,11 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx);
 /* Tilefinch: name the runtime's JS_PinAtomTable() atoms by index. Only a
    runtime holding the same table reads the result. */
 #define JS_WRITE_OBJ_PINNED_ATOMS (1 << 4)
+/* Tilefinch: omit the variable table of a function whose locals nothing
+   captures and whose table names none of them (compiled with JS_STRIP_DEBUG
+   and without direct eval). Its frame slots are unchanged. For bytecode
+   whose functions are never debugged: the bootstrap generator's. */
+#define JS_WRITE_OBJ_STRIP_UNUSED_LOCALS (1 << 5)
 uint8_t *JS_WriteObject(JSContext *ctx, size_t *psize, JSValueConst obj,
                         int flags);
 uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,

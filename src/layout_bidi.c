@@ -100,6 +100,24 @@ static bool bidi_atomic_inline_node(lxb_dom_node_t *node,
         || document_node_is_tag(node, LXB_TAG_BUTTON);
 }
 
+/* The style of an inline descendant. Resolving it is cascade work, and
+   the first pass to touch an inline subtree pays it, so the lab and
+   validation builds keep it out of the bidi timer (bidi_scan_style_us). */
+static ComputedStyle bidi_style_for_node(LayoutContext *context,
+                                         lxb_dom_node_t *node,
+                                         const ComputedStyle *parent)
+{
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+    uint64_t started_us = tilefinch_platform_monotonic_time_us();
+    ComputedStyle style = layout_style_for_node(context, node, parent);
+    context->bidi_scan_style_us +=
+        tilefinch_platform_monotonic_time_us() - started_us;
+    return style;
+#else
+    return layout_style_for_node(context, node, parent);
+#endif
+}
+
 static bool bidi_scan_inline_subtree(LayoutContext *context,
                                      lxb_dom_node_t *node,
                                      const ComputedStyle *parent,
@@ -126,7 +144,7 @@ static bool bidi_scan_inline_subtree(LayoutContext *context,
     }
     if (node->type != LXB_DOM_NODE_TYPE_ELEMENT) return false;
     ComputedStyle style = root ? *parent
-        : layout_style_for_node(context, node, parent);
+        : bidi_style_for_node(context, node, parent);
     if (style.display == DISPLAY_NONE || style.visibility_hidden) return false;
     if (!root && is_block_display(style.display)) return false;
     bool direction_boundary = !root
@@ -224,7 +242,7 @@ static bool bidi_flatten(LayoutBidiFlow *flow, lxb_dom_node_t *node,
     }
     if (node->type != LXB_DOM_NODE_TYPE_ELEMENT) return true;
     ComputedStyle style = root ? *parent
-        : layout_style_for_node(flow->context, node, parent);
+        : bidi_style_for_node(flow->context, node, parent);
     if (style.display == DISPLAY_NONE || style.visibility_hidden) return true;
     if (!root && is_block_display(style.display)) return true;
 
@@ -288,22 +306,36 @@ static bool bidi_flatten(LayoutBidiFlow *flow, lxb_dom_node_t *node,
 }
 
 #define LAYOUT_BIDI_RTL_ANCESTOR_LIMIT 2048u
+#define LAYOUT_BIDI_RETAINED_ANCESTORS 32u
+
+/* A compact, optional proof for repeated provisional layouts. This records
+ * a DOM fact, not the current result of a dynamic selector: no inline
+ * direction change exists and every candidate rule needs a class/id that
+ * occurs nowhere in the walked tree. Focus/hover cannot create that key.
+ * Store only complete, sparse walks; never lend this storage to a job. */
+typedef struct LayoutBidiAbsence {
+    const lxb_html_document_t *root;
+    uint64_t content, host, sheet;
+    size_t count;
+    lxb_dom_node_t *ancestors[];
+} LayoutBidiAbsence;
+
+size_t layout_bidi_forget_absence(LayoutReuseCache *reuse)
+{
+    if (reuse == NULL || reuse->bidi_absence == NULL) return 0;
+    size_t bytes = sizeof(LayoutBidiAbsence)
+        + reuse->bidi_absence->count * sizeof(lxb_dom_node_t *);
+    budget_free(reuse->budget, reuse->bidi_absence);
+    reuse->bidi_absence = NULL;
+    reuse->stats.retained_bytes -= bytes;
+    return bytes;
+}
 
 static bool bidi_text_has_rtl(const char *text, size_t length)
 {
     size_t at = 0;
     while (at < length && (unsigned char) text[at] < 0x80u) at++;
     return at < length && text_bidi_maybe_needed(text + at, length - at);
-}
-
-static bool bidi_span_contains_ci(const char *text, size_t length,
-                                  const char *needle)
-{
-    size_t needle_length = strlen(needle);
-    for (size_t at = 0; at + needle_length <= length; at++) {
-        if (strncasecmp(text + at, needle, needle_length) == 0) return true;
-    }
-    return false;
 }
 
 static int bidi_compare_nodes(const void *left, const void *right)
@@ -341,6 +373,43 @@ void layout_bidi_prepare(LayoutContext *context, Budget *budget)
         && (context->sheet == NULL
             || !context->sheet->has_bidi_declarations)) return;
     const Stylesheet *sheet = context->sheet;
+    const PocDocument *doc = context->document;
+    LayoutReuseCache *reuse = context->reuse;
+    bool prove = context->preview_y_limit > 0 && reuse != NULL
+        && (reuse->extending || reuse->bidi_absence != NULL)
+        && !reuse->style_pressure_trimmed && !doc->script_realm_bound
+        && sheet != NULL && sheet->scopes.shadow_scope_count == 0
+        && sheet->scopes.adopted_source_count == 0;
+#ifndef TILEFINCH_NO_TRACE
+    if (prove && getenv("TILEFINCH_DISABLE_BIDI_PREFLIGHT_REUSE")) prove = false;
+#endif
+    uint64_t content = doc->content_generation;
+    uint64_t host = prove ? document_style_generation() : 0;
+    uint64_t build = sheet == NULL ? 0 : sheet->build_generation;
+    LayoutBidiAbsence *memo = prove ? reuse->bidi_absence : NULL;
+    if (memo != NULL) {
+        if (memo->root == doc->html && memo->host == host
+            && memo->content == content && memo->sheet == build) {
+            /* The allocation can synchronously trim this very memo. */
+            size_t count = memo->count;
+            lxb_dom_node_t *snapshot[LAYOUT_BIDI_RETAINED_ANCESTORS];
+            size_t bytes = count * sizeof(*snapshot);
+            if (bytes != 0) {
+                memcpy(snapshot, memo->ancestors, bytes);
+                context->bidi_rtl_ancestors = budget_malloc(budget, bytes);
+                if (context->bidi_rtl_ancestors == NULL) return;
+                memcpy(context->bidi_rtl_ancestors, snapshot, bytes);
+            }
+            context->bidi_rtl_ancestor_count = count;
+            context->bidi_direction_change_possible = false;
+            context->bidi_prepared = true;
+            return;
+        }
+        (void) layout_bidi_forget_absence(reuse);
+    }
+    /* Only build a new proof ahead of the reader. At an unprepared edge
+       take the original path without paying its extra key checks. */
+    prove = prove && reuse->extending;
     size_t candidates[8];
     size_t candidate_count = 0;
     bool change_possible = false;
@@ -352,6 +421,16 @@ void layout_bidi_prepare(LayoutContext *context, Budget *budget)
                sheet, true, candidates,
                sizeof(candidates) / sizeof(candidates[0]),
                &candidate_count)) return;
+    uint32_t required[8];
+    for (size_t i = 0; prove && i < candidate_count; i++) {
+        const StyleRule *rule = &sheet->rules[candidates[i]];
+        const char *s = rule->selector;
+        prove = rule->selector_length != 0 && (s[0] == '.' || s[0] == '#')
+            && memchr(s, ',', rule->selector_length) == NULL
+            && memchr(s, '\\', rule->selector_length) == NULL
+            && (required[i] = style_selector_compound_key_at(
+                    s, rule->selector_length, 0)) != 0;
+    }
     lxb_dom_node_t **ancestors = budget_malloc(
         budget, LAYOUT_BIDI_RTL_ANCESTOR_LIMIT * sizeof(*ancestors));
     if (ancestors == NULL) return;
@@ -383,13 +462,13 @@ void layout_bidi_prepare(LayoutContext *context, Budget *budget)
             }
         } else if (node->type == LXB_DOM_NODE_TYPE_ELEMENT
                    && !change_possible) {
+            if (prove && style_element_carries_any_key_unsorted(
+                    node, required, candidate_count)) prove = false;
             size_t length = 0;
             const char *inline_style = document_attribute(
                 node, "style", &length);
-            if (inline_style != NULL
-                && (bidi_span_contains_ci(inline_style, length, "direction")
-                    || bidi_span_contains_ci(inline_style, length,
-                                             "unicode-bidi"))) {
+            if (style_declarations_may_change_direction(
+                    inline_style, length)) {
                 change_possible = true;
             }
             size_t dir_length = 0;
@@ -420,6 +499,28 @@ void layout_bidi_prepare(LayoutContext *context, Budget *budget)
         node = node->next;
     }
     qsort(ancestors, count, sizeof(*ancestors), bidi_compare_nodes);
+#ifndef TILEFINCH_NO_TRACE
+    context->layout->performance.bidi_prepare_nodes += (uint32_t) visited;
+#endif
+    if (prove && !change_possible && count <= LAYOUT_BIDI_RETAINED_ANCESTORS
+        && content == doc->content_generation && host == document_style_generation()
+        && build == sheet->build_generation) {
+        size_t bytes = sizeof(*memo) + count * sizeof(*ancestors);
+        if (!budget_pressure_required(budget, bytes,
+                LAYOUT_REUSE_STYLE_WORKING_BYTES + LAYOUT_REUSE_STYLE_RESERVE_BYTES))
+            memo = budget_malloc(budget, bytes);
+        else memo = NULL;
+        if (memo != NULL) {
+            if (reuse->style_pressure_trimmed || reuse->bidi_absence != NULL) {
+                budget_free(budget, memo);
+            } else {
+                *memo = (LayoutBidiAbsence) { doc->html, content, host, build, count };
+                memcpy(memo->ancestors, ancestors, count * sizeof(*ancestors));
+                reuse->bidi_absence = memo;
+                reuse->stats.retained_bytes += bytes;
+            }
+        }
+    }
     context->bidi_rtl_ancestors = ancestors;
     context->bidi_rtl_ancestor_count = count;
     context->bidi_direction_change_possible = change_possible;
@@ -458,6 +559,17 @@ static TextBidiBase bidi_paragraph_base(lxb_dom_node_t *node,
     return rtl ? TEXT_BIDI_BASE_RTL : TEXT_BIDI_BASE_LTR;
 }
 
+/* Charges the bidi timer for one flow, less the style resolution its
+   scans performed. */
+static void bidi_charge_us(LayoutContext *context, uint64_t started_us,
+                           uint64_t style_before_us)
+{
+    uint64_t elapsed = tilefinch_platform_monotonic_time_us() - started_us;
+    uint64_t style_us = context->bidi_scan_style_us - style_before_us;
+    context->layout->performance.bidi_us +=
+        style_us < elapsed ? elapsed - style_us : 0;
+}
+
 LayoutBidiFlow *layout_bidi_flow_create(LayoutContext *context,
                                          lxb_dom_node_t *node,
                                          const ComputedStyle *style,
@@ -479,6 +591,7 @@ LayoutBidiFlow *layout_bidi_flow_create(LayoutContext *context,
         && !bidi_node_contains_rtl_text(context, node))
         return NULL;
     uint64_t started_us = tilefinch_platform_monotonic_time_us();
+    uint64_t style_before_us = context->bidi_scan_style_us;
     size_t budget_before = context->layout->budget->current;
     size_t nodes = 0, bytes = 0;
     bool limited = false;
@@ -490,8 +603,7 @@ LayoutBidiFlow *layout_bidi_flow_create(LayoutContext *context,
             if (attempted != NULL) *attempted = true;
             context->layout->performance.bidi_limit_degradations++;
         }
-        context->layout->performance.bidi_us +=
-            tilefinch_platform_monotonic_time_us() - started_us;
+        bidi_charge_us(context, started_us, style_before_us);
         return NULL;
     }
     if (attempted != NULL) *attempted = true;
@@ -499,8 +611,7 @@ LayoutBidiFlow *layout_bidi_flow_create(LayoutContext *context,
         context->layout->budget, 1, sizeof(*flow));
     if (flow == NULL) {
         context->layout->performance.bidi_line_fallbacks++;
-        context->layout->performance.bidi_us +=
-            tilefinch_platform_monotonic_time_us() - started_us;
+        bidi_charge_us(context, started_us, style_before_us);
         return NULL;
     }
     flow->budget = context->layout->budget;
@@ -510,8 +621,7 @@ LayoutBidiFlow *layout_bidi_flow_create(LayoutContext *context,
         if (flow->truncated)
             context->layout->performance.bidi_limit_degradations++;
         budget_free(flow->budget, flow);
-        context->layout->performance.bidi_us +=
-            tilefinch_platform_monotonic_time_us() - started_us;
+        bidi_charge_us(context, started_us, style_before_us);
         return NULL;
     }
     TextBidiStatus status = TEXT_BIDI_MALFORMED;
@@ -524,8 +634,7 @@ LayoutBidiFlow *layout_bidi_flow_create(LayoutContext *context,
             context->layout->performance.bidi_limit_degradations++;
         else
             context->layout->performance.bidi_line_fallbacks++;
-        context->layout->performance.bidi_us +=
-            tilefinch_platform_monotonic_time_us() - started_us;
+        bidi_charge_us(context, started_us, style_before_us);
         return NULL;
     }
     for (size_t i = 0; i < flow->atomic_count; i++) {
@@ -536,8 +645,7 @@ LayoutBidiFlow *layout_bidi_flow_create(LayoutContext *context,
             text_bidi_paragraph_destroy(flow->paragraph);
             budget_free(flow->budget, flow);
             context->layout->performance.bidi_line_fallbacks++;
-            context->layout->performance.bidi_us +=
-                tilefinch_platform_monotonic_time_us() - started_us;
+            bidi_charge_us(context, started_us, style_before_us);
             return NULL;
         }
         flow->atomics[i].unit = (uint16_t) unit;
@@ -548,8 +656,7 @@ LayoutBidiFlow *layout_bidi_flow_create(LayoutContext *context,
         > context->layout->performance.bidi_peak_transient_bytes) {
         context->layout->performance.bidi_peak_transient_bytes = transient;
     }
-    context->layout->performance.bidi_us +=
-        tilefinch_platform_monotonic_time_us() - started_us;
+    bidi_charge_us(context, started_us, style_before_us);
     return flow;
 }
 

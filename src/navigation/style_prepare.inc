@@ -142,6 +142,7 @@ static bool navigation_stream_style_prepare_take_head(
     }
     Stylesheet *sheet = &stream->blocking_stylesheet;
     sheet->noscript_rendered = document->noscript_rendered;
+    sheet->noscript_images = document->noscript_images;
     sheet->font_text_pages = document->font_text_pages;
     if (head_inputs != 0)
         memcpy(prefix, inputs, head_inputs * sizeof(*prefix));
@@ -164,10 +165,13 @@ static bool navigation_stream_style_prepare_take_head(
 
 /* Starts the build: an append to the ready sheet when its inputs are a
    prefix, else a fresh sheet from the compiled cache (whole, or its <head>
-   part with the rest appended) or a sliced full pass. False abandons the preparation. */
+   part with the rest appended) or a sliced full pass. False abandons the
+   preparation; `*sheet_intact` is then whether the ready sheet was left as
+   it was. */
 static bool navigation_stream_style_prepare_build(
-    NavigationDocumentStream *stream)
+    NavigationDocumentStream *stream, bool *sheet_intact)
 {
+    *sheet_intact = false;
     NavigationSession *session = stream->session;
     NavigationStylePrepare *prepare = &stream->style_prepare;
     PocDocument *document = &stream->parser->document;
@@ -186,7 +190,11 @@ static bool navigation_stream_style_prepare_build(
     if (!navigation_stream_collect_stylesheet_inputs(
             stream, document, &inputs, &count, &overflow)) return false;
     if (overflow) {
+        /* More sources than a continuation tracks: the checkpoint rebuilds
+           the sheet. Until then the ready one is still sound (a preview may
+           borrow it), so it is kept. */
         budget_free(session->budget, inputs);
+        *sheet_intact = true;
         return false;
     }
     if (session->external_resources_enabled
@@ -195,9 +203,11 @@ static bool navigation_stream_style_prepare_build(
         bool inline_only = true;
         for (size_t i = stream->stylesheet_input_count; i < count; i++)
             inline_only = inline_only && inputs[i].style;
-        if (inline_only) {
+        if (inline_only && count - stream->stylesheet_input_count
+                               <= NAVIGATION_STYLESHEET_SUFFIX_LIMIT) {
             /* <style> blocks append in one parse, as the checkpoint
-               does; there is no response to wait for. */
+               does; there is no response to wait for. A longer suffix
+               appends in runs below. */
             budget_free(session->budget, inputs);
             prepare->phase = NAVIGATION_STYLE_PREPARE_IDLE;
             return navigation_stream_continue_stylesheet_suffix(
@@ -380,8 +390,11 @@ static void navigation_stream_style_prepare_run(
                 && !navigation_stream_poll_style_preloads(stream))
                 return;   /* Waiting on the network: yield the pump. */
             prepare->phase = NAVIGATION_STYLE_PREPARE_BUILD;
-            if (!navigation_stream_style_prepare_build(stream)) {
-                navigation_stream_style_prepare_abandon(stream, true);
+            bool sheet_intact = false;
+            if (!navigation_stream_style_prepare_build(
+                    stream, &sheet_intact)) {
+                navigation_stream_style_prepare_abandon(
+                    stream, !sheet_intact);
                 return;
             }
             if (prepare->phase == NAVIGATION_STYLE_PREPARE_BUILD) {
@@ -414,8 +427,12 @@ static void navigation_stream_style_prepare_run(
                 prepare->phase = NAVIGATION_STYLE_PREPARE_FINISH;
                 break;
             }
-            lxb_dom_node_t *nodes[NAVIGATION_STYLESHEET_INPUT_LIMIT];
+            /* A long suffix appends in runs, each in document order after
+               the last. */
+            lxb_dom_node_t *nodes[NAVIGATION_STYLESHEET_SUFFIX_LIMIT];
             size_t node_count = prepare->input_count - prepare->next_input;
+            if (node_count > NAVIGATION_STYLESHEET_SUFFIX_LIMIT)
+                node_count = NAVIGATION_STYLESHEET_SUFFIX_LIMIT;
             for (size_t i = 0; i < node_count; i++)
                 nodes[i] = prepare->inputs[prepare->next_input + i].node;
             size_t consumed = 0;

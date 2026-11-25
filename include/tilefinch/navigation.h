@@ -97,6 +97,10 @@ typedef struct {
     ScriptRuntime *parent_runtime;
     size_t parent_frame_slot_plus_one;
     NavigationFramePresentation *presentation;
+    /* The response ledger of the document's external stylesheets, made
+       when it first links one, so a snapshot refresh does not fetch them
+       again; it goes with the presentation. */
+    StylesheetDocumentResources *stylesheet_resources;
     ScriptResult script_result;
     lxb_dom_node_t *element;
     long parent_handle;
@@ -135,7 +139,8 @@ typedef struct {
        (navigation_stop_exhausted_frame_realm): the document stays and is
        drawn without scripts, as a top-level page whose realm was retired.
        realm_refusals_seen is the realm's allocation-refusal count when it
-       was last checked. */
+       was last assessed, realm_memory_kept_low the assessments that kept
+       it with little room (as NavigationPage's script_memory_kept_low). */
     bool realm_memory_stopped;
     /* A big script waits for the page's answer. With no earlier scripts the
        realm/document are discarded and loaded again from heavy_response;
@@ -146,6 +151,9 @@ typedef struct {
     size_t heavy_held_bytes;
     FetchResult *heavy_response;
     size_t realm_refusals_seen;
+    /* After the word above, with the optional field below, in the PSP tail
+       padding: the bool run above stays four bytes. */
+    uint8_t realm_memory_kept_low;
 #if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
     /* frame_lite lazy_realm (include/tilefinch/frame_lite.h): committed
        with scripts allowed but no realm, because nothing in the document
@@ -164,9 +172,14 @@ typedef struct {
     char source_origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
     char *json;
     char *target_origin;
+    /* Private key bytes trail the terminating NUL in the JSON allocation. */
+    size_t key_offset;
+    size_t key_length;
 } NavigationMessage;
 
 typedef struct {
+    /* Match a named control and its authored kind, not just its old position. */
+    uint64_t identity;
     uint16_t control_index;
     /* The value's length, or a tag: NAVIGATION_HISTORY_CONTROL_OPTIONS on
        bounded option-selectedness (the length is under the mask), or
@@ -221,6 +234,8 @@ typedef struct {
     int focus_kind;
     size_t focus_index;
     uint64_t focus_identity;
+    const NavigationHistoryControl *controls;
+    size_t control_count;
 } NavigationHistoryRecord;
 
 /* Consecutive refresh navigations (meta refresh or the Refresh header) that
@@ -362,6 +377,8 @@ typedef struct {
     /* Current-page memory admission/retirement failure. Header links do not
        prove an application initialized after this measured refusal. */
     bool script_memory_limited;
+    /* One idle retry if retirement could not replace an empty display list. */
+    bool static_layout_retry_pending;
     /* script_result.host_compile_memory_refusals when the page first
        committed with a layout. A later refusal (a dynamic script, an ad
        SDK) came after the content was built and cannot have kept it from
@@ -370,13 +387,18 @@ typedef struct {
     /* Why this document lost its realm, with the memory picture at that
        moment. First cause wins. Numbers only: it feeds a shareable report. */
     NavigationScriptStop script_stop;
-    /* Script-heap rejections already attributed by the realm-retirement
-       check, so a later check needs a new rejection, not just text. */
-    size_t script_heap_rejections_seen;
+    /* The realm's allocation refusals (its heap limit's and the page
+       Budget's) when navigation_assess_script_memory last judged it: a
+       task boundary assesses the realm only after a new refusal. */
+    size_t script_memory_refusals_assessed;
     /* The page's realm ran out of memory and took the server-rendered body
        down with it; the body was restored from the memory-rescue copy and
        the realm retired (navigation_page_memory_rescued). */
     bool script_memory_rescued;
+    /* Assessments that kept the realm with under twice the stop headroom
+       left; the third such stops it (docs/engineering/SCRIPT_MEMORY.md,
+       "Exhaustion"). */
+    uint8_t script_memory_kept_low;
     FetchSchedulerDomain *fetch_domain;
     FetchScheduler *resource_scheduler;
     /* Optional visual resources continue only from owner idle ticks. The
@@ -445,6 +467,16 @@ typedef struct {
        revealed further away. */
     bool image_reveal_armed;
     bool image_reveal_look;
+    /* The <noscript> image fallback (navigation_noscript_images_advance):
+       page time since the load and since the reader last moved, whether a
+       look may take fallbacks now, and a look owed for them (and for
+       nothing else). */
+    uint32_t noscript_settle_ms;
+    uint32_t noscript_still_ms;
+    int noscript_scroll_y;
+    bool noscript_ready;
+    bool noscript_look;
+    bool noscript_look_only;
     bool deferred_images_from_viewport;
     int viewport_images_scroll_y;
     /* What the last look saw when every image it found was already waiting
@@ -507,6 +539,10 @@ typedef struct {
        the scroll position (layout.content_limit_y); idle work completes it
        with navigation_complete_layout. */
     bool layout_provisional;
+    /* If an idle extension prepared extra readable screens, schedule the
+       next extension from its original target, not from the end of the
+       reserve. Zero for ordinary builds; never a scroll or hit-test limit. */
+    int layout_prefetch_start;
     /* Build cost of the last complete layout, which predicts the next. */
     uint64_t layout_complete_us;
     /* The last complete layout's size, which predicts the complete build a
@@ -825,6 +861,9 @@ typedef struct {
        nothing (display:none), proven unable to restyle anything that
        renders: no relayout. */
     size_t hidden_relayout_skips;
+    /* Journals that left the tree as it was (content inserted and removed
+       again within the turn): no relayout. */
+    size_t transient_relayout_skips;
     size_t focus_outline_relayout_skips;
     size_t focus_paint_relayout_skips;
     size_t layout_reuse_style_hits;
@@ -1296,6 +1335,9 @@ struct NavigationSession {
        embed hop sets it after retiring the incumbent's script realm, so the
        player page never has to fit beside the page it leaves. */
     bool replacement_low_memory_next;
+    /* A live draft needs full transactional rollback, even if the next
+       load otherwise requests destructive low-memory replacement. */
+    bool replacement_preserve_incumbent;
     /* The next load is a page opened only to play its video (the embed
        hop): its parser-blocking JavaScript -- the player itself, often one
        inline bundle of a megabyte -- gets
@@ -1366,6 +1408,12 @@ typedef struct {
        evaluated and DOM mutations. A watchdog compares successive values
        to tell a slow, working load from a stuck one. */
     size_t progress_units;
+    /* Monotonic count of the streaming parser's own work: document bytes
+       it has consumed and scripts its realm has evaluated. Kept apart from
+       progress_units, which also paces in-frame pumping, so that a stall
+       watchdog can add it: a parse that runs long scripts or style
+       rebuilds after the transport has delivered its bytes still moves. */
+    size_t parser_progress_units;
     /* The candidate page's scripts evaluated so far, in the parser's realm
        or the candidate page's (its runtime's telemetry; 0 without one). */
     size_t scripts_evaluated;
@@ -1819,6 +1867,10 @@ NavigationRelayoutPlan navigation_test_relayout_plan(
    fault must remain a hard navigation failure. */
 void navigation_test_refuse_next_parser_checkpoint(
     NavigationParserCheckpointTestFault fault);
+/* Whether the load's streaming parser holds a ready blocking stylesheet
+   (between pumps). */
+bool navigation_test_load_blocking_stylesheet_ready(
+    const NavigationLoad *load);
 /* Refuse one streaming scheduler creation without consuming an unrelated
    Budget allocation. This pins the resource-only degradation boundary. */
 void navigation_test_refuse_next_stream_scheduler_creation(void);
@@ -1924,6 +1976,12 @@ size_t navigation_yield_style_memos(NavigationSession *session,
    used, until about needed bytes are free. Frees only. */
 size_t navigation_yield_preloaded_scripts(NavigationLoad *load,
                                           size_t needed);
+/* Budget reclaim between builds only (budget_make_room_between_builds):
+   frees the resolved styles of the page's layout reuse cache, then, if
+   about `needed` bytes are still not free, the whole cache (its retained
+   match lists too); the next build starts a new one. Frees only. */
+size_t navigation_yield_layout_reuse(NavigationSession *session,
+                                     size_t needed);
 bool navigation_dispatch_event(NavigationSession *session,
                                const char *selector,
                                const char *event_type);

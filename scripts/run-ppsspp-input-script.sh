@@ -37,6 +37,10 @@
 #     --timeout N       seconds to wait for the run (default 300)
 #     --runs N          replay N times and require identical traces (default 1)
 #     --debug-log       add PPSSPP's -d syscall trace to the emulator log
+#                       (always on for an offline run; see below)
+#     --allow-network   this run may use the live network: a live scenario
+#                       that starts on native HOME. A start URL on HTTPS
+#                       without --trace, and --capture-trace, imply it.
 #     --update-golden   rewrite the golden from this run instead of diffing
 #     --measure         a measurement scenario: pass without a golden (one
 #                       that exists is still enforced); used by
@@ -71,9 +75,19 @@
 # native HOME until the sampler installs boot.cfg.after-reset and reboots the
 # game. Unset for every gate.
 #
+# Every other run is offline: trace replay, native HOME, or a loopback
+# page. PPSSPP hands the PSP's sockets and name lookups to the host's real
+# network, so an offline run boots with `validation_preconnect=0` (the HOME
+# tile's speculative preconnect would otherwise reach the provider once the
+# emulated Wi-Fi is up) and always records PPSSPP's -d syscall log, which
+# tools/check_ppsspp_network.py reads: any connect, datagram, or name lookup
+# for a non-loopback address fails the run.
+#
 # Exits 0 only when the EBOOT prints `tilefinch-input-script: outcome=`, the
-# extracted trace matches the golden, and the run reaches
-# `tilefinch-validation: outcome=clean-exit`. Artifacts land in
+# extracted trace matches the golden, the run reaches
+# `tilefinch-validation: outcome=clean-exit`, and an offline run passes the
+# network check. A validation EBOOT's boot scanf self-test outcome is
+# printed, and a failed one fails the run. Artifacts land in
 # <build-dir>/ppsspp-input-script-latest/.
 #
 # The trace needs no wall-clock masking, which is the point of the readiness
@@ -101,6 +115,7 @@ scenario=menu-tour
 timeout_seconds=300
 runs=1
 debug_log=0
+allow_network=0
 update_golden=0
 measure=0
 start_url=
@@ -166,11 +181,12 @@ ${1#--boot=}"; shift ;;
         --runs) runs=$2; shift 2 ;;
         --runs=*) runs=${1#--runs=}; shift ;;
         --debug-log) debug_log=1; shift ;;
+        --allow-network) allow_network=1; shift ;;
         --update-golden) update_golden=1; shift ;;
         --measure) measure=1; shift ;;
         --record-video) record_video=$2; shift 2 ;;
         --record-video=*) record_video=${1#--record-video=}; shift ;;
-        -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,54p' "$0"; exit 0 ;;
         *) printf 'unknown option: %s\n' "$1" >&2; exit 2 ;;
     esac
 done
@@ -213,6 +229,17 @@ if [ -n "$start_url" ]; then
             exit 2 ;;
     esac
 fi
+# Offline unless the caller asked for the network: a trace replays every
+# request, and native HOME or a loopback page needs none.
+network_offline=1
+if [ "$allow_network" -eq 1 ] || [ -n "$capture_target" ]; then
+    network_offline=0
+elif [ -z "$trace_source" ]; then
+    case "$start_url" in
+        https://*) network_offline=0 ;;
+    esac
+fi
+[ "$network_offline" -eq 0 ] || debug_log=1
 if [ -n "$offline_library" ]; then
     case "$offline_library" in
         /*) ;;
@@ -535,6 +562,10 @@ run_once() {
         [ -z "$capture_target" ] || printf '%s\n' "trace_capture=capture"
     } >"$config_path"
     [ -z "$heap_mb" ] || printf 'heap_mb=%s\n' "$heap_mb" >>"$config_path"
+    # Under trace replay the HOME preconnect is already off.
+    if [ "$network_offline" -eq 1 ] && [ "$trace_name" = none ]; then
+        printf '%s\n' 'validation_preconnect=0' >>"$config_path"
+    fi
     if [ -n "$boot_extra" ]; then
         printf '%s\n' "$boot_extra" | sed '/^$/d' >>"$config_path"
     fi
@@ -760,6 +791,27 @@ run_once() {
     sed -n -e 's/^\(tilefinch-input-script: until-met .*\) at-us=[0-9]*$/\1/p' \
         -e t -e 's/^\(tilefinch-input-script: .*\)$/\1/p' "$validation_log" \
         2>/dev/null >"$run_result/trace.txt" || true
+    if [ "$network_offline" -eq 1 ]; then
+        python3 "$root/tools/check_ppsspp_network.py" \
+            "$run_result/ppsspp.log" >"$run_result/network-check.txt" 2>&1 || {
+            cat "$run_result/network-check.txt" >&2
+            printf '%s\n' \
+                "FAIL: offline run $run_index reached past loopback (or left no -d log)." \
+                'Pass --allow-network only to a run that is meant to be live.' >&2
+            return 1
+        }
+        cat "$run_result/network-check.txt"
+    fi
+    # The validation build's boot self-test of the aliased scanf core.
+    if grep -q '^tilefinch-scanf-check: outcome=fail' "$validation_log" \
+            2>/dev/null; then
+        grep '^tilefinch-scanf-check: ' "$validation_log" | grep -v ' ok=1 ' >&2
+        printf 'FAIL: run %s failed the boot scanf self-test.\n' \
+            "$run_index" >&2
+        return 1
+    fi
+    grep '^tilefinch-scanf-check: outcome=' "$validation_log" 2>/dev/null \
+        || true
     [ "$saw_outcome" -eq 1 ] || {
         printf 'FAIL: run %s never reached a clean exit.\n' "$run_index" >&2
         return 1
@@ -788,6 +840,21 @@ run_once() {
 run_index=1
 while [ "$run_index" -le "$runs" ]; do
     run_once "$run_index" || exit 1
+    case "$scenario" in
+        youtube-details-preview-play)
+            awk -v preview_play_run=1 -f "$root/tools/check_youtube_back.awk" \
+                "$result_dir/run-$run_index/tilefinch-validation.txt" || exit 1 ;;
+        youtube-details-play-switch)
+            awk -v switch_run=1 -f "$root/tools/check_youtube_back.awk" \
+                "$result_dir/run-$run_index/tilefinch-validation.txt" || exit 1 ;;
+        youtube-bbb|youtube-details-back-deep|youtube-details-cancel)
+            deep=0
+            [ "$scenario" != youtube-details-back-deep ] || deep=1
+            cancel=0
+            [ "$scenario" != youtube-details-cancel ] || cancel=1
+            awk -v deep="$deep" -v cancel="$cancel" -f "$root/tools/check_youtube_back.awk" \
+                "$result_dir/run-$run_index/tilefinch-validation.txt" || exit 1 ;;
+    esac
     run_index=$((run_index + 1))
 done
 

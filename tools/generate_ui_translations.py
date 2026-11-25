@@ -56,6 +56,7 @@ latest_languages["he"] = ("he", "Hebrew", "HEBREW")
 CATALOGS.append((18, list(latest_languages.values())))
 CATALOGS.append((19, list(latest_languages.values())))
 CATALOGS.append((20, list(latest_languages.values())))
+CATALOGS.append((21, list(latest_languages.values())))
 ACTIVE_VERSION = CATALOGS[-1][0]
 # Languages read right to left: their catalog rows are stored in display
 # order at load and the browser's list panels are mirrored

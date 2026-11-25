@@ -1,0 +1,37 @@
+Update records inserted by getOrInsertComputed callbacks in place.
+
+diff --git a/quickjs.c b/quickjs.c
+index 9a9bf5b92..212df3603 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -63848,16 +63848,24 @@ static JSValue js_map_getOrInsert(JSContext *ctx, JSValueConst this_val,
+             value = JS_Call(ctx, argv[1], JS_UNDEFINED, 1, &key);
+             if (JS_IsException(value))
+                 return JS_EXCEPTION;
+-            map_delete_record(ctx, s, key);
++            /* The callback may have inserted the key. Update that record
++               in place to preserve iteration order and the weak reference. */
++            mr = map_find_record(ctx, s, key);
+         } else {
+             value = JS_DupValue(ctx, argv[1]);
+         }
+-        mr = map_add_record(ctx, s, key);
+-        if (!mr) {
+-            JS_FreeValue(ctx, value);
+-            return JS_EXCEPTION;
++        if (mr) {
++            JSValue old_value = mr->value;
++            mr->value = value;
++            JS_FreeValue(ctx, old_value);
++        } else {
++            mr = map_add_record(ctx, s, key);
++            if (!mr) {
++                JS_FreeValue(ctx, value);
++                return JS_EXCEPTION;
++            }
++            mr->value = value;
+         }
+-        mr->value = value;
+     }
+     return JS_DupValue(ctx, mr->value);
+ }

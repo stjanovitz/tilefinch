@@ -113,6 +113,14 @@ bool fetch_prepare_page_request(
     const char *referrer_source = security_context->referrer_source_url != NULL
         ? security_context->referrer_source_url
         : security_context->document_url;
+    /* Fetch strips a local scheme's URL (about:, blob:, data:) to no
+       referrer, redirects included: a data: or blob: module's imports send
+       none. */
+    if (referrer_source != NULL
+        && (strncasecmp(referrer_source, "about:", 6) == 0
+            || strncasecmp(referrer_source, "blob:", 5) == 0
+            || strncasecmp(referrer_source, "data:", 5) == 0))
+        referrer_source = NULL;
     if (referrer_source != NULL
         && !fetch_compute_referrer(
             referrer_source, descriptor->target_url,

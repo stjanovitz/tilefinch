@@ -25,6 +25,79 @@ const settled = async (html, ids) => {
 };
 const canvas = () => item('<canvas width=24 height=24></canvas>').getContext('2d');
 const cases = {
+  async countAndCursorBindings() {
+    let deleted, badDeleted;
+    const db = await opening('cursor-bindings', 1, d => {
+      const s = d.createObjectStore('rows'); deleted = s.createIndex('gone','n');
+      s.deleteIndex('gone');
+      badDeleted = ['count','openCursor','openKeyCursor'].every(n =>
+        checkThrow(() => deleted[n]({}), 'InvalidStateError'));
+      s.createIndex('groups','n');
+      for (const [key,n] of [[1,8],[2,8],[3,9]]) s.put({n},key);
+    });
+    const tx = db.transaction('rows'), done = completion(tx), s = tx.objectStore('rows'),
+      i = s.index('groups'), work = [];
+    for (const source of [s,i]) {
+      for (const n of ['count','openCursor','openKeyCursor'])
+        if (source[n].length !== 0 ||
+            !checkThrow(() => source[n].call(source === i ? s : i), 'TypeError')) return false;
+      work.push(requestValue(source.count()).then(v => v === 3));
+      for (const n of ['openCursor','openKeyCursor']) {
+        if (!checkThrow(() => source[n]({}, 'backwards'), 'TypeError')) return false;
+        const r = source[n](null, 'prevunique'), seen = [];
+        work.push(new Promise(resolve => { r.onsuccess = () => {
+          const c = r.result;
+          if (!c) return resolve(seen.join() === (source === s ? '3,2,1' : '3,1'));
+          if (r.source !== source || c.source !== source || ('value' in c) !== (n === 'openCursor'))
+            return resolve(false);
+          seen.push(c.primaryKey); c.continue();
+        }; }));
+      }
+    }
+    if (!badDeleted || !(await Promise.all(work)).every(Boolean) || !await done) return false;
+    for (const source of [s,i]) for (const n of ['count','openCursor','openKeyCursor'])
+      if (!checkThrow(() => source[n]({}), 'TransactionInactiveError')) return false;
+    const tx2 = db.transaction('rows'), aborted = completion(tx2), store = tx2.objectStore('rows');
+    const key = [1]; let first = true;
+    Object.defineProperty(key, 0, {get(){if(first){first=false;tx2.abort()} return 1}});
+    const rejected = checkThrow(() => store.openCursor(key), 'TransactionInactiveError');
+    await aborted; db.close(); return rejected;
+  },
+  async storeAndIndexReadBindingsAgree() {
+    const db = await opening('read-bindings', 1, d => {
+      const store = d.createObjectStore('rows');
+      store.createIndex('byGroup', 'group');
+      store.put({group:'a', n:2}, 2); store.put({group:'a', n:1}, 1);
+    });
+    const tx = db.transaction('rows'), done = completion(tx),
+      store = tx.objectStore('rows'), index = store.index('byGroup');
+    const pending = [];
+    for (const [source, key] of [[store, 1], [index, 'a']]) {
+      if (!checkThrow(() => source.get(), 'TypeError') ||
+          !checkThrow(() => source.getKey(null), 'DataError')) return false;
+      const range = source === store ? IDBKeyRange.bound(1, 2) : key;
+      for (const [name, args, expect] of [
+        ['get', [key], {group:'a', n:1}], ['getKey', [key], 1],
+        ['getAll', [range, 1], [{group:'a', n:1}]], ['getAllKeys', [range], [1,2]]
+      ]) {
+        if (source[name].length !== (name === 'get' || name === 'getKey' ? 1 : 0) ||
+            !checkThrow(() => source[name].call(source === store ? index : store, ...args), 'TypeError'))
+          return false;
+        const request = source[name](...args);
+        if (request.source !== source) return false;
+        pending.push(requestValue(request).then(v => JSON.stringify(v) === JSON.stringify(expect)));
+      }
+    }
+    if (!(await Promise.all(pending)).every(Boolean) || !await done) return false;
+    db.close();
+    for (const source of [store,index]) {
+      for (const name of ['get','getKey','getAll','getAllKeys'])
+        if (!checkThrow(() => source[name]({}), 'TransactionInactiveError')) return false;
+      if (!checkThrow(() => source.get(), 'TypeError') ||
+          !checkThrow(() => source.getAll({}, -1), 'TypeError')) return false;
+    }
+    return true;
+  },
   async commitCannotBeAborted() {
     const db = await opening('commit', 1, d => d.createObjectStore('store'));
     const tx = db.transaction('store', 'readwrite'), done = completion(tx);

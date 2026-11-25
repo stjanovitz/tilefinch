@@ -19,9 +19,7 @@
  #else /* WASM_CPU_SUPPORTS_UNALIGNED_ADDR_ACCESS != 0 */
 --- a/core/iwasm/interpreter/wasm_interp.h
 +++ b/core/iwasm/interpreter/wasm_interp.h
-@@ -99,9 +99,11 @@ wasm_interp_interp_frame_size(unsigned all_cell_num)
-         (uint32)offsetof(WASMInterpFrame, lp) + align_uint(all_cell_num * 5, 4);
- #endif
+@@ -98,7 +98,9 @@ wasm_interp_interp_frame_size(unsigned all_cell_num)
  #else
      frame_size = (uint32)offsetof(WASMInterpFrame, operand) + all_cell_num * 4;
  #endif
@@ -34,7 +32,7 @@
  void
 --- a/core/iwasm/interpreter/wasm_interp_fast.c
 +++ b/core/iwasm/interpreter/wasm_interp_fast.c
-@@ -281,7 +281,13 @@ local_copysign(double x, double y)
+@@ -282,7 +282,13 @@ local_copysign(double x, double y)
  
  #if WASM_CPU_SUPPORTS_UNALIGNED_ADDR_ACCESS != 0
  #define LOAD_U32_WITH_2U16S(addr) (*(uint32 *)(addr))
@@ -49,8 +47,7 @@
  #else /* else of WASM_CPU_SUPPORTS_UNALIGNED_ADDR_ACCESS */
  static inline uint32
  LOAD_U32_WITH_2U16S(void *addr)
-@@ -1439,13 +1445,13 @@ print_frame_ip(uint8 *frame_ip)
- #else
+@@ -1434,12 +1440,12 @@ wasm_interp_dump_op_count()
  #define HANDLE_OP(opcode) HANDLE_##opcode:
  #endif
  #if WASM_CPU_SUPPORTS_UNALIGNED_ADDR_ACCESS != 0
@@ -68,4 +65,4 @@
 +        goto *p_label_addr;                                   \
      } while (0)
  #else
- #define FETCH_OPCODE_AND_DISPATCH()             \
+ #if UINTPTR_MAX == UINT64_MAX

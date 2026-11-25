@@ -1584,7 +1584,9 @@ void js_rt_record_exception(JSContext *context, ScriptResult *result)
         js_rt_clear_formatting_exception(context);
         stack_value = JS_UNDEFINED;
     }
-    const char *stack = JS_IsUndefined(stack_value)
+    /* A null stack is an error whose stack text could not be allocated
+       (the engine's backtrace-pending-exception layer): nothing to add. */
+    const char *stack = JS_IsUndefined(stack_value) || JS_IsNull(stack_value)
         ? NULL : js_rt_exception_to_cstring(context, stack_value);
     if (stack != NULL && stack[0] != '\0') {
         size_t used = strlen(result->error);
@@ -1797,27 +1799,17 @@ static void promise_rejection_tracker(JSContext *context,
                                       void *opaque)
 {
     if (opaque == NULL) return;
-    /* Worker promise rejection events belong to the WorkerGlobalScope, not
-       the owner Window.  The immutable realm hook only queues a bounded task;
-       it never invokes author handlers from inside QuickJS's rejection
-       tracker.  A failure in this browser-owned notification path must not
-       replace the promise's own rejection.  Only a worker realm's
-       platform initializer defines the hook (non-writable and
-       non-configurable): elsewhere the name is the page's to define, and
-       the tracker never calls page code. */
-    DomBridge *bridge = JS_GetContextOpaque(context);
-    bool worker_realm = false;
-    if (bridge != NULL && bridge->host != NULL) {
-        for (size_t i = 0; i < SCRIPT_WORKER_REALM_LIMIT; i++)
-            if (bridge->host->worker_realms[i].context == context)
-                worker_realm = true;
-    }
-    JSValue worker_global = worker_realm
-        ? JS_GetGlobalObject(context) : JS_UNDEFINED;
-    JSValue worker_notify = worker_realm
-        ? JS_GetPropertyStr(context, worker_global,
-                            "__tilefinchQueuePromiseRejection")
-        : JS_UNDEFINED;
+    /* Promise rejection events belong to the realm's global: the Window, or
+       a worker's WorkerGlobalScope.  The immutable realm hook only queues a
+       bounded task; it never invokes author handlers from inside QuickJS's
+       rejection tracker.  A failure in this browser-owned notification path
+       must not replace the promise's own rejection.  Every realm's
+       bootstrap defines the hook non-writable and non-configurable (a page
+       realm's is locked with the other protected names), so the tracker
+       never calls page code. */
+    JSValue worker_global = JS_GetGlobalObject(context);
+    JSValue worker_notify = JS_GetPropertyStr(
+        context, worker_global, "__tilefinchQueuePromiseRejection");
     if (JS_IsFunction(context, worker_notify)) {
         JSValue args[3] = {
             JS_DupValue(context, promise),
@@ -2877,7 +2869,7 @@ JSValue js_rt_compile_source_type(JSContext *context, const char *source,
        has been measured) is abandoned like a compile refused for memory: no
        author code ran, the parser has freed what it held, and the realm is
        intact, so it must not read as the realm exhausting its memory
-       (navigation_retire_exhausted_script_realms). The heap rejections it
+       (navigation_assess_script_memory). The heap rejections it
        caused are absorbed from that count. */
     size_t heap_rejections_after =
         profile_owner == NULL || profile_owner->quickjs_pool == NULL ? 0

@@ -555,12 +555,11 @@ void psp_input_script_observe(const PspUiIntent *intent, const PspUiState *ui)
            (unsigned) intent->tab_index);
 }
 
-static bool psp_input_script_until_media_playing(void)
+static bool psp_input_script_until_directive(const char *directive)
 {
-    static const char directive[] = "@media-playing";
-    if (strncmp(psp_input_script_until_js, directive,
-                sizeof(directive) - 1u) != 0) return false;
-    const char *tail = psp_input_script_until_js + sizeof(directive) - 1u;
+    size_t length = strlen(directive);
+    if (strncmp(psp_input_script_until_js, directive, length) != 0) return false;
+    const char *tail = psp_input_script_until_js + length;
     while (*tail == ' ' || *tail == '\t' || *tail == '\r' || *tail == '\n')
         tail++;
     return *tail == '\0';
@@ -570,7 +569,8 @@ static void psp_input_script_test_until(const NavigationSession *navigation)
 {
     if (!psp_input_script_awaiting_condition(&psp_input_script)
         || psp_input_script_until_js[0] == '\0'
-        || psp_input_script_until_media_playing()
+        || psp_input_script_until_directive("@media-playing")
+        || psp_input_script_until_directive("@watch-play-ready")
         || navigation->page.runtime == NULL) return;
     unsigned long long now = sceKernelGetSystemTimeWide();
     if (psp_input_script_until_checks != 0
@@ -631,6 +631,21 @@ void psp_input_script_observe_page(
     const PspEngineViews *views, const BrowserEngine *engine)
 {
     const NavigationSession *navigation = views == NULL ? NULL : views->navigation;
+    if (navigation && engine && views->controller
+        && psp_input_script_awaiting_condition(&psp_input_script)
+        && psp_input_script_until_directive("@watch-play-ready")
+        && !browser_engine_navigation_pending(engine)) {
+        lxb_dom_node_t *focused = controller_focused_node(views->controller);
+        size_t length = 0;
+        const char *role = focused ? document_attribute(focused, "class", &length) : NULL;
+        if (role && length == sizeof("watch-target") - 1u
+            && !memcmp(role, "watch-target", length)) {
+            printf("tilefinch-input-script: until-met step=%u native=watch-play-ready at-us=%llu\n",
+                   (unsigned) psp_input_script.step,
+                   (unsigned long long) sceKernelGetSystemTimeWide());
+            psp_input_script_satisfy_condition(&psp_input_script);
+        }
+    }
     if (navigation != NULL) psp_input_script_test_until(navigation);
     const char *mark = psp_input_script_mark(&psp_input_script);
     /* A mark closes the last focus move's settled-frame record. */
@@ -1031,7 +1046,7 @@ void psp_input_script_observe_media(
        to the loading screen instead of the player. Native media readiness is
        deliberately independent of author JavaScript and loading duration. */
     if (psp_input_script_awaiting_condition(&psp_input_script)
-        && psp_input_script_until_media_playing()
+        && psp_input_script_until_directive("@media-playing")
         && media->visible && media->playing && !media->resolving
         && !media->failed && !media->buffering && !media->seek_in_progress
         && media->current_time_us != 0) {

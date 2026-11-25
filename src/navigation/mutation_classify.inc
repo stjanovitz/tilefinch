@@ -120,7 +120,9 @@ static void navigation_retire_subtree(void *opaque,
         session->page.read_sheet_settle.host_count = 0;
     }
     if (session->page.layout_reuse == NULL) return;
+    layout_reuse_proof_retiring(session->page.layout_reuse, true);
     layout_reuse_cache_retire_subtree(session->page.layout_reuse, root);
+    layout_reuse_proof_retiring(session->page.layout_reuse, false);
 }
 
 static bool navigation_node_retirement_disabled(void)

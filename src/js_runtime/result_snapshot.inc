@@ -188,6 +188,7 @@ static void js_rt_runtime_update_telemetry(ScriptRuntime *runtime,
         JS_FreeCString(runtime->context, xhr_states_text);
     }
     JS_FreeValue(runtime->context, xhr_states);
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
     JSValue reject_stack = JS_GetPropertyStr(
         runtime->context, global, "__tilefinchLastRejectStack");
     if (!JS_IsUndefined(reject_stack)) {
@@ -199,6 +200,7 @@ static void js_rt_runtime_update_telemetry(ScriptRuntime *runtime,
         }
     }
     JS_FreeValue(runtime->context, reject_stack);
+#endif
     JSValue uncaught_task = JS_GetPropertyStr(
         runtime->context, global, "__tilefinchLastUncaughtTask");
     if (!JS_IsUndefined(uncaught_task)) {
@@ -451,8 +453,25 @@ void script_runtime_preserve_first_error(const ScriptRuntime *runtime,
              runtime->result.error_source_context);
 }
 
+static const char *form_submission_body_slot(bool native_dispatch)
+{
+    return native_dispatch ? "__tilefinchNativeSubmittedBody"
+                           : "__tilefinchSubmittedBody";
+}
+
+void script_runtime_clear_form_submission_body(
+    ScriptRuntime *runtime, bool native_dispatch)
+{
+    if (runtime == NULL) return;
+    JSValue global = JS_GetGlobalObject(runtime->context);
+    (void) JS_SetPropertyStr(runtime->context, global,
+                             form_submission_body_slot(native_dispatch), JS_NULL);
+    JS_FreeValue(runtime->context, global);
+}
+
 ScriptFormBodyTake script_runtime_take_form_submission_body(
-    ScriptRuntime *runtime, Budget *budget, size_t maximum_length,
+    ScriptRuntime *runtime, bool native_dispatch, Budget *budget,
+    size_t maximum_length,
     char **output, size_t *length)
 {
     if (length != NULL) *length = 0;
@@ -460,30 +479,32 @@ ScriptFormBodyTake script_runtime_take_form_submission_body(
     if (runtime == NULL || budget == NULL || output == NULL)
         return SCRIPT_FORM_BODY_NONE;
     JSValue global = JS_GetGlobalObject(runtime->context);
-    JSValue body = JS_GetPropertyStr(
-        runtime->context, global, "__tilefinchSubmittedBody");
-    ScriptFormBodyTake taken = SCRIPT_FORM_BODY_NONE;
-    if (JS_IsString(body)) {
-        taken = SCRIPT_FORM_BODY_REFUSED;
+    const char *slot = form_submission_body_slot(native_dispatch);
+    JSValue body = JS_GetPropertyStr(runtime->context, global, slot);
+    ScriptFormBodyTake taken = JS_IsNull(body) || JS_IsUndefined(body)
+        ? SCRIPT_FORM_BODY_NONE : SCRIPT_FORM_BODY_REFUSED;
+    if (JS_IsString(body) || JS_IsObject(body)) {
         size_t body_length = 0;
-        const char *text = JS_ToCStringLen(
-            runtime->context, &body_length, body);
-        char *copy = text != NULL && body_length <= maximum_length
+        bool binary = JS_IsObject(body);
+        const char *bytes = binary
+            ? (const char *) JS_GetArrayBuffer(runtime->context, &body_length, body)
+            : JS_ToCStringLen(runtime->context, &body_length, body);
+        char *copy = bytes != NULL && body_length <= maximum_length && body_length < SIZE_MAX
             ? budget_malloc_category(budget, BUDGET_CATEGORY_NAVIGATION,
                                      body_length + 1u)
             : NULL;
         if (copy != NULL) {
-            memcpy(copy, text, body_length);
+            memcpy(copy, bytes, body_length);
             copy[body_length] = '\0';
             *output = copy;
             if (length != NULL) *length = body_length;
-            taken = SCRIPT_FORM_BODY_TAKEN;
+            taken = binary ? SCRIPT_FORM_BODY_BINARY : SCRIPT_FORM_BODY_TAKEN;
         }
-        if (text != NULL) JS_FreeCString(runtime->context, text);
+        if (bytes == NULL) JS_FreeValue(runtime->context, JS_GetException(runtime->context));
+        else if (!binary) JS_FreeCString(runtime->context, bytes);
     }
     JS_FreeValue(runtime->context, body);
-    (void) JS_SetPropertyStr(runtime->context, global,
-                             "__tilefinchSubmittedBody", JS_NULL);
+    (void) JS_SetPropertyStr(runtime->context, global, slot, JS_NULL);
     JS_FreeValue(runtime->context, global);
     return taken;
 }
@@ -525,7 +546,10 @@ bool script_runtime_take_form_submission(
         JS_NewInt32(runtime->context, 0));
     JS_FreeValue(runtime->context, global);
     runtime->result.form_submission_requested = false;
-    if (!converted || form_handle <= 0) return false;
+    if (!converted || form_handle <= 0) {
+        script_runtime_clear_form_submission_body(runtime, false);
+        return false;
+    }
     JSValue form_handle_value = JS_NewInt64(
         runtime->context, form_handle);
     *form = js_rt_bridge_node_arg(
@@ -538,5 +562,6 @@ bool script_runtime_take_form_submission(
             runtime->context, &runtime->bridge, submitter_handle_value);
         JS_FreeValue(runtime->context, submitter_handle_value);
     }
+    if (*form == NULL) script_runtime_clear_form_submission_body(runtime, false);
     return *form != NULL;
 }

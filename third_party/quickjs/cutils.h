@@ -93,6 +93,18 @@ static inline int min_int(int a, int b)
         return b;
 }
 
+/* Leave allocator bookkeeping room before multiplying a count by its width. */
+static inline int qjs_array_count_fits(size_t count, size_t width, size_t limit)
+{
+    return width && limit > 4096 && count < (limit - 4096) / width;
+}
+
+/* The top indices of the 16-bit scope operand are reserved. */
+static inline int qjs_scope_index_fits(int index)
+{
+    return (unsigned)index < 65533u;
+}
+
 static inline uint32_t max_uint32(uint32_t a, uint32_t b)
 {
     if (a > b)

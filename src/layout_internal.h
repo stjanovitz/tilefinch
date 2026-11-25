@@ -21,21 +21,29 @@
    native metadata, never an author DOM marker. Its box does not depend on the
    resource, so the resource can arrive or be evicted without a flow. Intrinsic
    sizing retains full flow; fallback alt ink is a separate retained text
-   command, retired on image arrival. */
+   command, retired on image arrival. An absolutely positioned or fixed one
+   resolves its percentages against its containing block, never against its
+   content; `containing_height` is that block's height where the caller
+   knows it (0 otherwise). */
 static inline bool layout_fixed_image_slot(lxb_dom_node_t *node,
                                            const ComputedStyle *style,
-                                           const ComputedStyle *parent)
+                                           const ComputedStyle *parent,
+                                           int containing_height)
 {
+    bool positioned = style->out_of_flow || style->fixed_position;
     return (document_node_is_tag(node, LXB_TAG_IMG)
             || document_node_is_tag(node, LXB_TAG_SVG))
         && style->has_width && style->has_height
         && style->width > 0 && style->height > 0
         && style->width <= STYLE_LENGTH_DIRECT_LIMIT
         && style->height <= STYLE_LENGTH_DIRECT_LIMIT
-        && (!style->width_percent || (parent != NULL && parent->has_width
+        && (!style->width_percent || positioned
+            || (parent != NULL && parent->has_width
             && parent->width > 0 && parent->width <= STYLE_LENGTH_DIRECT_LIMIT
             && !parent->width_percent))
-        && (!style->height_percent || (parent != NULL && parent->has_height
+        && (!style->height_percent
+            || (positioned && containing_height > 0)
+            || (parent != NULL && parent->has_height
             && parent->height > 0 && parent->height <= STYLE_LENGTH_DIRECT_LIMIT
             && !parent->height_percent))
         && !style->width_max_content
@@ -61,6 +69,9 @@ typedef struct {
     uint8_t column;
     uint8_t column_span;
     uint8_t row_span;
+    /* The span the cell's own row gives it, before an auto-layout table
+       cuts it at the last column a cell starts in (column_span). */
+    uint8_t row_column_span;
 } TableCellPlacement;
 
 typedef struct {
@@ -71,7 +82,6 @@ typedef struct {
     TableCellPlacement *placements;
     size_t placement_count;
     lxb_dom_node_t *first_row;
-    lxb_dom_node_t *last_row;
     int collapsed_left_gutter;
     int collapsed_right_gutter;
     int collapsed_top_gutter;
@@ -80,6 +90,9 @@ typedef struct {
     uint8_t spacing_y;
     bool border_collapse;
     bool has_row_spans;
+    /* The table was narrower than its columns' specified widths, so the
+       fixed tracks end below them (table_distribute). */
+    bool squeezed;
     /* LayoutContext.table_track_clock at the last lookup that found it. */
     uint32_t last_use;
 } TableTracks;
@@ -264,6 +277,19 @@ typedef struct {
     bool generated_pseudo;
 } LayoutStackingContext;
 
+/* A positioned box laid out once its auto-height containing block finished
+   (LayoutContext.positioned_height_jobs). Its commands [start, end) paint
+   as if emitted at `anchor`, the command index its tree position gave it,
+   so later positioned siblings still paint over it. Recorded in post-order:
+   `end` never decreases from one record to the next. */
+typedef struct {
+    uint32_t anchor;
+    uint32_t start;
+    uint32_t end;
+} LayoutDeferredPaint;
+
+#define LAYOUT_DEFERRED_PAINT_LIMIT 1024u
+
 /* visibility participates in layout and is inherited, but a descendant may
    explicitly become visible again.  Retain only visibility boundaries while
    layout is in flight, then resolve them into command/interaction state and
@@ -372,9 +398,25 @@ typedef struct {
        is not reused while a pass logs container-query evaluations. */
     uint8_t dependent;
     uint16_t payload;
+    /* Bit 1 << pseudo: a build resolved that pseudo-element while this
+       entry stood (geometry proofs check only those). */
+    uint8_t pseudo_resolved;
 } LayoutReuseStyleEntry;
 #define LAYOUT_REUSE_FONT_DEPENDENT 1u
 #define LAYOUT_REUSE_CONTAINER_DEPENDENT 2u
+
+/* A spanning cell's contribution to the column widths: its content minimum
+   and maximum, and its percentage in hundredths of a percent (0 for none),
+   over `span` columns from `column`. The table takes off the spacing
+   between the columns once it knows them (table_measure_rows). */
+#define LAYOUT_TABLE_ROW_SPAN_CELLS 8u
+typedef struct {
+    int minimum;
+    int maximum;
+    uint16_t points;
+    uint8_t column;
+    uint8_t span;
+} TableSpanCell;
 
 /* A viewport preview measures only a bounded prefix of an auto-layout table.
    Retain each completed row's intrinsic contribution, rather than the
@@ -384,8 +426,22 @@ typedef struct {
     lxb_dom_node_t *row;
     int available_width;
     size_t count;
+    /* Each column's maximum and content minimum (CSS Tables 3 column
+       min/max: a fixed cell's width is its maximum, never its minimum), its
+       raw percentage in hundredths of a percent, and masks of the columns
+       a cell covers, constrains with a fixed width, or sizes by a
+       percentage. */
     int preferred[16];
     int minimum[16];
+    uint16_t percent[16];
+    uint16_t seen;
+    uint16_t constrained;
+    uint16_t percent_columns;
+    /* The row's first eight spanning cells, distributed over their
+       columns once every row's single-column cells are merged
+       (layout_table.c); any more split evenly. */
+    uint8_t span_count;
+    TableSpanCell spans[LAYOUT_TABLE_ROW_SPAN_CELLS];
     uint64_t stamp;
 } LayoutReuseTableRowEntry;
 
@@ -433,8 +489,15 @@ _Static_assert((LAYOUT_TEXT_MEASURE_INITIAL_CAPACITY
 _Static_assert(sizeof(LayoutCounterEntry) * LAYOUT_COUNTER_NODE_LIMIT <= 65536u,
     "counter prefix must remain at most 64 KiB (32 KiB on the PSP)");
 
+typedef struct LayoutReuseParserFrontier LayoutReuseParserFrontier;
+
 struct LayoutReuseCache {
+    struct LayoutBidiAbsence *bidi_absence;
     int focus_scroll;
+    /* layout_unpin_tall_fixed_stacks's last decision on this page; kept
+       across resets like focus_scroll. */
+    uint8_t fixed_unpin_state;
+    bool extending;
     Budget *budget;
     const Stylesheet *sheet;
     uint64_t sheet_generation;
@@ -564,11 +627,16 @@ struct LayoutReuseCache {
        streaming preview cache never retains matches across parser appends. */
     struct StyleRetainedMatches *matches;
     bool matches_enabled;
+    /* A streaming preview's, until adopted
+       (layout_reuse_cache_mark_streaming_preview). */
+    bool streaming_preview;
     /* The runtime evicts freed subtrees through
        layout_reuse_cache_retire_subtree, so removals, moves and innerHTML
        replacements may invalidate their scope instead of resetting. */
     bool node_retirement;
     bool matches_attempted;
+    /* layout_reuse_cache_epoch. */
+    uint64_t epoch;
     /* Class/id changes queued for one token-aware pass over the matched
        lists (layout_reuse_cache_flush_invalidations). */
     uint32_t pending_tokens[LAYOUT_REUSE_PENDING_TOKEN_LIMIT];
@@ -591,7 +659,51 @@ struct LayoutReuseCache {
     bool text_measure_refused;
     /* layout_reuse_cache_yield_text_measures: never admitted again. */
     bool text_measure_yielded;
+    /* The path to the last node of a document still being parsed, while
+       the cache follows the parse (src/layout_reuse_parser.inc). */
+    struct LayoutReuseParserFrontier *parser;
+    /* The parse finished: the next prepare or style read restyles what it
+       added since the last build, then drops `parser`. */
+    bool parser_settling;
+    /* Geometry read proofs (layout_reuse_proof_*). `proof_coverage` names
+       the last build (LayoutDocument.reuse_serial) every element style of
+       which an entry still holds, at `proof_coverage_epoch`; any other
+       loss of an entry clears it. While a proof is open each dropped entry
+       is kept as a row instead (`proof_rows`, the first drop of a node,
+       holding its payload), and nothing new is stored. A style the covered
+       build used that the table could not keep (a full probe window) is
+       held in `proof_held` instead, and every proof re-checks it. */
+#define LAYOUT_REUSE_PROOF_ROW_LIMIT 32u
+#define LAYOUT_REUSE_PROOF_HELD_LIMIT 16u
+    LayoutReuseStyleEntry proof_rows[LAYOUT_REUSE_PROOF_ROW_LIMIT];
+    LayoutReuseStyleEntry proof_held[LAYOUT_REUSE_PROOF_HELD_LIMIT];
+    uint8_t proof_row_count;
+    uint8_t proof_held_count;
+    bool proof_active;
+    bool proof_overflow;
+    /* The drop under way loses nothing: a re-resolution to the same
+       payload, or a freed node's entry. */
+    bool proof_quiet;
+    /* Between a build's preparation and its take: its own re-resolutions
+       replace entries. */
+    bool proof_building;
+    /* The build under way failed to store a style it resolved. */
+    bool proof_build_lost;
+    uint32_t proof_build_serial;
+    uint32_t proof_coverage;
+    uint64_t proof_coverage_epoch;
+    uint64_t proof_epoch;
 };
+
+/* Called for every style entry an invalidation, eviction or replacement
+   drops, before its payload is released. */
+void layout_reuse_proof_note_drop(LayoutReuseCache *cache,
+                                  const LayoutReuseStyleEntry *entry);
+/* A build of `cache` begins (after its preparation) and is taken: the
+   serial its layout carries when every style it resolved stayed stored. */
+uint32_t layout_reuse_proof_build_begin(LayoutReuseCache *cache);
+uint32_t layout_reuse_proof_build_end(LayoutReuseCache *cache,
+                                      uint32_t serial, bool complete);
 
 /* Atomic inline boxes (inline-blocks, replaced elements, form controls)
    placed on the line being built. They are laid out at the line top and
@@ -714,6 +826,9 @@ typedef struct {
         intrinsic_cache[LAYOUT_INTRINSIC_CACHE_CAPACITY];
     LayoutMarginCacheEntry margin_cache[LAYOUT_MARGIN_CACHE_CAPACITY];
     TableTracks table_tracks[LAYOUT_TABLE_TRACK_SLOTS];
+    /* Borrowed for the row being placed, including its cell descendants. */
+    const lxb_dom_node_t *placing_table_row;
+    const TableTracks *placing_row_tracks;
     size_t table_track_count;
     uint32_t table_track_clock;
     LayoutStackingContext *stacking_contexts;
@@ -784,14 +899,21 @@ typedef struct {
         int assumed_bottom;
     } bottom_fixups[LAYOUT_BOTTOM_FIXUP_LIMIT];
     size_t bottom_fixup_count;
-    /* Absolute descendants with percentage heights or vertical insets wait
-       for an auto-height containing block's used padding box. No second
-       layout or raster. */
+    /* Absolute descendants whose height or vertical position depends on an
+       auto-height containing block (percentage heights or vertical insets,
+       or both vertical insets with an auto height or auto margins) wait
+       for its used padding box. No second layout or raster. `paint_anchor`
+       is the command index they would have started at; command insertion
+       keeps it current. */
     struct {
         lxb_dom_node_t *node, *containing_node, *link_container;
         int x, y, width;
+        size_t paint_anchor;
     } positioned_height_jobs[LAYOUT_BOTTOM_FIXUP_LIMIT];
     size_t positioned_height_job_count;
+    LayoutDeferredPaint *deferred_paint;
+    size_t deferred_paint_count;
+    size_t deferred_paint_capacity;
     LineAtomicStack line_atomics;
     /* The block whose descendants layout_block is currently placing. A box
        reached through an inline or display:contents <a href> between it and
@@ -824,6 +946,9 @@ typedef struct {
     bool bidi_direction_change_possible;
     lxb_dom_node_t **bidi_rtl_ancestors;
     size_t bidi_rtl_ancestor_count;
+    /* Style resolution performed by bidi scans (lab and validation
+       builds), which bidi_us leaves out. */
+    uint64_t bidi_scan_style_us;
     bool cancelled;
     LayoutReuseCache *reuse;
     /* Per ordered list (the few most recent, so lists nested in items keep
@@ -876,6 +1001,15 @@ void layout_reuse_note_pseudo(LayoutReuseCache *cache,
                               PseudoElement pseudo,
                               const ComputedStyle *parent,
                               const ComputedStyle *result);
+#ifndef TILEFINCH_NO_TRACE
+/* TILEFINCH_TRACE_INVALIDATION_VERIFY: a pseudo-element the cache reported
+   absent, resolved straight from the sheet (src/layout_reuse_verify.inc). */
+void layout_reuse_verify_pseudo_absent(const LayoutReuseCache *cache,
+                                       const Stylesheet *sheet,
+                                       lxb_dom_node_t *node,
+                                       PseudoElement pseudo,
+                                       const ComputedStyle *parent);
+#endif
 
 #if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PROFILE_LAYOUT_FLOW)
 typedef struct {
@@ -911,8 +1045,14 @@ ImagePriorityTarget *layout_note_unresolved_external_visual(
     LayoutContext *context, lxb_dom_node_t *node, const char *source,
     uint8_t kind, PseudoElement pseudo);
 /* Gives each recorded single-layer element background its border box (CSS
-   pixels) once the layout's boxes are final. */
+   pixels) once the layout's boxes are final, and each recorded element
+   mask its box when layout placed one. */
 void layout_size_background_visuals(LayoutDocument *layout);
+/* Records a single-layer mask's declared box (layout_declared_box_size)
+   and mask-size on its unresolved target, for the loader. */
+void layout_size_mask_visual(LayoutContext *context,
+                             ImagePriorityTarget *target,
+                             const ComputedStyle *style);
 
 /* The first stop records the traversal prefix (LayoutDocument
    preview_cut_*): everything recorded before it is laid out exactly as the
@@ -1241,6 +1381,7 @@ typedef struct {
     size_t count;
     size_t capacity;
     bool active;
+    bool no_generated_row_items;
     int inline_values[4];
     LayoutNodeBox *generated_boxes;
     LayoutNodeBox inline_generated_boxes[2];
@@ -1466,6 +1607,7 @@ void layout_bidi_flow_destroy(LayoutBidiFlow *flow);
 void layout_bidi_insert_commands(LayoutContext *context, size_t index,
                                  size_t count);
 void layout_bidi_prepare(LayoutContext *context, Budget *budget);
+size_t layout_bidi_forget_absence(LayoutReuseCache *reuse);
 void layout_bidi_release(LayoutContext *context, Budget *budget);
 void layout_bidi_note_text_command(
     LineState *line, size_t command_index,
@@ -1540,6 +1682,11 @@ bool layout_intern_gradient(LayoutDocument *layout, const StyleGradient *gradien
 FlexLineMetrics flex_line_metrics(LayoutContext *context, FlexItemIterator *iterator, FlatItem *item, int content_width, int content_height, int gap);
 GeneratedPseudoFlow generated_pseudo_flow( LayoutContext *context, lxb_dom_node_t *node, const ComputedStyle *parent, PseudoElement pseudo, int width, int containing_height);
 bool add_fixed_range(LayoutDocument *layout, size_t start, size_t end, size_t link_start, size_t link_end, size_t control_start, size_t control_end, int origin_y, int height, int inset, bool from_bottom);
+/* Lays out a fixed stack covering most of the viewport as scrolling with
+   the page (layout_scroll.c). state carries the page's last decision for
+   hysteresis (NULL: none) and receives this one. */
+void layout_unpin_tall_fixed_stacks(LayoutDocument *layout,
+                                    int viewport_height, uint8_t *state);
 void layout_record_grid_columns(LayoutDocument *layout,
     lxb_dom_node_t *node, const int *widths, unsigned count, unsigned origin);
 /* The size-contained content height of `node`'s recorded box (see
@@ -1679,6 +1826,12 @@ bool layout_cooperate(LayoutContext *context, lxb_dom_node_t *node);
 bool layout_cooperate_timed(LayoutContext *context);
 bool layout_insert_commands(LayoutContext *context, size_t index,
                             const DrawCommand *commands, size_t count);
+/* Record a deferred positioned box's commands [start, end) to paint at
+   `anchor` (LayoutDeferredPaint). False only when out of memory. */
+bool layout_record_deferred_paint(LayoutContext *context, size_t anchor,
+                                  size_t start, size_t end);
+bool layout_record_positioned_item_paint(LayoutContext *context,
+    const FlatItem *item, size_t start);
 bool layout_insert_command(LayoutContext *context, size_t index,
                            DrawCommand command);
 #define layout_node_within document_node_within
@@ -1703,7 +1856,6 @@ void constrain_replaced_content_size(
     int *width, int *height);
 bool style_uses_bold_face(const ComputedStyle *style);
 bool style_uses_synthetic_weight(const FontSet *fonts, const WebFontSet *web_fonts, const ComputedStyle *style, const FontFace *face);
-const TableTracks *table_tracks_for_row( LayoutContext *context, lxb_dom_node_t *row, int available_width);
 bool table_cell_uses_collapsed_geometry(
     const LayoutContext *context, const lxb_dom_node_t *cell);
 const TableTracks *table_tracks_for_table( LayoutContext *context, lxb_dom_node_t *table, const ComputedStyle *table_style, int available_width);
@@ -1891,6 +2043,8 @@ void layout_mask_background_gradient(LayoutContext *context,
                                       DrawCommand *command);
 void layout_stretch_grid_item(LayoutContext *context, const FlatItem *item,
                               int target_height);
+void layout_shrink_grid_scroller(LayoutContext *context, const FlatItem *item,
+                                 int target_height, bool percent_of_area);
 int layout_fit_column_scroller(LayoutContext *context, lxb_dom_node_t *node,
     const ComputedStyle *style, const FlexOrderPlan *order, int width, int height);
 bool apply_visual_range(LayoutContext *context, lxb_dom_node_t *node,

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Site census driver: live capture, offline keyed replay, metrics JSONL.
 
-  census.py capture [--retry] [SELECTOR...]      live network, one page each
+  census.py capture [--retry] [--settle-pumps N] [--idle N] [--drain-ms N]
+                    [SELECTOR...]                live network, one page each
   census.py replay  [-j N] [--out DIR] [--probe]
                     [--revisit | --revisit-ticked | --restart] [--idle N]
+                    [--settle-pumps N]
                     [--runtime-ticks]
-                    [--verify-style-appends] [--user-css-before-load]
+                    [--verify-style-appends] [--user-css-after-load]
                     [SELECTOR...]
   census.py extract RUN_ROOT                     re-extract a replay's JSONL
   census.py sheet OUT.png RUN_ROOT NAME...       480x272 screenshot sheet
@@ -17,8 +19,9 @@ page's URL and tags.
 
 Every run uses Tilefinch's honest default UA, the PSP app's realistic profile
 (--psp-profile realistic: memory, script, document caps), basic content
-blocking and hidden cookie notices, at 480x272, with a seeded clock and
-random source. Replays are response-keyed and never touch the network.
+blocking with page ads and cookie notices hidden (set before the load, as the
+PSP app sets them), at 480x272, with a seeded clock and random source. Replays
+are response-keyed and never touch the network.
 """
 import argparse
 import concurrent.futures
@@ -51,6 +54,16 @@ PROBE_CHUNKS = 64
 PUMP_TICKS = "pump 150 33"
 RUNTIME_TICKS = "tick 150 33"
 TICKS = PUMP_TICKS
+# The PSP app's default Hide page ads sheet (lab --hide-page-ads, from
+# 2026-11-19). --show-page-ads leaves it out, for labs built before the lab
+# had the option (they reject it) and for comparison with their runs.
+HIDE_PAGE_ADS = True
+# The presentation sheets (page ads, cookie notices) are set before the load
+# (lab --user-css-before-load, from 2026-11-19), as the PSP app sets its
+# presentation CSS before each navigation, instead of applied after it with
+# a whole-sheet rebuild the device never does. --user-css-after-load restores
+# the older order, for comparison with runs made before.
+USER_CSS_BEFORE_LOAD = True
 # Page-idle turns after a visit's ticks (at most this many; the lab's "idle"
 # stops at the first turn that leaves no work): the engine's idle work
 # (deferred bytecode stores, persistent-tier writes, tiles, background
@@ -60,6 +73,12 @@ IDLE_TURNS = 300
 # --focus-moves: idle turns after the moves (a bounded focus layout's
 # completion is one turn; image and font work may take others).
 FOCUS_IDLE_TURNS = 20
+# A capture's drain before quit (lab "drain-fetches"): at most this much wall
+# time for the requests still in flight to finish, with no new ones admitted,
+# so the trace records their responses instead of the cancellations a quit
+# records ("image pipeline aborted"). Replays need none: they render every
+# frame before quit, and a replay's quit writes nothing.
+DRAIN_MS = 10000
 
 # Page facts the native summary lacks. Kept allocation-light: a page at its
 # JS heap limit fails anything bigger (innerText of bbc.co.uk articles ran out
@@ -110,7 +129,7 @@ def first_visit_script():
 
 
 def command_script(frames, probe, revisit_url=None, idle=0, focus_moves=0,
-                   focus_hashes="each"):
+                   focus_hashes="each", settle_pumps=0, drain_ms=0):
     # --revisit-ticked: run the first visit for the same ticks (so its async
     # and dynamic scripts load too) and its idle turns (the PSP loop runs
     # idle work whenever the page is quiet: classic bytecode is stored
@@ -119,6 +138,13 @@ def command_script(frames, probe, revisit_url=None, idle=0, focus_moves=0,
     lines = (["status", TICKS, "idle %d" % IDLE_TURNS, "go " + revisit_url]
              if revisit_url else [])
     lines += ["status", TICKS]
+    if settle_pumps:
+        # More 33 ms loop frames after the visit's: the page's timers,
+        # async and dynamic scripts and their fetches keep running (owner
+        # idle turns never advance the page runtime). A capture that runs
+        # them records what a page requests after its first 150 frames, so
+        # a replay with the same or fewer turns finds every response.
+        lines += ["pump %d 33" % settle_pumps]
     if idle:
         # Owner idle turns after the ticks, as the PSP loop runs between
         # frames: background images, fonts, display retargeting and the
@@ -153,25 +179,27 @@ def command_script(frames, probe, revisit_url=None, idle=0, focus_moves=0,
         # Basic view retires the page realm and rebuilds the DOM, which would
         # rewrite the end-of-run summary, so only the probe pass takes it.
         lines += ["basic-on", "render %s/basic.ppm" % frames]
+    if drain_ms:
+        # Last, after every frame and page fact: the requests in flight
+        # finish (or the cap passes) before quit cancels them.
+        lines += ["drain-fetches %d" % drain_ms]
     lines += ["status", "quit"]
     return "\n".join(lines) + "\n"
 
 
 def lab_command(lab, site, run_dir, network_args, reload_count,
-                commands="commands", user_css_before_load=False):
+                commands="commands"):
     args = [lab, "--url", site["url"], "--fetch-scripts",
             "--psp-profile", "realistic",
             "--content-blocker", "basic", "--hide-cookie-banners",
+            *(["--hide-page-ads"] if HIDE_PAGE_ADS else []),
             "--deterministic-replay-seed", "1",
             "--commands", os.path.join(run_dir, commands),
             "--no-loop-capture",
             "--output", os.path.join(run_dir, "frames", "final.ppm")]
     if reload_count:
         args += ["--reload", str(reload_count)]
-    if user_css_before_load:
-        # The cookie-banner sheet is set before the load, as the PSP app
-        # sets its presentation CSS, instead of applied after it with a
-        # whole-sheet rebuild the device never does.
+    if USER_CSS_BEFORE_LOAD:
         args += ["--user-css-before-load"]
     # Per-page lab arguments from the page's corpus meta.json
     # ("replay_lab_args"), such as a tighter --limit-mb for a canary entry.
@@ -184,7 +212,7 @@ def lab_command(lab, site, run_dir, network_args, reload_count,
 def run_page(lab, site, run_dir, network_args, mode, probe=False, revisit=False,
              timeout=600, revisit_ticked=False, restart=False, idle=0,
              focus_moves=0, focus_hashes="each", verify_style_appends=False,
-             user_css_before_load=False):
+             settle_pumps=0, drain_ms=0):
     if os.path.isdir(run_dir):
         shutil.rmtree(run_dir)
     frames = os.path.join(run_dir, "frames")
@@ -192,7 +220,8 @@ def run_page(lab, site, run_dir, network_args, mode, probe=False, revisit=False,
     with open(os.path.join(run_dir, "commands"), "w") as f:
         f.write(command_script(frames, probe,
                                site["url"] if revisit_ticked else None,
-                               idle, focus_moves, focus_hashes))
+                               idle, focus_moves, focus_hashes,
+                               settle_pumps, drain_ms))
     env = dict(os.environ)
     env["TILEFINCH_TRACE_CENSUS"] = "1"
     for name in ("TILEFINCH_LAB_INIT_SCRIPT", "TILEFINCH_TRACE_SCRIPT_FAILURES",
@@ -208,8 +237,7 @@ def run_page(lab, site, run_dir, network_args, mode, probe=False, revisit=False,
         # in the diagnostic pass: it also allocates a failure record per
         # inline script, which more than doubled amazon.com's lab load.
         env["TILEFINCH_TRACE_SCRIPT_FAILURES"] = "1"
-    args = lab_command(lab, site, run_dir, network_args, 1 if revisit else 0,
-                       user_css_before_load=user_css_before_load)
+    args = lab_command(lab, site, run_dir, network_args, 1 if revisit else 0)
     started = time.time()
     if restart:
         # A browser restart between visits: the first visit runs in its own
@@ -219,8 +247,7 @@ def run_page(lab, site, run_dir, network_args, mode, probe=False, revisit=False,
         with open(os.path.join(run_dir, "commands.first"), "w") as f:
             f.write(first_visit_script())
         first = lab_command(lab, site, run_dir, network_args, 0,
-                            "commands.first",
-                            user_css_before_load=user_css_before_load) + [
+                            "commands.first") + [
             "--script-cache-dir", cache, "--script-cache-write"]
         with open(os.path.join(run_dir, "lab.first.log"), "w") as out, \
                 open(os.path.join(run_dir, "lab.first.err"), "w") as err:
@@ -242,9 +269,12 @@ def run_page(lab, site, run_dir, network_args, mode, probe=False, revisit=False,
             "mode": mode + ("+probe" if probe else "") + ("+revisit" if revisit else "")
                     + ("+revisit-ticked" if revisit_ticked else "")
                     + ("+restart" if restart else "")
+                    + ("+settle" if settle_pumps else "")
                     + ("+idle" if idle else "")
+                    + ("+drain" if drain_ms else "")
                     + ("+verify-style-appends" if verify_style_appends else "")
-                    + ("+user-css-before-load" if user_css_before_load else ""),
+                    + ("+user-css-before-load" if USER_CSS_BEFORE_LOAD else "")
+                    + ("" if HIDE_PAGE_ADS else "+show-page-ads"),
             "exit": code, "wall_s": round(time.time() - started, 2)}
     with open(os.path.join(run_dir, "meta.json"), "w") as f:
         json.dump(meta, f)
@@ -252,6 +282,10 @@ def run_page(lab, site, run_dir, network_args, mode, probe=False, revisit=False,
 
 
 def capture(args):
+    global HIDE_PAGE_ADS, USER_CSS_BEFORE_LOAD
+    HIDE_PAGE_ADS = not getattr(args, "show_page_ads", False)
+    USER_CSS_BEFORE_LOAD = not getattr(args, "user_css_after_load", False)
+    drain_ms = getattr(args, "drain_ms", 0)
     sites = select(load_sites(args.sites), args.selectors)
     corpus = corpus_dir(args)
     moved = []
@@ -267,7 +301,9 @@ def capture(args):
                 shutil.rmtree(trace)
             os.makedirs(page_dir, exist_ok=True)
             meta = run_page(args.lab, site, os.path.join(page_dir, "capture-run"),
-                            ["--capture-http", trace], "capture")
+                            ["--capture-http", trace], "capture",
+                            idle=args.idle, settle_pumps=args.settle_pumps,
+                            drain_ms=drain_ms)
             rec = extract.extract(os.path.join(page_dir, "capture-run"))
             final, reason = capture_destination(
                 os.path.join(page_dir, "capture-run"), trace, site["url"])
@@ -277,13 +313,24 @@ def capture(args):
                          "final_url": final})
             if reason:
                 meta["final_url_mismatch"] = reason
+            drain = drain_summary(os.path.join(page_dir, "capture-run"))
+            if drain is not None:
+                meta["drain"] = drain
+            lab_args = os.environ.get("CENSUS_LAB_ARGS", "").split()
+            if args.settle_pumps or args.idle or drain_ms or lab_args:
+                meta.update({"settle_pumps": args.settle_pumps,
+                             "idle": args.idle, "drain_ms": drain_ms,
+                             "lab_args": lab_args})
             with open(os.path.join(page_dir, "meta.json"), "w") as f:
                 json.dump(meta, f, indent=1)
-            print("%-20s exit=%s http=%s outcome=%s wall=%.1fs%s" % (
+            print("%-20s exit=%s http=%s outcome=%s wall=%.1fs%s%s" % (
                 site["name"], meta["exit"], rec["http_status"],
-                rec["outcome_auto"], meta["wall_s"],
+                rec["outcome_auto"], meta["wall_s"], drain_note(drain),
                 " FAIL %s: landed on %s" % (reason, final) if reason else ""),
                 flush=True)
+            for url in (drain or {}).get("pending_urls", []):
+                print("    still in flight after the drain: %s" % url,
+                      flush=True)
             if reason:
                 # Not the page asked for (old-reddit's capture is a login
                 # redirect): a finding, so no retry, and the run fails.
@@ -301,6 +348,48 @@ def capture(args):
             name, reason, final))
     if moved:
         sys.exit(1)
+
+
+DRAIN_LINE = re.compile(r"^drain-fetches (.*)$", re.M)
+DRAIN_SLOT = re.compile(
+    r'^scheduler-slot label=drain-fetches .*\bcomplete=0 .*url="([^"]*)"',
+    re.M)
+
+
+def drain_summary(run_dir):
+    """The capture's drain-fetches line (lab.log) as a dict, with the URLs
+    the resource scheduler still had in flight at the cap (lab.err); None
+    when the run had no drain."""
+    try:
+        with open(os.path.join(run_dir, "lab.log"), errors="replace") as f:
+            matches = DRAIN_LINE.findall(f.read())
+    except OSError:
+        return None
+    if not matches:
+        return None
+    fields = dict(item.split("=", 1) for item in matches[-1].split()
+                  if "=" in item)
+    drain = {key.replace("-", "_"): int(value) if value.isdigit() else value
+             for key, value in fields.items()}
+    drain["drained"] = drain.get("drained") == "yes"
+    try:
+        with open(os.path.join(run_dir, "lab.err"), errors="replace") as f:
+            drain["pending_urls"] = DRAIN_SLOT.findall(f.read())
+    except OSError:
+        drain["pending_urls"] = []
+    return drain
+
+
+def drain_note(drain):
+    if drain is None:
+        return ""
+    note = " drain=%s at-start=%s ms=%s" % (
+        drain.get("reason"), drain.get("at_start"), drain.get("ms"))
+    if not drain["drained"]:
+        note += " in-flight=%s (resources=%s scripts=%s)" % (
+            drain.get("in_flight"), drain.get("resources"),
+            drain.get("scripts"))
+    return note
 
 
 def capture_destination(run_dir, trace, url):
@@ -336,8 +425,10 @@ def trace_complete(trace):
 
 
 def replay(args):
-    global TICKS
+    global TICKS, HIDE_PAGE_ADS, USER_CSS_BEFORE_LOAD
     TICKS = RUNTIME_TICKS if args.runtime_ticks else PUMP_TICKS
+    HIDE_PAGE_ADS = not getattr(args, "show_page_ads", False)
+    USER_CSS_BEFORE_LOAD = not getattr(args, "user_css_after_load", False)
     corpus = corpus_dir(args)
     sites = [s for s in select(load_sites(args.sites), args.selectors)
              if trace_complete(os.path.join(corpus, s["name"], "capture"))]
@@ -363,7 +454,7 @@ def replay(args):
                      focus_moves=args.focus_moves,
                      focus_hashes=args.focus_hashes,
                      verify_style_appends=args.verify_style_appends,
-                     user_css_before_load=args.user_css_before_load)
+                     settle_pumps=args.settle_pumps)
             reps.append(extract.extract(run_dir))
             if (reps[0]["wall_s"] or 0) > 20:
                 # A page that runs into the 60 s script watchdog is
@@ -393,11 +484,13 @@ def replay(args):
                    "revisit_ticked": args.revisit_ticked,
                    "restart": args.restart,
                    "idle": args.idle,
+                   "settle_pumps": args.settle_pumps,
                    "ticks": TICKS,
                    "focus_moves": args.focus_moves,
                    "focus_hashes": args.focus_hashes,
                    "verify_style_appends": args.verify_style_appends,
-                   "user_css_before_load": args.user_css_before_load},
+                   "user_css_before_load": USER_CSS_BEFORE_LOAD,
+                   "hide_page_ads": HIDE_PAGE_ADS},
                   f, indent=1)
     print("replayed %d pages in %.1f s with %d jobs -> %s" % (
         len(records), wall, args.jobs, jsonl))
@@ -534,6 +627,27 @@ def main():
     p = sub.add_parser("capture")
     p.add_argument("--retry", action="store_true", help="one retry on failure")
     p.add_argument("--force", action="store_true")
+    p.add_argument("--settle-pumps", type=int, default=0,
+                   help="extra 33 ms loop frames (lab 'pump') after the "
+                        "visit's 150, so the trace holds what the page "
+                        "requests later; default none")
+    p.add_argument("--idle", type=int, default=0,
+                   help="owner idle turns after the frames (background "
+                        "images, fonts); default none")
+    p.add_argument("--drain-ms", type=int, default=DRAIN_MS,
+                   help="before quit, wait at most this many ms (wall) for "
+                        "the requests still in flight to finish, admitting "
+                        "no new ones (lab 'drain-fetches'); 0 for none "
+                        "(default %d)" % DRAIN_MS)
+    p.add_argument("--show-page-ads", action="store_true",
+                   help="leave out the PSP app's default page-ad sheet "
+                        "(lab --hide-page-ads); for labs without the option "
+                        "and comparison with runs made before 2026-11-19")
+    p.add_argument("--user-css-after-load", action="store_true",
+                   help="apply the presentation sheets (page ads, cookie "
+                        "notices) after the load, with a whole-sheet "
+                        "rebuild the PSP app never does, instead of before "
+                        "it; for comparison with runs made before 2026-11-19")
     p.add_argument("selectors", nargs="*")
     p.set_defaults(func=capture)
     p = sub.add_parser("replay")
@@ -557,6 +671,10 @@ def main():
                    help="owner idle turns after the ticks (background "
                         "images, fonts, display retargeting, classic "
                         "bytecode stores); default none")
+    p.add_argument("--settle-pumps", type=int, default=0,
+                   help="extra 33 ms loop frames (lab 'pump') after the "
+                        "visit's 150 and before any idle turns, as a capture "
+                        "made with --settle-pumps ran; default none")
     p.add_argument("--runtime-ticks", action="store_true",
                    help="advance only the page runtime in the visit's 150 "
                         "frames (lab 'tick', the default before 2026-11-16) "
@@ -579,9 +697,18 @@ def main():
                         "fails when a check fails or differs, or none ran. "
                         "Each check costs a rebuild: never use for timing")
     p.add_argument("--user-css-before-load", action="store_true",
-                   help="set the cookie-banner user sheet before the load, "
-                        "as the PSP app does, instead of after it with a "
-                        "whole-sheet rebuild; use it for timing")
+                   help="the default since 2026-11-19 (accepted for older "
+                        "scripts): the presentation sheets are set before "
+                        "the load, as the PSP app does")
+    p.add_argument("--user-css-after-load", action="store_true",
+                   help="apply the presentation sheets (page ads, cookie "
+                        "notices) after the load, with a whole-sheet "
+                        "rebuild the PSP app never does, instead of before "
+                        "it; for comparison with runs made before 2026-11-19")
+    p.add_argument("--show-page-ads", action="store_true",
+                   help="leave out the PSP app's default page-ad sheet "
+                        "(lab --hide-page-ads); for labs without the option "
+                        "and comparison with runs made before 2026-11-19")
     p.add_argument("--quiet", action="store_true")
     p.add_argument("selectors", nargs="*")
     p.set_defaults(func=replay)

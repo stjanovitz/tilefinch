@@ -1415,7 +1415,213 @@ static int test_async_generator_views(void)
     return failed;
 }
 
+static int test_map_computed_insert(void)
+{
+    JSRuntime *runtime;
+    JSContext *context = open_realm(&runtime);
+    CHECK(context != NULL);
+    static const char check[] =
+        "var result = (() => {"
+        " const map = new Map(), value = {}, old = {};"
+        " let iter, calls = 0;"
+        " const result = map.getOrInsertComputed('a', key => {"
+        "   ++calls; map.set(key, old); map.set('b', 2);"
+        "   iter = map.keys(); if (iter.next().value !== 'a') throw Error('first');"
+        "   return value;"
+        " });"
+        " if (result !== value || map.get('a') !== value ||"
+        "     calls !== 1 || map.size !== 2) return 'computed Map value';"
+        " if ([...map.keys()].join() !== 'a,b' || iter.next().value !== 'b' ||"
+        "     !iter.next().done) return 'computed Map insertion order';"
+        " if (map.getOrInsertComputed('a', () => { throw Error('hit'); }) !== value)"
+        "   return 'computed Map hit';"
+        " map.getOrInsertComputed('c', key => {"
+        "   map.set(key, old); map.delete(key); map.set('d', 4); return value;"
+        " });"
+        " if ([...map.keys()].join() !== 'a,b,d,c' || map.get('c') !== value)"
+        "   return 'computed Map insertion after deletion';"
+        " const weak = new WeakMap(), key = {}, other = {}, error = {};"
+        " if (weak.getOrInsertComputed(key, k => {"
+        "   weak.set(k, old); return old;"
+        " }) !== old || weak.get(key) !== old) return 'computed WeakMap alias';"
+        " try { weak.getOrInsertComputed(other, k => {"
+        "   weak.set(k, old); throw error;"
+        " }); return 'missing callback exception'; }"
+        " catch (e) { if (e !== error || weak.get(other) !== old)"
+        "   return 'computed WeakMap callback exception'; }"
+        " return 'OK';"
+        "})();";
+    int failed = run_page(context, "map-computed-insert", check);
+    JS_FreeContext(context);
+    JS_FreeRuntime(runtime);
+    return failed;
+}
+
+static JSValue js_author_running(JSContext *context, JSValueConst this_value,
+                                 int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    (void) argc;
+    (void) argv;
+    return JS_NewBool(context, JS_IsAuthorCodeRunning(context));
+}
+
+/* Calls global function `name` from the embedder, outside any script, and
+   leaves its result's truthiness in *out. */
+static int call_global(JSContext *context, const char *name, int argc,
+                       JSValueConst *argv, int *out)
+{
+    JSValue global = JS_GetGlobalObject(context);
+    JSValue function = JS_GetPropertyStr(context, global, name);
+    JSValue value = JS_Call(context, function, JS_UNDEFINED, argc, argv);
+    JS_FreeValue(context, function);
+    JS_FreeValue(context, global);
+    CHECK(!JS_IsException(value));
+    *out = JS_ToBool(context, value);
+    JS_FreeValue(context, value);
+    return 0;
+}
+
+/* JS_IsAuthorCodeRunning: true while a page frame is on the stack
+   (directly, through browser code it called, or through a bracket such as
+   a profiling trampoline makes), false for browser code on its own, the
+   embedder, and a job browser code queued. */
+static int test_author_code_running(void)
+{
+    JSRuntime *runtime;
+    JSContext *context = open_realm(&runtime);
+    CHECK(context != NULL);
+    JSValue global = JS_GetGlobalObject(context);
+    JS_SetPropertyStr(context, global, "authorRunning",
+                      JS_NewCFunction(context, js_author_running,
+                                      "authorRunning", 0));
+    JS_FreeValue(context, global);
+    static const char browser[] =
+        "globalThis.probe = function () { return authorRunning(); };"
+        "globalThis.dispatch = function (f) { f(); return authorRunning(); };"
+        "globalThis.invoke = function (f) { return f(); };"
+        "globalThis.queue = function () {"
+        " Promise.resolve().then(() => { globalThis.browserJob = authorRunning(); });"
+        "};";
+    JSValue value = JS_Eval(context, browser, strlen(browser), "<browser>",
+                            JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_TRUSTED);
+    CHECK(!JS_IsException(value));
+    JS_FreeValue(context, value);
+    int running = -1;
+    CHECK(!JS_IsAuthorCodeRunning(context));
+    CHECK(call_global(context, "probe", 0, NULL, &running) == 0 && !running);
+    static const char page_source[] =
+        "var listener = function () { globalThis.inListener = authorRunning(); };"
+        "var result = (() => {"
+        " if (!authorRunning()) return 'page frame';"
+        " if (!probe()) return 'page through browser code';"
+        " if (!install(function () { return authorRunning(); }))"
+        "   return 'page through a browser-code bracket';"
+        " if (!bracketed({ f: authorRunning }, 'f')())"
+        "   return 'page through a frameless bracket';"
+        " Promise.resolve().then(() => { globalThis.pageJob = authorRunning(); });"
+        " return 'OK';"
+        "})();";
+    int failed = run_page(context, "author-code-running", page_source);
+    global = JS_GetGlobalObject(context);
+    JSValue listener = JS_GetPropertyStr(context, global, "listener");
+    CHECK(call_global(context, "dispatch", 1, &listener, &running) == 0);
+    CHECK(!running); /* the dispatcher after its listener returned */
+    CHECK(call_global(context, "invoke", 1, &listener, &running) == 0);
+    JS_FreeValue(context, listener);
+    CHECK(call_global(context, "queue", 0, NULL, &running) == 0);
+    JSContext *job_context;
+    while (JS_ExecutePendingJob(runtime, &job_context) > 0) {}
+    static const char *const expected[][2] = {
+        {"inListener", "true"}, {"pageJob", "true"}, {"browserJob", "false"}};
+    for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
+        JSValue got = JS_GetPropertyStr(context, global, expected[i][0]);
+        const char *text = JS_ToCString(context, got);
+        if (text == NULL || strcmp(text, expected[i][1]) != 0) {
+            fprintf(stderr, "author-code-running: %s=%s\n", expected[i][0],
+                    text ? text : "?");
+            failed = 1;
+        }
+        JS_FreeCString(context, text);
+        JS_FreeValue(context, got);
+    }
+    JS_FreeValue(context, global);
+    JS_FreeContext(context);
+    JS_FreeRuntime(runtime);
+    return failed;
+}
+
 #if !defined(__PSP__)
+/* Use the embedder API to book weak references without allocating thousands
+   of script wrappers. All returned targets are the same value, each with
+   one separately owned reference. */
+static int test_weak_reference_limit(void)
+{
+    enum { LIMIT = (1u << 14) - 1 };
+    JSRuntime *runtime;
+    JSContext *context = open_realm(&runtime);
+    CHECK(context != NULL);
+    JSValue global = JS_GetGlobalObject(context);
+    JSValue target = JS_NewObject(context);
+    CHECK(!JS_IsException(target));
+    CHECK(JS_SetPropertyStr(context, global, "weakTarget",
+                            JS_DupValue(context, target)) > 0);
+    for (unsigned i = 0; i < LIMIT; i++)
+        CHECK(JS_IsObject(JS_NewWeakTarget(context, target)));
+    JSValue refused = JS_NewWeakTarget(context, target);
+    bool hit_limit = JS_IsException(refused);
+    if (hit_limit) JS_FreeValue(context, JS_GetException(context));
+    else JS_FreeWeakTarget(runtime, refused);
+
+    int failed = !hit_limit;
+    if (hit_limit) {
+        JS_FreeWeakTarget(runtime, target);
+        static const char check[] =
+            "var result = (() => {"
+            "const t = weakTarget, m = new WeakMap(), s = new WeakSet(),"
+            " r = new FinalizationRegistry(() => {});"
+            "const refuses = f => { try { f(); return false; }"
+            " catch(e) { return e instanceof RangeError; } };"
+            "const pairRolledBack = refuses(() => r.register(t, 0, t))"
+            " && !r.unregister(t);"
+            "m.set(t, 1);" /* the released slot can be acquired again */
+            "const rejected = refuses(() => s.add(t)) && !s.has(t)"
+            " && refuses(() => new WeakMap().set(t, 1))"
+            " && refuses(() => new WeakRef(t))"
+            " && refuses(() => r.register(t, 0));"
+            "m.set(t, 2);" /* updating an existing weak key needs no slot */
+            "const released = m.get(t) === 2 && m.delete(t);"
+            "const token = {}; r.register(t, 0, token);"
+            "return pairRolledBack && rejected && released"
+            " && r.unregister(token)"
+            " ? 'OK' : 'weak reference admission or rollback failed';"
+            "})();";
+        failed |= run_page(context, "weak-reference-limit", check);
+        for (unsigned i = 0; i < LIMIT - 2u; i++)
+            JS_FreeWeakTarget(runtime, target);
+        CHECK(!JS_WeakTargetCarriesState(runtime, target, NULL, 0));
+        JSValue still_live = JS_WeakTargetDeref(context, target);
+        CHECK(JS_IsObject(still_live));
+        JS_FreeValue(context, still_live);
+        JSAtom key = JS_NewAtom(context, "weakTarget");
+        CHECK(key != JS_ATOM_NULL);
+        CHECK(JS_DeleteProperty(context, global, key, JS_PROP_THROW) > 0);
+        JS_FreeAtom(context, key);
+        JS_FreeValue(context, target);
+        CHECK(JS_IsUndefined(JS_WeakTargetDeref(context, target)));
+        JS_FreeWeakTarget(runtime, target);
+    } else {
+        fprintf(stderr, "weak-reference-limit: host admission did not refuse\n");
+        for (unsigned i = 0; i < LIMIT; i++)
+            JS_FreeWeakTarget(runtime, target);
+        JS_FreeValue(context, target);
+    }
+    JS_FreeValue(context, global);
+    JS_FreeContext(context);
+    JS_FreeRuntime(runtime);
+    return failed;
+}
+
 /* Refusing each allocation of the page's first change in turn either fails
    that change with no twin left behind, or completes it; either way the
    browser's view is intact and a later change succeeds. */
@@ -1483,8 +1689,11 @@ int main(void)
     failed |= test_cyclic_reparent();
     failed |= test_promise_jobs();
     failed |= test_async_generator_views();
+    failed |= test_map_computed_insert();
+    failed |= test_author_code_running();
 #if !defined(__PSP__)
     failed |= test_refused_twin();
+    failed |= test_weak_reference_limit();
 #endif
     return failed;
 }

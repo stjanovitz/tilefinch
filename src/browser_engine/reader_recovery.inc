@@ -438,7 +438,7 @@ static bool browser_engine_has_script_degradation(
     const ScriptResult *result = &navigation->page.script_result;
     bool heap_rejected = navigation->page.runtime != NULL
         && script_runtime_heap_rejections(navigation->page.runtime) != 0u;
-    /* A realm retired by navigation_retire_exhausted_script_realms no longer
+    /* A realm stopped for memory (navigation_assess_script_memory) no longer
        exposes its allocator counter; that retirement sets
        script_degradation_observed. */
     return navigation->page.script_degradation_observed
@@ -684,7 +684,8 @@ static bool browser_engine_commit_media_card(
         && navigation_relayout(&engine->navigation);
     if (!layout_adopted) {
         lxb_dom_node_t *nodes[] = {card};
-        images_discard_nodes(&page->images, nodes, 1u);
+        images_discard_nodes(&page->images, nodes, 1u,
+                             engine->navigation.maximum_images);
         layout_reuse_cache_update_images(
             page->layout_reuse, &page->images);
         if (document->declared_video_card_node == card)

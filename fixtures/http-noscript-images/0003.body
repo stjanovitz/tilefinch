@@ -1,0 +1,4 @@
+<!doctype html><style>html,body{margin:0}img,div{display:block;width:40px;height:20px}</style><body>
+<p>Placeholders</p>
+<img id=d alt=""><noscript><img src=/d.svg></noscript>
+<script>addEventListener('load',()=>{document.getElementById('d').src='/never.svg'});globalThis.hold=[];for(;;)hold.push(new Array(4096).fill(0))</script>

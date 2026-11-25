@@ -20,7 +20,8 @@ typedef enum {
     LITE_FEED_HISTORY_FRAMING = 6,  /* framing the history response */
     LITE_FEED_HISTORY_VIDEO = 7,    /* reading its first history video */
     LITE_FEED_PLAYLIST_RECHECK = 8, /* waiting to re-read a playlist edit */
-    LITE_FEED_ACCOUNT_STATE = 9     /* confirming exact account state */
+    LITE_FEED_ACCOUNT_STATE = 9,    /* confirming exact account state */
+    LITE_FEED_RATING_START = 10     /* waiting to admit the first request */
 } LiteFeedPhase;
 struct YoutubeLiteFeedJob {
     Budget *budget;
@@ -501,7 +502,9 @@ YoutubeLiteFeedJob *youtube_lite_rating_begin(Budget *budget,
     if (job == NULL) return NULL;
     snprintf(job->like_video_id, sizeof(job->like_video_id), "%s", video_id);
     job->like_selected = liked;
-    if (!lite_feed_start(job)) { youtube_lite_feed_destroy(job); return NULL; }
+    /* A cached identity permits a POST immediately, and enqueue can
+       start background transport. Admit it only in an owner-checked pump. */
+    job->phase = LITE_FEED_RATING_START;
     return job;
 }
 
@@ -1035,6 +1038,20 @@ static YoutubeLiteLoadStatus lite_feed_pump_step(YoutubeLiteFeedJob *job,
                                                 const FetchPumpQuota *quota)
 {
     if (job->status != YOUTUBE_LITE_LOAD_PENDING) return job->status;
+    /* A mutation belongs to the session that initiated it. Check before
+       moving an admitted request onto the wire, signing after bootstrap,
+       or treating a response as confirmation. */
+    if ((job->action != YOUTUBE_LITE_ACTION_NONE || job->like_video_id[0] != '\0')
+        && (job->login_identity == 0 || job->login_identity
+            != youtube_lite_session_login_identity(job->session))) {
+        if (job->request != 0) {
+            (void) fetch_scheduler_cancel(job->scheduler, job->request, "YouTube session changed");
+            job->request = 0;
+        }
+        job->failure = YOUTUBE_FEED_FAILURE_SESSION_CHANGED;
+        job->status = YOUTUBE_LITE_LOAD_CANCELLED;
+        return job->status;
+    }
     /* Keep the session binding through optional history and construction,
        not only at the first authenticated response. */
     if (job->authenticated_identity != 0 && job->authenticated_identity
@@ -1069,9 +1086,9 @@ static YoutubeLiteLoadStatus lite_feed_pump_step(YoutubeLiteFeedJob *job,
             job->status = YOUTUBE_LITE_LOAD_FAILED; return job->status;
         }
     }
-    if (job->action != YOUTUBE_LITE_ACTION_NONE
-        && (job->login_identity == 0 || job->login_identity != youtube_lite_session_login_identity(job->session))) {
-        job->status = YOUTUBE_LITE_LOAD_CANCELLED; return job->status;
+    if (job->phase == LITE_FEED_RATING_START) {
+        if (!lite_feed_start(job)) job->status = YOUTUBE_LITE_LOAD_FAILED;
+        return job->status;
     }
     if (job->phase == LITE_FEED_PLAYLIST_RECHECK || job->phase == LITE_FEED_ACCOUNT_STATE) {
         if (job->phase == LITE_FEED_ACCOUNT_STATE) lite_account_state_pump(job);
@@ -1180,7 +1197,9 @@ static YoutubeLiteLoadStatus lite_feed_pump_step(YoutubeLiteFeedJob *job,
         : lite_supplemental_context("https://m.youtube.com/", job->target);
     context.initiator_url = "https://m.youtube.com/";
     lite_accept_cookies(job->session, &context, &job->response, job->target);
-    if (job->action != YOUTUBE_LITE_ACTION_NONE)
+    /* Only cookies from this job's own accepted response may move its
+       binding forward. The pump-entry guard runs before these are applied. */
+    if (job->action != YOUTUBE_LITE_ACTION_NONE || job->like_video_id[0] != '\0')
         job->login_identity = youtube_lite_session_login_identity(job->session);
     if (job->phase == LITE_FEED_BOOTSTRAP) {
         job->account = (YoutubeLiteBootstrapAccount) {0};

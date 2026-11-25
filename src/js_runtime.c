@@ -13,6 +13,7 @@
 #include "tilefinch/platform.h"
 #include "tilefinch/public_suffix.h"
 #include "tilefinch/sha256.h"
+#include "tilefinch/web_crypto.h"
 #include "tilefinch/text_encoding.h"
 #include "tilefinch/url.h"
 #include "tilefinch/site_identity.h"

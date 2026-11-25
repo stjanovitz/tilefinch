@@ -7,7 +7,10 @@
      errors, promises and platform objects with the constructors
      hardening.js captured. */
   const { defineProperty, Error, TypeError, DOMException, WeakMap,
-    WeakRef } = globalThis.__tilefinchEventInterfaces;
+    WeakRef, claimHooks } = globalThis.__tilefinchEventInterfaces;
+  /* The NodeIterator hooks go to dom.js through this module's publisher
+     (hardening.js), claimed before any page code can run. */
+  const publish = claimHooks?.();
   const wrap = globalThis.__tilefinchWrap,
     __tilefinchTraverse = globalThis.__tilefinchTraverse,
     nativeDescendants = globalThis.__tilefinchDescendants,
@@ -614,7 +617,7 @@
         const reference = previous ? lastInclusiveDescendant(previous) : parent;
         if (reference) state.reference = reference;
       };
-    globalThis.__tilefinchSetNodeIteratorHooks?.({
+    publish?.("__tilefinchNodeIteratorHooks", {
       hitTestElements,
       active: () => liveIterators.length > 0,
       /* Called after a removal with the removed nodes (a contiguous run,

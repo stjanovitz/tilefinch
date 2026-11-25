@@ -634,7 +634,7 @@ static void bridge_computed_style_keys(DomBridge *bridge)
 
 /* Whether a structural test that reaches descendants (`.a + .b .c`,
    `tr:last-child > *`) can concern one of `parent`'s children, as
-   layout_reuse_structure_deep asks: then a change to a child restyles its
+   layout_reuse_structure_reach asks: then a change to a child restyles its
    siblings' subtrees, not only the siblings. Past the child bound, assume
    it can. */
 static bool bridge_computed_style_structure_deep(
@@ -1554,6 +1554,57 @@ static void computed_style_format_scaled(char *output, size_t output_size,
     snprintf(output, output_size, "%lu.%s", whole, digits);
 }
 
+/* A length as the cascade kept it: pixels, or a percentage when `percent`
+   is set. An integral percentage is its plain number; a fractional one
+   (33.333%) stays tagged in 16.16 fixed point (parse_dimension_length),
+   and a calc() is a tagged program of `sheet`. */
+static void computed_style_format_length(char *output, size_t output_size,
+                                         const Stylesheet *sheet,
+                                         int length, bool percent)
+{
+    if (length >= STYLE_LENGTH_PROGRAM_TAG
+        && length <= STYLE_LENGTH_PROGRAM_END) {
+        /* A linear program is A px + B %, read from its values against
+           0, 50000 and 100000 px (B to a thousandth of a percent), and
+           serializes as Chrome's calc(); any other (min(), clamp())
+           gives its value against a zero basis. */
+        int zero = 0, half = 0, full = 0;
+        if (!style_length_resolve(sheet, length, 0, &zero)) zero = 0;
+        if (percent && style_length_resolve(sheet, length, 50000, &half)
+            && style_length_resolve(sheet, length, 100000, &full)
+            && full != zero && abs(2 * half - zero - full) <= 1) {
+            long thousandths = (long) full - zero;
+            char digits[24];
+            computed_style_format_scaled(
+                digits, sizeof(digits),
+                (unsigned long) (thousandths < 0 ? -thousandths
+                                                 : thousandths), 1000ul);
+            if (zero == 0)
+                snprintf(output, output_size, "%s%s%%",
+                         thousandths < 0 ? "-" : "", digits);
+            else
+                snprintf(output, output_size, "calc(%s%s%% %c %dpx)",
+                         thousandths < 0 ? "-" : "", digits,
+                         zero < 0 ? '-' : '+', zero < 0 ? -zero : zero);
+            return;
+        }
+        snprintf(output, output_size, "%dpx", zero);
+        return;
+    }
+    if (percent && length >= STYLE_LENGTH_PERCENT_TAG
+        && length <= STYLE_LENGTH_PERCENT_END) {
+        long q16 = (long) length - STYLE_LENGTH_PERCENT_TAG
+                   - STYLE_LENGTH_PERCENT_BIAS;
+        char digits[24];
+        computed_style_format_scaled(digits, sizeof(digits),
+                                     (unsigned long) (q16 < 0 ? -q16 : q16),
+                                     (unsigned long) STYLE_MATH_Q16);
+        snprintf(output, output_size, "%s%s%%", q16 < 0 ? "-" : "", digits);
+        return;
+    }
+    snprintf(output, output_size, "%d%s", length, percent ? "%" : "px");
+}
+
 /* The properties js_computed_style_get() resolves for an ordinary rendered
    element, in strcmp order. This one table answers every CSSOM question about
    the *set* of supported properties -- `name in style`, `length`, `item()`,
@@ -2399,8 +2450,9 @@ static TILEFINCH_OUT_OF_LINE const char *computed_style_sparse_modern_initial(
    !important are already settled by the time a value gets here. Returns
    false for a property this function does not own. */
 static TILEFINCH_OUT_OF_LINE bool computed_style_serialize_retained(
-    const lxb_dom_node_t *node, const ComputedStyle *style,
-    ComputedStylePropertyId id, char *value, size_t value_size)
+    const Stylesheet *sheet, const lxb_dom_node_t *node,
+    const ComputedStyle *style, ComputedStylePropertyId id, char *value,
+    size_t value_size)
 {
     if (id == CSP_LINE_HEIGHT) {
         /* `normal` stays a keyword even though layout later picks a number
@@ -2485,8 +2537,9 @@ static TILEFINCH_OUT_OF_LINE bool computed_style_serialize_retained(
                          ? -style->flex_basis_offset
                          : style->flex_basis_offset);
         } else {
-            snprintf(value, value_size, "%d%s", style->flex_basis,
-                     style->flex_basis_percent ? "%" : "px");
+            computed_style_format_length(
+                value, value_size, sheet, style->flex_basis,
+                style->flex_basis_percent);
         }
     } else if (id == CSP_LIST_STYLE_TYPE) {
         static const char *const names[] = {
@@ -3526,30 +3579,30 @@ static void computed_style_serialize(const ComputedStyleRead *read,
     }
     case CSP_TOP: {
         if (!style->has_top) snprintf(value, value_size, "auto");
-        else snprintf(value, value_size, "%d%s", style->top,
-                      style->inset_percent_mask & STYLE_INSET_TOP_PERCENT
-                      ? "%" : "px");
+        else computed_style_format_length(
+            value, value_size, bridge->stylesheet, style->top,
+            style->inset_percent_mask & STYLE_INSET_TOP_PERCENT);
         break;
     }
     case CSP_RIGHT: {
         if (!style->has_right) snprintf(value, value_size, "auto");
-        else snprintf(value, value_size, "%d%s", style->right,
-                      style->inset_percent_mask & STYLE_INSET_RIGHT_PERCENT
-                      ? "%" : "px");
+        else computed_style_format_length(
+            value, value_size, bridge->stylesheet, style->right,
+            style->inset_percent_mask & STYLE_INSET_RIGHT_PERCENT);
         break;
     }
     case CSP_BOTTOM: {
         if (!style->has_bottom) snprintf(value, value_size, "auto");
-        else snprintf(value, value_size, "%d%s", style->bottom,
-                      style->inset_percent_mask & STYLE_INSET_BOTTOM_PERCENT
-                      ? "%" : "px");
+        else computed_style_format_length(
+            value, value_size, bridge->stylesheet, style->bottom,
+            style->inset_percent_mask & STYLE_INSET_BOTTOM_PERCENT);
         break;
     }
     case CSP_LEFT: {
         if (!style->has_left) snprintf(value, value_size, "auto");
-        else snprintf(value, value_size, "%d%s", style->left,
-                      style->inset_percent_mask & STYLE_INSET_LEFT_PERCENT
-                      ? "%" : "px");
+        else computed_style_format_length(
+            value, value_size, bridge->stylesheet, style->left,
+            style->inset_percent_mask & STYLE_INSET_LEFT_PERCENT);
         break;
     }
     case CSP_OVERFLOW: {
@@ -3724,8 +3777,9 @@ static void computed_style_serialize(const ComputedStyleRead *read,
         } else if (style->flex_basis == STYLE_LENGTH_FIT_CONTENT) {
             snprintf(basis, sizeof(basis), "fit-content");
         } else {
-            snprintf(basis, sizeof(basis), "%d%s", style->flex_basis,
-                     style->flex_basis_percent ? "%" : "px");
+            computed_style_format_length(
+                basis, sizeof(basis), bridge->stylesheet, style->flex_basis,
+                style->flex_basis_percent);
         }
         snprintf(value, value_size, "%.3g %.3g %s",
                  (double) style->flex_grow / 1000.0,
@@ -3816,8 +3870,9 @@ static void computed_style_serialize(const ComputedStyleRead *read,
             } else if (computed_style_width_fit_content(style)) {
                 snprintf(value, value_size, "fit-content");
             } else {
-                snprintf(value, value_size, "%d%s", style->width,
-                         style->width_percent ? "%" : "px");
+                computed_style_format_length(
+                    value, value_size, bridge->stylesheet, style->width,
+                    style->width_percent);
             }
         }
         break;
@@ -3830,8 +3885,9 @@ static void computed_style_serialize(const ComputedStyleRead *read,
             snprintf(value, value_size, "max-content");
         else if (style->min_width == STYLE_LENGTH_FIT_CONTENT)
             snprintf(value, value_size, "fit-content");
-        else snprintf(value, value_size, "%d%s", style->min_width,
-                      style->min_width_percent ? "%" : "px");
+        else computed_style_format_length(
+            value, value_size, bridge->stylesheet, style->min_width,
+            style->min_width_percent);
         break;
     }
     case CSP_MAX_WIDTH: {
@@ -3843,8 +3899,9 @@ static void computed_style_serialize(const ComputedStyleRead *read,
             snprintf(value, value_size, "max-content");
         } else if (style->max_width == STYLE_LENGTH_FIT_CONTENT) {
             snprintf(value, value_size, "fit-content");
-        } else snprintf(value, value_size, "%d%s", style->max_width,
-                      style->max_width_percent ? "%" : "px");
+        } else computed_style_format_length(
+            value, value_size, bridge->stylesheet, style->max_width,
+            style->max_width_percent);
         break;
     }
     case CSP_HEIGHT: {
@@ -3855,14 +3912,16 @@ static void computed_style_serialize(const ComputedStyleRead *read,
         } else if (!style->has_height) {
             snprintf(value, value_size, "auto");
         } else {
-            snprintf(value, value_size, "%d%s", style->height,
-                     style->height_percent ? "%" : "px");
+            computed_style_format_length(
+                value, value_size, bridge->stylesheet, style->height,
+                style->height_percent);
         }
         break;
     }
     case CSP_MIN_HEIGHT: {
-        snprintf(value, value_size, "%d%s", style->min_height,
-                 style->min_height_percent ? "%" : "px");
+        computed_style_format_length(
+            value, value_size, bridge->stylesheet, style->min_height,
+            style->min_height_percent);
         break;
     }
     case CSP_MAX_HEIGHT: {
@@ -3871,8 +3930,9 @@ static void computed_style_serialize(const ComputedStyleRead *read,
         } else if (style->max_height == STYLE_LENGTH_MIN_CONTENT) {
             snprintf(value, value_size, "min-content");
         }
-        else snprintf(value, value_size, "%d%s", style->max_height,
-                      style->max_height_percent ? "%" : "px");
+        else computed_style_format_length(
+            value, value_size, bridge->stylesheet, style->max_height,
+            style->max_height_percent);
         break;
     }
     case CSP_MARGIN_TOP: {
@@ -4192,7 +4252,7 @@ static void computed_style_serialize(const ComputedStyleRead *read,
         /* Reached only after every older case declined, so none of their
            paths grew. */
         (void) computed_style_serialize_retained(
-            node, style, id, value, value_size);
+            bridge->stylesheet, node, style, id, value, value_size);
         break;
     }
 }

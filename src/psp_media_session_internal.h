@@ -14,6 +14,28 @@ static inline uint64_t psp_media_internal_now_us(
 
 uint64_t psp_media_session_decode_clock_us(
     const PspMediaSession *media, bool awaiting_first_frame);
+
+/* Single owner-thread commit point for a controller event. User intents
+   have no token. A stamped completion may only consume its own service,
+   and an out-of-phase notification cannot cancel the expected result. */
+static inline bool psp_media_commit_controller_event(
+    PspMediaSession *media, const PspMediaEvent *event)
+{
+    if (event->service_epoch != 0
+        && !psp_media_service_token_matches(&media->service, event)) {
+        if (media->stale_service_completions != UINT32_MAX)
+            media->stale_service_completions++;
+        return false;
+    }
+    PspMediaDecision decision = psp_media_machine_transition(&media->machine, event);
+    media->machine = decision.next;
+    if (event->service_epoch != 0 && decision.handled && !decision.deliberate_noop)
+        psp_media_service_token_clear(&media->service);
+    if (decision.command != PSP_MEDIA_COMMAND_NONE)
+        psp_media_service_token_begin(&media->service, decision.command,
+                                      psp_media_internal_now_us(media), 0);
+    return true;
+}
 BrowserYoutubeQuality psp_media_open_quality(PspMediaSession *media);
 bool psp_media_offline_route(
     const PspMediaSession *media, const char *url);
@@ -30,6 +52,24 @@ void psp_media_retire_first_frame(PspMediaSession *media);
 PspMediaEvent psp_media_service_completion(
     const PspMediaSession *media, PspMediaEventType type);
 bool psp_media_open_phase(PspMediaJobPhase phase);
+/* Scheduling only. The next phase still gets its own service token,
+   cancellation and deadline checks. */
+static inline bool psp_media_open_followup_due(
+    const PspMediaSession *media, PspMediaJobPhase before, uint64_t elapsed_us)
+{
+    if (elapsed_us > 4000u || media->machine.state != PSP_MEDIA_SESSION_OPENING
+        || media->service.command != PSP_MEDIA_COMMAND_START_OPEN_PHASE
+        || !media->service.epoch || media->open_service_pending
+        || !media->ui.visible || media->ui.failed || media->page_source
+        || media->offline_source || media->use_swdec || media->stream.live_hls)
+        return false;
+    return (before == PSP_MEDIA_JOB_OPEN_RESOLVE
+            && media->job_phase == PSP_MEDIA_JOB_OPEN_DECODER_PREPARE)
+        || (before == PSP_MEDIA_JOB_OPEN_DECODER_PREPARE
+            && media->job_phase == PSP_MEDIA_JOB_OPEN_VIDEO_RANGE)
+        || (before == PSP_MEDIA_JOB_OPEN_VIDEO_PRIME
+            && media->job_phase == PSP_MEDIA_JOB_OPEN_PLAYBACK);
+}
 bool psp_media_seek_phase(PspMediaJobPhase phase);
 PspMediaPipelineState psp_media_owned_pipeline(
     const PspMediaSession *media);
@@ -52,6 +92,8 @@ size_t psp_media_transport_rate_floor(
     uint64_t content_length, uint64_t duration_ms);
 uint64_t psp_media_recovery_position_us(
     const PspMediaSession *media);
+void psp_media_capture_resume_audio(PspMediaSession *media);
+void psp_media_reset_resume_output(PspMediaSession *media);
 void psp_media_remember_retry_state(
     PspMediaSession *media, bool resume_playing);
 void psp_media_request_user_retry(PspMediaSession *media);

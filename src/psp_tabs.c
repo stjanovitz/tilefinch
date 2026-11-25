@@ -29,29 +29,35 @@ static const BrowserTabHistoryEntry *psp_tabs_target_entry(
 }
 
 PspTabRequestResult psp_tabs_request(
-    BrowserTabs *tabs, const NavigationSession *navigation,
+    BrowserTabs *tabs, BrowserEngine *engine,
     bool capture_current_document,
     PspUiAction action, size_t requested_index, const char *homepage_url,
     const char *hibernation_path, PspTabTransition *transition,
     char destination[NAVIGATION_URL_LIMIT])
 {
-    if (tabs == NULL || navigation == NULL || transition == NULL
-        || destination == NULL || transition->pending) {
+    if (tabs == NULL || engine == NULL || transition == NULL
+        || destination == NULL || transition->pending
+        || browser_engine_navigation_pending(engine)) {
         return PSP_TAB_REQUEST_REFUSED;
     }
-    if (capture_current_document
-        && !browser_tabs_capture_active(tabs, navigation))
-        return PSP_TAB_REQUEST_REFUSED;
-
     size_t previous = browser_tabs_active_index(tabs);
+    if (action == PSP_UI_ACTION_SWITCH_TAB && requested_index == previous
+        && capture_current_document) return PSP_TAB_REQUEST_COMPLETE;
+    if (capture_current_document
+        && action != PSP_UI_ACTION_CLOSE_TAB) {
+        BrowserFrontendSnapshot snapshot = {0};
+        if (!browser_engine_prepare_tab_departure(engine)
+            || !browser_engine_frontend_snapshot(engine, &snapshot)
+            || !browser_tabs_capture_active(tabs, snapshot.navigation))
+            return PSP_TAB_REQUEST_CAPTURE_FAILED;
+    }
+
     size_t target = previous;
     size_t close_after = PSP_TAB_INDEX_NONE;
     bool added = false;
     if (action == PSP_UI_ACTION_SWITCH_TAB) {
         if (requested_index >= browser_tabs_count(tabs))
             return PSP_TAB_REQUEST_REFUSED;
-        if (requested_index == previous && capture_current_document)
-            return PSP_TAB_REQUEST_COMPLETE;
         target = requested_index;
         if (browser_tabs_hibernated(tabs, target)
             && !browser_tabs_rehydrate(
@@ -103,6 +109,13 @@ PspTabRequestResult psp_tabs_request(
         .target_index = target,
         .close_after_success = close_after
     };
+    NavigationHistoryRecord records[BROWSER_TAB_HISTORY_LIMIT];
+    size_t current;
+    if (!browser_tab_history_records(browser_tabs_active(tabs), records, NULL, &current)
+        || !browser_engine_set_tab_restore(engine, &records[current])) {
+        (void) psp_tabs_finish(tabs, engine, transition, false, false, NULL);
+        return PSP_TAB_REQUEST_CAPTURE_FAILED;
+    }
     return PSP_TAB_REQUEST_LOAD;
 }
 
@@ -113,6 +126,7 @@ bool psp_tabs_finish(
 {
     if (tabs == NULL || engine == NULL || transition == NULL
         || !transition->pending) return false;
+    (void) browser_engine_set_tab_restore(engine, NULL);
 
     if (!succeeded) {
         if (transition->added_target) {
@@ -151,6 +165,7 @@ bool psp_tabs_finish(
          * one-entry tab and let the user continue from the committed page.
          */
         browser_engine_recover_tab_history(engine);
+        (void) browser_engine_capture_history_controls(engine);
         (void) browser_tabs_capture_active(tabs, navigation);
         if (transition->close_after_success != PSP_TAB_INDEX_NONE)
             (void) browser_tabs_remove(
@@ -185,6 +200,15 @@ bool psp_tabs_finish(
     return true;
 }
 
+const char *psp_tabs_unread_notice(const BrowserProfile *profile,
+                                   const BrowserTabs *tabs)
+{
+    if (browser_profile_save_blocked(profile))
+        return PSP_TABS_PROFILE_UNREAD_NOTICE;
+    return browser_tabs_session_save_blocked(tabs)
+        ? PSP_TABS_SESSION_UNREAD_NOTICE : NULL;
+}
+
 bool psp_tabs_restore_startup(BrowserTabs *tabs, BrowserEngine *engine,
                               const char *path)
 {
@@ -198,11 +222,12 @@ bool psp_tabs_restore_startup(BrowserTabs *tabs, BrowserEngine *engine,
 }
 
 bool psp_tabs_finish_native_home(
-    BrowserTabs *tabs, PspTabTransition *transition,
+    BrowserTabs *tabs, BrowserEngine *engine, PspTabTransition *transition,
     bool hibernation_enabled, const char *hibernation_path)
 {
     if (tabs == NULL || transition == NULL || !transition->pending)
         return false;
+    (void) browser_engine_set_tab_restore(engine, NULL);
     if (!browser_tabs_update_active_document(
             tabs, TILEFINCH_HOMEPAGE_URL, "Home")) {
         if (transition->added_target)

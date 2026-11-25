@@ -529,6 +529,59 @@ without `_deps/pocketsphinx-src` can point
 unpacked source tree (the configure patches it in place), or leave voice out
 with `-DPSP_BROWSER_ENABLE_PSP_VOICE=OFF`.
 
+### Dependency patches
+
+Tilefinch's changes to fetched dependencies are the files in `patches/`.
+`cmake/apply_patch.cmake` applies them at configure time, and every patch
+file is a configure input, so editing one reconfigures each tree that uses
+it. Every hunk must match its context exactly (`patch -F0`; an offset is
+accepted), so a patch never lands on drifted lines. A dependency's source
+tree records the patches it took in `.tilefinch-applied/`: an exact copy of
+each, and the order they went in.
+
+On a later configure, a patch that matches its copy is left alone, and a
+configure where every patch matches runs no `patch` at all. A patch that has
+changed replaces the version the tree holds: the recorded patches from the
+newest down to that one come off, newest first, so patches on the same
+lines unstack cleanly, and then it and the ones after it go back on. Nothing
+is downloaded, so trees configured with `FETCHCONTENT_FULLY_DISCONNECTED`
+update the same way. A patch renamed without other change takes over its
+old record. Patches that rewrite each other's lines, as the NanoSVG and
+PocketSphinx ones do, go to the script as one ordered list, so that a patch
+held off by a later one, or inserted under one, is tried again with the
+later ones off.
+
+A patch the tree has no record of, as in a tree patched before trees kept
+one, is adopted when it reverses cleanly, and the configure log says so.
+Adoption cannot see a hunk dropped from the patch after that tree was
+patched: the old hunk stays in the tree. When a patch loses a hunk, replace
+such trees with fresh copies of the dependency.
+
+Before changing a tree, the script saves the files its patches name, and
+the record, in `.tilefinch-transaction/`. A configure that fails puts them
+back, so it leaves the tree as it found it, and a configure that was killed
+partway is put back by the next one. Three cases fail, and the message names
+the tree and the repair:
+
+- In a tree patched before trees kept a record, a patch edited since then
+  neither applies nor reverses. The message gives the
+  `git show <older-commit>:patches/<name> | patch -R -p1 -d <tree>` command
+  that takes the old version off.
+- A tree whose patched files were edited by hand no longer reverses its
+  recorded copy exactly. The message names the copy that would not reverse.
+- A recorded copy has gone missing. The message names it.
+
+A patch removed from the CMake lists is not taken out of existing trees: no
+call names it any more, so it stays applied and recorded. Take it out with
+`patch -R -p1 -d <tree> -i <tree>/.tilefinch-applied/<name>` (after any
+later patch on the same lines), then delete that copy and its line in the
+`stack` file, or replace the tree with a fresh copy of the dependency.
+
+The PSP transport archives are patched by ExternalProject and re-extracted
+when one of their patches changes
+([PSP transport](engineering/PSP_TRANSPORT.md)).
+`tilefinch-apply-patch-tests` covers these cases on synthetic trees.
+
 ### QuickJS configuration
 
 QuickJS is vendored in `third_party/quickjs` with the repository's changes

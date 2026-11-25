@@ -181,6 +181,8 @@ bool navigation_replace_history(
         const NavigationHistoryRecord *source = &records[index];
         if (source->url == NULL || source->url[0] == '\0'
             || source->title == NULL
+            || source->control_count > NAVIGATION_HISTORY_CONTROL_LIMIT
+            || (source->control_count != 0 && source->controls == NULL)
             || strnlen(source->url, NAVIGATION_URL_LIMIT)
                    >= NAVIGATION_URL_LIMIT
             || strnlen(source->title, NAVIGATION_TITLE_LIMIT)
@@ -203,6 +205,10 @@ bool navigation_replace_history(
         staged[index].focus_kind = source->focus_kind;
         staged[index].focus_index = source->focus_index;
         staged[index].focus_identity = source->focus_identity;
+        staged[index].control_count = source->control_count;
+        if (source->control_count != 0)
+            memcpy(staged[index].controls, source->controls,
+                   source->control_count * sizeof(*source->controls));
     }
     navigation_clear_history(session);
     memcpy(session->history, staged, count * sizeof(*staged));

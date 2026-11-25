@@ -86,12 +86,24 @@ bool layout_block_emit_decoration(
            ? images_find_background_source(
                context->images, node, style->background_image, PSEUDO_NONE)
            : images_find_background_node(context->images, node));
+    /* An empty placeholder the page's script left unfilled shows its
+       <noscript> image (image_noscript_arm), keyed to the box itself. */
+    size_t noscript_length = 0;
+    bool noscript_cover = !layered_background
+        && style->background_image == NULL
+        && !image_resource_available(element_background)
+        && image_noscript_placeholder_source(context->sheet, node,
+                                             &noscript_length) != NULL
+        && image_resource_available(images_find_node(context->images, node));
+    if (noscript_cover)
+        element_background = images_find_node(context->images, node);
     if (element_mask_declared
         && !image_resource_available(element_mask)) {
         if (mask_layer->kind == STYLE_PAINT_IMAGE_URL) {
-            layout_note_unresolved_external_visual(
-                context, node, mask_layer->image, IMAGE_PRIORITY_KIND_MASK,
-                PSEUDO_NONE);
+            layout_size_mask_visual(context,
+                layout_note_unresolved_external_visual(
+                    context, node, mask_layer->image,
+                    IMAGE_PRIORITY_KIND_MASK, PSEUDO_NONE), style);
         }
     }
     if (layered_background) {
@@ -476,9 +488,12 @@ bool layout_block_emit_decoration(
                 - background_inset_left - background_inset_right,
             .height = 0,
             .image = element_background,
-            .image_fit = style->background_fit,
+            .image_fit = noscript_cover ? LAYOUT_IMAGE_FIT_COVER
+                                        : style->background_fit,
             .scale = background_radius
         };
+        if (noscript_cover)
+            draw_command_set_object_position(&background_image, 50, 50);
         background_image_index = context->layout->count;
         if (layout_add_command(context->layout, background_image) == NULL) return false;
     }
@@ -508,7 +523,10 @@ bool layout_block_emit_decoration(
             }
         }
     }
-    if (mask_layer != NULL
+    /* A gradient mask paints the box's own background through it. With no
+       background the box has nothing of its own to paint: the mask only
+       fades its content, which paints unmasked here. */
+    if (mask_layer != NULL && style->has_background
         && mask_layer->kind == STYLE_PAINT_IMAGE_GRADIENT
         && mask_layer->gradient.stop_count >= 2) {
         size_t gradient_slot = 0;
@@ -520,12 +538,10 @@ bool layout_block_emit_decoration(
                 .y = outer_y,
                 .width = outer_width,
                 .height = 0,
-                .color = style->has_background
-                    ? style->background : style->color,
+                .color = style->background,
                 .radius = border_radius_code,
                 .opacity_scale = alpha_opacity_scale(
-                    style->has_background
-                    ? style->background_alpha : style->color_alpha),
+                    style->background_alpha),
                 .image_fit = LAYOUT_FILL_GRADIENT_AS_MASK
             };
             draw_command_set_fill_gradient(&mask, gradient_slot);
@@ -551,6 +567,7 @@ bool layout_block_emit_decoration(
     plan->background_geometry = background_geometry;
     plan->element_mask = element_mask;
     plan->element_background = element_background;
+    plan->noscript_cover = noscript_cover;
     plan->background_index = background_index;
     plan->background_gradient_index = background_gradient_index;
     plan->background_image_index = background_image_index;
@@ -810,7 +827,9 @@ bool layout_block_patch_decoration(
             layout_block_set_paint_layer_object_position(
                 background_image, background_geometry);
         }
-        if ((style->background_size_flags
+        if (plan->noscript_cover) {
+            /* Already a centered cover of the paint area. */
+        } else if ((style->background_size_flags
              & STYLE_BACKGROUND_SIZE_EXPLICIT) != 0) {
             int image_width = 0, image_height = 0;
             layout_background_tile_size(
@@ -848,12 +867,10 @@ bool layout_block_patch_decoration(
                natural size against the area. */
             bool pixels = (style->background_size_flags
                            & STYLE_BACKGROUND_POSITION_PIXELS) != 0;
-            int natural_width = element_background->source_width > 0
-                                ? element_background->source_width
-                                : element_background->width;
-            int natural_height = element_background->source_height > 0
-                                 ? element_background->source_height
-                                 : element_background->height;
+            int natural_width = 0, natural_height = 0;
+            layout_image_auto_size(element_background, origin_width,
+                                   origin_height, &natural_width,
+                                   &natural_height);
             int offset_x = pixels ? style->background_position_x
                 : (origin_width - natural_width)
                   * style->background_position_x / 100;
@@ -873,6 +890,9 @@ bool layout_block_patch_decoration(
                              : LAYOUT_IMAGE_FIT_SPRITE));
             draw_command_set_image_offset(background_image,
                                           offset_x, offset_y);
+            if (element_background->no_natural_size)
+                draw_command_set_image_sprite_size(
+                    background_image, natural_width, natural_height);
         }
     }
     if (rounded_border_index != (size_t) -1) {

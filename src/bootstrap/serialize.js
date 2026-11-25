@@ -80,12 +80,9 @@
         };
       if (self) stack.push([root, null, null]);
       else if (!xml) out += pushContent(root, null, null);
-      else {
-        /* Children see the bindings their parent is serialized with. */
-        const prefixes = Object.create(null);
-        if (root.prefix) prefixes[root.prefix] = root.namespaceURI;
-        pushChildren(childrenOf(root), root.namespaceURI ?? null, prefixes);
-      }
+      /* XML children start with no bindings, so each declares its own
+         namespace, as in Chromium (WPT domparsing/innerhtml-03.xhtml). */
+      else pushChildren(childrenOf(root), null, null);
       while (stack.length) {
         const item = stack.pop();
         if (typeof item === "string") {
@@ -253,17 +250,40 @@
   }
   globalThis.XMLSerializer = XMLSerializer;
   /* shadowRoots names the roots to include, open or closed. A root is
-     never serializable here (attachShadow ignores that option), so
-     serializableShadowRoots adds none. */
-  function getHTML(options = undefined) {
+     never serializable here (attachShadow ignores that option and a root
+     has no serializable attribute), so serializableShadowRoots adds none,
+     and declarative roots are not parsed back (setHTMLUnsafe is
+     innerHTML). Element's and ShadowRoot's getHTML are separate members,
+     each refusing the other's receivers, as in Chromium. */
+  const getHTML = (node, options) => {
+    if (options != null && typeof options !== "object" &&
+        typeof options !== "function")
+      throw new TypeError("Failed to execute 'getHTML': " +
+                          "parameter 1 is not of type 'GetHTMLOptions'.");
     let hosts = null;
-    for (const root of options?.shadowRoots || [])
-      if (root instanceof ShadowRootType)
-        (hosts ||= new Map()).set(root.host, root);
-    return hosts ? markup(this, false, false, hosts) : this.innerHTML;
-  }
-  method(Element.prototype, "getHTML", getHTML);
-  method(ShadowRootType.prototype, "getHTML", getHTML);
+    for (const root of options?.shadowRoots || []) {
+      if (!(root instanceof ShadowRootType))
+        throw new TypeError("Failed to execute 'getHTML': " +
+                            "shadowRoots must hold ShadowRoot objects.");
+      (hosts ||= new Map()).set(root.host, root);
+    }
+    /* HTML even in an XML document, whose innerHTML is XML. */
+    return hosts || node.ownerDocument?.contentType !== "text/html"
+      ? markup(node, false, false, hosts) : node.innerHTML;
+  };
+  method(Element.prototype, "getHTML", {
+    getHTML(options = undefined) {
+      if (!(this instanceof Element)) throw new TypeError("Illegal invocation");
+      return getHTML(this, options);
+    },
+  }.getHTML);
+  method(ShadowRootType.prototype, "getHTML", {
+    getHTML(options = undefined) {
+      if (!(this instanceof ShadowRootType))
+        throw new TypeError("Illegal invocation");
+      return getHTML(this, options);
+    },
+  }.getHTML);
   const mergeNext = (node) => {
     const next = node?.nextSibling;
     if (node?.nodeType === NodeType.TEXT_NODE &&

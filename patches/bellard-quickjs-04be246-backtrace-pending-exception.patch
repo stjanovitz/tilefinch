@@ -1,0 +1,52 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -9015,11 +9015,23 @@
+     const char *func_name_str;
+     const char *str1;
+     JSObject *p;
++    JSRuntime *rt = ctx->rt;
++    JSValue saved_exception;
++    BOOL saved_uncatchable;
+ 
+     if (!JS_IsObject(error_obj))
+         return; /* protection in the out of memory case */
+     rooted_error_obj = JS_DupValue(ctx, error_obj);
+-    
++    /* Tilefinch: building the text allocates, and a refused allocation
++       throws. Keep the pending exception and its uncatchable mark through
++       that: an interrupt (or a lazy compile refused for memory) whose stack
++       capture was refused became a catchable "out of memory", so page code
++       that caught it and tried again ran on at the heap wall, each later
++       interrupt lost the same way. */
++    saved_exception = rt->current_exception;
++    saved_uncatchable = rt->current_exception_is_uncatchable;
++    rt->current_exception = JS_UNINITIALIZED;
++
+     js_dbuf_init(ctx, &dbuf);
+     if (filename) {
+         dbuf_printf(&dbuf, "    at %s", filename);
+@@ -9083,13 +9095,22 @@
+     else
+         str = JS_NewString(ctx, (char *)dbuf.buf);
+     dbuf_free(&dbuf);
++    /* A refused string leaves "stack" null, as a refused buffer does, so
++       each frame the exception unwinds through does not try again. */
++    if (JS_IsException(str))
++        str = JS_NULL;
+     JS_DefinePropertyValue(ctx, rooted_error_obj, JS_ATOM_stack, str,
+                            JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+-    JS_FreeValue(ctx, rooted_error_obj);
+-    return;
++    goto done;
+  fail:
+     dbuf_free(&dbuf);
++ done:
+     JS_FreeValue(ctx, rooted_error_obj);
++    if (!JS_IsUninitialized(rt->current_exception)) {
++        JS_FreeValue(ctx, rt->current_exception);
++    }
++    rt->current_exception = saved_exception;
++    rt->current_exception_is_uncatchable = saved_uncatchable;
+ }
+ 
+ /* Note: it is important that no exception is returned by this function */

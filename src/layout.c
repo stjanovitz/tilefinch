@@ -112,6 +112,10 @@ ComputedStyle layout_style_for_pseudo(
     if (layout_reuse_pseudo_absent(context->reuse, context->sheet, node,
                                    pseudo, parent)) {
         context->pseudo_absence_hits++;
+#ifndef TILEFINCH_NO_TRACE
+        layout_reuse_verify_pseudo_absent(context->reuse, context->sheet,
+                                          node, pseudo, parent);
+#endif
         return (ComputedStyle) {0};
     }
     StyleRetainedMatches *previous_matches = style_retained_matches_attach(
@@ -203,6 +207,7 @@ static void layout_release_context(LayoutContext *context, Budget *budget)
     }
     budget_free(budget, context->stacking_contexts);
     budget_free(budget, context->visibility_ranges);
+    budget_free(budget, context->deferred_paint);
     LayoutReuseCache *reuse = context->reuse;
     if (reuse != NULL && context->counter_entries != NULL
         && !context->cancelled && !context->counter_entries_allocation_failed
@@ -1030,6 +1035,19 @@ static void inline_fragment_unlink(LayoutInlineFragments *table,
     }
 }
 
+size_t layout_inline_fragment_count(const LayoutDocument *layout)
+{
+    return layout == NULL || layout->inline_fragments == NULL
+        ? 0u : layout->inline_fragments->count;
+}
+
+const LayoutInlineFragment *layout_inline_fragment_at(
+    const LayoutDocument *layout, size_t at)
+{
+    return at < layout_inline_fragment_count(layout)
+        ? &layout->inline_fragments->entries[at] : NULL;
+}
+
 bool layout_inline_fragments_complete(const LayoutDocument *layout)
 {
     return layout != NULL && !layout->inline_fragments_disabled
@@ -1720,6 +1738,8 @@ struct LayoutBuildJob {
     const ImageResources *images;
     ViewportContext viewport;
     LayoutReuseCache *reuse;
+    /* layout_reuse_proof_build_begin's serial for this pass. */
+    uint32_t reuse_serial;
     LayoutDocument layout;
     LayoutContext *context;
     lxb_dom_node_t *body;
@@ -1924,6 +1944,7 @@ static bool layout_job_init(LayoutBuildJob *job)
                                            job->document->element_count);
     layout_reuse_cache_prepare(job->reuse, job->stylesheet, job->fonts,
                                job->images, job->viewport_width);
+    job->reuse_serial = layout_reuse_proof_build_begin(job->reuse);
     /* Binding a new sheet and resolving the root style (hundreds of
        custom properties on Wikipedia) are each tens of ms on the PSP. */
     if (!layout_cooperate_timed(context)) return false;
@@ -2364,6 +2385,9 @@ LayoutBuildStatus layout_build_job_pump(LayoutBuildJob *job)
         }
         break;
     case LAYOUT_JOB_COMPACT:
+        layout_unpin_tall_fixed_stacks(
+            &job->layout, job->viewport_height,
+            job->reuse == NULL ? NULL : &job->reuse->fixed_unpin_state);
         compact_layout_storage(&job->layout);
         layout_job_fingerprint_commands(job);
         job->layout.performance.compact_us =
@@ -2520,6 +2544,11 @@ bool layout_build_job_take(LayoutBuildJob *job, LayoutDocument *layout)
 {
     if (job == NULL || layout == NULL
         || job->status != LAYOUT_BUILD_COMPLETE || job->taken) return false;
+    job->layout.reuse_serial = layout_reuse_proof_build_end(
+        job->reuse, job->reuse_serial,
+        job->preview_y_limit <= 0 && !job->preview_truncated);
+    if (job->layout.reuse_serial != 0)
+        job->layout.image_fingerprint = images_layout_fingerprint(job->images);
 #ifdef TILEFINCH_LAYOUT_DIFF
     layout_validation_report_build(&job->layout);
 #endif
@@ -2875,8 +2904,12 @@ void layout_size_background_visuals(LayoutDocument *layout)
     for (size_t i = 0; i < layout->visual_priority_count; i++) {
         ImagePriorityTarget *target = &layout->visual_priority_targets[i];
         if (!target->background_sized) continue;
+        bool mask = target->kind == IMAGE_PRIORITY_KIND_MASK;
+        if (mask && target->pseudo != (uint8_t) PSEUDO_NONE) continue;
         const LayoutNodeBox *box = layout_box_for_node(layout, target->node);
         bool known = box != NULL && box->width > 0 && box->height > 0;
+        /* A mask keeps its declared box when layout placed none. */
+        if (mask && !known) continue;
         target->display_width = !known ? 0
             : (box->width > UINT16_MAX ? UINT16_MAX : (uint16_t) box->width);
         target->display_height = !known ? 0

@@ -67,7 +67,7 @@ static int test_youtube_page_builder_long_strings(void)
     snprintf(expected, sizeof(expected), "<span class=title>%.255s</span>", title);
     CHECK(strstr(document.html, expected) != NULL
         && strstr(document.html, "YouTube video") == NULL);
-    snprintf(expected, sizeof(expected), "<span class=channel>%.126s</span>", channel);
+    snprintf(expected, sizeof(expected), "<span class=\"meta channel\">%.126s</span>", channel);
     CHECK(strstr(document.html, expected) != NULL);
     youtube_lite_document_destroy(&document);
 
@@ -266,8 +266,8 @@ static int test_youtube_page_builder_lockup_rows(void)
     const char *views = strstr(one, "1.2M views");
     const char *age = strstr(one, "3 days ago");
     CHECK(views != NULL && views < two && age != NULL && age < two
-        && strstr(document.html, "<span class=channel>1.2M views") == NULL);
-    const char *channel = strstr(two, "<span class=channel>Some Channel</span>");
+        && strstr(document.html, "<span class=\"meta channel\">1.2M views") == NULL);
+    const char *channel = strstr(two, "<span class=\"meta channel\">Some Channel</span>");
     CHECK(channel != NULL && strstr(two, "5K views") != NULL
         && strstr(two, "1 year ago") != NULL);
     youtube_lite_document_destroy(&document);

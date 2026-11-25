@@ -2029,7 +2029,7 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                          "player: resolver worker was unavailable");
             } else {
                 YoutubeResolveJobStatus status =
-                    youtube_resolve_job_pump(media->resolver_job);
+                    youtube_resolve_job_pump_playback(media->resolver_job);
                 if (status == YOUTUBE_RESOLVE_JOB_PENDING) {
                     ok = true;
                     break;
@@ -2514,7 +2514,6 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
             media->first_frame_started_us = 0;
             media->first_frame_opened_us = 0;
             media->first_frame_pump_us = 0;
-            media->last_resume_saved_us = media->job_target_us;
         } else {
             media->job_phase = PSP_MEDIA_JOB_NONE;
             media->job_started_us = 0;

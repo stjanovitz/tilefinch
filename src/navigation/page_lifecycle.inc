@@ -71,9 +71,11 @@ static ImageResources *navigation_frame_parent_images(
 static void navigation_frame_presentation_destroy(
     NavigationSession *session, NavigationFrame *frame)
 {
-    if (session == NULL || frame == NULL || frame->presentation == NULL) {
-        return;
-    }
+    if (session == NULL || frame == NULL) return;
+    stylesheet_document_resources_destroy(frame->stylesheet_resources);
+    budget_free(session->budget, frame->stylesheet_resources);
+    frame->stylesheet_resources = NULL;
+    if (frame->presentation == NULL) return;
     if (frame->runtime != NULL) {
         script_runtime_set_node_retirement_callback(frame->runtime, NULL, NULL);
         script_runtime_set_layout(frame->runtime, NULL, 0);
@@ -388,6 +390,7 @@ static bool navigation_compiled_stylesheet_cache_take_entry(
     /* API registrations are document-owned and never reusable across a
        navigation, even when the external source bytes are identical. */
     sheet->api_registrations = NULL;
+    sheet->noscript_images = NULL;
     *external_stats = session->compiled_stylesheet_cache_external_stats;
     memset(&session->compiled_stylesheet_cache, 0,
            sizeof(session->compiled_stylesheet_cache));
@@ -954,15 +957,18 @@ static ScriptRuntime *navigation_create_runtime(
 }
 
 static void navigation_prepare_layout_reuse(
-    NavigationSession *session, const ScriptMutationJournal *mutations,
+    NavigationSession *session, ScriptMutationJournal *mutations,
     bool full_rebuild, const bool *local_focus);
 static bool navigation_focus_geometry_unchanged(
     NavigationSession *session, const ScriptMutationJournal *mutations);
 static void navigation_evict_layout_reuse_under_pressure(
     NavigationSession *session);
+static void navigation_prepare_geometry_proof(
+    NavigationSession *session, ScriptMutationJournal *mutations,
+    bool *geometry_unchanged);
 
 static LayoutReuseCache *navigation_prepare_geometry_reuse(
-    void *opaque, const ScriptMutationJournal *mutations,
+    void *opaque, ScriptMutationJournal *mutations,
     bool *geometry_unchanged)
 {
     NavigationSession *session = opaque;
@@ -970,13 +976,7 @@ static LayoutReuseCache *navigation_prepare_geometry_reuse(
         *geometry_unchanged = navigation_focus_geometry_unchanged(session, mutations);
         if (*geometry_unchanged) return NULL;
     }
-    /* The normal publication still consumes these mutations later. Apply
-       its exact invalidation now as well, rather than using stale styles
-       or resolving the entire document anew inside a geometry accessor. */
-    /* A queued resource/style rebuild does not change this build's installed
-       cascade. Its generation guards invalidate the cache when replacement
-       rules actually arrive; the journal still invalidates changed DOM now. */
-    navigation_prepare_layout_reuse(session, mutations, false, NULL);
+    navigation_prepare_geometry_proof(session, mutations, geometry_unchanged);
     navigation_evict_layout_reuse_under_pressure(session);
     return session->page.layout_reuse;
 }
@@ -1078,11 +1078,13 @@ static void navigation_attach_layout(NavigationSession *session)
 #endif
     if (session != NULL) {
         session->page.visual_image_publication_pending = false;
+        session->page.static_layout_retry_pending = false;
         session->page.layout_provisional =
             session->page.layout.content_limit_y != 0;
         /* Each publication proves its own region (relayout.inc sets it
            after this, for a bounded focus layout only). */
         session->page.bounded_focus_region_end = 0;
+        session->page.layout_prefetch_start = 0;
         session->page.bounded_focus_geometry_refused = false;
         session->page.bounded_focus_completion_counted = false;
         session->page.viewport_images_pending = true;
@@ -1923,14 +1925,24 @@ static bool page_has_owned_state(const NavigationPage *page)
             || page->fetch_domain != NULL);
 }
 
+static void navigation_free_frame_message(Budget *budget,
+                                          NavigationMessage *message)
+{
+    if (message->key_length != 0) {
+        tilefinch_web_crypto_zeroize(message->json + message->key_offset,
+                                     message->key_length);
+    }
+    budget_free(budget, message->json);
+    budget_free(budget, message->target_origin);
+}
+
 static void navigation_clear_frame_messages(
     NavigationSession *session, NavigationPage *page, bool record_drops)
 {
     if (session == NULL || page == NULL) return;
     size_t dropped = page->message_count;
     for (size_t i = 0; i < dropped; i++) {
-        budget_free(session->budget, page->messages[i].json);
-        budget_free(session->budget, page->messages[i].target_origin);
+        navigation_free_frame_message(session->budget, &page->messages[i]);
     }
     memset(page->messages, 0, sizeof(page->messages));
     page->message_count = 0;
@@ -2176,43 +2188,104 @@ void navigation_retire_large_incumbent_realm(NavigationSession *session)
     }
 }
 
-static bool navigation_retire_exhausted_script_realms_mode(
-    NavigationSession *session, bool allocator_rejection_observed,
-    bool static_fallback)
+/* A realm is stopped for memory by what it can still obtain after a
+   refused allocation, never by how the refusal reached the page: QuickJS
+   throws a catchable "out of memory" at the first refused allocation, and
+   whether that becomes a rejection, a caught exception, a listener error,
+   a failed timer or a failed host call depends on which operation needed
+   the next 4 KB arena, which any byte of heap moves. So at each author-task
+   boundary after a refusal (the realm's heap limit or the page Budget),
+   the realm's garbage is collected, optional memory is reclaimed when it
+   can help, and the realm is stopped only when the heap it can
+   obtain is under NAVIGATION_SCRIPT_MEMORY_HEADROOM. Otherwise it keeps
+   running and whatever exception surfaced is an ordinary author error.
+   A realm kept NAVIGATION_SCRIPT_MEMORY_KEPT_LOW_LIMIT times with under
+   twice the headroom stops at the last of them: it lives at its limit.
+   docs/engineering/SCRIPT_MEMORY.md, "Exhaustion". */
+#define NAVIGATION_SCRIPT_MEMORY_HEADROOM \
+    SCRIPT_ADMISSION_MEMORY_STOP_HEADROOM_BYTES
+#define NAVIGATION_SCRIPT_MEMORY_KEPT_LOW_LIMIT 3u
+
+typedef enum {
+    /* No allocation was refused since the last assessment. */
+    NAVIGATION_SCRIPT_MEMORY_UNREFUSED,
+    /* Refused, with room left: the realm runs on. */
+    NAVIGATION_SCRIPT_MEMORY_KEPT,
+    /* Refused and out of room: the realm was stopped. */
+    NAVIGATION_SCRIPT_MEMORY_STOPPED
+} NavigationScriptMemoryVerdict;
+
+static NavigationScriptMemoryVerdict navigation_judge_realm_memory(
+    ScriptRuntime *runtime, size_t *refusals_assessed, uint8_t *kept_low,
+    const char *where)
+{
+    (void) where;
+    if (runtime == NULL) return NAVIGATION_SCRIPT_MEMORY_UNREFUSED;
+    size_t refusals = script_runtime_allocation_refusals(runtime);
+    if (refusals <= *refusals_assessed) {
+        *refusals_assessed = refusals;
+        return NAVIGATION_SCRIPT_MEMORY_UNREFUSED;
+    }
+    size_t new_refusals = refusals - *refusals_assessed;
+    (void) new_refusals;
+    (void) script_runtime_collect_and_trim(runtime);
+    bool last_low = *kept_low + 1u >= NAVIGATION_SCRIPT_MEMORY_KEPT_LOW_LIMIT;
+    size_t wanted = last_low ? 2u * NAVIGATION_SCRIPT_MEMORY_HEADROOM
+                             : NAVIGATION_SCRIPT_MEMORY_HEADROOM;
+    /* What an allocation could obtain now: headroom under the limit only as
+       far as the page Budget backs it, and growth as the growth hook grants
+       it, so a Budget refusal reads as exhaustion as a limit refusal does. */
+    size_t obtainable = script_runtime_heap_obtainable(runtime);
+    if (obtainable < wanted) {
+        script_runtime_reclaim_heap_headroom(runtime, wanted);
+        obtainable = script_runtime_heap_obtainable(runtime);
+    }
+    /* Reclaiming allocates nothing in the realm; count from here. */
+    *refusals_assessed = script_runtime_allocation_refusals(runtime);
+    bool stop = obtainable < NAVIGATION_SCRIPT_MEMORY_HEADROOM;
+    if (!stop && obtainable < 2u * NAVIGATION_SCRIPT_MEMORY_HEADROOM) {
+        if (*kept_low < UINT8_MAX) (*kept_low)++;
+        stop = *kept_low >= NAVIGATION_SCRIPT_MEMORY_KEPT_LOW_LIMIT;
+    }
+#ifndef TILEFINCH_NO_TRACE
+    if (tilefinch_trace_script_failures()) {
+        fprintf(stderr,
+                "tilefinch-script-memory-assess: where=%s verdict=%s "
+                "refusals=%zu obtainable=%zu available=%zu used=%zu "
+                "kept-low=%u\n",
+                where, stop ? "stop" : "keep", new_refusals, obtainable,
+                script_runtime_heap_available(runtime),
+                script_runtime_heap_used(runtime), (unsigned) *kept_low);
+    }
+#endif
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    {
+        char message[200];
+        snprintf(message, sizeof(message),
+                 "tilefinch-script-memory-assess: where=%s verdict=%s "
+                 "refusals=%zu obtainable=%zu available=%zu used=%zu "
+                 "kept-low=%u",
+                 where, stop ? "stop" : "keep", new_refusals, obtainable,
+                 script_runtime_heap_available(runtime),
+                 script_runtime_heap_used(runtime), (unsigned) *kept_low);
+        tilefinch_platform_log_message(message);
+    }
+#endif
+    return stop ? NAVIGATION_SCRIPT_MEMORY_STOPPED
+                : NAVIGATION_SCRIPT_MEMORY_KEPT;
+}
+
+/* Stop the page's realms for memory: the DOM, stylesheet and layout stay,
+   scripts stop with "JavaScript stopped at its memory limit", and (with
+   `static_fallback`) the static-content cascade applies from the next
+   layout. Callers either assessed the realm (navigation_assess_script_memory)
+   or need its memory for the page itself (a layout the Budget refused). */
+static bool navigation_stop_script_realms_for_memory(
+    NavigationSession *session, bool static_fallback)
 {
     if (session == NULL || session->page.runtime == NULL) {
         return false;
     }
-    /* QuickJS reports a refused allocation as "out of memory", which a page
-       can also throw. Only believe the text when the realm's heap actually
-       refused an allocation since the last check. */
-    size_t heap_rejections =
-        script_runtime_heap_rejections(session->page.runtime);
-    bool new_rejection =
-        heap_rejections > session->page.script_heap_rejections_seen;
-    session->page.script_heap_rejections_seen = heap_rejections;
-    bool explicit_oom = new_rejection
-        && script_error_reports_out_of_memory(
-               session->page.script_result.error);
-    /* With memory-pressure growth a small margin under the current limit is
-       normal; exhaustion means the realm cannot obtain more. */
-    size_t remaining = script_runtime_heap_available(
-        session->page.runtime);
-#ifndef TILEFINCH_NO_TRACE
-    if (tilefinch_trace_script_failures()) {
-        fprintf(stderr,
-                "tilefinch-script-retirement: explicit-oom=%s "
-                "heap-remaining=%zu error=\"%.160s\"\n",
-                explicit_oom ? "yes" : "no", remaining,
-                session->page.script_result.error);
-    }
-#endif
-    /* A caught allocation failure leaves no exception text and can leave
-       substantial nominal headroom when one oversized request was refused.
-       Only the runtime pump may authorize that case, using the allocator's
-       monotonic rejection counter sampled around the author task. */
-    if (!allocator_rejection_observed
-        && !explicit_oom && remaining >= 256u * 1024u) return false;
     /*
      * Author JavaScript exhausting its separately bounded realm must not
      * discard an otherwise usable document.  The DOM, completed stylesheet,
@@ -2229,10 +2302,11 @@ static bool navigation_retire_exhausted_script_realms_mode(
         snprintf(message, sizeof(message),
                  "tilefinch-script-memory-stop: limit=%zu floor=%zu "
                  "raises=%zu refusals=%zu refused=%zu reason=%u "
-                 "budget-free=%zu remaining=%zu error=\"%.80s\"",
+                 "budget-free=%zu obtainable=%zu error=\"%.80s\"",
                  growth.limit, growth.floor, growth.raises, growth.refusals,
                  growth.refused_bytes, (unsigned) growth.refused_reason,
-                 budget_remaining(session->budget), remaining,
+                 budget_remaining(session->budget),
+                 script_runtime_heap_obtainable(session->page.runtime),
                  session->page.script_result.error);
         tilefinch_platform_log_message(message);
     }
@@ -2251,11 +2325,40 @@ static bool navigation_retire_exhausted_script_realms_mode(
     return true;
 }
 
-static bool navigation_retire_exhausted_script_realms(
-    NavigationSession *session, bool allocator_rejection_observed)
+/* The task boundary check (see navigation_judge_realm_memory). Only the
+   page's realm is judged here; a child frame's realm is judged on its own
+   (navigation_stop_exhausted_frame_realm). */
+static bool navigation_restore_server_body_if_degraded(
+    NavigationSession *session, const DocumentBodySnapshot *snapshot);
+
+static NavigationScriptMemoryVerdict navigation_assess_script_memory_mode(
+    NavigationSession *session, bool static_fallback, const char *where)
 {
-    return navigation_retire_exhausted_script_realms_mode(
-        session, allocator_rejection_observed, true);
+    if (session == NULL || session->page.runtime == NULL)
+        return NAVIGATION_SCRIPT_MEMORY_UNREFUSED;
+    NavigationScriptMemoryVerdict verdict = navigation_judge_realm_memory(
+        session->page.runtime, &session->page.script_memory_refusals_assessed,
+        &session->page.script_memory_kept_low, where);
+    if (verdict == NAVIGATION_SCRIPT_MEMORY_STOPPED) {
+        /* A caught refusal is still a refusal. Consume its pre-teardown
+           snapshot before retiring the realm, while its node handles and
+           resource-retirement hooks can see the replacement. The caller's
+           static relayout will publish the recovered DOM. */
+        DocumentBodySnapshot rescue = {0};
+        if (script_runtime_take_memory_rescue(session->page.runtime, &rescue)
+            && navigation_restore_server_body_if_degraded(session, &rescue))
+            session->page.script_memory_rescued = true;
+        document_body_snapshot_destroy(&rescue);
+        (void) navigation_stop_script_realms_for_memory(
+            session, static_fallback);
+    }
+    return verdict;
+}
+
+static NavigationScriptMemoryVerdict navigation_assess_script_memory(
+    NavigationSession *session, const char *where)
+{
+    return navigation_assess_script_memory_mode(session, true, where);
 }
 
 static bool url_origin(const char *url, char *output, size_t capacity)

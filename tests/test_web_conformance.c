@@ -1876,6 +1876,8 @@ static const char frame_global_names_probe[] =
     "own.has(n)||String(n>>>0)===n));"
     "t('unique',()=>own.size===names.length);"
     "t('no bridges',()=>!names.some(n=>n.startsWith('__tilefinch')));"
+    "t('no sender',()=>typeof __tilefinchPostMessage==='undefined'"
+    "&&w.eval('typeof __tilefinchPostMessage')==='undefined');"
     "t('inside',()=>w.eval('Object.getOwnPropertyNames(window).length')"
     "===names.length&&w.eval('Object.hasOwn(window,\"HTMLElement\")'));"
     "t('descriptors',()=>names.every(n=>!!Object.getOwnPropertyDescriptor(w,n)));"
@@ -2528,16 +2530,17 @@ static const char webgl_frozen_probe[] =
     "t('still frozen',()=>Object.isFrozen(G.prototype));"
     COMPAT_SUMMARY("WEBGL-FROZEN-OK");
 
-/* Every promise-returning operation the receiver marking leaves unmarked
+/* Every promise-returning operation the receiver marking makes reject
    (runtime_promise_operations) names a real interface member once the
    features that define them have loaded: a stale entry would be skipped
    silently, and the operation would throw instead of rejecting. */
 static const char promise_operations_probe[] =
     "void indexedDB;new ReadableStream();new WritableStream();"
+    "void createImageBitmap;"
     "void navigator.mediaDevices;void document.fonts;"
     "try{new AudioContext()}catch(_){}"
     "navigator.storage.getDirectory().catch(()=>{});"
-    "void FileSystemHandle;"
+    "void FileSystemHandle;void crypto.subtle;void GPU;"
     "const left=__tilefinchUnresolvedPromiseOperations();"
     "globalThis.pocSummary=left.length?'UNRESOLVED '+left.join(' ')"
     ":'PROMISE-OPERATIONS-OK';";

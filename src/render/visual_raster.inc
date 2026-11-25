@@ -91,6 +91,75 @@ static DecodedImageCacheEntry *decoded_image_insert(
     return entry;
 }
 
+/* Frees the held decode unless a command paints from it; returns the bytes
+   the Budget got back. Every paint decision that could decode, or that
+   reads how much Budget is free, calls this first, so the pass decides
+   exactly as one that never held a decode. */
+static size_t held_image_release(TileCache *cache)
+{
+    HeldImageDecode *held = &cache->held_image;
+    if (!held->valid || held->borrowed) return 0;
+    size_t before = cache->budget->current;
+    image_resource_free_decoded(cache->budget, held->pixels);
+    memset(held, 0, sizeof(*held));
+    return before - cache->budget->current;
+}
+
+/* The held decode for this key, borrowed until image_command_done. */
+static const unsigned char *held_image_find(TileCache *cache,
+                                            const HeldImageDecode *key,
+                                            bool allow_grayscale)
+{
+    HeldImageDecode *held = &cache->held_image;
+    if (!held->valid || held->borrowed || held->full != key->full
+        || held->identity != key->identity || held->serial != key->serial
+        || held->source_width != key->source_width
+        || held->source_height != key->source_height
+        || held->width != key->width || held->height != key->height
+        || (held->grayscale && !allow_grayscale)) return NULL;
+    held->borrowed = true;
+    cache->held_image_hits++;
+    return held->pixels;
+}
+
+/* Keeps a decode no cache can hold for the rest of the pass; false (the
+   caller frees it after its command) while another command paints from
+   the held one. */
+static bool held_image_take(TileCache *cache, HeldImageDecode key,
+                            unsigned char *pixels)
+{
+    if (!cache->hold_decodes || cache->held_image.borrowed) return false;
+    (void) held_image_release(cache);
+    key.pixels = pixels;
+    key.valid = key.borrowed = true;
+    cache->held_image = key;
+    return true;
+}
+
+/* A command has finished painting `pixels`: its temporary decode is freed
+   and the held decode may be released again. */
+static void image_command_done(TileCache *cache, const unsigned char *pixels,
+                               unsigned char *temporary)
+{
+    image_resource_free_decoded(cache->budget, temporary);
+    if (cache->held_image.valid && pixels == cache->held_image.pixels)
+        cache->held_image.borrowed = false;
+}
+
+size_t tile_cache_reclaim_held_image(TileCache *cache)
+{
+    if (cache == NULL || cache->budget == NULL) return 0;
+    size_t released = held_image_release(cache);
+    if (released != 0) cache->held_image_reclaims++;
+    return released;
+}
+
+static size_t render_image_retry_free(const TileCache *cache,
+                                      const ImageResource *target);
+static bool render_image_refused(const TileCache *cache,
+                                 size_t failures_before,
+                                 size_t injected_before);
+
 static const unsigned char *decoded_image_pixels(
     TileCache *cache, const ImageResource *image,
     unsigned char **temporary)
@@ -107,6 +176,14 @@ static const unsigned char *decoded_image_pixels(
     const void *identity = image_resource_backing_identity(image);
     if (identity == NULL) identity = image;
     uint64_t serial = image_cache_serial(cache, image);
+    HeldImageDecode key = {
+        .identity = identity, .serial = serial, .full = true,
+        .source_width = image->width, .source_height = image->height,
+        .width = image->width, .height = image->height,
+        .pixel_width = image->width, .pixel_height = image->height
+    };
+    const unsigned char *held = held_image_find(cache, &key, false);
+    if (held != NULL) return held;
     for (size_t i = 0; i < TILEFINCH_IMAGE_CACHE_ENTRIES; i++) {
         DecodedImageCacheEntry *entry = &cache->decoded_images[i];
         if (!entry->valid || entry->identity != identity
@@ -115,11 +192,22 @@ static const unsigned char *decoded_image_pixels(
             continue;
         }
         entry->last_used = ++cache->clock;
-        if (entry->failed) return NULL;
+        if (entry->failed) {
+            /* Refused for memory: retried once more Budget is free. */
+            if (entry->retry_free_bytes == 0) return NULL;
+            (void) held_image_release(cache);
+            if (budget_remaining(cache->budget) < entry->retry_free_bytes)
+                return NULL;
+            decoded_image_evict(cache, i);
+            break;
+        }
         cache->decoded_image_hits++;
         return entry->pixels;
     }
+    (void) held_image_release(cache);
     unsigned char *pixels = NULL;
+    size_t injected_before = cache->budget->injected_failure_count;
+    size_t failures_before = cache->budget->failure_count;
     uint64_t decode_started = render_now_us();
     ImageDecodeStatus decode_status = image_resource_decode_checked(
         image, cache->budget, &pixels);
@@ -133,6 +221,14 @@ static const unsigned char *decoded_image_pixels(
         if (decode_status == IMAGE_DECODE_DETERMINISTIC_FAILURE) {
             (void) decoded_image_insert(cache, identity, serial, image->width,
                                         image->height, NULL, true);
+        } else if (render_image_refused(cache, failures_before,
+                                        injected_before)) {
+            DecodedImageCacheEntry *entry = decoded_image_insert(
+                cache, identity, serial, image->width, image->height, NULL,
+                true);
+            if (entry != NULL)
+                entry->retry_free_bytes = render_image_retry_free(cache,
+                                                                  image);
         }
         return NULL;
     }
@@ -142,10 +238,11 @@ static const unsigned char *decoded_image_pixels(
     if (entry == NULL) {
         /*
          * Keep the cache at a real hard cap.  An oversized decode (or a
-         * metadata insertion failure) is still rendered exactly, but its
-         * ownership is returned to the caller for command-scoped cleanup.
+         * metadata insertion failure) is still rendered exactly; it is held
+         * for the rest of the paint pass, or else returned to the caller
+         * for command-scoped cleanup.
          */
-        *temporary = pixels;
+        if (!held_image_take(cache, key, pixels)) *temporary = pixels;
         return pixels;
     }
     return entry->pixels;
@@ -225,6 +322,8 @@ static ScaledImageCacheEntry *scaled_image_insert(
         .source_height = source_height,
         .width = width,
         .height = height,
+        .pixel_width = width,
+        .pixel_height = height,
         .bytes = bytes,
         .last_used = ++cache->clock,
         .valid = true,
@@ -232,6 +331,105 @@ static ScaledImageCacheEntry *scaled_image_insert(
     };
     cache->scaled_image_cache_bytes += bytes;
     return entry;
+}
+
+/* A decode refused for memory is tried again only once more Budget is free
+   than when it was refused, and about what it needs by its frame header when
+   that is readable (image_decode_reduced_fallback), so paints at unchanged
+   pressure do not repeat it. */
+#define RENDER_IMAGE_RETRY_STEP (64u * 1024u)
+
+static size_t render_image_retry_free(const TileCache *cache,
+                                      const ImageResource *target)
+{
+    size_t free_bytes = budget_remaining(cache->budget);
+    size_t retry = free_bytes <= SIZE_MAX - RENDER_IMAGE_RETRY_STEP
+        ? free_bytes + RENDER_IMAGE_RETRY_STEP : SIZE_MAX;
+    int width = target->width, height = target->height;
+    size_t needed = 0;
+    (void) image_decode_reduced_fallback(target, cache->budget, false,
+                                         SIZE_MAX, &width, &height, &needed);
+    return needed > retry ? needed : retry;
+}
+
+/* Whether a failed decode was refused by the Budget (an injected test
+   failure is not a refusal), rather than busy, interrupted or undecodable. */
+static bool render_image_refused(const TileCache *cache,
+                                 size_t failures_before,
+                                 size_t injected_before)
+{
+    return cache->budget->failure_count != failures_before
+        && cache->budget->injected_failure_count == injected_before;
+}
+
+/* The pixels painted for `target` while its painted-size decode waits
+   (`record`): a reduced decode, half or a quarter of its source, kept in the
+   record, or nothing. Only a size the cache can keep is used: one it cannot
+   keep would be decoded again for every tile it touches. A reduced decode
+   refused for memory waits as the painted-size one does; one busy or
+   interrupted is tried again at the next paint. */
+static const unsigned char *scaled_image_reduced(
+    TileCache *cache, ScaledImageCacheEntry *record,
+    const ImageResource *target, int *pixel_width, int *pixel_height,
+    unsigned char **temporary_decoded)
+{
+    if (record->pixels != NULL) {
+        cache->scaled_image_hits++;
+        *pixel_width = record->pixel_width;
+        *pixel_height = record->pixel_height;
+        return record->pixels;
+    }
+    if (budget_remaining(cache->budget) < record->reduced_retry_free_bytes)
+        return NULL;
+    ImageResource reduced = *target;
+    size_t needed = 0;
+    unsigned char *pixels = NULL;
+    if (!image_decode_reduced_fallback(target, cache->budget, false,
+                                       TILEFINCH_SCALED_IMAGE_CACHE_BYTES,
+                                       &reduced.width, &reduced.height,
+                                       &needed))
+        return NULL;
+    size_t injected_before = cache->budget->injected_failure_count;
+    size_t failures_before = cache->budget->failure_count;
+    uint64_t started = render_now_us();
+    ImageDecodeStatus status = image_resource_decode_checked(
+        &reduced, cache->budget, &pixels);
+    uint64_t elapsed = render_now_us() - started;
+    cache->decoded_image_us += elapsed;
+    if (elapsed > cache->max_decoded_image_us)
+        cache->max_decoded_image_us = elapsed;
+    if (status != IMAGE_DECODE_SUCCEEDED) {
+        cache->decoded_image_failures++;
+        if (status == IMAGE_DECODE_DETERMINISTIC_FAILURE)
+            record->reduced_retry_free_bytes = SIZE_MAX;
+        else if (render_image_refused(cache, failures_before,
+                                      injected_before))
+            record->reduced_retry_free_bytes =
+                render_image_retry_free(cache, &reduced);
+        return NULL;
+    }
+    cache->decoded_image_builds++;
+    *pixel_width = reduced.width;
+    *pixel_height = reduced.height;
+    ScaledImageCacheEntry kept = *record;
+    scaled_image_evict(cache, (size_t) (record - cache->scaled_images));
+    record = scaled_image_insert(cache, kept.identity, kept.serial,
+        kept.source_width, kept.source_height, kept.width, kept.height,
+        pixels, false);
+    if (record != NULL) {
+        record->pixel_width = reduced.width;
+        record->pixel_height = reduced.height;
+        cache->scaled_image_builds++;
+    } else {
+        *temporary_decoded = pixels;
+        record = scaled_image_insert(cache, kept.identity, kept.serial,
+            kept.source_width, kept.source_height, kept.width, kept.height,
+            NULL, false);
+        if (record == NULL) return pixels;
+    }
+    record->retry_free_bytes = kept.retry_free_bytes;
+    record->upgrade_tried = kept.upgrade_tried;
+    return pixels;
 }
 
 static ScaleStepper image_linear_stepper(int position, int source, int target);
@@ -307,7 +505,22 @@ static const unsigned char *image_pixels_for_command(
         wants_scaled = direct_scaled;
     }
     bool scaled_failed = false;
+    ScaledImageCacheEntry *refusal = NULL;
+    HeldImageDecode key = {
+        .identity = identity, .serial = serial,
+        .source_width = image->width, .source_height = image->height,
+        .width = scaled_width, .height = scaled_height,
+        .pixel_width = scaled_width, .pixel_height = scaled_height
+    };
     if (wants_scaled) {
+        const unsigned char *held = held_image_find(cache, &key,
+                                                    compact_command);
+        if (held != NULL) {
+            *pixel_width = cache->held_image.pixel_width;
+            *pixel_height = cache->held_image.pixel_height;
+            *grayscale = cache->held_image.grayscale;
+            return held;
+        }
         for (size_t i = 0; i < TILEFINCH_IMAGE_CACHE_ENTRIES; i++) {
             ScaledImageCacheEntry *entry = &cache->scaled_images[i];
             if (!entry->valid || (entry->grayscale && !compact_command)
@@ -322,52 +535,80 @@ static const unsigned char *image_pixels_for_command(
                 scaled_failed = true;
                 break;
             }
+            if (entry->retry_free_bytes != 0) {
+                refusal = entry;
+                break;
+            }
             cache->scaled_image_hits++;
-            *pixel_width = entry->width;
-            *pixel_height = entry->height;
+            *pixel_width = entry->pixel_width;
+            *pixel_height = entry->pixel_height;
             *grayscale = entry->grayscale;
             return entry->pixels;
         }
     }
 
     if (direct_scaled && !scaled_failed) {
+        (void) held_image_release(cache);
         ImageResource decode_target = *image;
         decode_target.width = scaled_width;
         decode_target.height = scaled_height;
+        /* Refused for memory before: the painted-size decode waits until
+           about the Budget it needs is free (a reduced one it replaces is
+           tried once); meanwhile a reduced decode is painted if one fits. */
+        bool waiting = refusal != NULL
+            && (budget_remaining(cache->budget) < refusal->retry_free_bytes
+                || (refusal->pixels != NULL && refusal->upgrade_tried));
+        /* A full-scale JPEG decode its frame header says cannot fit, when a
+           reduced one can, is refused without running into the limit. */
+        int fit_width = scaled_width, fit_height = scaled_height;
+        size_t needed = 0;
+        bool attempt = !waiting && (refusal != NULL
+            || !image_decode_reduced_fallback(&decode_target, cache->budget,
+                   false, TILEFINCH_SCALED_IMAGE_CACHE_BYTES, &fit_width,
+                   &fit_height, &needed)
+            || !budget_pressure_required(cache->budget, needed, 0));
         unsigned char *pixels = NULL;
         size_t injected_before = cache->budget->injected_failure_count;
         size_t failures_before = cache->budget->failure_count;
-        uint64_t decode_started = render_now_us();
-        ImageDecodeStatus decode_status = image_resource_decode_checked(
-            &decode_target, cache->budget, &pixels);
-        uint64_t decode_elapsed = render_now_us() - decode_started;
-        cache->decoded_image_us += decode_elapsed;
-        if (decode_elapsed > cache->max_decoded_image_us)
-            cache->max_decoded_image_us = decode_elapsed;
+        ImageDecodeStatus decode_status = IMAGE_DECODE_TRANSIENT_FAILURE;
+        if (attempt) {
+            uint64_t decode_started = render_now_us();
+            decode_status = image_resource_decode_checked(
+                &decode_target, cache->budget, &pixels);
+            uint64_t decode_elapsed = render_now_us() - decode_started;
+            cache->decoded_image_us += decode_elapsed;
+            if (decode_elapsed > cache->max_decoded_image_us)
+                cache->max_decoded_image_us = decode_elapsed;
+        }
         if (decode_status == IMAGE_DECODE_SUCCEEDED) {
+            cache->decoded_image_builds++;
+            if (refusal != NULL)
+                scaled_image_evict(cache,
+                                   (size_t) (refusal - cache->scaled_images));
             ScaledImageCacheEntry *entry = scaled_image_insert(
                 cache, identity, serial, image->width, image->height,
                 scaled_width, scaled_height, pixels, false);
             if (entry != NULL) {
-                cache->decoded_image_builds++;
                 cache->scaled_image_builds++;
                 *pixel_width = entry->width;
                 *pixel_height = entry->height;
                 return entry->pixels;
             }
-            *temporary_decoded = pixels;
+            if (!held_image_take(cache, key, pixels))
+                *temporary_decoded = pixels;
             *pixel_width = scaled_width;
             *pixel_height = scaled_height;
             return pixels;
         }
-        cache->decoded_image_failures++;
+        if (attempt) cache->decoded_image_failures++;
+        bool memory = !waiting && (!attempt
+            || (decode_status == IMAGE_DECODE_TRANSIENT_FAILURE
+                && render_image_refused(cache, failures_before,
+                                        injected_before)));
         /* A grayscale photograph has three identical color channels. Under
            pressure retain those samples once, not a lower-quality image.
            Restrict this fallback to the exact-size, unrotated stretch path. */
-        bool compact_allowed = decode_status == IMAGE_DECODE_TRANSIENT_FAILURE
-            && compact_command
-            && cache->budget->failure_count != failures_before
-            && cache->budget->injected_failure_count == injected_before;
+        bool compact_allowed = memory && compact_command && refusal == NULL;
         uint64_t compact_started = compact_allowed ? render_now_us() : 0;
         ImageDecodeStatus compact_status = compact_allowed
             ? image_resource_decode_gray_checked(&decode_target, cache->budget,
@@ -383,8 +624,10 @@ static const unsigned char *image_pixels_for_command(
             ScaledImageCacheEntry *entry = scaled_image_insert(cache, identity,
                 serial,image->width,image->height,scaled_width,scaled_height,
                 pixels,false);
+            key.grayscale = true;
             if (entry != NULL) entry->grayscale = true;
-            else *temporary_decoded = pixels;
+            else if (!held_image_take(cache, key, pixels))
+                *temporary_decoded = pixels;
             *pixel_width = scaled_width;
             *pixel_height = scaled_height;
             *grayscale = true;
@@ -392,13 +635,35 @@ static const unsigned char *image_pixels_for_command(
             if (entry != NULL) cache->scaled_image_builds++;
             return pixels;
         }
-        if (decode_status == IMAGE_DECODE_DETERMINISTIC_FAILURE) {
+        if (memory) {
+            /* A kept reduced decode is replaced at most once. */
+            if (refusal != NULL && refusal->pixels != NULL)
+                refusal->upgrade_tried = true;
+            if (refusal == NULL)
+                refusal = scaled_image_insert(
+                    cache, identity, serial, image->width, image->height,
+                    scaled_width, scaled_height, NULL, false);
+            if (refusal != NULL)
+                refusal->retry_free_bytes = render_image_retry_free(
+                    cache, &decode_target);
+        } else if (decode_status == IMAGE_DECODE_DETERMINISTIC_FAILURE) {
+            if (refusal != NULL)
+                scaled_image_evict(cache,
+                                   (size_t) (refusal - cache->scaled_images));
+            refusal = NULL;
             (void) scaled_image_insert(
                 cache, identity, serial, image->width, image->height,
                 scaled_width, scaled_height, NULL, true);
         }
+        /* A reduced decode when one applies; otherwise, as for any other
+           failure, the full-size decode below (often already cached). */
+        if (refusal != NULL) {
+            const unsigned char *reduced = scaled_image_reduced(
+                cache, refusal, &decode_target, pixel_width, pixel_height,
+                temporary_decoded);
+            if (reduced != NULL) return reduced;
+        }
     }
-
     const unsigned char *source = decoded_image_pixels(
         cache, image, temporary_decoded);
     if (source == NULL) return NULL;
@@ -444,9 +709,12 @@ static const unsigned char *image_pixels_for_command(
                     scaled_width, scaled_height, scaled, false);
                 if (entry != NULL) {
                     cache->scaled_image_builds++;
-                    image_resource_free_decoded(cache->budget,
-                                                *temporary_decoded);
+                    /* The source is not needed again this pass. */
+                    bool held = cache->held_image.valid
+                        && source == cache->held_image.pixels;
+                    image_command_done(cache, source, *temporary_decoded);
                     *temporary_decoded = NULL;
+                    if (held) (void) held_image_release(cache);
                     *pixel_width = entry->width;
                     *pixel_height = entry->height;
                     return entry->pixels;
@@ -567,7 +835,7 @@ static void rasterize_image_pixels(TileCache *cache, RasterTarget *target,
         cache, image, command, &pixel_width, &pixel_height,
         &temporary_decoded, &grayscale);
     if (pixels == NULL) {
-        image_resource_free_decoded(cache->budget, temporary_decoded);
+        image_command_done(cache, pixels, temporary_decoded);
         return;
     }
     if (grayscale) {
@@ -592,7 +860,7 @@ static void rasterize_image_pixels(TileCache *cache, RasterTarget *target,
                                alpha);
             }
         }
-        image_resource_free_decoded(cache->budget, temporary_decoded);
+        image_command_done(cache, pixels, temporary_decoded);
         return;
     }
     int image_clip_radius = draw_command_image_clip_radius(command);
@@ -675,7 +943,7 @@ static void rasterize_image_pixels(TileCache *cache, RasterTarget *target,
                 scale_stepper_advance(&horizontal);
             }
         }
-        image_resource_free_decoded(cache->budget, temporary_decoded);
+        image_command_done(cache, pixels, temporary_decoded);
         return;
     }
     int draw_x = command->x, draw_y = command->y;
@@ -884,7 +1152,7 @@ static void rasterize_image_pixels(TileCache *cache, RasterTarget *target,
                 blend_at_index(target, index, color, alpha);
             }
         }
-        image_resource_free_decoded(cache->budget, temporary_decoded);
+        image_command_done(cache, pixels, temporary_decoded);
         return;
     }
     ScaleStepper source_y_step = scale_stepper(y0 - draw_y, source_height,
@@ -998,7 +1266,7 @@ static void rasterize_image_pixels(TileCache *cache, RasterTarget *target,
         scale_stepper_advance(&source_y_step);
         if (linear) scale_stepper_advance(&linear_y);
     }
-    image_resource_free_decoded(cache->budget, temporary_decoded);
+    image_command_done(cache, pixels, temporary_decoded);
 }
 
 /* Keep the allocation-refusal LUT fallback off ordinary image stacks. */

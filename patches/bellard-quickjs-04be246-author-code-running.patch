@@ -1,0 +1,46 @@
+Report whether author code is running: a page frame on the stack.
+
+diff --git a/quickjs.c b/quickjs.c
+index 212df3603..026fe672f 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -73837,3 +73837,27 @@ void JS_ComputeMemoryDetail(JSRuntime *rt, JSMemoryDetailRow *row, void *opaque)
+     }
+ }
+ #endif
++
++/* Whether author code is running: one of its frames is on the stack,
++   however far below the running code and whatever browser code, bracket
++   (JS_EnterBrowserCode(), as a profiling trampoline makes) or job view
++   lies between. A page's listener reading an interface, directly or
++   through browser code it called, is; browser code with no page frame
++   under it (a dispatcher between listeners, an observer pass, a job of
++   its own) and embedder code outside any script are not. Unlike
++   js_snap_author_in_view(), it ignores views: it asks whose request the
++   work is, not whose interfaces it reads. */
++JS_BOOL JS_IsAuthorCodeRunning(JSContext *ctx)
++{
++    JSStackFrame *sf;
++    for (sf = ctx->rt->current_stack_frame; sf; sf = sf->prev_frame) {
++        JSObject *f;
++        if (JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
++            continue;
++        f = JS_VALUE_GET_OBJ(sf->cur_func);
++        if (js_class_has_bytecode(f->class_id) &&
++            !f->u.func.function_bytecode->trusted)
++            return TRUE;
++    }
++    return FALSE;
++}
+diff --git a/quickjs.h b/quickjs.h
+index e692a17b2..e87bd513b 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -418,6 +418,7 @@ void JS_MarkBrowserNative(JSContext *ctx, JSValueConst func);
+ void JS_MarkBrowserFunction(JSContext *ctx, JSValueConst func);
+ void *JS_EnterBrowserCode(JSContext *ctx);
+ void JS_LeaveBrowserCode(JSContext *ctx, void *previous);
++JS_BOOL JS_IsAuthorCodeRunning(JSContext *ctx);
+ void JS_GetSnapshotCounts(JSContext *ctx, uint32_t *pmembers, uint32_t *ptwins);
+ JSContext *JS_DupContext(JSContext *ctx);
+ void *JS_GetContextOpaque(JSContext *ctx);

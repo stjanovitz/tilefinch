@@ -7,6 +7,59 @@
 #include "layout_block_internal.h"
 #include "tilefinch/integer_math.h"
 
+/* A percentage cell's width once the row's percentages are cut at 100%
+   (CSS Tables 3, as Chromium does): a cell whose percentage would take the
+   row past its width only gets what is left, down to none. `used` is the
+   row width the earlier cells' percentages took. The percentage sets the
+   cell's border box, padding and borders included, whatever its
+   box-sizing; the caller raises it to the cell's content minimum. */
+static int flex_table_percent_cap(LayoutContext *context,
+                                  const ComputedStyle *style,
+                                  int content_width, int *used, int width)
+{
+    if (!style->has_width || !style->width_percent) return width;
+    int percent = resolve_declared_length(
+        context->sheet, style->width, true, content_width);
+    if (percent < 0) percent = 0;
+    int left = layout_subtract_coordinate(content_width, *used);
+    if (left < 0) left = 0;
+    int kept = percent < left ? percent : left;
+    *used = layout_add_coordinate(*used, kept);
+    return kept;
+}
+
+/* A percentage cell's share of a CSS table row's leftover width: its
+   percentage of the row, without padding or borders. */
+static int flex_table_percent_weight(LayoutContext *context,
+                                     const ComputedStyle *style,
+                                     int content_width)
+{
+    int width = resolve_declared_length(
+        context->sheet, style->width, true, content_width);
+    return width > 0 ? width : 0;
+}
+
+/* border-spacing of a display:table box in the separated borders model;
+   false when it has none. */
+static bool flex_css_table_spacing(LayoutContext *context,
+                                   const ComputedStyle *style,
+                                   int *spacing_x, int *spacing_y)
+{
+    if (style->display != DISPLAY_TABLE || style->table_border_collapse) {
+        return false;
+    }
+    const StylePaintStack *paint = stylesheet_paint_stack(
+        context->sheet, computed_style_paint_stack_id(style));
+    if (paint == NULL
+        || (paint->components & STYLE_PAINT_COMPONENT_TABLE_SPACING) == 0
+        || (paint->table_spacing_x == 0 && paint->table_spacing_y == 0)) {
+        return false;
+    }
+    *spacing_x = paint->table_spacing_x;
+    *spacing_y = paint->table_spacing_y;
+    return true;
+}
+
 bool layout_block_flexrow_section(LayoutContext *context,
                                   const LayoutBlockFrame *frame)
 {
@@ -42,6 +95,25 @@ bool layout_block_flexrow_section(LayoutContext *context,
     int total_grow_frozen_basis = 0;
     int total_grow = 0;
     int anonymous_percentage_width = 0;
+    /* A CSS table row narrower than its cells' specified widths: the sum
+       of the content minimums, what the percentage cells and the fixed
+       cells ask for beyond theirs (CSS Tables 3 "min-content-percentage"
+       and "min-content-specified" guesses), and the percentage of the row
+       the cells so far have taken (percentages past 100% are cut). */
+    int table_content_minimum = 0;
+    int table_percent_extra = 0;
+    int table_fixed_extra = 0;
+    size_t table_fixed_cells = 0;
+    size_t table_percent_cells = 0;
+    int table_percent_used = 0;
+    /* A CSS table row without auto cells hands its leftover width to the
+       fixed cells in proportion to their widths, or with no fixed cells to
+       the percentage cells in proportion to their percentages. */
+    long long table_fixed_weight = 0;
+    long long table_percent_weight = 0;
+    /* Auto cells share a CSS table row's leftover width in proportion to
+       their max-content widths (CSS Tables 3, as Chromium does). */
+    long long table_auto_weight = 0;
     long long total_shrink_weight = 0;
     int total_shrink_factor = 0;
     bool planned = false;
@@ -69,7 +141,11 @@ bool layout_block_flexrow_section(LayoutContext *context,
         FlexItemIterator *iterator = &scratch->traversal.flex.iterator;
         FlatItem *item = &scratch->traversal.flex.item;
         flex_iterator_init(iterator, context, node, style, row_order);
-        while (flex_iterator_next(iterator, item)) {
+        /* The plan already counted in-flow cells. Only the table owns
+           their widths; re-scanning for flex growth both costs a walk
+           and applies a flex declaration to a non-flex item. */
+        if (table_row) flex_children = count;
+        while (!table_row && flex_iterator_next(iterator, item)) {
             if (item->style.out_of_flow || item->style.fixed_position) continue;
             flex_children++;
             if (css_table_row && !item->style.has_width) {
@@ -78,7 +154,7 @@ bool layout_block_flexrow_section(LayoutContext *context,
             if (line_sized) continue;
             bool previous_intrinsic_pair_mode =
                 context->intrinsic_pair_mode;
-            if (!table_row) context->intrinsic_pair_mode = true;
+            context->intrinsic_pair_mode = true;
             if (planned && flex_children <= count) {
                 flex_measure_row_main(context, item, &row_order->main_items[flex_children - 1u],
                     content_width, child_containing_height,
@@ -89,18 +165,51 @@ bool layout_block_flexrow_section(LayoutContext *context,
                 context->intrinsic_pair_mode = previous_intrinsic_pair_mode;
                 continue;
             }
-            int child_basis = table_row ? 0
-                              : flex_child_basis(context, item,
-                                                 content_width, child_containing_height);
-            int child_minimum = table_row ? 0 : flex_child_row_minimum(
+            int child_basis = flex_child_basis(context, item, content_width, child_containing_height);
+            int child_minimum = flex_child_row_minimum(
                 context, item, content_width, css_table_row);
             context->intrinsic_pair_mode = previous_intrinsic_pair_mode;
+            if (css_table_row) {
+                bool fixed = item->style.has_width
+                    && !item->style.width_percent;
+                child_basis = flex_table_percent_cap(
+                    context, &item->style, content_width,
+                    &table_percent_used, child_basis);
+                int extra = item->style.has_width
+                    && child_basis > child_minimum
+                    ? child_basis - child_minimum : 0;
+                table_content_minimum = layout_add_coordinate(
+                    table_content_minimum, child_minimum);
+                if (fixed) {
+                    table_fixed_extra = layout_add_coordinate(
+                        table_fixed_extra, extra);
+                    table_fixed_cells++;
+                } else if (item->style.has_width) {
+                    table_percent_extra = layout_add_coordinate(
+                        table_percent_extra, extra);
+                    table_percent_cells++;
+                }
+            }
             if (css_table_row && item->style.has_width
                 && !item->style.width_percent) {
+                /* A fixed cell's width is its preferred width; content
+                   wider than it widens the cell. */
+                if (child_basis < child_minimum) child_basis = child_minimum;
                 child_minimum = child_basis;
             }
             if (css_table_row && child_basis < child_minimum) {
                 child_basis = child_minimum;
+            }
+            if (css_table_row && !item->style.has_width) {
+                table_auto_weight += child_basis;
+            }
+            if (css_table_row && item->style.has_width) {
+                if (item->style.width_percent) {
+                    table_percent_weight += flex_table_percent_weight(
+                        context, &item->style, content_width);
+                } else {
+                    table_fixed_weight += child_basis;
+                }
             }
             if (anonymous_cell_row && item->style.has_width
                 && item->style.width_percent) {
@@ -128,15 +237,8 @@ bool layout_block_flexrow_section(LayoutContext *context,
                     ? child_minimum : child_basis);
             total_grow = layout_add_coordinate(
                 total_grow, item->style.flex_grow);
-            if (!table_row) {
-                if (item->style.margin_left_auto) {
-                    total_main_auto_margins++;
-                }
-                if (item->style.margin_right_auto) {
-                    total_main_auto_margins++;
-                }
-            }
-            if (!table_row && item->style.flex_shrink > 0) {
+            total_main_auto_margins += item->style.margin_left_auto + item->style.margin_right_auto;
+            if (item->style.flex_shrink > 0) {
                 int shrink_capacity = child_basis - child_minimum;
                 if (shrink_capacity > 0) {
                     /* CSS Flexbox scales flex-shrink by the outer flex base
@@ -153,11 +255,20 @@ bool layout_block_flexrow_section(LayoutContext *context,
     }
     if (flex_row && flex_children != 0 && !replaced_content) {
         layout_flush_line(line);
-        const TableTracks *table_tracks = table_row
-            ? table_tracks_for_row(context, node, content_width)
-            : NULL;
-        int gaps = table_row ? 0 : layout_clamp_coordinate(
-            (int64_t) style->gap * (int64_t) (flex_children - 1u));
+        const TableTracks *table_tracks = table_row && context->placing_table_row == node
+            ? context->placing_row_tracks : NULL;
+        /* The anonymous row of a separated-borders display:table box keeps
+           border-spacing around and between its cells, as an explicit row
+           takes it from its table's tracks. */
+        int css_spacing_x = 0, css_spacing_y = 0;
+        bool css_table_spacing = css_table_row && !anonymous_cell_row
+            && flex_css_table_spacing(context, style, &css_spacing_x,
+                                      &css_spacing_y);
+        int gaps = table_row ? 0 : css_table_spacing
+            ? layout_clamp_coordinate(
+                  (int64_t) css_spacing_x * (int64_t) (flex_children + 1u))
+            : layout_clamp_coordinate(
+                  (int64_t) style->gap * (int64_t) (flex_children - 1u));
         planned = planned && flex_children <= row_order->item_count;
         if (planned) {
             total_basis = flex_resolve_main(row_order->main_items, flex_children,
@@ -179,6 +290,39 @@ bool layout_block_flexrow_section(LayoutContext *context,
         }
         int remaining = layout_subtract_coordinate(
             layout_subtract_coordinate(content_width, total_basis), gaps);
+        /* A specified cell width is the column's preferred width, not a
+           floor (CSS Tables 3 column minimums are the content minimums).
+           When the row cannot give every specified cell its width, auto
+           cells keep their content minimum; the percentage cells grow from
+           theirs toward their percentage widths first, then the fixed cells
+           toward their specified widths, each in proportion to what it asks
+           for beyond its minimum. */
+        int table_room = layout_subtract_coordinate(content_width, gaps);
+        int table_percent_guess = layout_add_coordinate(
+            table_content_minimum, table_percent_extra);
+        bool table_squeezed = css_table_row
+            && table_fixed_cells + table_percent_cells != 0
+            && table_room < layout_add_coordinate(
+                   table_percent_guess, table_fixed_extra);
+        bool squeeze_percent = table_squeezed
+            && table_room < table_percent_guess;
+        int squeeze_room = !table_squeezed ? 0
+            : layout_subtract_coordinate(
+                  table_room, squeeze_percent ? table_content_minimum
+                                              : table_percent_guess);
+        if (squeeze_room < 0) squeeze_room = 0;
+        int squeeze_span = squeeze_percent ? table_percent_extra
+                                           : table_fixed_extra;
+        int squeeze_seen = 0;
+        int table_percent_seen = 0;
+        /* No auto cell takes the leftover width: give it to the fixed
+           cells, else to the percentage cells (CSS Tables 3 distribution,
+           as Chromium does). An anonymous-cell row shrink-wraps instead. */
+        bool table_leftover_to_specified = css_table_row
+            && !anonymous_cell_row && css_table_auto_children == 0
+            && !table_squeezed && remaining > 0
+            && (table_fixed_weight > 0 || table_percent_weight > 0);
+        long long leftover_seen = 0;
         const int shrink_remaining = total_shrink_factor < 512
             ? tilefinch_mul_div_int(remaining, total_shrink_factor, 512)
             : remaining;
@@ -201,8 +345,12 @@ bool layout_block_flexrow_section(LayoutContext *context,
             cursor_x = layout_add_coordinate(
                 cursor_x, table_tracks->spacing_x);
         }
-        int flex_gap = table_row ? 0 : style->gap;
-        size_t css_table_auto_seen = 0;
+        if (css_table_spacing) {
+            cursor_x = layout_add_coordinate(cursor_x, css_spacing_x);
+        }
+        int flex_gap = table_row ? 0
+                       : css_table_spacing ? css_spacing_x : style->gap;
+        long long css_table_auto_seen = 0;
         trace_flex_sizing(context, "container", node, NULL, NULL,
                           content_width, total_basis, remaining, cursor_x,
                           0, 0);
@@ -214,6 +362,8 @@ bool layout_block_flexrow_section(LayoutContext *context,
             && !table_tracks->border_collapse) {
             cursor_y = layout_add_coordinate(
                 cursor_y, table_tracks->spacing_y);
+        } else if (css_table_spacing) {
+            cursor_y = layout_add_coordinate(cursor_y, css_spacing_y);
         }
         int anonymous_cursor_fixed = layout_fixed_from_integer(cursor_x);
         int row_bottom = cursor_y;
@@ -335,27 +485,6 @@ bool layout_block_flexrow_section(LayoutContext *context,
                             (int64_t) table_tracks->spacing_x
                             * (int64_t) (table_span - 1u)));
                 }
-                /* A spanning cell's authored width covers the complete grid
-                   area, including the internal border-spacing gutters. The
-                   track solver distributes that constraint, but available-
-                   width growth can make the sum larger; retain the explicit
-                   non-percent cell width as the used border-box floor and
-                   ceiling for this bounded table path. */
-                if (!table_tracks->border_collapse && table_span > 1
-                    && child_style->has_width
-                    && !child_style->width_max_content
-                    && !child_style->width_percent) {
-                    int authored = resolve_declared_length(
-                        context->sheet, child_style->width, false,
-                        content_width);
-                    if (!child_style->box_sizing_border_box) {
-                        authored += child_style->padding.left
-                                    + child_style->padding.right
-                                    + child_style->border.left
-                                    + child_style->border.right;
-                    }
-                    if (authored > 0) child_width = authored;
-                }
             } else if (table_row) {
                 child_width = content_width / (int) flex_children;
             } else if (planned && main_index < flex_children) {
@@ -367,22 +496,75 @@ bool layout_block_flexrow_section(LayoutContext *context,
             if (css_table_row) {
                 int table_minimum = flex_child_row_minimum(
                     context, item, content_width, true);
-                if (child_style->has_width
-                    && !child_style->width_percent) {
-                    table_minimum = child_width;
+                bool fixed = child_style->has_width
+                    && !child_style->width_percent;
+                bool percent = child_style->has_width
+                    && child_style->width_percent;
+                child_width = flex_table_percent_cap(
+                    context, child_style, content_width,
+                    &table_percent_seen, child_width);
+                if (table_squeezed) {
+                    int extra = child_style->has_width
+                        && child_width > table_minimum
+                        ? child_width - table_minimum : 0;
+                    if (percent && !squeeze_percent) {
+                        /* Past the percentage guess: full percentage. */
+                        child_width = layout_add_coordinate(
+                            table_minimum, extra);
+                    } else {
+                        if (percent != squeeze_percent) extra = 0;
+                        int before = squeeze_span > 0
+                            ? tilefinch_mul_div_int(
+                                  squeeze_room, squeeze_seen, squeeze_span)
+                            : 0;
+                        squeeze_seen = layout_add_coordinate(
+                            squeeze_seen, extra);
+                        int after = squeeze_span > 0
+                            ? tilefinch_mul_div_int(
+                                  squeeze_room, squeeze_seen, squeeze_span)
+                            : 0;
+                        child_width = layout_add_coordinate(
+                            table_minimum, after - before);
+                    }
+                } else {
+                    if (fixed && child_width > table_minimum) {
+                        table_minimum = child_width;
+                    }
+                    if (child_width < table_minimum) {
+                        child_width = table_minimum;
+                    }
                 }
-                if (child_width < table_minimum) {
-                    child_width = table_minimum;
-                }
+            }
+            if (table_leftover_to_specified && child_style->has_width) {
+                bool percent_share = table_fixed_weight == 0;
+                long long weight = child_style->width_percent != percent_share
+                    ? 0
+                    : percent_share
+                        ? flex_table_percent_weight(
+                              context, child_style, content_width)
+                        : child_width;
+                long long total = percent_share ? table_percent_weight
+                                                : table_fixed_weight;
+                int before = (int) ((long long) remaining * leftover_seen
+                                    / total);
+                leftover_seen += weight;
+                int after = (int) ((long long) remaining * leftover_seen
+                                   / total);
+                child_width = layout_add_coordinate(
+                    child_width, after - before);
             }
             if (css_table_row && remaining > 0
                 && !child_style->has_width
                 && css_table_auto_children != 0) {
-                int before = tilefinch_mul_div_int(
-                    remaining, css_table_auto_seen, css_table_auto_children);
-                css_table_auto_seen++;
-                int after = tilefinch_mul_div_int(
-                    remaining, css_table_auto_seen, css_table_auto_children);
+                bool weighted = table_auto_weight > 0;
+                long long total = weighted
+                    ? table_auto_weight
+                    : (long long) css_table_auto_children;
+                int before = (int) ((long long) remaining
+                                    * css_table_auto_seen / total);
+                css_table_auto_seen += weighted ? child_width : 1;
+                int after = (int) ((long long) remaining
+                                   * css_table_auto_seen / total);
                 child_width = layout_add_coordinate(
                     child_width, after - before);
             }
@@ -397,7 +579,7 @@ bool layout_block_flexrow_section(LayoutContext *context,
                     tilefinch_mul_div_int(
                         available, child_style->flex_grow,
                         available_grow < 1000 ? 1000 : available_grow));
-            } else if (remaining < 0 && !style->flex_wrap
+            } else if (remaining < 0 && !style->flex_wrap && !table_squeezed
                        && child_style->flex_shrink > 0
                        && total_shrink_weight > 0) {
                 int child_minimum = flex_child_row_minimum(
@@ -421,9 +603,10 @@ bool layout_block_flexrow_section(LayoutContext *context,
                 if (child_width < child_minimum) child_width = child_minimum;
                 shrink_weight_seen = next_weight;
             }
-            int used_minimum = table_row || planned ? 0 : flex_child_row_minimum(
-                context, item, content_width, css_table_row);
-            if (css_table_row && child_style->has_width
+            int used_minimum = table_row || planned || table_squeezed
+                ? 0 : flex_child_row_minimum(
+                    context, item, content_width, css_table_row);
+            if (css_table_row && !table_squeezed && child_style->has_width
                 && !child_style->width_percent) {
                 used_minimum = child_basis;
             }
@@ -605,7 +788,8 @@ bool layout_block_flexrow_section(LayoutContext *context,
         reverse_flex_cross_items(
             context, node, style, row_order, flex_flow_top,
             cross_height > 0 ? cross_height : row_bottom - flex_flow_top);
-        line->y = row_bottom;
+        line->y = css_table_spacing
+            ? layout_add_coordinate(row_bottom, css_spacing_y) : row_bottom;
         line_cursor_set(line, line->start_x);
         line->line_height = 0;
         line->line_height_fixed = 0;

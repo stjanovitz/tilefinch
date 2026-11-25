@@ -7,7 +7,7 @@ Blob	platform.js
 confirm	js_runtime/page_dialogs.inc
 CSSStyleDeclaration	platform.js
 DOMImplementation	platform.js
-EventSource	compat.js
+EventSource	event-source.js
 FormData	platform.js
 Headers	compat.js
 print	js_runtime/legacy_surface.inc

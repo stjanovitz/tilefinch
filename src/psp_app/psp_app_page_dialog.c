@@ -41,6 +41,7 @@ static struct {
     const char *argv0;
     int owner_thread;
     uint64_t open_us;
+    unsigned draft_stays;
 } psp_page_dialog;
 
 /* What is on screen with the dialog over it. Static: the UI state is about
@@ -174,11 +175,9 @@ static void psp_page_dialog_capture(PageDialogKind kind)
 }
 #endif
 
-bool psp_page_dialog_show(void *context,
-                          const TilefinchPageDialogRequest *request,
-                          TilefinchPageDialogResponse *response)
+static bool psp_show_modal(const TilefinchPageDialogRequest *request,
+                           TilefinchPageDialogResponse *response, bool browser_draft)
 {
-    (void) context;
     if (request == NULL || response == NULL || response->text == NULL
         || response->text_capacity == 0
         || (unsigned) request->kind > (unsigned) PAGE_DIALOG_PROMPT
@@ -195,7 +194,7 @@ bool psp_page_dialog_show(void *context,
         ? &cooperate->supervisor_ui : psp_page_dialog.ui;
     const uint16_t *frame = fenced
         ? psp_supervisor_page_frame(cooperate) : psp_page_dialog.views->frame;
-    if (frame == NULL || psp_ui_screen_is_native_surface(base->screen)) {
+    if (frame == NULL || (!browser_draft && psp_ui_screen_is_native_surface(base->screen))) {
         psp_presentation_fence_release(fenced);
         return false;
     }
@@ -207,6 +206,7 @@ bool psp_page_dialog_show(void *context,
     const char *glyph_value = request->default_value;
     PspUiPageDialogView view = {
         .kind = request->kind,
+        .browser_draft = browser_draft,
         .offer_suppress = request->offer_suppress,
         .host = request->host != NULL ? request->host : "",
         .message = message,
@@ -311,7 +311,7 @@ bool psp_page_dialog_show(void *context,
             &psp_page_dialog.interactive->navigation_watchdog, open_us);
     }
     psp_page_dialog.open_us += open_us;
-    if (response->outcome == PAGE_DIALOG_OUTCOME_LEAVE) {
+    if (!browser_draft && response->outcome == PAGE_DIALOG_OUTCOME_LEAVE) {
         /* Leaving a page that is still loading stops the load, as Circle
            does there; a loaded page goes Back, as Circle does there. */
         if (fenced && !cooperate->owner_thread_only
@@ -331,4 +331,34 @@ bool psp_page_dialog_show(void *context,
            (unsigned long long) (open_us / 1000u));
 #endif
     return shown;
+}
+
+bool psp_page_dialog_show(void *context, const TilefinchPageDialogRequest *request,
+                          TilefinchPageDialogResponse *response)
+{
+    (void) context;
+    return psp_show_modal(request, response, false);
+}
+
+/* Only a released, newly pressed X accepts. HOME, lost scanout, timeout,
+   Circle and Triangle all stay on the incumbent without queuing a Back. */
+bool psp_confirm_draft_loss(void *context)
+{
+    (void) context;
+    char unused[1] = {0};
+    TilefinchPageDialogResponse answer = {.text = unused, .text_capacity = sizeof(unused)};
+    const TilefinchPageDialogRequest request = {
+        .kind = PAGE_DIALOG_CONFIRM,
+        /* The modal wraps/shapes logical text, unlike its fixed hints. */
+        .message = tilefinch_ui_logical_text("Not all edits can be saved. Leave this page without saving them?")
+    };
+    if (!psp_show_modal(&request, &answer, true)) return false;
+    if (answer.outcome == PAGE_DIALOG_OUTCOME_ACCEPTED) return true;
+    psp_page_dialog.draft_stays++;
+    return false;
+}
+
+unsigned psp_draft_stays(void)
+{
+    return psp_page_dialog.draft_stays;
 }

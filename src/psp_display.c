@@ -1,4 +1,5 @@
 #include "tilefinch/psp_display.h"
+#include "tilefinch/pixel_math.h"
 
 #include <stddef.h>
 #include <stdio.h>
@@ -538,6 +539,46 @@ static int latch_buffer(PspDisplay *display, unsigned index,
     return result;
 }
 
+TILEFINCH_PIXEL_INLINE uint32_t page_pixel_8888(uint16_t p)
+{
+    unsigned r = tilefinch_rgb565_red_code(p), g = tilefinch_rgb565_green_code(p);
+    unsigned b = tilefinch_rgb565_blue_code(p);
+    return UINT32_C(0xff000000) | ((r << 3) | (r >> 2))
+        | (((g << 2) | (g >> 4)) << 8) | (((b << 3) | (b >> 2)) << 16);
+}
+
+static void expand_page_bridge(uint32_t *dest, const uint16_t *source)
+{
+    _Static_assert(PSP_DISPLAY_BUFFER_PIXELS % 2 == 0, "whole scanout pairs");
+    /* Page slots share the word-aligned video allocation. Solid runs in the
+       loading UI usually repeat the previous pair. memcpy preserves aliasing
+       and the two lanes' native memory order. */
+    uint32_t previous = 0, first = UINT32_C(0xff000000), second = first;
+    for (size_t i = 0; i < PSP_DISPLAY_BUFFER_PIXELS; i += 2) {
+        uint32_t pair;
+#if defined(__GNUC__) || defined(__clang__)
+        __builtin_memcpy(&pair, __builtin_assume_aligned(source + i, _Alignof(uint32_t)), sizeof(pair));
+#else
+        memcpy(&pair, source + i, sizeof(pair));
+#endif
+        if (pair != previous) {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+            /* Keep the two halfwords in registers on Allegrex. */
+            first = page_pixel_8888((uint16_t)pair);
+            second = page_pixel_8888((uint16_t)(pair >> 16));
+#else
+            uint16_t lanes[2];
+            memcpy(lanes, &pair, sizeof(pair));
+            first = page_pixel_8888(lanes[0]);
+            second = page_pixel_8888(lanes[1]);
+#endif
+            previous = pair;
+        }
+        dest[i] = first;
+        dest[i + 1] = second;
+    }
+}
+
 bool psp_display_video_begin(PspDisplay *display)
 {
     if (display == NULL || display->backend == NULL
@@ -561,17 +602,7 @@ bool psp_display_video_begin(PspDisplay *display)
     const uint16_t *source = buffer_at(display, page_front);
     uint32_t *bridge = video_buffer_at(display, video_bridge);
     if (source == NULL || bridge == NULL) return false;
-    for (size_t at = 0; at < PSP_DISPLAY_BUFFER_PIXELS; at++) {
-        uint16_t pixel = source[at];
-        unsigned red = (unsigned) (pixel >> 11) & 31u;
-        unsigned green = (unsigned) (pixel >> 5) & 63u;
-        unsigned blue = (unsigned) pixel & 31u;
-        red = (red << 3) | (red >> 2);
-        green = (green << 2) | (green >> 4);
-        blue = (blue << 3) | (blue >> 2);
-        bridge[at] = (uint32_t) red | ((uint32_t) green << 8)
-            | ((uint32_t) blue << 16) | UINT32_C(0xff000000);
-    }
+    expand_page_bridge(bridge, source);
     display->back_buffer = video_bridge;
     psp_display_content_epoch++;
     if (psp_display_content_epoch == 0u) psp_display_content_epoch = 1u;

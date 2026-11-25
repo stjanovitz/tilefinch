@@ -1695,6 +1695,7 @@ void js_rt_bridge_note_parser_writes(DomBridge *bridge)
     bridge->parser_writes_seen = bridge->document->parser_writes;
     bridge->dom_version++;
     bridge->dom_structure_version++;
+    bridge->tree_version++;
     bridge->document_base_dirty = true;
     bridge->computed_style_cache.dirty_all = true;
 }
@@ -4315,6 +4316,36 @@ JSValue js_dom_get_inner_html(JSContext *context,
     return value;
 }
 
+/* Whether a record already in the turn's journal names a node or scope
+   in `root`'s subtree (`root` itself only when `inclusive`), or the journal
+   could not keep every change. A :has() probe of that subtree sees it as
+   it is now, after such a write, and once the subtree leaves the write's
+   own record reaches no anchor: the tree change must stay conservative.
+   Past a bounded walk the answer is yes. */
+static bool bridge_journal_reaches_subtree(const DomBridge *bridge,
+                                           const lxb_dom_node_t *root,
+                                           bool inclusive)
+{
+    const ScriptMutationJournal *journal = bridge->mutations;
+    if (journal == NULL) return false;
+    if (journal->overflowed) return true;
+    size_t hops = 0;
+    for (size_t i = journal->count; i != 0; i--) {
+        const ScriptMutationRecord *record = &journal->records[i - 1];
+        if (record->kind == SCRIPT_MUTATION_CANVAS) continue;
+        const lxb_dom_node_t *named[2] = {record->node, record->scope};
+        for (size_t n = 0; n < 2; n++) {
+            for (const lxb_dom_node_t *at = named[n]; at != NULL;
+                 at = at->parent) {
+                if (++hops > 4096u) return true;
+                if (at == root && (inclusive || at != named[n]))
+                    return true;
+            }
+        }
+    }
+    return false;
+}
+
 /* `context_name`, when given, replaces the target's own name as the
    fragment parser's context element (Range.createContextualFragment parses
    into a new DocumentFragment, which has none) and leaves parsed scripts
@@ -4369,6 +4400,17 @@ static bool bridge_replace_inner_html(
                html == NULL ? "" : html, length);
     document_style_quiet_end();
     bool changed = false;
+    /* The :has() entries the old children leave (probed before they go)
+       and the new ones reach (after they arrive). */
+    uint64_t has_entries = UINT64_MAX;
+    uint32_t has_serial = 0;
+    bool relational = true;
+    if (valid && bridge->stylesheet != NULL
+        && bridge_node_is_connected(node))
+        relational = stylesheet_children_change_has_entries(
+            bridge->stylesheet, node, &has_entries, &has_serial);
+    if (has_serial != 0 && bridge_journal_reaches_subtree(bridge, node, false))
+        has_serial = 0;
     if (valid) {
         bridge_detach_and_discard_children(bridge, node);
         changed = true;
@@ -4392,8 +4434,17 @@ static bool bridge_replace_inner_html(
            every restored source node before publishing the mutation. */
         if (!script_element_states_register_parsed_subtree(
                 bridge, node, context_override != NULL)) valid = false;
-        bridge_mutated(
-            bridge, SCRIPT_MUTATION_INNER_HTML, node, NULL, 0);
+        if (has_serial != 0)
+            relational = stylesheet_children_change_has_entries(
+                bridge->stylesheet, node, &has_entries, &has_serial)
+                || relational;
+        if (has_serial == 0) {
+            relational = true;
+            has_entries = UINT64_MAX;
+        }
+        bridge_mutated_summarized(
+            bridge, SCRIPT_MUTATION_INNER_HTML, node, NULL, 0, relational,
+            NULL, 0, has_entries, has_serial);
         if (prepare_dynamic_scripts)
             (void) js_rt_dynamic_prepare_subtree(
                 bridge->host->context, node);
@@ -4529,14 +4580,28 @@ JS_RT_GUARDED_NATIVE(, js_dom_image_property)(JSContext *context,
         return property == 0 ? JS_NewString(context, "")
                              : JS_NewInt32(context, 0);
     }
+    if (property >= 4 && property <= 6) {
+        long handle = (long) js_rt_bridge_find_node_handle(bridge, node);
+        int ticket = argc > 2 && JS_VALUE_GET_TAG(argv[2]) == JS_TAG_INT
+            ? JS_VALUE_GET_INT(argv[2]) : 0;
+        return JS_NewInt32(context, handle > 0
+            ? js_rt_image_decode_ticket(bridge, handle, property, ticket) : 0);
+    }
+    /* A <noscript> fallback shown in the image's place is the browser's,
+       not the page's: script still sees an image with no source. */
     if (property == 0) {
         size_t length = 0;
-        const char *source = image_select_source(
+        const char *source = image_select_author_source(
             bridge->stylesheet, node, &length);
         return source == NULL ? JS_NewString(context, "")
                               : JS_NewStringLen(context, source, length);
     }
-    const ImageResource *image = images_find_node(bridge->images, node);
+    const ImageResource *image =
+        image_noscript_fallback_shown(bridge->stylesheet, node)
+        ? NULL : images_find_node(bridge->images, node);
+    /* The previous picture can remain on screen during replacement, but
+       its pixels cannot make the pending request complete. */
+    if (property == 3 && image && image->request_replaced) image = NULL;
     if (!image_resource_available(image)) image = js_rt_image_preload_find(bridge, node);
     bool available = image_resource_available(image);
     /* Viewport admission can have taken the pixels back for now. The page
@@ -4554,7 +4619,7 @@ JS_RT_GUARDED_NATIVE(, js_dom_image_property)(JSContext *context,
     }
     if (property == 3) {
         size_t length = 0;
-        const char *source = image_select_source(
+        const char *source = image_select_author_source(
             bridge->stylesheet, node, &length);
         return JS_NewBool(context,
                           source == NULL || length == 0 || available || remembered
@@ -4653,7 +4718,7 @@ JS_RT_GUARDED_NATIVE(, js_dom_set_attribute)(JSContext *context,
     size_t changed_token_count = 0;
     bool changed_tokens_exact = !unchanged_selector_identity
         && stylesheet_attribute_change_tokens(
-            name, name_length,
+            bridge == NULL ? NULL : bridge->stylesheet, name, name_length,
             old_present ? (old_value == NULL ? "" : (const char *) old_value)
                         : NULL,
             old_present ? old_value_length : 0,
@@ -4670,6 +4735,12 @@ JS_RT_GUARDED_NATIVE(, js_dom_set_attribute)(JSContext *context,
     bool preserve_geometry = !unchanged_selector_identity
         && js_rt_geometry_attribute_write_begin(
                bridge, node, name, name_length, &geometry_write);
+    bool preserve_hidden_geometry = !unchanged_selector_identity
+        && !preserve_geometry
+        && ((name_length == 5 && strncasecmp(name, "class", 5) == 0)
+            || (name_length == 5 && strncasecmp(name, "style", 5) == 0))
+        && js_rt_geometry_hidden_write_begin(
+               bridge, node, relational_selector_sensitive);
     document_style_quiet_begin();
     lxb_dom_attr_t *attribute = lxb_dom_element_set_attribute(
         lxb_dom_interface_element(node), (const lxb_char_t *) name,
@@ -4695,6 +4766,8 @@ JS_RT_GUARDED_NATIVE(, js_dom_set_attribute)(JSContext *context,
                 changed_token_count);
             if (preserve_geometry)
                 js_rt_geometry_attribute_write_end(bridge, &geometry_write);
+            else if (preserve_hidden_geometry)
+                js_rt_geometry_hidden_write_end(bridge);
         }
         ScriptElementState *state = js_rt_script_element_state_find(bridge, node);
         if (async_attribute && state != NULL && state->programmatic
@@ -4930,7 +5003,7 @@ JS_RT_GUARDED_NATIVE(, js_dom_remove_attribute)(JSContext *context,
     uint32_t changed_tokens[SCRIPT_MUTATION_TOKEN_LIMIT];
     size_t changed_token_count = 0;
     bool changed_tokens_exact = stylesheet_attribute_change_tokens(
-        name, name_length,
+        bridge == NULL ? NULL : bridge->stylesheet, name, name_length,
         existed ? (old_value == NULL ? "" : (const char *) old_value) : NULL,
         existed ? old_value_length : 0, NULL, 0, changed_tokens,
         SCRIPT_MUTATION_TOKEN_LIMIT, &changed_token_count);
@@ -5145,6 +5218,8 @@ JS_RT_GUARDED_NATIVE(, js_style_set)(JSContext *context, JSValueConst this_value
             && end == value + value_length))
             preserve_geometry = js_rt_geometry_opacity_write_begin(bridge, node);
     }
+    bool preserve_hidden_geometry = !preserve_geometry
+        && js_rt_geometry_hidden_write_begin(bridge, node, relational);
     lxb_status_t status;
     document_style_quiet_begin();
     status = lxb_dom_element_set_attribute(
@@ -5161,6 +5236,8 @@ JS_RT_GUARDED_NATIVE(, js_style_set)(JSContext *context, JSValueConst this_value
             bridge, SCRIPT_MUTATION_INLINE_STYLE, node, wanted, wanted_length,
             relational, NULL, 0);
         if (preserve_geometry) js_rt_geometry_opacity_write_end(bridge);
+        else if (preserve_hidden_geometry)
+            js_rt_geometry_hidden_write_end(bridge);
     }
     JS_FreeCString(context, value);
     JS_FreeCString(context, wanted);
@@ -5211,6 +5288,7 @@ static void bridge_mutation_note_scope(
         if (record->scope == NULL) {
             record->scope = scope;
             record->removed_last = last;
+            record->reuse_applied = false;
         }
         return;
     }
@@ -5239,7 +5317,19 @@ static void bridge_note_removal(DomBridge *bridge, lxb_dom_node_t *node)
         bridge_mutation_resource_subtree(bridge->document, node);
     ScriptMutationKind removal_kind =
         bridge_child_mutation_kind(bridge, node->parent, node);
-    bridge_mutated(bridge, removal_kind, node, NULL, 0);
+    /* Classified while attached, as bridge_mutated does, unless an earlier
+       write in the turn changed the subtree since. */
+    uint64_t has_entries = UINT64_MAX;
+    uint32_t has_serial = 0;
+    bool relational = stylesheet_tree_change_has_entries(
+        bridge->stylesheet, node, node->parent, &has_entries, &has_serial);
+    if (has_serial != 0 && bridge_journal_reaches_subtree(bridge, node, true)) {
+        relational = true;
+        has_entries = UINT64_MAX;
+        has_serial = 0;
+    }
+    bridge_mutated_summarized(bridge, removal_kind, node, NULL, 0, relational,
+                              NULL, 0, has_entries, has_serial);
     bridge_mutation_note_scope(bridge, removal_kind, node, node->parent,
                                bridge_node_is_last_element(node));
     ScriptMutationJournal *journal = (removed_resources
@@ -5298,6 +5388,11 @@ static BridgeDeparture bridge_note_departure(DomBridge *bridge,
     departure.relational = stylesheet_tree_change_has_entries(
         bridge->stylesheet, node, node->parent, &departure.has_entries,
         &departure.has_serial);
+    if (departure.has_serial != 0
+        && bridge_journal_reaches_subtree(bridge, node, true)) {
+        departure.relational = true;
+        departure.has_serial = 0;
+    }
     return departure;
 }
 

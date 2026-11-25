@@ -1,0 +1,25 @@
+# Open the ninth result, activate Play as soon as ordinary input is admitted,
+# close the native player, then interrupt another result and switch back.
+wait 1
+press 8 down
+tap right
+mark selected
+tap cross
+until-live 600
+tap-live cross
+mark-live native-player
+tap-live circle
+wait 1
+mark from-player
+tap circle
+mark returned
+tap up
+mark other
+tap cross
+wait-live 3
+tap-live circle
+tap-live down
+mark-live switched
+tap-live cross
+mark reopened
+end

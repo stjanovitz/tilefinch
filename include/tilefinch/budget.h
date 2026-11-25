@@ -88,6 +88,8 @@ typedef struct {
     size_t (*reclaim_hook)(void *opaque, size_t needed_bytes);
     void *reclaim_opaque;
     bool reclaim_active;
+    /* Set by budget_make_room_between_builds() for its hook call. */
+    bool reclaim_between_builds;
     size_t reclaim_calls;
     size_t reclaimed_bytes;
 #if defined(TILEFINCH_OWNER_CHECKS)
@@ -175,6 +177,10 @@ void budget_set_reclaim_hook(Budget *budget, BudgetReclaimHook hook,
 /* True when at least `free_bytes` are unused, first asking the reclaim hook
    (once) to release optional cache memory if they are not. */
 bool budget_make_room(Budget *budget, size_t free_bytes);
+/* budget_make_room() from a point where no layout build is borrowing a
+   cache (reclaim_between_builds is set for the hook): the hook may then
+   also release caches a build holds while it runs. */
+bool budget_make_room_between_builds(Budget *budget, size_t free_bytes);
 void budget_inject_failure_after(Budget *budget, size_t successful_attempts);
 void budget_clear_failure_injection(Budget *budget);
 /* Lexbor's allocator table is process-global. Install refuses to replace an
@@ -202,6 +208,8 @@ void *budget_calloc(Budget *budget, size_t count, size_t size);
 void *budget_realloc(Budget *budget, void *ptr, size_t size);
 void budget_free(Budget *budget, void *ptr);
 size_t budget_usable_size(const void *ptr);
+/* Charge for an ordinary allocation of this payload, including its header. */
+size_t budget_malloc_charge(size_t size);
 bool budget_owns(const Budget *budget, const void *ptr);
 size_t budget_remaining(const Budget *budget);
 bool budget_pressure_required(const Budget *budget, size_t working_bytes,

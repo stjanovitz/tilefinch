@@ -1498,6 +1498,9 @@ static TILEFINCH_OUT_OF_LINE bool commit_setup(NavigationSession *session,
         if (txn->streaming->viewport.css_width == session->viewport.css_width
             && txn->streaming->viewport.css_height
                 == session->viewport.css_height) {
+            /* What the parser added after the last preview. */
+            layout_reuse_cache_settle_parser(
+                txn->streaming->preview_layout_reuse);
             session->page.layout_reuse =
                 txn->streaming->preview_layout_reuse;
             txn->streaming->preview_layout_reuse = NULL;
@@ -1893,6 +1896,12 @@ static TILEFINCH_OUT_OF_LINE bool commit_scripts(NavigationSession *session,
                 document_body_snapshot_destroy(&server_snapshot);
                 return false;
             }
+            /* The document's scripts are one task boundary: a realm they
+               ran out of memory is stopped and the parsed target commits
+               without further script, whether or not the pipeline failed
+               (navigation_assess_script_memory). */
+            NavigationScriptMemoryVerdict scripts_memory =
+                navigation_assess_script_memory(session, "commit");
             if (!scripts_ok) {
                 snprintf(session->last_error, sizeof(session->last_error),
                          "%s",
@@ -1908,32 +1917,15 @@ static TILEFINCH_OUT_OF_LINE bool commit_scripts(NavigationSession *session,
                         session, session->page.script_result.error);
                 }
                 /* Exhausting the separately bounded author realm should not
-                   discard an otherwise usable parsed target. Retire the
-                   poisoned realm and finish this candidate without further
-                   script. Infrastructure failures and cancellation remain
-                   transactional failures. */
-                if (!navigation_retire_exhausted_script_realms(
-                        session, false)) {
+                   discard an otherwise usable parsed target: the realm was
+                   stopped above, or kept with room, and the failure was its
+                   author code's. Infrastructure failures and cancellation
+                   (no refusal) remain transactional failures. */
+                if (scripts_memory == NAVIGATION_SCRIPT_MEMORY_UNREFUSED) {
                     document_body_snapshot_destroy(&server_snapshot);
                     return false;
                 }
             }
-            /* A script that filled the realm without failing the pipeline
-               (an inline script's error is the page's) leaves it as unable
-               to run as one that did; whether a later step also fails
-               depends on how much the error object took. A refused
-               allocation with room left is the page's to recover from, and
-               so is "out of memory" (or null) the page threw itself: the
-               heap must have refused an allocation since the last check. */
-            if (scripts_ok && session->page.runtime != NULL
-                && script_error_reports_out_of_memory(
-                       session->page.script_result.error)
-                && script_runtime_heap_rejections(session->page.runtime)
-                       > session->page.script_heap_rejections_seen
-                && script_runtime_heap_available(session->page.runtime)
-                       < 256u * 1024u)
-                (void) navigation_retire_exhausted_script_realms(
-                    session, false);
             bool hydration_degraded = !scripts_ok || metrics.failed != 0
                 || metrics.skipped_quota != 0
                 || metrics.skipped_pressure != 0
@@ -2123,8 +2115,8 @@ static TILEFINCH_OUT_OF_LINE bool commit_final_style(NavigationSession *session,
         }
         if (!navigation_dispatch_stylesheet_events(
                 session, session->page.resource_base_url)
-            && !navigation_retire_exhausted_script_realms(
-                    session, false)) {
+            && navigation_assess_script_memory(session, "stylesheet-events")
+                   == NAVIGATION_SCRIPT_MEMORY_UNREFUSED) {
             snprintf(session->last_error, sizeof(session->last_error),
                      "stylesheet completion event dispatch failed");
             return false;
@@ -2378,6 +2370,7 @@ static TILEFINCH_OUT_OF_LINE bool commit_images(NavigationSession *session,
         NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT];
     size_t image_priority_count = 0;
     bool static_image_plan = false;
+    bool adopted_static_image_plan = false;
     /* A committed LayoutDocument borrows ImageResource pointers. Reserve the
        bounded child-frame tail before the first preview/final layout so an
        asynchronously completed iframe can append its snapshot without
@@ -2428,6 +2421,7 @@ static TILEFINCH_OUT_OF_LINE bool commit_images(NavigationSession *session,
                 session, txn->fonts, txn->images, image_priority_targets,
                 NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT,
                 &image_priority_count, &txn->final_layout_ready);
+            adopted_static_image_plan = txn->final_layout_ready;
             session->performance.progressive_image_priority_nodes =
                 image_priority_count;
         }
@@ -2543,8 +2537,9 @@ static TILEFINCH_OUT_OF_LINE bool commit_images(NavigationSession *session,
         bool defer_static_document_images = static_image_plan
             && session->page.deferred_image_count != 0
             && !txn->allow_runtime && txn->streaming == NULL
-            && navigation_document_images_are_defer_safe(
-                   &session->page.document, &session->page.stylesheet, &session->page.images);
+            /* Adoption already proved this and no eager images were loaded. */
+            && (adopted_static_image_plan || navigation_document_images_are_defer_safe(
+                   &session->page.document, &session->page.stylesheet, &session->page.images));
         if (image_pipeline_refused) {
             budget_free(session->budget, session->page.deferred_image_targets);
             session->page.deferred_image_targets = NULL;
@@ -2652,6 +2647,51 @@ typedef enum {
     NAVIGATION_COMMIT_LAYOUT_BUILT
 } NavigationCommitLayoutOutcome;
 
+static NavigationRetainedPreview *navigation_stream_live_preview(
+    NavigationDocumentStream *stream);
+
+/* Build the ordinary prefix plus at most one band of readable content.
+   At handoff, available is the live preview's real reach; on an idle
+   extension it is unrestricted. Neither path borrows preview geometry:
+   new text and hit targets are built and published together. */
+static bool navigation_build_reader_band(NavigationSession *session,
+    LayoutDocument *layout, const FontSet *fonts, const ImageResources *images,
+    int ordinary, int available, bool *truncated, int *prefetch_start)
+{
+    const int screen = session->viewport.css_height;
+    int band = ordinary;
+    /* Keep the same two-MiB completion reserve as streaming input. A
+       released preview is not permission to immediately spend that space
+       again on the first background extension of a pressured article. */
+    if (available > ordinary && !budget_pressure_required(session->budget,
+               navigation_progressive_preview_estimate(&session->page.document),
+               2u * 1024u * 1024u)) {
+        /* Cover the old two-screen placeholder and a short burst of page
+           presses, but do not multiply this reserve on successive passes. */
+        int64_t reach = ordinary + 7 * (int64_t) screen;
+        band = reach < available ? (int) reach : available;
+    }
+    for (unsigned attempt = 0; attempt < 2; ++attempt) {
+        size_t failures = session->budget->failure_count;
+        if (layout_build_context_preview(layout, session->budget,
+                &session->page.document, &session->page.stylesheet, fonts,
+                images, &session->viewport, session->page.layout_reuse,
+                band, truncated)) {
+            if (prefetch_start != NULL && band > ordinary && *truncated
+                && layout->height > ordinary) *prefetch_start = ordinary;
+            return true;
+        }
+        if (band == ordinary || layout->performance.cancelled
+            || session->budget->failure_count == failures) break;
+        /* Refusal of optional lookahead is not refusal of the ordinary
+           first screens. Keep their existing fallback. */
+        layout_destroy(layout);
+        memset(layout, 0, sizeof(*layout));
+        band = ordinary;
+    }
+    return false;
+}
+
 /* Layout: build the authoritative layout (a progressive preview, a
    provisional prefix, a deferred job, or the full build with one minimal-
    stylesheet retry under pressure) and finish it. */
@@ -2680,15 +2720,16 @@ static TILEFINCH_OUT_OF_LINE NavigationCommitLayoutOutcome commit_layout(
             bool truncated = false;
             /* Through the screen the reader scrolled the load preview to,
                and two more, so the commit lands where they are reading. */
-            int limit = 3 * session->viewport.css_height;
-            int reader_y = session->provisional_reader_y;
-            if (reader_y > 0 && reader_y <= INT_MAX - limit)
-                limit += reader_y;
-            if (layout_build_context_preview(
-                    &session->page.layout, session->budget,
-                    &session->page.document, &session->page.stylesheet,
-                    txn->fonts, txn->images, &session->viewport,
-                    session->page.layout_reuse, limit, &truncated)) {
+            int64_t ordinary = 3 * (int64_t) session->viewport.css_height;
+            if (session->provisional_reader_y > 0)
+                ordinary += session->provisional_reader_y;
+            int limit = ordinary > INT_MAX ? INT_MAX : (int) ordinary;
+            const NavigationRetainedPreview *live =
+                session->provisional_reader_y >= session->viewport.css_height
+                ? navigation_stream_live_preview(txn->streaming) : NULL;
+            if (navigation_build_reader_band(session, &session->page.layout,
+                    txn->fonts, txn->images, limit, live ? live->content_end_y : 0,
+                    &truncated, &session->page.layout_prefetch_start)) {
                 if (truncated) {
                     LayoutDocument *layout = &session->page.layout;
                     layout->content_limit_y =

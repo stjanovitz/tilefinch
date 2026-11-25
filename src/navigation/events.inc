@@ -10,12 +10,35 @@ bool navigation_set_gamepad_state(
     return script_runtime_set_gamepad_state(session->page.runtime, state);
 }
 
+/* An input task is a task boundary (navigation_assess_script_memory): a
+   realm its listeners ran out of memory stops, and the page is laid out
+   without scripts. */
 static bool navigation_settle_dispatched_event(NavigationSession *session)
 {
+    if (navigation_assess_script_memory(session, "input")
+            == NAVIGATION_SCRIPT_MEMORY_STOPPED) {
+        (void) navigation_relayout_static_fallback(session);
+        return true;
+    }
     if (script_runtime_consume_relayout(session->page.runtime)
         && !navigation_relayout(session)) return false;
     (void) navigation_publish_script_scroll(session);
     return true;
+}
+
+/* A dispatch that failed in a realm refused memory: stopped, or kept with
+   room and the failure its author code's. Either way the page goes on. */
+static bool navigation_settle_failed_dispatch(NavigationSession *session)
+{
+    if (navigation_retire_failed_document_refresh(
+            session, session->page.runtime)
+        || navigation_assess_script_memory(session, "input")
+               == NAVIGATION_SCRIPT_MEMORY_UNREFUSED) return false;
+    if (session->page.runtime == NULL) {
+        (void) navigation_relayout_static_fallback(session);
+        return true;
+    }
+    return navigation_settle_dispatched_event(session);
 }
 
 bool navigation_dispatch_event(NavigationSession *session,
@@ -25,11 +48,8 @@ bool navigation_dispatch_event(NavigationSession *session,
     if (session == NULL || session->page.runtime == NULL
         || !session->page.loaded) return false;
     if (!script_runtime_dispatch(session->page.runtime, selector, event_type,
-                                 &session->page.script_result)) {
-        (void) navigation_retire_failed_document_refresh(
-            session, session->page.runtime);
-        return false;
-    }
+                                 &session->page.script_result))
+        return navigation_settle_failed_dispatch(session);
     return navigation_settle_dispatched_event(session);
 }
 
@@ -40,11 +60,8 @@ bool navigation_dispatch_node_event(NavigationSession *session,
     if (session == NULL || session->page.runtime == NULL
         || !session->page.loaded || node == NULL) return false;
     if (!script_runtime_dispatch_node(session->page.runtime, node, event_type,
-                                      &session->page.script_result)) {
-        (void) navigation_retire_failed_document_refresh(
-            session, session->page.runtime);
-        return false;
-    }
+                                      &session->page.script_result))
+        return navigation_settle_failed_dispatch(session);
     return navigation_settle_dispatched_event(session);
 }
 
@@ -54,11 +71,8 @@ bool navigation_dispatch_node_activation(NavigationSession *session,
     if (session == NULL || session->page.runtime == NULL
         || !session->page.loaded || node == NULL) return false;
     if (!script_runtime_dispatch_activation_node(
-            session->page.runtime, node, &session->page.script_result)) {
-        (void) navigation_retire_failed_document_refresh(
-            session, session->page.runtime);
-        return false;
-    }
+            session->page.runtime, node, &session->page.script_result))
+        return navigation_settle_failed_dispatch(session);
     return navigation_settle_dispatched_event(session);
 }
 
@@ -344,11 +358,8 @@ bool navigation_dispatch_node_pointer(
 #endif
     if (!script_runtime_dispatch_pointer_node(
         session->page.runtime, node, phase, client_x, client_y,
-            offset_x, offset_y, buttons, &session->page.script_result)) {
-        (void) navigation_retire_failed_document_refresh(
-            session, session->page.runtime);
-        return false;
-    }
+            offset_x, offset_y, buttons, &session->page.script_result))
+        return navigation_settle_failed_dispatch(session);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     uint64_t pointer_dispatched = navigation_now_us();
 #endif
@@ -378,10 +389,12 @@ bool navigation_dispatch_node_input_event(NavigationSession *session,
     if (!script_runtime_dispatch_input_node(
             session->page.runtime, node, event_type, data, input_type,
             current_value,
-            &session->page.script_result)) {
-        (void) navigation_retire_failed_document_refresh(
-            session, session->page.runtime);
-        return false;
+            &session->page.script_result))
+        return navigation_settle_failed_dispatch(session);
+    if (navigation_assess_script_memory(session, "input")
+            == NAVIGATION_SCRIPT_MEMORY_STOPPED) {
+        (void) navigation_relayout_static_fallback(session);
+        return true;
     }
     return !script_runtime_consume_relayout(session->page.runtime)
            || navigation_relayout(session);
@@ -397,10 +410,12 @@ bool navigation_dispatch_node_submit_event(NavigationSession *session,
     }
     if (!script_runtime_dispatch_submit_node(
             session->page.runtime, form, submitter,
-            &session->page.script_result)) {
-        (void) navigation_retire_failed_document_refresh(
-            session, session->page.runtime);
-        return false;
+            &session->page.script_result))
+        return navigation_settle_failed_dispatch(session);
+    if (navigation_assess_script_memory(session, "input")
+            == NAVIGATION_SCRIPT_MEMORY_STOPPED) {
+        (void) navigation_relayout_static_fallback(session);
+        return true;
     }
     return !script_runtime_consume_relayout(session->page.runtime)
            || navigation_relayout(session);

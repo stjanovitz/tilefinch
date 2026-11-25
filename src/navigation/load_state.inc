@@ -1024,6 +1024,7 @@ static NavigationLoad *navigation_load_begin_common(
     /* An incumbent whose realms are already retired has no runtime left
        to drain, which is what the bound above protects. */
     load->low_memory_replacement = low_memory_requested
+        && !session->replacement_preserve_incumbent
         && (!external_script_incumbent || bounded_external_script_incumbent
             || (low_memory_once && session->page.runtime == NULL));
     if (low_memory_requested && !load->low_memory_replacement) {
@@ -2049,6 +2050,15 @@ NavigationLoadStatus navigation_load_status(const NavigationLoad *load)
     return load == NULL ? NAVIGATION_LOAD_FAILED : load->status;
 }
 
+#if !defined(__PSP__)
+bool navigation_test_load_blocking_stylesheet_ready(
+    const NavigationLoad *load)
+{
+    return load != NULL && load->document_stream != NULL
+        && load->document_stream->blocking_stylesheet_ready;
+}
+#endif
+
 bool navigation_load_metrics(const NavigationLoad *load,
                              NavigationLoadMetrics *metrics)
 {
@@ -2064,9 +2074,13 @@ bool navigation_load_metrics(const NavigationLoad *load,
     /* A blocking sheet deliberately pauses HTML delivery while its CSS is
        consumed in slices. Count actual source advancement, not preparation
        polls, so slow parsing progresses without keeping a stuck fetch alive. */
-    if (load->document_stream != NULL)
+    metrics->parser_progress_units = 0;
+    if (load->document_stream != NULL) {
         metrics->progress_units += stylesheet_sliced_parse_progress(
             load->document_stream->style_prepare.deferral.parse);
+        metrics->parser_progress_units =
+            load->document_stream->parsed_body_bytes;
+    }
     if (load->candidate_session != NULL
         && load->candidate_session->page.runtime != NULL) {
         ScriptRuntimeTelemetry telemetry;
@@ -2082,6 +2096,7 @@ bool navigation_load_metrics(const NavigationLoad *load,
         ScriptRuntimeTelemetry telemetry;
         script_runtime_telemetry(load->document_stream->runtime, &telemetry);
         metrics->scripts_evaluated = telemetry.scripts_evaluated;
+        metrics->parser_progress_units += telemetry.scripts_evaluated;
     }
     metrics->response_received = load->response_taken
         || (load->status == NAVIGATION_LOAD_PENDING && load->request_id != 0

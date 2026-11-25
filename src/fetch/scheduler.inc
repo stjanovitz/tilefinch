@@ -3,6 +3,10 @@
 static void scheduled_capture_finish(FetchScheduler *scheduler,
                                      ScheduledFetch *item,
                                      bool external_cancel);
+static void scheduled_mark_complete(FetchScheduler *scheduler,
+                                    ScheduledFetch *item, bool success,
+                                    const char *error,
+                                    bool external_cancel);
 
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
 static void scheduled_timeline(const FetchScheduler *scheduler,
@@ -1013,16 +1017,19 @@ static bool scheduled_fetch_prepare(FetchScheduler *scheduler,
                item->easy, CURLOPT_NOSIGNAL, 1L) != CURLE_OK
         || curl_easy_setopt(
                item->easy, CURLOPT_FAILONERROR,
-               item->request.allow_http_errors ? 0L : 1L) != CURLE_OK
+               fetch_curl_fail_on_error(
+                   &item->writer, item->request.allow_http_errors))
+               != CURLE_OK
         || curl_easy_setopt(
                item->easy, CURLOPT_ERRORBUFFER, item->error) != CURLE_OK
         || curl_easy_setopt(
-               item->easy, CURLOPT_WRITEFUNCTION, receive_data) != CURLE_OK
+               item->easy, CURLOPT_WRITEFUNCTION,
+               fetch_curl_receive_data) != CURLE_OK
         || curl_easy_setopt(
                item->easy, CURLOPT_WRITEDATA, &item->writer) != CURLE_OK
         || curl_easy_setopt(
                item->easy, CURLOPT_HEADERFUNCTION,
-               receive_header) != CURLE_OK
+               fetch_curl_receive_header) != CURLE_OK
         || curl_easy_setopt(
                item->easy, CURLOPT_HEADERDATA, &item->writer) != CURLE_OK
         || curl_easy_setopt(
@@ -1030,6 +1037,21 @@ static bool scheduled_fetch_prepare(FetchScheduler *scheduler,
         return scheduled_fetch_prepare_failure(
             item, "easy-options", CURLE_FAILED_INIT);
     }
+#if !defined(__PSP__)
+    /* A deferred abort ends here (fetch_defer_abort). */
+    if (fetch_libcurl_breaks_http2_aborts()
+        && (curl_easy_setopt(
+                item->easy, CURLOPT_XFERINFOFUNCTION,
+                fetch_deferred_abort_progress) != CURLE_OK
+            || curl_easy_setopt(
+                   item->easy, CURLOPT_XFERINFODATA, &item->writer)
+                   != CURLE_OK
+            || curl_easy_setopt(item->easy, CURLOPT_NOPROGRESS, 0L)
+                   != CURLE_OK)) {
+        return scheduled_fetch_prepare_failure(
+            item, "easy-options", CURLE_FAILED_INIT);
+    }
+#endif
     if (!fetch_hop_configure_cookie(
             item->easy, item->hop, &item->request, true)) {
         return scheduled_fetch_prepare_failure(
@@ -1076,6 +1098,29 @@ static size_t scheduler_ordinary_items(const FetchScheduler *scheduler)
         if (item != NULL && !item->blocking_slot) count++;
     }
     return count;
+}
+
+/* Cancels parked request slot `i` if it is still running, and frees it. */
+static void scheduled_release_parked(FetchScheduler *scheduler, size_t i)
+{
+    if (!scheduler->items[i]->complete)
+        scheduled_mark_complete(scheduler, scheduler->items[i], false,
+                                "parked request released", true);
+    scheduled_fetch_clear(scheduler, &scheduler->items[i]);
+}
+
+/* Releases the parked requests (fetch_scheduler_park): all of them, or only
+   those parked FETCH_SCHEDULER_PARK_PUMPS pumps ago. */
+static void scheduler_release_parked(FetchScheduler *scheduler,
+                                     bool expired_only)
+{
+    for (size_t i = 0; i < scheduler->capacity; i++) {
+        ScheduledFetch *item = scheduler->items[i];
+        if (item != NULL && item->park_key != 0
+            && (!expired_only || scheduler->pump_generation
+                    - item->park_generation >= FETCH_SCHEDULER_PARK_PUMPS))
+            scheduled_release_parked(scheduler, i);
+    }
 }
 
 typedef enum {
@@ -1163,6 +1208,12 @@ static uint64_t fetch_scheduler_enqueue_internal(
             scheduler, "stream callback limits are invalid");
         return 0;
     }
+    /* A new request outranks a parked one for its slot and bytes. */
+    if ((maximum_bytes > scheduler->maximum_reserved_bytes
+                             - scheduler->reserved_bytes
+         || scheduler_slot_admission(scheduler, blocking)
+                == SCHEDULER_ADMIT_NONE))
+        scheduler_release_parked(scheduler, false);
     if (maximum_bytes > scheduler->maximum_reserved_bytes
                               - scheduler->reserved_bytes) {
         fetch_scheduler_set_error(
@@ -1276,6 +1327,18 @@ static uint64_t fetch_scheduler_enqueue_internal(
             .pump_quota_enabled = true,
             .defer_replay_body = true
         };
+        /* What fetch_scheduler_adopt compares, as a live request keeps. */
+        item->logical_url = scheduler_copy(
+            scheduler->budget, logical_url, 4095);
+        item->initiator_url = scheduler_copy(
+            scheduler->budget,
+            request == NULL ? NULL : request->initiator_url, 4095);
+        item->page_top_level_url = scheduler_copy(
+            scheduler->budget,
+            request == NULL || request->page_context == NULL
+                ? NULL : request->page_context->top_level_url, 4095);
+        item->request.content_security_policy = request == NULL
+            ? NULL : request->content_security_policy;
         item->replay_source_success = trace_replay_response(
             scheduler->budget,
             request == NULL || request->method == NULL
@@ -1475,19 +1538,27 @@ bool fetch_scheduler_enqueue_would_block(
         || maximum_bytes > scheduler->maximum_reserved_bytes) {
         return false;
     }
-    bool has_local_slot = scheduler_ordinary_items(scheduler)
+    /* As enqueue sees it once it has released the parked requests: their
+       slots and the bytes they still hold are free. */
+    size_t parked = 0, parked_bytes = 0, parked_pending = 0;
+    for (size_t i = 0; i < scheduler->capacity; i++) {
+        const ScheduledFetch *item = scheduler->items[i];
+        if (item == NULL || item->park_key == 0) continue;
+        parked++;
+        parked_bytes += item->reserved_bytes;
+        if (!item->complete) parked_pending++;
+    }
+    size_t reserved = scheduler->reserved_bytes - parked_bytes;
+    size_t active = scheduler->domain->active_slots - parked;
+    bool has_local_slot = scheduler_ordinary_items(scheduler) - parked
         < scheduler->ordinary_capacity;
     bool reservation_busy =
-        maximum_bytes > scheduler->maximum_reserved_bytes
-                            - scheduler->reserved_bytes;
-    bool domain_busy =
-        scheduler->domain->active_slots
-            >= scheduler->domain->maximum_active_slots;
+        maximum_bytes > scheduler->maximum_reserved_bytes - reserved;
+    bool domain_busy = active >= scheduler->domain->maximum_active_slots;
     bool capacity_busy = !has_local_slot
         || reservation_busy || domain_busy;
-    bool work_can_release_capacity = scheduler->pending != 0
-        || scheduler->reserved_bytes != 0
-        || scheduler->domain->active_slots != 0;
+    bool work_can_release_capacity = scheduler->pending != parked_pending
+        || reserved != 0 || active != 0;
     return capacity_busy && work_can_release_capacity;
 }
 
@@ -2309,6 +2380,7 @@ size_t fetch_scheduler_pump_bounded(
     if (maximum_wait_ms > 10) maximum_wait_ms = 10;
     uint64_t started_us = tilefinch_platform_monotonic_time_us();
     scheduler->pump_generation++;
+    scheduler_release_parked(scheduler, true);
     size_t stream_start[FETCH_SCHEDULER_ITEM_LIMIT] = {0};
     bool active_seen[FETCH_SCHEDULER_ITEM_LIMIT] = {0};
     bool stream_seen[FETCH_SCHEDULER_ITEM_LIMIT] = {0};
@@ -2542,19 +2614,22 @@ size_t fetch_scheduler_pump_bounded(
             (void) curl_easy_getinfo(message->easy_handle,
                                      CURLINFO_PRIVATE, &item);
             if (item == NULL || !item->active) continue;
+            CURLcode result = fetch_settle_deferred_abort(
+                &item->writer, message->data.result, item->error,
+                sizeof(item->error));
             if (scheduled_retry_tls12_compatibility(
-                    scheduler, item, message->data.result)) {
+                    scheduler, item, result)) {
                 continue;
             }
-            if (message->data.result == CURLE_OK
+            if (result == CURLE_OK
                 && item->writer.pending_offset
                        < item->writer.pending_length) {
                 item->transport_complete = true;
-                item->transport_result = message->data.result;
+                item->transport_result = result;
                 continue;
             }
-            if (scheduled_finish_transport(
-                    scheduler, item, message->data.result)) completed++;
+            if (scheduled_finish_transport(scheduler, item, result))
+                completed++;
         }
     }
     pump->elapsed_us = fetch_pump_elapsed_us(started_us);
@@ -3001,6 +3076,96 @@ bool fetch_scheduler_discard(FetchScheduler *scheduler,
         return true;
     }
     return false;
+}
+
+bool fetch_scheduler_park(FetchScheduler *scheduler, uint64_t request_id,
+                          uint64_t key)
+{
+    if (scheduler == NULL || request_id == 0 || key == 0) return false;
+    for (size_t i = 0; i < scheduler->capacity; i++) {
+        ScheduledFetch *item = scheduler->items[i];
+        if (item == NULL || item->id != request_id) continue;
+        /* A replayed record the capture saw cancelled has no response to
+           wait for: the request is cancelled as it was then, and the next
+           one takes the capture's next record. */
+        if (item->streaming || item->blocking_slot
+            || (item->complete && !item->success)
+            || (FETCH_TRACE_MODE == FETCH_TRACE_REPLAY
+                && item->result.trace_external_cancel)) return false;
+        item->park_key = key;
+        item->park_generation = scheduler->pump_generation;
+        return true;
+    }
+    return false;
+}
+
+static bool scheduler_text_equal(const char *a, const char *b)
+{
+    return a == NULL || b == NULL ? a == b : strcmp(a, b) == 0;
+}
+
+uint64_t fetch_scheduler_adopt(FetchScheduler *scheduler, uint64_t key,
+                               const char *url, const FetchRequest *request,
+                               size_t limit)
+{
+    if (scheduler == NULL || key == 0 || url == NULL) return 0;
+    char logical[TILEFINCH_URL_SERIALIZED_LIMIT];
+    bool normalized = false;
+    for (size_t i = 0; i < scheduler->capacity; i++) {
+        ScheduledFetch *item = scheduler->items[i];
+        if (item == NULL || item->park_key != key) continue;
+        if (!normalized) {
+            if (!tilefinch_url_normalize(url, logical, sizeof(logical)))
+                return 0;
+            normalized = true;
+        }
+        /* The key is a hash: the request must be the same one, made for
+           the same document (a frame shares the page's scheduler). */
+        if (item->logical_url == NULL
+            || strcmp(item->logical_url, logical) != 0
+            || !scheduler_text_equal(item->initiator_url, request == NULL
+                   ? NULL : request->initiator_url)
+            || !scheduler_text_equal(item->page_top_level_url,
+                   request == NULL || request->page_context == NULL
+                       ? NULL : request->page_context->top_level_url)
+            || item->request.content_security_policy != (request == NULL
+                   ? NULL : request->content_security_policy)) continue;
+        if ((item->complete && !item->success)
+            || item->writer.maximum_bytes > limit) {
+            scheduled_release_parked(scheduler, i);
+            return 0;
+        }
+        item->park_key = 0;
+        return item->id;
+    }
+    return 0;
+}
+
+size_t fetch_scheduler_parked_bytes(const FetchScheduler *scheduler)
+{
+    size_t bytes = 0;
+    for (size_t i = 0; scheduler != NULL && i < scheduler->capacity; i++) {
+        const ScheduledFetch *item = scheduler->items[i];
+        if (item != NULL && item->park_key != 0)
+            bytes += item->result.capacity;
+    }
+    return bytes;
+}
+
+size_t fetch_scheduler_release_parked(FetchScheduler *scheduler, bool all)
+{
+    size_t bytes = fetch_scheduler_parked_bytes(scheduler);
+    if (scheduler == NULL) return 0;
+    if (all) {
+        scheduler_release_parked(scheduler, false);
+        return bytes;
+    }
+    /* A turn that does not pump (nothing else in flight) still counts. */
+    if (scheduler->pending == 0) {
+        scheduler->pump_generation++;
+        scheduler_release_parked(scheduler, true);
+    }
+    return 0;
 }
 
 size_t fetch_scheduler_pending(const FetchScheduler *scheduler)

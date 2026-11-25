@@ -657,8 +657,15 @@ static int emit_bytecode(FILE *output, JSContext *context,
                          const BootstrapInput *input)
 {
     size_t bytecode_length = 0;
+    /* A function whose locals nothing captures keeps no variable table:
+       with the names stripped and no direct eval, nothing reads it, and
+       each realm would otherwise copy 12 bytes per argument and local out
+       of ROM (JS_WRITE_OBJ_STRIP_UNUSED_LOCALS). Only this generator asks
+       for it; page scripts are compiled and cached as before. */
     uint8_t *bytecode = compile_bytecode(
-        context, input, JS_WRITE_OBJ_BYTECODE | JS_WRITE_OBJ_PINNED_ATOMS,
+        context, input,
+        JS_WRITE_OBJ_BYTECODE | JS_WRITE_OBJ_PINNED_ATOMS
+            | JS_WRITE_OBJ_STRIP_UNUSED_LOCALS,
         &bytecode_length);
     if (bytecode == NULL) return 0;
     fprintf(output, "static const unsigned char %s_data[] = {\n    ",

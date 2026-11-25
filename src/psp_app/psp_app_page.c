@@ -324,8 +324,8 @@ bool psp_begin_page_load(BrowserEngine *engine, PspUiState *ui,
     psp_text_input_before_navigation(text_input);
     /* The loading surface is already visible while the provider's bounded
        trusted-face set is prepared. Rebind chrome once here as metric bold
-       may have become available; the engine repeats the preparation cheaply
-       inside begin_navigation for non-PSP callers. */
+       may have become available. Navigation through a page control can
+       instead prepare these faces after its first provider transport turn. */
     if (site_adapter_navigation_requires_stable_typography("GET", url)
         && browser_engine_prepare_navigation_fonts(engine, "GET", url)) {
         psp_presentation_rebind_chrome_fonts(
@@ -576,7 +576,9 @@ bool psp_run_initial_page_load(
         }
         if (status == BROWSER_NAVIGATION_JOB_PENDING
             && psp_navigation_watchdog_expired(
-                   &watchdog, now_us, metrics.load.progress_units)) {
+                   &watchdog, now_us,
+                   metrics.load.progress_units
+                       + metrics.load.parser_progress_units)) {
             browser_engine_cancel_navigation(
                 engine, "PSP navigation watchdog expired");
             status = BROWSER_NAVIGATION_JOB_CANCELLED;

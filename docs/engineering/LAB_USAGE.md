@@ -46,11 +46,17 @@ DejaVu sans, serif, and bounded sans-italic faces are loaded under
 `--sans-italic-font` select alternatives, and `--no-ttf` exercises the
 zero-font fallback.
 
+`--hide-cookie-banners` applies the built-in cookie-notice sheet and
+`--hide-page-ads` the built-in page-ad sheet, which the PSP app applies by
+default while content blocking is on (**Hide page ads**); `--hide-page-ads`
+therefore needs `--content-blocker basic` or `custom`. Together they give
+the PSP app's presentation sheet in its order, page ads first.
+
 The interactive lab's `--reader-mode` option instead exercises the product's
 bounded content-shape classifier and generic Reader stylesheet after the page
-has committed. It cannot be combined with `--user-css` or
-`--hide-cookie-banners`, keeping the capture's presentation source
-unambiguous.
+has committed. It cannot be combined with `--user-css`,
+`--hide-cookie-banners` or `--hide-page-ads`, keeping the capture's
+presentation source unambiguous.
 
 ### Images
 
@@ -373,6 +379,20 @@ loop, and a measurement must use the one that runs the work it measures:
   the queue's batches so far, and whether the queue is still running
   (`pending=no` with targets still queued means they are `loading=lazy`
   images waiting for the viewport).
+- `drain-fetches [CAP-MS]` lets the requests already on the wire finish:
+  it holds the page's fetch domain (nothing new is admitted) and runs loop
+  turns without moving the page clock until no request is in flight or the
+  cap passes (default 10000 ms of wall time against a live network; in a
+  replay each turn counts 16 ms, so a replayed drain is deterministic). In
+  flight means admitted and not complete, in the page resource scheduler or
+  behind the page's and its frames' script fetch queues. It prints
+  `drain-fetches drained=yes|no reason=idle|cap clock=live|replay ms=...
+  cap-ms=... turns=... at-start=... in-flight=... resources=... scripts=...
+  waiting=...` (`waiting`: script requests not admitted, which hold no
+  request), and at the cap the resource scheduler's slots on stderr
+  (`scheduler-slot label=drain-fetches`, `complete=0` still in flight). A
+  `--capture-http` run uses it before `quit`, which would record those
+  requests as cancelled.
 
 Script caches:
 

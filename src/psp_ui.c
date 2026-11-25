@@ -2986,11 +2986,12 @@ void psp_ui_set_loading(PspUiState *ui, bool loading,
     }
     ui->loading = loading;
     ui->progress_per_mille = progress_per_mille;
-    if (!loading && ui->toast_kind == PSP_UI_TOAST_LOADING) {
+    if (!loading && (ui->toast_kind == PSP_UI_TOAST_LOADING
+                     || ui->toast_kind == PSP_UI_TOAST_VIDEO_DETAILS)) {
         ui->toast_kind = PSP_UI_TOAST_PLAIN;
         ui->toast_frames = 0;
         ui->toast_entry_frames = 0;
-        ui->status[0] = '\0';
+        memset(ui->status, 0, sizeof(ui->status));
     }
     if (loading) {
         /* Announce a new load, but respect Triangle during its continuation. */
@@ -3109,6 +3110,16 @@ const char *psp_ui_loading_status_text(unsigned phase)
     }
 }
 
+void psp_ui_show_video_details(PspUiState *ui, const char *title, const char *channel)
+{
+    if (!ui || !ui->loading || !title || !*title) return;
+    psp_ui_show_status(ui, "Video", 600u);
+    copy_string(ui->video_details.title, sizeof(ui->video_details.title), title);
+    copy_string(ui->video_details.channel, sizeof(ui->video_details.channel), channel);
+    ui->toast_kind = PSP_UI_TOAST_VIDEO_DETAILS;
+    ui->toast_entry_frames = 0;
+}
+
 void psp_ui_show_loading_status(PspUiState *ui, unsigned phase,
                                 unsigned duration_frames)
 {
@@ -3122,7 +3133,7 @@ void psp_ui_show_loading_status(PspUiState *ui, unsigned phase,
 void psp_ui_follow_loading_phase(PspUiState *ui, unsigned phase,
                                  bool may_show)
 {
-    if (ui == NULL) return;
+    if (ui == NULL || (ui->toast_kind == PSP_UI_TOAST_VIDEO_DETAILS && ui->toast_frames)) return;
     if (phase > 3u) phase = 3u;
     if (ui->toast_frames == 0) {
         /* An ended loading status keeps its kind and phase (until the load
@@ -3162,6 +3173,9 @@ void psp_ui_show_status(PspUiState *ui, const char *status,
                         unsigned duration_frames)
 {
     if (ui == NULL) return;
+    if (ui->toast_kind == PSP_UI_TOAST_VIDEO_DETAILS)
+        memset(ui->status + sizeof(ui->video_details.key), 0,
+               sizeof(ui->status) - sizeof(ui->video_details.key));
     ui->toast_kind = PSP_UI_TOAST_PLAIN;
     ui->toast_payload = 0;
     copy_string(ui->status, sizeof(ui->status), status);
@@ -3557,6 +3571,39 @@ void psp_ui_set_collections(
         ui->collections_selection = (uint8_t) (rows - 1u);
     if (ui->collections_first_row > ui->collections_selection)
         ui->collections_first_row = ui->collections_selection;
+}
+
+static bool ui_offline_collection(unsigned section)
+{
+    return section == PSP_UI_COLLECTION_SAVED
+        || section == PSP_UI_COLLECTION_DOWNLOADS;
+}
+
+uint32_t psp_ui_collections_armed_offline_id(const PspUiState *ui)
+{
+    if (ui == NULL || ui->screen != PSP_UI_SCREEN_COLLECTIONS
+        || !ui_offline_collection(ui->collections_section)
+        || ui->collections_delete_confirmation
+            != ui->collections_selection + 1u
+        || ui->collections_selection >= ui_collections_row_count(ui))
+        return 0;
+    const PspUiCollectionsRow *row =
+        &ui->collections->rows[ui->collections_selection];
+    return row->deletable ? row->offline_id : 0;
+}
+
+void psp_ui_refresh_collections(
+    PspUiState *ui, const PspUiCollectionsView *collections, uint32_t armed_id)
+{
+    psp_ui_set_collections(ui, collections);
+    if (armed_id == 0 || ui == NULL
+        || !ui_offline_collection(ui->collections_section)
+        || ui->collections_selection >= ui_collections_row_count(ui))
+        return;
+    const PspUiCollectionsRow *row =
+        &collections->rows[ui->collections_selection];
+    if (row->deletable && row->offline_id == armed_id)
+        ui->collections_delete_confirmation = ui->collections_selection + 1u;
 }
 
 void psp_ui_show_collections(
@@ -7168,7 +7215,7 @@ static TILEFINCH_OUT_OF_LINE void draw_page_dialog(
     int left = box.x + 12, right = box.x + box.width - 12;
     int y = box.y + 7;
     draw_fitted_ui_text(pixels, width, height, stride, left, y,
-        tilefinch_ui_text("Page message"), right, muted, 1, false);
+        view->browser_draft ? "Tilefinch" : tilefinch_ui_text("Page message"), right, muted, 1, false);
     y += UI_PAGE_DIALOG_LINE;
     /* The host keeps its right end, where the registrable name is:
        "...pay.example.com", never "pay.example.com.attacker...". */
@@ -7181,7 +7228,7 @@ static TILEFINCH_OUT_OF_LINE void draw_page_dialog(
     y += 6;
 
     bool prompt = view->kind == PAGE_DIALOG_PROMPT;
-    int hints = view->offer_suppress ? 3 : 2;
+    int hints = view->browser_draft ? 1 : view->offer_suppress ? 3 : 2;
     int hint_top = box.y + box.height - 6 - hints * UI_PAGE_DIALOG_LINE;
     int message_bottom = hint_top - 4 - (prompt ? 24 : 0);
     const char *message = view->message != NULL ? view->message : "";
@@ -7233,11 +7280,13 @@ static TILEFINCH_OUT_OF_LINE void draw_page_dialog(
                 value_right, text, 1, NULL, false);
         }
     }
-    const char *primary = view->kind == PAGE_DIALOG_ALERT ? "X OK"
+    const char *primary = view->browser_draft ? "X Leave without saving   O Stay"
+        : view->kind == PAGE_DIALOG_ALERT ? "X OK"
         : prompt ? "X Edit   START OK   O Cancel" : "X OK   O Cancel";
     int hint_y = hint_top;
     draw_fitted_ui_text(pixels, width, height, stride, left, hint_y,
         tilefinch_ui_text(primary), right, muted, 1, false);
+    if (view->browser_draft) return;
     hint_y += UI_PAGE_DIALOG_LINE;
     draw_fitted_ui_text(pixels, width, height, stride, left, hint_y,
         tilefinch_ui_text("Triangle Leave page"), right, muted, 1, false);
@@ -10569,6 +10618,27 @@ static void draw_toast(const PspUiState *ui, uint16_t *pixels, int width,
     /* A menu's own feedback shows over it; a page toast raised before the
        menu opened waits until the page is back. */
     if (ui->screen != PSP_UI_SCREEN_PAGE && ui->toast_on_page) return;
+    if (ui->toast_kind == PSP_UI_TOAST_VIDEO_DETAILS) {
+        /* Every progress presentation shows the same selected row. Use a
+           fixed strip, not three text measurement passes and a blended
+           shadow per frame. The existing native Circle route cancels it. */
+        int scale = browser_ui_scale(ui), line = scale == 2 ? 22 : 16;
+        int bottom = height - (ui_bottom_bar_shown(ui) ? browser_bottom_height(ui) : 0);
+        int top = bottom - 3 * line - 8;
+        fill_rect(pixels, width, height, stride, (UiRect){0,top,width,bottom-top}, panel, 4);
+        fill_rect(pixels, width, height, stride, (UiRect){0,top,width,1}, accent, 4);
+        draw_page_text(pixels,width,height,stride,12,top+4,ui->video_details.title,
+                            48,width-12,text,scale,NULL,true);
+        draw_page_text(pixels,width,height,stride,12,top+4+line,ui->video_details.channel,
+                            24,width-12,PSP_THEME_TEXT_BODY,scale,NULL,false);
+        char controls[288];
+        const char *cancel = tilefinch_ui_text("O Cancel");
+        if (ui->cursor_visible) copy_string(controls, sizeof(controls), cancel);
+        else snprintf(controls, sizeof(controls), "%s    %s", tilefinch_ui_text("X PLAY"), cancel);
+        draw_text_with_font(pixels,width,height,stride,12,top+4+2*line,controls,
+                            64,width-12,PSP_THEME_TEXT_MUTED,scale,NULL,false);
+        return;
+    }
     if (ui->toast_kind == PSP_UI_TOAST_GLYPH_OFFER
         || ui->toast_kind == PSP_UI_TOAST_LANGUAGE_REPAIR) {
         if (ui->screen == PSP_UI_SCREEN_PAGE

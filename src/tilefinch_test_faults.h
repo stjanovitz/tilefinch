@@ -14,6 +14,14 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+typedef enum {
+    TILEFINCH_REPLACE_NO_PROCESS_CUT,
+    TILEFINCH_REPLACE_BEFORE_ROTATION,
+    TILEFINCH_REPLACE_AFTER_RETIRING_BACKUP,
+    TILEFINCH_REPLACE_AFTER_ROTATION,
+    TILEFINCH_REPLACE_AFTER_INSTALL,
+} TilefinchReplaceProcessCut;
+
 typedef struct {
     /* Host-only native audio allocation/publication refusal gates. */
     unsigned audio_slot_allocation_fail_at;
@@ -33,6 +41,9 @@ typedef struct {
     /* The most Budget bytes the WebAssembly interpreter has held at once.
        Reset by the test. */
     size_t wasm_runtime_bytes_peak;
+    /* Refuse this many upcoming takes of a completed inserted script's
+       response, as the page Budget refusing its FetchResult would. */
+    unsigned refuse_dynamic_script_takes;
     /* Refuse the next dedicated-worker realm creation once. */
     bool refuse_next_worker_realm;
     /* Backdate both halves of the Window performance origin by this many
@@ -96,6 +107,9 @@ typedef struct {
        decode spanning several owner pumps on the PSP is; counts them. */
     unsigned image_decode_collect_delay;
     unsigned image_decode_collect_delayed;
+    /* Refuse the worker decode's arena while set, as a Budget without room
+       for a large raster's working memory does. */
+    bool refuse_image_decode_arena;
     /* Hold the detached-image pump's sweep of dead slots while set, as
        when a node is released and its address reused before that pump. */
     bool defer_image_preload_sweep;
@@ -143,6 +157,7 @@ typedef struct {
     /* tilefinch_platform_replace_file: while set, rename refuses to
        replace an existing file, as FAT does. */
     bool replace_file_no_replace;
+    bool replace_file_rename_io_error;
     /* tilefinch_platform_replace_file, consumed once: fail the rename that
        installs the temporary file after the previous file moved aside (it
        is moved back; with or without a backup), or, with a backup, stop
@@ -150,6 +165,7 @@ typedef struct {
        would. */
     bool replace_file_fail_install;
     bool replace_file_crash_after_backup;
+    TilefinchReplaceProcessCut replace_file_process_cut;
     bool refuse_next_youtube_feed_build;
     bool expire_youtube_history;
     bool refuse_youtube_signin_recovery;

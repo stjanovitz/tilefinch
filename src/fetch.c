@@ -377,9 +377,18 @@ typedef struct {
     bool client_hint_header_rejected;
     bool redirect_callback_aborted;
     /* This redirect's body is read and discarded rather than aborted
-       (fetch_redirect_abort_unsafe), and how much of it has been read. */
+       (fetch_http2_abort_unsafe), and how much of it has been read. */
     bool redirect_drain;
     size_t redirect_drained_bytes;
+#if !defined(__PSP__)
+    /* Host libcurl older than 8.22 only (fetch_libcurl_breaks_http2_aborts):
+       this transfer rejects an HTTP error status itself, in place of
+       CURLOPT_FAILONERROR, and has rejected this response's; a callback's
+       abort waits for the progress callback (fetch_http2_abort_unsafe). */
+    bool fail_on_http_error;
+    bool http_error_rejected;
+    bool abort_deferred;
+#endif
     size_t response_cookie_start;
     bool has_response_location;
     bool redirect_response;

@@ -404,19 +404,17 @@ bool tilefinch_ui_translation_install(Budget *budget, const TilefinchInstallPath
     if (fd < 0) return false;
     FILE *file = fdopen(fd, "wb");
     if (!file) { close(fd); (void)remove(temp); return false; }
-    bool okay = fwrite(bytes, 1, length, file) == length && fflush(file) == 0;
+    bool okay = fwrite(bytes, 1, length, file) == length;
 #ifndef __PSP__
-    if (okay) okay = fsync(fileno(file)) == 0;
+    if (okay) okay = fflush(file) == 0 && fsync(fileno(file)) == 0;
 #endif
-    if (fclose(file) != 0) okay = false;
     /* PSP FAT rename refuses to replace an existing file, and a stale or
        damaged catalog of the same version keeps this exact name. */
-    if (okay) okay = tilefinch_platform_replace_file(temp, path, NULL);
+    okay = tilefinch_platform_finish_file(file, okay, temp, path, NULL);
     if (okay) translation_prune_older(paths, tilefinch_ui_language_spec(language));
     /* After the rename the verified file is already published, so the sync
        is only a durability hint (tilefinch_memory_stick_sync). */
     if (okay) (void)tilefinch_memory_stick_sync();
-    if (!okay) (void)remove(temp);
     return okay;
 }
 

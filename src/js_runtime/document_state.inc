@@ -74,6 +74,19 @@ size_t script_runtime_collect_and_trim(ScriptRuntime *runtime)
     return reclaimed;
 }
 
+size_t script_runtime_collect_idle(ScriptRuntime *runtime)
+{
+    if (runtime == NULL || runtime->budget == NULL
+        || !js_rt_gc_due(runtime)) return 0;
+    size_t before = budget_remaining(runtime->budget);
+    (void) script_runtime_collect_and_trim_phase(
+        runtime, SCRIPT_RUNTIME_COLLECT_FIRST_GC);
+    (void) script_runtime_collect_and_trim_phase(
+        runtime, SCRIPT_RUNTIME_COLLECT_TRIM);
+    size_t after = budget_remaining(runtime->budget);
+    return after > before ? after - before : 0;
+}
+
 size_t js_rt_prepare_network_response_delivery(ScriptRuntime *runtime,
                                                size_t response_bytes)
 {
@@ -594,6 +607,9 @@ size_t script_runtime_admission_reclaimable(const ScriptRuntime *runtime,
 {
     if (runtime == NULL || runtime->budget == NULL) return 0;
     size_t total = runtime->bridge.preloaded_script_bytes;
+    size_t parked = fetch_scheduler_parked_bytes(
+        runtime->bridge.fetch_scheduler);
+    total = total > SIZE_MAX - parked ? SIZE_MAX : total + parked;
     if (runtime->session != NULL
         && runtime->session->budget == runtime->budget) {
         size_t session = browser_session_admission_reclaimable_bytes(
@@ -617,6 +633,12 @@ size_t script_runtime_reclaim_for_admission(ScriptRuntime *runtime,
     size_t wanted = before > SIZE_MAX - needed ? SIZE_MAX : before + needed;
     (void) budget_make_room(runtime->budget, wanted);
     size_t free_bytes = budget_remaining(runtime->budget);
+    /* Image responses nobody has adopted yet: a later look fetches again. */
+    if (free_bytes < wanted) {
+        (void) fetch_scheduler_release_parked(runtime->bridge.fetch_scheduler,
+                                              true);
+        free_bytes = budget_remaining(runtime->budget);
+    }
     if (free_bytes < wanted) {
         script_runtime_release_script_bodies(runtime, wanted - free_bytes);
         free_bytes = budget_remaining(runtime->budget);
@@ -1080,11 +1102,62 @@ size_t script_runtime_heap_obtainable(const ScriptRuntime *runtime)
     return js_rt_heap_reachable_raw(runtime, 0, 0, false);
 }
 
-bool script_error_reports_out_of_memory(const char *error)
+/* The free page Budget the realm needs before it can obtain `wanted` more
+   heap (script_runtime_heap_obtainable): `wanted` itself while it fits
+   under the current limit, and past that the growth reserve as well, which
+   growth leaves after backing the whole request. SIZE_MAX when no Budget
+   gives it: the limit cannot grow that far, or the page Budget is smaller. */
+static size_t js_rt_heap_budget_needed(const ScriptRuntime *runtime,
+                                       size_t wanted)
 {
-    return error != NULL
-        && (strstr(error, "out of memory") != NULL
-            || strcmp(error, "null") == 0);
+    size_t room = script_runtime_heap_remaining(runtime);
+    size_t needed = wanted;
+    if (wanted > room) {
+        size_t limit = script_runtime_current_limit(runtime);
+        if (!runtime->heap_growth_enabled
+            || limit >= runtime->heap_growth_ceiling
+            || wanted - room > runtime->heap_growth_ceiling - limit
+            || runtime->heap_growth_reserve > SIZE_MAX - wanted)
+            return SIZE_MAX;
+        needed += runtime->heap_growth_reserve;
+    }
+    return needed <= runtime->budget->limit ? needed : SIZE_MAX;
+}
+
+size_t js_rt_reclaim_cached_responses_for_heap(ScriptRuntime *runtime,
+                                               size_t wanted)
+{
+    if (runtime == NULL || runtime->budget == NULL
+        || runtime->session == NULL
+        || runtime->session->budget != runtime->budget) return 0;
+    size_t needed = js_rt_heap_budget_needed(runtime, wanted);
+    size_t free_bytes = budget_remaining(runtime->budget);
+    if (needed == SIZE_MAX || needed <= free_bytes) return 0;
+    /* Evicting what others still hold frees nothing: when all of it could
+       not cover the shortfall, the cache stays. */
+    if (browser_session_cache_reclaimable_bytes(runtime->session)
+        < needed - free_bytes) return 0;
+    return browser_session_cache_reclaim(runtime->session,
+                                         needed - free_bytes);
+}
+
+void script_runtime_reclaim_heap_headroom(ScriptRuntime *runtime,
+                                          size_t wanted)
+{
+    if (runtime == NULL || runtime->budget == NULL) return;
+    size_t free_needed = js_rt_heap_budget_needed(runtime, wanted);
+    if (free_needed == SIZE_MAX) return;
+    size_t free_bytes = budget_remaining(runtime->budget);
+    if (free_needed > free_bytes)
+        (void) script_runtime_reclaim_for_admission(
+            runtime, free_needed - free_bytes, true);
+    /* Then the session's other cached responses (stylesheets, images,
+       data, script bodies with bytecode attached): optional, and the
+       alternative here is stopping the realm. The failed task's own memory
+       is gone by now: its body went with its task, or above with the
+       cache's sole-owned script bodies, and its garbage with the
+       collection before this. */
+    (void) js_rt_reclaim_cached_responses_for_heap(runtime, wanted);
 }
 
 size_t script_runtime_heap_admission_available(const ScriptRuntime *runtime)
@@ -1193,7 +1266,13 @@ size_t script_runtime_allocation_refusals(const ScriptRuntime *runtime)
     size_t limit = script_runtime_heap_rejections(runtime);
     size_t budget = budget_quickjs_pool_budget_refusal_count(
         runtime->quickjs_pool);
+    js_rt_saturating_add_size(&budget, runtime->delivery_refusals);
     return limit > SIZE_MAX - budget ? SIZE_MAX : limit + budget;
+}
+
+void js_rt_note_delivery_refusal(ScriptRuntime *runtime)
+{
+    js_rt_saturating_add_size(&runtime->delivery_refusals, 1);
 }
 
 void script_runtime_last_allocation_refusal(const ScriptRuntime *runtime,

@@ -16,11 +16,16 @@
 #include "tilefinch/user_agent.h"
 #define OFFLINE_DOWNLOAD_USER_AGENT TILEFINCH_BROWSER_USER_AGENT
 
-static uint64_t offline_file_size(const char *path)
+/* An absent stream has no bytes; an unreadable one is not evidence that
+   its bytes can be discarded or that a new stream can be opened there. */
+static bool offline_file_size(const char *path, uint64_t *size)
 {
     struct stat status;
-    return path != NULL && stat(path, &status) == 0 && status.st_size >= 0
-        ? (uint64_t) status.st_size : 0;
+    *size = 0;
+    if (stat(path, &status) != 0) return errno == ENOENT;
+    if (!S_ISREG(status.st_mode) || status.st_size < 0) return false;
+    *size = (uint64_t) status.st_size;
+    return true;
 }
 
 static size_t download_query_field(const TilefinchUrl *url, const char *name,
@@ -81,7 +86,8 @@ static bool download_identity_write(const char *path,
 typedef enum {
     DOWNLOAD_RECEIPT_MATCH,
     DOWNLOAD_RECEIPT_ABSENT,
-    DOWNLOAD_RECEIPT_OTHER /* another identity, damaged or unreadable */
+    DOWNLOAD_RECEIPT_OTHER, /* another identity or damaged */
+    DOWNLOAD_RECEIPT_UNAVAILABLE
 } DownloadReceipt;
 
 static DownloadReceipt download_identity_read(const char *path,
@@ -90,13 +96,14 @@ static DownloadReceipt download_identity_read(const char *path,
     FILE *file = fopen(path, "rb");
     if (file == NULL)
         return errno == ENOENT ? DOWNLOAD_RECEIPT_ABSENT
-                               : DOWNLOAD_RECEIPT_OTHER;
+                               : DOWNLOAD_RECEIPT_UNAVAILABLE;
     uint8_t recorded[TILEFINCH_SHA256_DIGEST_BYTES];
     bool ok = fread(recorded, 1, sizeof(recorded), file) == sizeof(recorded)
-        && fgetc(file) == EOF && !ferror(file)
+        && fgetc(file) == EOF
         && !memcmp(recorded, identity, sizeof(recorded));
-    return fclose(file) == 0 && ok ? DOWNLOAD_RECEIPT_MATCH
-                                   : DOWNLOAD_RECEIPT_OTHER;
+    bool read_error = ferror(file) != 0;
+    if (fclose(file) != 0 || read_error) return DOWNLOAD_RECEIPT_UNAVAILABLE;
+    return ok ? DOWNLOAD_RECEIPT_MATCH : DOWNLOAD_RECEIPT_OTHER;
 }
 
 static bool download_remove_stale(const char *path)
@@ -256,13 +263,38 @@ void offline_download_manager_set_cancel(
     manager->cancel_opaque = opaque;
 }
 
-static void download_close_output(OfflineDownloadManager *manager)
+static const char download_finalize_error[] =
+    "download file could not be finalized";
+
+static void download_invalidate_output(OfflineDownloadManager *manager)
 {
-    if (manager != NULL && manager->output != NULL) {
-        (void) fflush(manager->output);
-        (void) fclose(manager->output);
-        manager->output = NULL;
+    const bool audio = manager->phase == OFFLINE_DOWNLOAD_AUDIO;
+    char path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
+    OfflineLibraryItem *item =
+        offline_library_find_mutable(manager->library, manager->active_id);
+    if (offline_library_item_path(manager->library, manager->active_id,
+                audio ? ".audio.part" : ".video.part", path, sizeof(path))
+        && download_remove_stale(path)) {
+        if (item != NULL)
+            item->downloaded_bytes = audio ? item->content_bytes : 0;
+    } else if (item != NULL) {
+        /* Do not trust a full-sized part on resume after a write failure,
+           even if the filesystem refused to remove it. */
+        item->content_bytes = 0;
+        item->downloaded_bytes = 0;
     }
+}
+
+static bool download_close_output(OfflineDownloadManager *manager)
+{
+    if (manager->output == NULL) return true;
+    bool flushed = fflush(manager->output) == 0
+        && !ferror(manager->output);
+    bool closed = fclose(manager->output) == 0;
+    manager->output = NULL;
+    if (flushed && closed) return true;
+    download_invalidate_output(manager);
+    return false;
 }
 
 static void download_cancel_request(OfflineDownloadManager *manager)
@@ -303,7 +335,9 @@ static void download_reset_active(OfflineDownloadManager *manager)
     if (manager == NULL) return;
     download_release_resolve(manager);
     download_cancel_request(manager);
-    download_close_output(manager);
+    if (!download_close_output(manager))
+        download_set_state(manager, OFFLINE_ITEM_PAUSED,
+                           download_finalize_error);
     if (manager->completion != NULL) {
         fetch_result_destroy(manager->completion);
         budget_free(manager->budget, manager->completion);
@@ -419,10 +453,14 @@ static bool download_begin_part(
     if (!offline_library_item_path(
             manager->library, manager->active_id, part_suffix,
             path, sizeof(path))) return false;
-    uint64_t offset = offline_file_size(path);
-    /* Longer than the stream cannot be its prefix: "wb" starts it again. */
-    if (offset > total) offset = 0;
-    manager->output = fopen(path, offset == 0 ? "wb" : "ab");
+    uint64_t offset;
+    if (!offline_file_size(path, &offset)) return false;
+    /* A confirmed oversized file cannot be a prefix of this stream. */
+    if (offset > total) {
+        if (!download_remove_stale(path)) return false;
+        offset = 0;
+    }
+    manager->output = fopen(path, "ab");
     if (manager->output == NULL) return false;
     manager->part_offset = offset;
     manager->part_total = total;
@@ -442,10 +480,16 @@ static bool download_finish_resolve(
             && (manager->stream.audio_content_length == 0
                 || manager->stream.audio_content_length
                        > OFFLINE_DOWNLOAD_STREAM_LIMIT))) {
-        download_set_state(
-            manager, OFFLINE_ITEM_FAILED,
-            error == NULL || error[0] == '\0'
-                ? "video exceeds the offline size bound" : error);
+        /* Resolver diagnostics may embed a credential-bearing request URL.
+           Only fixed messages may reach the library and its UI. */
+        bool cancelled = error != NULL
+            && (strcmp(error, "YouTube resolution cancelled") == 0
+                || strcmp(error, "player: resolution cancelled") == 0
+                || strcmp(error, "watch: resolution cancelled") == 0);
+        download_set_state(manager, OFFLINE_ITEM_FAILED,
+            cancelled ? "YouTube resolution cancelled"
+                : !resolved ? "YouTube video could not be resolved"
+                            : "video exceeds the offline size bound");
         download_reset_active(manager);
         return false;
     }
@@ -558,26 +602,32 @@ bool offline_download_manager_adopt_resolved(
         }
         required += stream->audio_content_length;
     }
-    char video_part[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u] = {0};
-    char audio_part[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u] = {0};
-    uint64_t existing_video = offline_library_item_path(
+    char video_part[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
+    char audio_part[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
+    char video_final[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
+    char audio_final[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
+    uint64_t existing_video, existing_audio, final_video, final_audio;
+    if (!offline_library_item_path(
             manager->library, manager->active_id, ".video.part",
             video_part, sizeof(video_part))
-        ? offline_file_size(video_part) : 0;
-    uint64_t existing_audio = offline_library_item_path(
+        || !offline_file_size(video_part, &existing_video)
+        || !offline_library_item_path(
             manager->library, manager->active_id, ".audio.part",
             audio_part, sizeof(audio_part))
-        ? offline_file_size(audio_part) : 0;
-    char video_final[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u] = {0};
-    char audio_final[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u] = {0};
-    uint64_t final_video = offline_library_item_path(
+        || !offline_file_size(audio_part, &existing_audio)
+        || !offline_library_item_path(
             manager->library, manager->active_id, ".video.mp4",
             video_final, sizeof(video_final))
-        ? offline_file_size(video_final) : 0;
-    uint64_t final_audio = offline_library_item_path(
+        || !offline_file_size(video_final, &final_video)
+        || !offline_library_item_path(
             manager->library, manager->active_id, ".audio.mp4",
             audio_final, sizeof(audio_final))
-        ? offline_file_size(audio_final) : 0;
+        || !offline_file_size(audio_final, &final_audio)) {
+        download_set_state(manager, OFFLINE_ITEM_PAUSED,
+                           "download files could not be checked");
+        download_reset_active(manager);
+        return false;
+    }
     char identity_path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
     TilefinchSha256 hash;
     uint8_t identity[TILEFINCH_SHA256_DIGEST_BYTES];
@@ -589,7 +639,13 @@ bool offline_download_manager_adopt_resolved(
                                      ".video.identity", identity_path, sizeof(identity_path));
     DownloadReceipt receipt = identity_path_ok
         ? download_identity_read(identity_path, identity)
-        : DOWNLOAD_RECEIPT_OTHER;
+        : DOWNLOAD_RECEIPT_UNAVAILABLE;
+    if (receipt == DOWNLOAD_RECEIPT_UNAVAILABLE) {
+        download_set_state(manager, OFFLINE_ITEM_PAUSED,
+                           "download metadata could not be read");
+        download_reset_active(manager);
+        return false;
+    }
     bool index_matches = item->content_bytes == stream->content_length
         && item->audio_bytes == stream->audio_content_length
         && item->itag == stream->itag && item->audio_itag == stream->audio_itag
@@ -607,7 +663,7 @@ bool offline_download_manager_adopt_resolved(
         || (final_audio != 0
             && final_audio != stream->audio_content_length)) {
         /* Never publish the new identity until all old bytes are gone. */
-        if (!identity_path_ok || !download_remove_stale(video_part)
+        if (!download_remove_stale(video_part)
             || !download_remove_stale(audio_part)
             || !download_remove_stale(video_final)
             || !download_remove_stale(audio_final)
@@ -764,7 +820,12 @@ static bool download_publish_part(
 
 static bool download_advance_part(OfflineDownloadManager *manager)
 {
-    download_close_output(manager);
+    if (manager->output == NULL || !download_close_output(manager)) {
+        download_set_state(manager, OFFLINE_ITEM_PAUSED,
+                           download_finalize_error);
+        download_reset_active(manager);
+        return false;
+    }
     if (manager->phase == OFFLINE_DOWNLOAD_VIDEO) {
         if (!download_publish_part(
                 manager, ".video.part", ".video.mp4")) {
@@ -845,15 +906,21 @@ bool offline_download_manager_pump(OfflineDownloadManager *manager)
     manager->request_id = 0;
     bool exact = success && manager->headers_valid
         && manager->request_written == manager->request_length
-        && metrics.bytes_received == manager->request_length
-        && fflush(manager->output) == 0;
+        && metrics.bytes_received == manager->request_length;
+    if (exact && fflush(manager->output) != 0) {
+        snprintf(manager->error, sizeof(manager->error),
+                 "Memory Stick write failed");
+        exact = false;
+    }
     if (!exact) {
-        snprintf(manager->error, sizeof(manager->error), "%s",
-                 result->error[0] == '\0'
-                     ? "download chunk was incomplete" : result->error);
         fetch_result_destroy(result);
         result->budget = manager->budget;
-        download_set_state(manager, OFFLINE_ITEM_PAUSED, manager->error);
+        /* Do not store transport diagnostics, which may quote the signed
+           media URL (including the query) in the library and UI. */
+        download_set_state(manager, OFFLINE_ITEM_PAUSED,
+                           manager->error[0] == '\0'
+                               ? "download chunk was incomplete"
+                               : manager->error);
         download_reset_active(manager);
         return false;
     }
@@ -896,16 +963,14 @@ bool offline_download_manager_pause(
     if (item == NULL || item->type != OFFLINE_ITEM_YOUTUBE
         || item->state == OFFLINE_ITEM_READY) return false;
     if (manager->active_id == id) {
-        download_release_resolve(manager);
         download_cancel_request(manager);
-        download_close_output(manager);
-        if (manager->completion != NULL) {
-            fetch_result_destroy(manager->completion);
-            budget_free(manager->budget, manager->completion);
-            manager->completion = NULL;
+        if (!download_close_output(manager)) {
+            snprintf(manager->error, sizeof(manager->error), "%s",
+                     download_finalize_error);
+            snprintf(item->failure_reason, sizeof(item->failure_reason),
+                     "%s", download_finalize_error);
         }
-        manager->phase = OFFLINE_DOWNLOAD_IDLE;
-        manager->active_id = 0;
+        download_reset_active(manager);
     }
     item->state = OFFLINE_ITEM_PAUSED;
     return offline_library_save(manager->library);

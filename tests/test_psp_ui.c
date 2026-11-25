@@ -6397,8 +6397,41 @@ static bool test_collections_sections_and_deletes(void)
     (void) psp_ui_update(&ui, &input);
     CHECK(ui.screen == PSP_UI_SCREEN_PAGE);
 
+    /* The builder replaces the same view in place on each download tick. */
+    psp_ui_show_collections(&ui, PSP_UI_COLLECTION_DOWNLOADS);
+    view.section = PSP_UI_COLLECTION_DOWNLOADS;
+    view.rows[0].offline_id = 10;
+    psp_ui_set_collections(&ui, &view);
+    input.pressed = PSP_UI_BUTTON_RELOAD;
+    CHECK(psp_ui_update(&ui, &input).action == PSP_UI_ACTION_NONE);
+    uint32_t armed_id = psp_ui_collections_armed_offline_id(&ui);
+    CHECK(armed_id == 10);
+    view.rows[0].progress_per_mille = 500;
+    view.rows[0].detail = "New download status";
+    psp_ui_refresh_collections(&ui, &view, armed_id);
+    CHECK(psp_ui_update(&ui, &input).action == PSP_UI_ACTION_COLLECTION_DELETE);
+    CHECK(psp_ui_update(&ui, &input).action == PSP_UI_ACTION_NONE);
+    armed_id = psp_ui_collections_armed_offline_id(&ui);
+    view.rows[0].offline_id = 11;
+    psp_ui_refresh_collections(&ui, &view, armed_id);
+    CHECK(psp_ui_update(&ui, &input).action == PSP_UI_ACTION_NONE
+          && psp_ui_collections_armed_offline_id(&ui) == 11);
+
+    /* History has no stable item ID; rebuilding discards its confirmation
+       without reading a row pointer from the previous profile snapshot. */
+    psp_ui_show_collections(&ui, PSP_UI_COLLECTION_HISTORY);
+    view.section = PSP_UI_COLLECTION_HISTORY;
+    psp_ui_set_collections(&ui, &view);
+    CHECK(psp_ui_update(&ui, &input).action == PSP_UI_ACTION_NONE);
+    armed_id = psp_ui_collections_armed_offline_id(&ui);
+    CHECK(armed_id == 0);
+    view.rows[0].detail = "https://example.test/replacement";
+    psp_ui_refresh_collections(&ui, &view, armed_id);
+    CHECK(psp_ui_update(&ui, &input).action == PSP_UI_ACTION_NONE);
+
     /* A row that cannot be deleted says so rather than arming a confirm. */
     psp_ui_show_collections(&ui, PSP_UI_COLLECTION_OFFLINE);
+    view.section = PSP_UI_COLLECTION_OFFLINE;
     psp_ui_set_collections(&ui, &view);
     ui.collections_selection = 5;
     input.pressed = PSP_UI_BUTTON_RELOAD;
@@ -7704,6 +7737,8 @@ static bool test_preview_hint_toast(void)
    preview on screen, leaves other toasts alone, and ends with the load. */
 static bool test_loading_status_follows_phase(void)
 {
+    enum { W = 480, H = 272 };
+    static uint16_t original[W * H], changed[W * H];
     PspUiState ui;
     psp_ui_init(&ui);
     PspUiInput idle = { .analog_x = 128, .analog_y = 128, .elapsed_ms = 16 };
@@ -7713,6 +7748,34 @@ static bool test_loading_status_follows_phase(void)
     for (unsigned phase = 0; phase < 4u; phase++)
         CHECK(strcmp(psp_ui_loading_status_text(phase), texts[phase]) == 0);
     CHECK(strcmp(psp_ui_loading_status_text(9u), texts[3]) == 0);
+    psp_ui_set_page(&ui, "Results", "https://www.youtube.com/results", true);
+    psp_ui_set_loading(&ui, true, -1);
+    /* Prove each selected label is actually painted, on its own line, at
+       the first presentation (before any loading or animation ticks). */
+    psp_ui_show_video_details(&ui, "A", "A");
+    memset(original, 0, sizeof(original));
+    psp_ui_composite(&ui, original, W, H, W);
+    unsigned end_of_title = 0;
+    for (unsigned label = 0; label < 2u; label++) {
+        psp_ui_show_video_details(&ui, label ? "A" : "W", label ? "W" : "A");
+        memset(changed, 0, sizeof(changed));
+        psp_ui_composite(&ui, changed, W, H, W);
+        unsigned first = H, last = 0;
+        for (unsigned y = 0; y < H; y++) {
+            if (memcmp(original + y * W, changed + y * W, W * sizeof(*changed))) {
+                if (first == H) first = y;
+                last = y;
+            }
+        }
+        CHECK(first < H && (label == 0u || first > end_of_title));
+        end_of_title = last;
+    }
+    psp_ui_show_video_details(&ui,"O Cancel","Fixture channel");
+    psp_ui_follow_loading_phase(&ui,1u,true);
+    CHECK(ui.toast_kind == PSP_UI_TOAST_VIDEO_DETAILS && !strcmp(ui.status,"Video")
+        && !strcmp(ui.video_details.title,"O Cancel") && !strcmp(ui.video_details.channel,"Fixture channel"));
+    psp_ui_set_loading(&ui,false,0);
+    CHECK(!ui.toast_frames && !ui.video_details.title[0] && !ui.video_details.channel[0]);
     psp_ui_set_loading(&ui, true, -1);
     psp_ui_show_loading_status(&ui, 0u, 120);
     CHECK(strcmp(ui.status, texts[0]) == 0 && ui.toast_entry_frames != 0);

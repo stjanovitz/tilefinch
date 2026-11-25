@@ -1,0 +1,96 @@
+diff --git a/quickjs.c b/quickjs.c
+index 88d6fad7c..9a9bf5b92 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1482,7 +1482,7 @@ struct JSObject {
+ /* Every page object pays for a field added here. */
+ _Static_assert(sizeof(JSObject) <= (sizeof(void *) == 4 ? 40 : 64),
+                "JSObject grew");
+-/* A weak reference count that reaches this stays there: the object's
+-   structure is then kept for the runtime's lifetime. */
++/* Refuse another weak reference at this limit, without losing track
++   of the references that still have to be released. */
+ #define JS_WEAKREF_COUNT_MAX ((1u << 14) - 1)
+ #define JS_PLATFORM_INTERFACE_LIMIT ((1u << 10) - 1)
+@@ -63341,8 +63341,6 @@ static void js_weakref_free(JSRuntime *rt, JSValue val)
+     if (JS_VALUE_GET_TAG(val) == JS_TAG_OBJECT) {
+         JSObject *p = JS_VALUE_GET_OBJ(val);
+         assert(p->weakref_count >= 1);
+-        if (p->weakref_count == JS_WEAKREF_COUNT_MAX)
+-            return; /* saturated: the structure stays */
+         p->weakref_count--;
+         /* 'mark' is tested to avoid freeing the object structure when
+            it is about to be freed in a cycle or in
+@@ -63368,10 +63366,9 @@ static JSValue js_weakref_new(JSContext *ctx, JSValueConst val)
+ {
+     if (JS_VALUE_GET_TAG(val) == JS_TAG_OBJECT) {
+         JSObject *p = JS_VALUE_GET_OBJ(val);
+-        /* a 14-bit field: it shares its word with the Web IDL fields and
+-           the snapshot's flags, and saturates (js_weakref_free) */
+-        if (p->weakref_count < JS_WEAKREF_COUNT_MAX)
+-            p->weakref_count++;
++        if (p->weakref_count == JS_WEAKREF_COUNT_MAX)
++            return JS_ThrowRangeError(ctx, "too many weak references to object");
++        p->weakref_count++;
+     } else if (JS_VALUE_GET_TAG(val) == JS_TAG_SYMBOL) {
+         JSString *p = JS_VALUE_GET_STRING(val);
+         /* XXX: could return an exception if too many references */
+@@ -63658,6 +63655,10 @@ static JSMapRecord *map_add_record(JSContext *ctx, JSMapState *s,
+     mr->empty = FALSE;
+     if (s->is_weak) {
+         mr->key = js_weakref_new(ctx, key);
++        if (JS_IsException(mr->key)) {
++            js_free(ctx, mr);
++            return NULL;
++        }
+     } else {
+         mr->key = JS_DupValue(ctx, key);
+     }
+@@ -72913,6 +72914,11 @@ static JSValue js_weakref_constructor(JSContext *ctx, JSValueConst new_target,
+         return JS_EXCEPTION;
+     }
+     wrd->target = js_weakref_new(ctx, arg);
++    if (JS_IsException(wrd->target)) {
++        js_free(ctx, wrd);
++        JS_FreeValue(ctx, obj);
++        return JS_EXCEPTION;
++    }
+     wrd->weakref_header.weakref_type = JS_WEAKREF_TYPE_WEAKREF;
+     list_add_tail(&wrd->weakref_header.link, &ctx->rt->weakref_list);
+     JS_SetOpaque(obj, wrd);
+@@ -73138,8 +73144,17 @@ static JSValue js_finrec_register(JSContext *ctx, JSValueConst this_val,
+     if (!fre)
+         return JS_EXCEPTION;
+     fre->target = js_weakref_new(ctx, target);
+-    fre->held_val = JS_DupValue(ctx, held_val);
++    if (JS_IsException(fre->target)) {
++        js_free(ctx, fre);
++        return JS_EXCEPTION;
++    }
+     fre->token = js_weakref_new(ctx, token);
++    if (JS_IsException(fre->token)) {
++        js_weakref_free(ctx->rt, fre->target);
++        js_free(ctx, fre);
++        return JS_EXCEPTION;
++    }
++    fre->held_val = JS_DupValue(ctx, held_val);
+     list_add_tail(&fre->link, &frd->entries);
+     return JS_UNDEFINED;
+ }
+diff --git a/quickjs.h b/quickjs.h
+index 8fe0f57d0..e692a17b2 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1166,8 +1166,10 @@ const char *JS_ExecutionCensusName(unsigned zone);
+ /* True while any JavaScript or native-function frame is active (Tilefinch). */
+ int JS_IsStackActive(JSRuntime *rt);
+ /* A weak reference to an object without a WeakRef object (Tilefinch DOM
+-   handle table): JS_WeakTargetDeref gives the target (a new reference) or
+-   undefined once it died; free each with JS_FreeWeakTarget. */
++   handle table): JS_NewWeakTarget returns JS_EXCEPTION if the object
++   cannot take another weak reference, or JS_UNDEFINED for a non-object.
++   JS_WeakTargetDeref gives the target (a new reference) or undefined
++   once it died; free each acquired weak reference with JS_FreeWeakTarget. */
+ JSValue JS_NewWeakTarget(JSContext *ctx, JSValueConst obj);
+ JSValue JS_WeakTargetDeref(JSContext *ctx, JSValueConst target);
+ void JS_FreeWeakTarget(JSRuntime *rt, JSValue target);

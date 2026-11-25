@@ -50,6 +50,17 @@ int main(int argc, char **argv)
         RUN_TEST(test_child_realm_caught_refusal_keeps_realm);
         return 0;
     }
+    if (argc == 2 && strcmp(argv[1], "--memory-rule-only") == 0) {
+        RUN_TEST(test_memory_rule_hoard_stops_on_every_surface);
+        RUN_TEST(test_memory_rule_oversized_request_kept_on_every_surface);
+        RUN_TEST(test_memory_rule_transient_peak_kept);
+        RUN_TEST(test_memory_rule_padding_invariant);
+        RUN_TEST(test_memory_rule_budget_refusal_as_heap_refusal);
+        RUN_TEST(test_memory_rule_third_low_keep_stops);
+        RUN_TEST(test_memory_rule_hard_ceiling_does_not_reclaim);
+        RUN_TEST(test_caught_memory_stop_restores_torn_down_server_page);
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--preload-reuse-only") == 0) {
         RUN_TEST(test_dynamic_script_consumes_preload);
         RUN_TEST(test_preload_map_releases_under_pressure);
@@ -59,6 +70,10 @@ int main(int argc, char **argv)
     }
     if (argc == 2 && strcmp(argv[1], "--frame-local-replacement-only") == 0) {
         RUN_TEST(test_remote_frame_local_replacement);
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--challenge-collect-only") == 0) {
+        RUN_TEST(test_challenge_frame_collects_idle_parent);
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "--cache-safety-only") == 0) {
@@ -80,6 +95,11 @@ int main(int argc, char **argv)
             && test_head_reuse_take_survives_budget_refusal()
             && test_late_user_css_reaches_committed_sheet()
             ? 0 : 1;
+    if (argc == 2 && strcmp(argv[1], "--many-stylesheets-only") == 0)
+        return test_many_body_styles_continue_the_blocking_sheet()
+            && test_stylesheet_overflow_keeps_the_ready_sheet()
+            && test_long_stylesheet_suffix_keeps_the_cascade()
+            && test_parser_progress_moves_after_delivery() ? 0 : 1;
     if (argc == 2 && strcmp(argv[1], "--sliced-stylesheet-only") == 0)
         return test_parser_blocking_stylesheet_prepared_in_slices()
             && test_sliced_stylesheet_keeps_document_order() ? 0 : 1;
@@ -87,6 +107,40 @@ int main(int argc, char **argv)
         RUN_TEST(test_stale_frame_snapshot_activation);
         RUN_TEST(test_stale_frame_snapshot_pointer);
         RUN_TEST(test_stale_frame_snapshot_refused_rebuild);
+        return 0;
+    }
+    if (argc >= 2 && strcmp(argv[1], "--stream-growth-only") == 0) {
+        /* An optional second argument picks cases by name (comma
+           separated). */
+        const char *only = argc >= 3 ? argv[2] : "";
+        if (stream_growth_selected(only, "siblings"))
+            RUN_TEST(test_streaming_preview_restyles_trailing_siblings);
+        if (stream_growth_selected(only, "keyed-siblings"))
+            RUN_TEST(test_streaming_preview_restyles_keyed_trailing_siblings);
+        if (stream_growth_selected(only, "has"))
+            RUN_TEST(test_streaming_preview_restyles_has_answers);
+        if (stream_growth_selected(only, "sheet"))
+            RUN_TEST(test_streaming_preview_follows_arriving_stylesheet);
+        if (stream_growth_selected(only, "foster"))
+            RUN_TEST(test_streaming_preview_follows_fostered_content);
+        if (stream_growth_selected(only, "foster-text"))
+            RUN_TEST(test_streaming_preview_measures_fostered_text);
+        if (stream_growth_selected(only, "after-body"))
+            RUN_TEST(test_streaming_preview_follows_content_after_body);
+        if (stream_growth_selected(only, "empty"))
+            RUN_TEST(test_streaming_preview_restyles_empty_parent);
+        if (stream_growth_selected(only, "text"))
+            RUN_TEST(test_streaming_preview_measures_growing_text);
+        if (stream_growth_selected(only, "body-attr"))
+            RUN_TEST(test_streaming_preview_follows_merged_body_attributes);
+        if (stream_growth_selected(only, "deep"))
+            RUN_TEST(test_streaming_preview_restyles_past_depth_bound);
+        if (stream_growth_selected(only, "adoption"))
+            RUN_TEST(test_streaming_preview_follows_adoption_agency);
+        if (stream_growth_selected(only, "children"))
+            RUN_TEST(test_streaming_preview_measures_appended_children);
+        if (stream_growth_selected(only, "foster-after"))
+            RUN_TEST(test_streaming_preview_follows_content_fostered_after);
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "--parser-frees-only") == 0) {
@@ -180,10 +234,12 @@ int main(int argc, char **argv)
         RUN_TEST(test_static_svg_publication_refusal_is_clean);
         RUN_TEST(test_visible_lazy_pair_overlaps_transport_and_decode);
         RUN_TEST(test_visible_lazy_queue_continues_after_first_pair);
+        RUN_TEST(test_noscript_image_fallback_fills_empty_placeholders);
         puts("static image layout tests passed");
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "--image-retarget-only") == 0) {
+        RUN_TEST(test_svg_one_dimension_uses_viewbox_ratio);
         RUN_TEST(test_inline_svg_css_viewport_preserves_circle);
         RUN_TEST(test_inline_svg_font_relative_attributes_use_computed_size);
         RUN_TEST(test_nested_svg_viewports_preserve_atlas_geometry);
@@ -255,6 +311,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_retarget_generation_keeps_tiles_and_fixed_layer);
     RUN_TEST(test_inline_svg_css_viewport_preserves_circle);
     RUN_TEST(test_inline_svg_font_relative_attributes_use_computed_size);
+    RUN_TEST(test_svg_one_dimension_uses_viewbox_ratio);
     RUN_TEST(test_nested_svg_viewports_preserve_atlas_geometry);
     RUN_TEST(test_svg_local_clips_preserve_artwork);
     RUN_TEST(test_svg_solid_luminance_mask);
@@ -285,8 +342,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_optional_image_layout_refusal_retains_page);
     RUN_TEST(test_optional_initial_image_refusal_retains_page);
     RUN_TEST(test_initial_layout_pressure_uses_minimal_style);
-    RUN_TEST(test_null_exception_reads_as_out_of_memory);
     RUN_TEST(test_commit_stop_rule_needs_refusal_and_little_room);
+    RUN_TEST(test_commit_startup_memory_is_bounded);
     RUN_TEST(test_node_retirement_observer_relocates);
     RUN_TEST(test_runtime_navigation_releases_large_incumbent);
     RUN_TEST(test_mutation_layout_pressure_releases_invalid_incumbent);
@@ -298,6 +355,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_visible_lazy_pair_overlaps_transport_and_decode);
     RUN_TEST(test_deferred_jpeg_decode_publishes_on_later_pump);
     RUN_TEST(test_visible_lazy_queue_continues_after_first_pair);
+    RUN_TEST(test_noscript_image_fallback_fills_empty_placeholders);
     RUN_TEST(test_focused_deferred_image_follows_active_pair);
     RUN_TEST(test_deferred_image_focus_rotation_preserves_order);
     RUN_TEST(test_visible_lazy_pair_retries_only_failed_suffix);
@@ -305,6 +363,20 @@ int main(int argc, char **argv)
     RUN_TEST(test_web_fonts_begin_after_fallback_layout);
     RUN_TEST(test_streaming_preview_precedes_eof);
     RUN_TEST(test_streaming_preview_cache_follows_parser_frees);
+    RUN_TEST(test_streaming_preview_restyles_trailing_siblings);
+    RUN_TEST(test_streaming_preview_restyles_keyed_trailing_siblings);
+    RUN_TEST(test_streaming_preview_restyles_has_answers);
+    RUN_TEST(test_streaming_preview_follows_arriving_stylesheet);
+    RUN_TEST(test_streaming_preview_follows_fostered_content);
+    RUN_TEST(test_streaming_preview_measures_fostered_text);
+    RUN_TEST(test_streaming_preview_follows_content_after_body);
+    RUN_TEST(test_streaming_preview_restyles_empty_parent);
+    RUN_TEST(test_streaming_preview_measures_growing_text);
+    RUN_TEST(test_streaming_preview_follows_merged_body_attributes);
+    RUN_TEST(test_streaming_preview_restyles_past_depth_bound);
+    RUN_TEST(test_streaming_preview_follows_adoption_agency);
+    RUN_TEST(test_streaming_preview_measures_appended_children);
+    RUN_TEST(test_streaming_preview_follows_content_fostered_after);
     RUN_TEST(test_stale_frame_snapshot_activation);
     RUN_TEST(test_stale_frame_snapshot_pointer);
     RUN_TEST(test_stale_frame_snapshot_refused_rebuild);
@@ -335,6 +407,10 @@ int main(int argc, char **argv)
     RUN_TEST(test_streaming_sheet_survives_script_refusal);
     RUN_TEST(test_parser_blocking_stylesheet_prepared_in_slices);
     RUN_TEST(test_sliced_stylesheet_keeps_document_order);
+    RUN_TEST(test_many_body_styles_continue_the_blocking_sheet);
+    RUN_TEST(test_stylesheet_overflow_keeps_the_ready_sheet);
+    RUN_TEST(test_long_stylesheet_suffix_keeps_the_cascade);
+    RUN_TEST(test_parser_progress_moves_after_delivery);
     RUN_TEST(test_streaming_preview_cancel_is_transient);
     RUN_TEST(test_parser_blocking_script_classification);
     RUN_TEST(test_valid_meta_referrer_overrides_response_policy);
@@ -352,12 +428,14 @@ int main(int argc, char **argv)
     RUN_TEST(test_commit_phase_refusals_keep_incumbent);
     RUN_TEST(test_script_oom_retains_usable_target);
     RUN_TEST(test_late_script_oom_reveals_staged_page_shell);
-    RUN_TEST(test_caught_large_allocation_retires_staged_page_shell);
+    RUN_TEST(test_caught_large_allocation_keeps_staged_page_realm);
     RUN_TEST(test_caught_large_allocation_keeps_visible_runtime);
     RUN_TEST(test_caught_allocation_keeps_gradient_presentation);
     RUN_TEST(test_caught_allocation_keeps_bounded_reader_runtime);
     RUN_TEST(test_caught_large_allocation_does_not_reveal_raw_app_shell);
     RUN_TEST(test_memory_exhaustion_restores_torn_down_server_page);
+    RUN_TEST(test_caught_memory_stop_restores_torn_down_server_page);
+    RUN_TEST(test_memory_rule_hard_ceiling_does_not_reclaim);
     RUN_TEST(test_memory_refusal_keeps_intact_page_and_realm);
     RUN_TEST(test_late_script_oom_frees_queued_frame_messages);
     RUN_TEST(test_frame_window_setup_oom_commits_top_document);
@@ -365,11 +443,18 @@ int main(int argc, char **argv)
     RUN_TEST(test_frame_messaging_refusal_keeps_page_and_realm);
     RUN_TEST(test_frame_completion_window_state_oom_keeps_page);
     RUN_TEST(test_remote_frame_local_replacement);
+    RUN_TEST(test_challenge_frame_collects_idle_parent);
     RUN_TEST(test_frame_completion_oom_cleanup_cannot_erase_failure);
     RUN_TEST(test_frame_completion_author_error_keeps_realm);
     RUN_TEST(test_frame_load_event_oom_retires_realm);
     RUN_TEST(test_child_realm_oom_stops_only_child);
     RUN_TEST(test_child_realm_caught_refusal_keeps_realm);
+    RUN_TEST(test_memory_rule_hoard_stops_on_every_surface);
+    RUN_TEST(test_memory_rule_oversized_request_kept_on_every_surface);
+    RUN_TEST(test_memory_rule_transient_peak_kept);
+    RUN_TEST(test_memory_rule_padding_invariant);
+    RUN_TEST(test_memory_rule_budget_refusal_as_heap_refusal);
+    RUN_TEST(test_memory_rule_third_low_keep_stops);
     RUN_TEST(test_dynamic_script_consumes_preload);
     RUN_TEST(test_preload_map_releases_under_pressure);
     RUN_TEST(test_preload_map_releases_unused_after_load);
@@ -446,6 +531,10 @@ int main(int argc, char **argv)
     RUN_TEST(test_canvas_surface_count_is_bounded);
     RUN_TEST(test_canvas_draw_image_accepts_loaded_html_image);
     RUN_TEST(test_image_load_tasks_follow_publication);
+    RUN_TEST(test_load_layout_allowance_skips_unchanged_reads);
+    RUN_TEST(test_load_layout_browser_reads_do_not_build);
+    RUN_TEST(test_load_layout_first_build_is_estimated);
+    RUN_TEST(test_load_layout_estimate_indexes_the_rules);
     RUN_TEST(test_detached_canvas_publishes_when_inserted);
     RUN_TEST(test_navigation_keeps_server_dom_after_author_script_error);
     RUN_TEST(test_document_script_refresh_failure_stops_following_scripts);

@@ -10,6 +10,7 @@
  */
 
 #include "tilefinch/psp_display.h"
+#include "tilefinch/pixel_math.h"
 #include "tilefinch/psp_input_cadence.h"
 
 #include <stdint.h>
@@ -136,9 +137,9 @@ static bool fake_reset(void)
 
 static uint32_t expected_widen(uint16_t pixel)
 {
-    unsigned red = (unsigned) (pixel >> 11) & 31u;
+    unsigned red = tilefinch_rgb565_red_code(pixel);
     unsigned green = (unsigned) (pixel >> 5) & 63u;
-    unsigned blue = (unsigned) pixel & 31u;
+    unsigned blue = tilefinch_rgb565_blue_code(pixel);
     red = (red << 3) | (red >> 2);
     green = (green << 2) | (green >> 4);
     blue = (blue << 3) | (blue >> 2);
@@ -542,9 +543,25 @@ static bool test_video_entry_avoids_visible_page_buffer(void)
         unsigned char *bridge_end = bridge_start
             + PSP_DISPLAY_VIDEO_BUFFER_BYTES;
         CHECK(bridge_end <= page_start || page_end <= bridge_start);
+        /* Exhaust all 565 values, neighboring colors, repeated pairs and
+           padding. Even a first pair of zero must be opaque black. */
+        uint16_t *front = (uint16_t *)page_start;
+        for (size_t i = 0; i < PSP_DISPLAY_BUFFER_PIXELS; i++) {
+            uint16_t p = i < 2 ? 0 : i < 65538 ? (uint16_t)(i - 2)
+                : (i & 1u) ? 0x07e0 : 0xf81f;
+            front[i] = tilefinch_rgb565_pack_codes(p >> 11, (p >> 5) & 63, p & 31);
+        }
 
         CHECK(psp_display_video_begin(&display));
         CHECK(fake.last_address == bridge_start);
+        for (size_t i = 0; i < PSP_DISPLAY_BUFFER_PIXELS; i++) {
+            uint16_t p = i < 2 ? 0 : i < 65538 ? (uint16_t)(i - 2)
+                : (i & 1u) ? 0x07e0 : 0xf81f;
+            unsigned r = p >> 11, g = (p >> 5) & 63, b = p & 31;
+            uint32_t expected = UINT32_C(0xff000000) | (r * 8 + r / 4)
+                | ((g * 4 + g / 16) << 8) | ((b * 8 + b / 4) << 16);
+            CHECK(((uint32_t *)bridge_start)[i] == expected);
+        }
         CHECK(display.back_buffer == (expected_video ^ 1u));
         unsigned char *video_start = (unsigned char *)
             psp_display_video_back_buffer(&display);

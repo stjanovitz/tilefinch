@@ -225,9 +225,13 @@ static RenderTile *tile_slot(TileCache *cache, size_t index)
 {
     RenderTile *tile = cache->tiles[index];
     if (tile != NULL) return tile;
+    /* A held decode yields first, as it would have been freed already. */
     if (index >= RENDER_TILE_BASE_CAPACITY
         && budget_pressure_required(cache->budget, sizeof(*tile),
-                                    RENDER_TILE_OPTIONAL_RESERVE)) {
+                                    RENDER_TILE_OPTIONAL_RESERVE)
+        && (held_image_release(cache) == 0
+            || budget_pressure_required(cache->budget, sizeof(*tile),
+                                        RENDER_TILE_OPTIONAL_RESERVE))) {
         return NULL;
     }
     tile = budget_malloc(cache->budget, sizeof(*tile));
@@ -706,6 +710,8 @@ void tile_cache_destroy(TileCache *cache)
         overlay_index_release(cache);
         budget_free(cache->budget, cache->gradient_cache);
         glyph_cache_clear(cache, false);
+        cache->held_image.borrowed = false;
+        (void) held_image_release(cache);
         scaled_image_clear(cache);
         decoded_image_clear(cache);
         canvas_overlay_cache_clear(cache);
@@ -2136,6 +2142,28 @@ void tile_cache_cancel_frame_work(TileCache *cache)
     if (cache->frame_work.pending) cache->frame_jobs_cancelled++;
     memset(&cache->frame_work, 0, sizeof(cache->frame_work));
     cache->canvas_paint_pending = false;
+    (void) held_image_release(cache);
+}
+
+/* A held decode outlives a call only while a frame's bounded tile work is
+   still pending (the page's frame job, whose slices run back to back); a
+   pass anything else runs (paint-ahead, a frame already complete) frees it
+   before the caller's other work can see less free memory. */
+static void held_image_end_call(TileCache *cache)
+{
+    if (!cache->frame_work.pending) (void) held_image_release(cache);
+}
+
+void tile_cache_end_paint_pass(TileCache *cache)
+{
+    if (cache != NULL) (void) held_image_release(cache);
+}
+
+void tile_cache_hold_decodes(TileCache *cache, bool enabled)
+{
+    if (cache == NULL) return;
+    cache->hold_decodes = enabled;
+    if (!enabled) (void) held_image_release(cache);
 }
 
 bool tile_cache_frame_work_pending(const TileCache *cache)
@@ -2214,7 +2242,24 @@ RenderFrameWorkResult tile_cache_prepare_frame_bounded(
         budget_us, maximum_units, NULL);
 }
 
+static RenderFrameWorkResult frame_work_run(
+    TileCache *cache, int scroll_y, int viewport_width, int viewport_height,
+    uint64_t budget_us, size_t maximum_units,
+    const TilefinchCancellation *cancellation);
+
 RenderFrameWorkResult tile_cache_prepare_frame_bounded_cancelable(
+    TileCache *cache, int scroll_y, int viewport_width, int viewport_height,
+    uint64_t budget_us, size_t maximum_units,
+    const TilefinchCancellation *cancellation)
+{
+    RenderFrameWorkResult result = frame_work_run(
+        cache, scroll_y, viewport_width, viewport_height, budget_us,
+        maximum_units, cancellation);
+    if (cache != NULL) held_image_end_call(cache);
+    return result;
+}
+
+static RenderFrameWorkResult frame_work_run(
     TileCache *cache, int scroll_y, int viewport_width, int viewport_height,
     uint64_t budget_us, size_t maximum_units,
     const TilefinchCancellation *cancellation)
@@ -2621,6 +2666,9 @@ bool tile_cache_render_frame(TileCache *cache, int scroll_y,
         cache->frame_io_us += render_now_us() - write_started;
     }
     if (temporary_frame) budget_free(cache->budget, frame);
+    /* The frame's paint pass is over (a placeholder frame, drawn while
+       bounded slices still paint its tiles, is not the end of it). */
+    if (!cache->frame_work.pending) (void) held_image_release(cache);
     tilefinch_platform_render_shell_borrow_end();
     cache->frame_composing = false;
     (void) render_platform_cooperate(cache, "render-compose", 0u,
@@ -2715,10 +2763,10 @@ static bool prefetch_command_image(TileCache *cache,
     int pixel_width = 0, pixel_height = 0;
     unsigned char *temporary = NULL;
     bool grayscale = false;
-    (void) image_pixels_for_command(
+    const unsigned char *pixels = image_pixels_for_command(
         cache, command->image, command, &pixel_width, &pixel_height,
         &temporary, &grayscale);
-    image_resource_free_decoded(cache->budget, temporary);
+    image_command_done(cache, pixels, temporary);
     if (cache->decoded_image_builds + cache->scaled_image_builds
         > builds_before) {
         if (overflow) cache->overflow_images_prewarmed++;
@@ -2750,7 +2798,9 @@ static bool prefetch_overflow_image(
 
 void tile_cache_cancel_idle_work(TileCache *cache)
 {
-    if (cache == NULL || !cache->idle_work.pending) return;
+    if (cache == NULL) return;
+    held_image_end_call(cache);
+    if (!cache->idle_work.pending) return;
     cache->idle_jobs_cancelled++;
     memset(&cache->idle_work, 0, sizeof(cache->idle_work));
 }
@@ -3204,8 +3254,19 @@ static void tile_cache_run_idle_unit(TileCache *cache)
     }
 }
 
+static bool idle_work_run(TileCache *cache, uint64_t budget_us,
+                          size_t maximum_units);
+
 bool tile_cache_run_idle_work(TileCache *cache, uint64_t budget_us,
                               size_t maximum_units)
+{
+    bool pending = idle_work_run(cache, budget_us, maximum_units);
+    if (cache != NULL) held_image_end_call(cache);
+    return pending;
+}
+
+static bool idle_work_run(TileCache *cache, uint64_t budget_us,
+                          size_t maximum_units)
 {
     if (cache == NULL || !cache->idle_work.pending || budget_us == 0
         || maximum_units == 0) return false;
@@ -3287,12 +3348,12 @@ void tile_cache_prepare_startup_visuals(TileCache *cache, int first_world_y,
         if (!cache->idle_work.pending) break;
         cache->idle_work.startup = true;
         cache->idle_work.allow_large_images = true;
-        (void) tile_cache_run_idle_work(
-            cache, total_budget_us - elapsed, 32);
+        (void) idle_work_run(cache, total_budget_us - elapsed, 32);
         if (cache->idle_work.pending) break;
         if (world_y > INT_MAX - css_step) break;
         world_y += css_step;
     }
+    held_image_end_call(cache);
     if (cache->idle_work.pending) {
         /*
          * The startup allowance is only a policy for the synchronous
@@ -3309,10 +3370,9 @@ void tile_cache_prepare_startup_visuals(TileCache *cache, int first_world_y,
 void tile_cache_prefetch_row(TileCache *cache, int world_y, int viewport_width)
 {
     tile_cache_schedule_prefetch_row(cache, world_y, viewport_width);
-    while (tile_cache_idle_work_pending(cache)) {
-        (void) tile_cache_run_idle_work(
-            cache, UINT64_MAX / 2u, 2048);
-    }
+    while (tile_cache_idle_work_pending(cache))
+        (void) idle_work_run(cache, UINT64_MAX / 2u, 2048);
+    if (cache != NULL) held_image_end_call(cache);
 }
 
 bool tile_cache_prefetch_satisfied(const TileCache *cache)
@@ -3510,6 +3570,8 @@ void tile_cache_invalidate_image_identity(TileCache *cache,
                                           const void *identity)
 {
     if (cache == NULL || identity == NULL) return;
+    if (cache->held_image.identity == identity)
+        (void) held_image_release(cache);
     for (size_t i = 0; i < TILEFINCH_IMAGE_CACHE_ENTRIES; i++) {
         if (cache->decoded_images[i].valid
             && cache->decoded_images[i].identity == identity) {
@@ -3525,6 +3587,7 @@ void tile_cache_invalidate_image_identity(TileCache *cache,
 static void tile_cache_clear_layout_transients(TileCache *cache, bool retain_images,
                                                bool retain_fixed)
 {
+    (void) held_image_release(cache);
     for (size_t i = 0; i < TILEFINCH_IMAGE_CACHE_ENTRIES; i++) {
         if (!retain_images || cache->scaled_images[i].serial == 0)
             scaled_image_evict(cache, i);

@@ -559,8 +559,17 @@ bool zip_install_begin(ZipInstall *install)
         return fail(install, "Not enough free Memory Stick space");
     if (!lstat(install->view.destination, &exists) || errno != ENOENT)
         return fail(install, "Destination already exists; nothing was replaced");
-    if (mkdir(install->stage, 0700))
-        return fail(install, "Cannot create staging folder; an unfinished installation may exist");
+    if (mkdir(install->stage, 0700)) {
+        /* A power cut can strand the first attempt. Never adopt or erase
+           its contents. One reserve name permits a clean retry without
+           accumulating an unbounded number of partial installations. */
+        if (errno != EEXIST) return fail(install, "Cannot create staging folder");
+        snprintf(install->stage, sizeof(install->stage), "%s/.tilefinch-unpack-%08x-retry",
+                 install->root, (unsigned)install->id);
+        if (mkdir(install->stage, 0700))
+            return fail(install, errno == EEXIST ? "Both staging folders exist; check them through USB"
+                                                  : "Cannot create staging folder");
+    }
     install->stage_owned = true;
     install->status = ZIP_INSTALL_PENDING;
     return true;

@@ -17,6 +17,8 @@
 #include "tilefinch/budget.h"
 #include "tilefinch/resources.h"
 #include "tilefinch/render.h"
+#include "tilefinch/pixel_math.h"
+#include "tilefinch/image_retarget.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/navigation.h"
 #include "tilefinch/js_runtime.h"
@@ -844,7 +846,77 @@ static int test_decode_allocation_refusals(Budget *budget)
     return 0;
 }
 
+/* A worker decode's arena stays charged until its result is collected,
+   while the page's script, network and layout turns keep allocating. A
+   submit that would leave them less than the worker reserve is refused,
+   charging nothing, with the arena plus the reserve as the charge an image
+   retry waits for. With the reserve free, the same decode runs. */
+static int test_worker_arena_leaves_reserve(Budget *budget)
+{
+    const int width = 1200, height = 800, tw = 600, th = 400;
+    Bytes jpeg = jpeg_synthetic(width, height, 3, 85);
+    CHECK(jpeg.length > 0);
+    unsigned char *copy = budget_malloc(budget, jpeg.length);
+    CHECK(copy != NULL);
+    memcpy(copy, jpeg.data, jpeg.length);
+    BrowserSharedBody *body = browser_shared_body_take(budget, copy,
+                                                       jpeg.length);
+    CHECK(body != NULL);
+    ImageResource image = {
+        .encoded = body->data, .encoded_body = body,
+        .encoded_length = jpeg.length,
+        .source_width = width, .source_height = height,
+        .width = tw, .height = th
+    };
+    size_t arena = 0;
+    for (unsigned pass = 0; pass < 2u; pass++) {
+        /* The first pass starts the worker; the second measures. */
+        size_t base = budget->current;
+        budget->peak = base;
+        uint32_t token = 0;
+        size_t refused = 0;
+        CHECK(image_decode_worker_submit(&image, budget, &token, &refused)
+                  == IMAGE_DECODE_SUBMIT_ACCEPTED && refused == 0);
+        arena = budget->peak - base;
+        /* The host worker decodes within the submit. */
+        ImageDecodeWorkerResult result = {0};
+        CHECK(image_decode_worker_collect(token, &result));
+        CHECK(result.status == IMAGE_DECODE_SUCCEEDED
+              && result.pixels != NULL);
+        budget_free(budget, result.pixels);
+        if (pass == 1u) CHECK(budget->current == base);
+    }
+    size_t limit = budget->limit;
+    size_t base = budget->current;
+    /* The arena fits, but would leave less than the reserve. */
+    budget->limit = base + arena + 64u * 1024u;
+    uint32_t token = 0;
+    size_t refused = 0;
+    ImageDecodeSubmitResult submit =
+        image_decode_worker_submit(&image, budget, &token, &refused);
+    fprintf(stderr, "worker arena=%zu refused=%zu at %zu free\n", arena,
+            refused, budget_remaining(budget));
+    CHECK(submit == IMAGE_DECODE_SUBMIT_REJECTED && token == 0
+          && budget->current == base
+          && refused >= arena + IMAGE_DECODE_WORKER_RESERVE);
+    budget->limit = base + refused;
+    CHECK(image_decode_worker_submit(&image, budget, &token, &refused)
+              == IMAGE_DECODE_SUBMIT_ACCEPTED);
+    ImageDecodeWorkerResult result = {0};
+    CHECK(image_decode_worker_collect(token, &result));
+    CHECK(result.status == IMAGE_DECODE_SUCCEEDED && result.pixels != NULL);
+    budget_free(budget, result.pixels);
+    budget->limit = limit;
+    browser_shared_body_release(body);
+    free(jpeg.data);
+    CHECK(images_decode_worker_shutdown(budget) && budget->current == 0);
+    return 0;
+}
+
 #include "suites/image_decode_webp_alpha.inc"
+#include "suites/image_decode_progressive.inc"
+#include "suites/image_decode_fallback.inc"
+#include "suites/image_decode_held.inc"
 
 static int test_rebuild_during_detached_decode(Budget *budget)
 {
@@ -1214,6 +1286,25 @@ int main(int argc, char **argv)
         {"jpeg-incomplete-header", test_jpeg_incomplete_header},
         {"webp", test_webp_accounting},
         {"allocation-refusals", test_decode_allocation_refusals},
+        {"worker-arena-reserve", test_worker_arena_leaves_reserve},
+        {"progressive-cut", test_progressive_matches_cut_baseline},
+        {"progressive-memory", test_progressive_scaled_memory},
+        {"progressive-quality", test_progressive_scaled_quality},
+        {"progressive-hostile", test_progressive_scaled_hostile},
+        {"progressive-cut-short", test_progressive_cut_short_is_neutral},
+        {"paint-fallback-half", test_paint_falls_back_to_half},
+        {"paint-refusal-waits", test_refused_paint_waits_for_memory},
+        {"paint-reduced-busy", test_busy_reduced_decode_retries},
+        {"paint-upgrade-busy", test_busy_upgrade_keeps_reduced},
+        {"paint-refused-png-cached", test_refused_png_paints_cached_decode},
+        {"paint-reduced-uncacheable", test_uncacheable_reduced_decode_waits},
+        {"worker-fallback-aligned", test_worker_fallback_matches_submit},
+        {"reduced-load-grows", test_reduced_load_grows_when_it_fits},
+        {"held-decode-once", test_large_picture_decoded_once_per_pass},
+        {"held-decode-pressure", test_pressure_frees_held_decode},
+        {"held-paint-ahead", test_paint_ahead_holds_no_decode_between_runs},
+        {"held-unreached-cache", test_unreached_cache_holds_no_decode},
+        {"held-end-pass", test_end_paint_pass_frees_pending_hold},
         {"webp-alpha", test_webp_alpha_byte_history},
         {"webp-alpha-filters", test_webp_alpha_filters},
         {"rebuild-preload", test_rebuild_during_detached_decode},

@@ -19,7 +19,8 @@ bool stylesheet_prefers_dark_color_scheme(void)
 static bool media_matches(const Stylesheet *sheet, const char *text, size_t length)
 {
     return media_evaluate(sheet, text, length, 1.0,
-                           sheet->viewport_width, sheet->viewport_height);
+                           sheet->viewport_width, sheet->viewport_height,
+                           sheet->device_width, sheet->device_height);
 }
 
 bool stylesheet_media_matches(const Stylesheet *sheet, const char *query,
@@ -30,10 +31,12 @@ bool stylesheet_media_matches(const Stylesheet *sheet, const char *query,
 }
 
 bool stylesheet_media_matches_viewport(int width, int height, double resolution,
+                                       int device_width, int device_height,
                                        const char *query, size_t length)
 {
     return width > 0 && height > 0 && isfinite(resolution) && resolution > 0
-        && media_evaluate(NULL, query, length, resolution, width, height);
+        && media_evaluate(NULL, query, length, resolution, width, height,
+                          device_width, device_height);
 }
 
 size_t skip_selector_identifier(const char *text, size_t length,

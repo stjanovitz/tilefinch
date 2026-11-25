@@ -16,7 +16,6 @@
       Blob.prototype,
       "type",
     ).get,
-    tilefinchBlobSize = Object.getOwnPropertyDescriptor(Blob.prototype, "size").get,
     trustedFunctionApply = Function.call.bind(Function.prototype.apply),
     containerEventTarget = EventTarget.prototype,
     dispatchNode =
@@ -103,15 +102,17 @@
         return false;
       }
     },
-    copyArrayBufferBytes = (buffer, byteOffset = 0, byteLength) => {
+    copyArrayBufferBytes = (buffer, byteOffset = 0, byteLength,
+      maximum = Infinity) => {
       const bufferLength = trustedArrayBufferByteLength(buffer);
       if (byteLength === undefined) byteLength = bufferLength - byteOffset;
+      if (byteLength > maximum) return null;
       const source = new Uint8ArrayCtor(buffer, byteOffset, byteLength),
         copy = new Uint8ArrayCtor(byteLength);
       trustedUint8ArraySet(copy, source, 0);
       return copy;
     },
-    copyArrayBufferViewBytes = (view) => {
+    copyArrayBufferViewBytes = (view, maximum) => {
       let buffer, byteOffset, byteLength;
       try {
         buffer = trustedTypedArrayBuffer(view);
@@ -122,7 +123,7 @@
         byteOffset = trustedDataViewByteOffset(view);
         byteLength = trustedDataViewByteLength(view);
       }
-      return copyArrayBufferBytes(buffer, byteOffset, byteLength);
+      return copyArrayBufferBytes(buffer, byteOffset, byteLength, maximum);
     };
   delete globalThis.__tilefinchNavigatorBrand;
   /* See dom.js: hardening.js only sees the globals that exist when it runs,
@@ -178,7 +179,6 @@
   const domShared = globalThis.__tilefinchDomShared,
     { reflectString, secondaryDocumentPrototype, asciiLower, checkDoctypeName,
       contextFragment } = domShared;
-  delete globalThis.__tilefinchDomShared;
   /* Native code runs it only where the ARIA reflections are installed
      (reflected_attributes.inc); elsewhere it goes with the channel. */
   globalThis.__tilefinchHostChannel.ariaElementReferences =
@@ -998,9 +998,8 @@
      and never fires cross-document `storage` events, but pages construct
      them (Firebase's localStorage polling builds StorageEvents); same-
      document navigation fires the other two. `fields` maps each attribute
-     to its default and its conversion. PageTransitionEvent,
-     PromiseRejectionEvent and BeforeUnloadEvent are left out: nothing
-     fires them, and the three cost an 8 KiB step of resident bootstrap. */
+     to its default and its conversion. PageTransitionEvent and
+     BeforeUnloadEvent are left out: nothing fires them. */
   const initEventStates = new WeakMap(),
     initEventState = (event) => {
       const state = initEventStates.get(event);
@@ -1079,6 +1078,59 @@
       initEventStore(this, init, popStateEventFields);
     }
   }, popStateEventFields);
+  /* HTML's rejection tracking, as in workers: the engine's tracker reports
+     each rejection to the host-locked __tilefinchQueuePromiseRejection; one
+     still unhandled when its task runs fires unhandledrejection on the
+     window, and a handler attached after that fires rejectionhandled. At
+     most 16 rejections are tracked at once. */
+  const promiseRejectionEventFields = {
+      promise: [undefined, anyValue],
+      reason: [undefined, anyValue],
+    },
+    PromiseRejectionEvent = class PromiseRejectionEvent extends Event {
+      constructor(type, init = undefined) {
+        if (init?.promise === undefined)
+          throw new TypeError("PromiseRejectionEvent requires a promise");
+        super(type, init);
+        initEventStore(this, init, promiseRejectionEventFields);
+      }
+    },
+    pendingRejections = new Map(),
+    reportedRejections = [],
+    fireRejection = (type, promise, reason) => domShared.browserDispatch(
+      globalThis, trustedEvent(browserEvent(PromiseRejectionEvent, type, {
+        cancelable: type === "unhandledrejection", promise, reason,
+      })));
+  defineInitEvent(PromiseRejectionEvent, promiseRejectionEventFields);
+  Object.defineProperty(globalThis, "__tilefinchQueuePromiseRejection", {
+    value(promise, reason, handled) {
+      let record = pendingRejections.get(promise);
+      if (handled) {
+        if (!record) return;
+        pendingRejections.delete(promise);
+        if (!record.reported)
+          return domShared.cancelTimer(record.timer);
+        reportedRejections.splice(reportedRejections.indexOf(promise), 1);
+        globalThis.__tilefinchScheduleTask(
+          () => fireRejection("rejectionhandled", promise, reason));
+        return;
+      }
+      while (!record && pendingRejections.size >= 16
+             && reportedRejections.length)
+        pendingRejections.delete(reportedRejections.shift());
+      if (record || pendingRejections.size >= 16) return;
+      record = { reported: false, timer: 0 };
+      /* Tracked only once its task is queued: a full queue (0) or a throw
+         leaves no record to hold the promise and fill the tracker. */
+      record.timer = globalThis.__tilefinchScheduleTask(() => {
+        if (pendingRejections.get(promise) !== record) return;
+        record.reported = true;
+        reportedRejections.push(promise);
+        fireRejection("unhandledrejection", promise, reason);
+      });
+      if (record.timer) pendingRejections.set(promise, record);
+    },
+  });
   const messageEventStates = new WeakMap(),
     messageEventStateGet = messageEventStates.get.bind(messageEventStates),
     messageEventStateSet = messageEventStates.set.bind(messageEventStates),
@@ -1236,180 +1288,6 @@
     browserInterfaces,
   );
   const fileReaderDispatch = domShared.dispatchSimpleEvent;
-  let fileReaderState;
-  globalThis.FileReader = class FileReader extends EventTarget {
-    #state;
-    static { fileReaderState = reader => reader.#state; }
-    constructor() {
-      super();
-      this.#state = { readyState: 0, result: null, error: null, task: 0, generation: 0 };
-      for (const name of [
-        "onloadstart",
-        "onprogress",
-        "onload",
-        "onabort",
-        "onerror",
-        "onloadend",
-      ])
-        this[name] = null;
-    }
-    get readyState() { return this.#state.readyState; }
-    get result() { return this.#state.result; }
-    get error() { return this.#state.error; }
-    #emit(type, loaded = 0, total = 0) {
-      const event = trustedEvent(
-        browserEvent(progressEventConstructor, type, {
-          lengthComputable: true,
-          loaded,
-          total,
-        }),
-      );
-      fileReaderDispatch(this, event);
-      try {
-        const handler = this["on" + type];
-        if (typeof handler === "function")
-          globalThis.__tilefinchRunTask("file-reader:" + type, handler, this, [event]);
-      } catch (error) {
-        globalThis.__tilefinchReportUncaught(error, "file-reader:" + type);
-      }
-    }
-    #read(blob, convert) {
-      const state = this.#state,
-        total = trustedFunctionApply(tilefinchBlobSize, blob, []);
-      if (state.readyState === 1)
-        throw new DOMException("A read is already active", "InvalidStateError");
-      const generation = state.generation + 1,
-        current = () => state.generation === generation && state.readyState === 1,
-        fail = error => {
-          if (!current()) return;
-          if (state.task) __tilefinchRealmGlobal.__tilefinchCancelTimer(state.task);
-          state.task = 0;
-          state.error = error;
-          state.result = null;
-          state.readyState = 2;
-          this.#emit("error", 0, total);
-          if (state.generation === generation && state.readyState !== 1)
-            this.#emit("loadend", 0, total);
-        };
-      let phase = 0;
-      const step = () => {
-        if (!current()) return;
-        state.task = 0;
-        if (phase < 2) {
-          const type = phase++ === 0 ? "loadstart" : "progress";
-          /* Keep one continuation admitted before invoking author code.
-             Separate tasks allow its promise jobs to abort before progress
-             or completion, without retaining a second task queue. */
-          state.task = __tilefinchRealmGlobal.__tilefinchScheduleTask(step);
-          try {
-            this.#emit(type, type === "loadstart" ? 0 : total, total);
-            if (current() && !state.task) fail(new DOMException(
-              "File read task quota exceeded", "QuotaExceededError"));
-          } catch (error) {
-            if (!current()) throw error;
-            fail(error);
-          }
-          return;
-        }
-        try {
-          const result = convert(tilefinchBlobBytes(blob));
-          if (!current()) return;
-          state.result = result;
-          state.readyState = 2;
-          this.#emit("load", total, total);
-        } catch (error) {
-          if (!current()) throw error;
-          fail(error);
-          return;
-        }
-        if (state.generation === generation && state.readyState !== 1)
-          this.#emit("loadend", total, total);
-      };
-      const task = __tilefinchRealmGlobal.__tilefinchScheduleTask(step);
-      /* A refused reservation must leave EMPTY/DONE usable for a retry,
-         rather than publishing a LOADING state with no task to finish it. */
-      if (!task) throw new DOMException("File read task quota exceeded", "QuotaExceededError");
-      state.generation = generation;
-      state.task = task;
-      state.readyState = 1;
-      state.result = state.error = null;
-    }
-    readAsArrayBuffer(blob) {
-      this.#read(blob, (bytes) => bytes.slice().buffer);
-    }
-    readAsText(blob, encoding = "utf-8") {
-      this.#read(blob, (bytes) =>
-        new TextDecoder(String(encoding || "utf-8")).decode(bytes),
-      );
-    }
-    readAsBinaryString(blob) {
-      this.#read(blob, (bytes) => {
-        let binary = "";
-        for (let at = 0; at < bytes.length; at += 8192)
-          binary += trustedFunctionApply(TrustedString.fromCharCode, null,
-            bytes.subarray(at, at + 8192));
-        return binary;
-      });
-    }
-    readAsDataURL(blob) {
-      this.#read(blob, (bytes) =>
-        "data:" +
-        (blob.type || "application/octet-stream") +
-        ";base64," +
-        /* The native is a frozen global, which a page cannot replace. */
-        (bytes.length ? __tilefinchBase64EncodeBytes(bytes) : ""));
-    }
-    abort() {
-      const state = this.#state;
-      if (state.readyState !== 1) {
-        state.result = null;
-        return;
-      }
-      const generation = ++state.generation;
-      __tilefinchRealmGlobal.__tilefinchCancelTimer(state.task);
-      state.task = 0;
-      state.readyState = 2;
-      state.result = null;
-      this.#emit("abort");
-      if (state.generation === generation && state.readyState !== 1)
-        this.#emit("loadend");
-    }
-  };
-  for (const [name, value] of Object.entries({
-    EMPTY: 0,
-    LOADING: 1,
-    DONE: 2,
-  })) {
-    Object.defineProperty(FileReader, name, { value });
-    Object.defineProperty(FileReader.prototype, name, { value });
-  }
-  /* Worker teardown must cancel an owner-backed FileReader without emitting
-     abort/loadend into a realm that has already been retired. */
-  Object.defineProperty(globalThis, "__tilefinchAbortFileReaderForWorker", {
-    configurable: false,
-    enumerable: false,
-    writable: false,
-    value(reader) {
-      let state;
-      try { state = fileReaderState(reader); } catch (_) { return false; }
-      ++state.generation;
-      if (state.task) __tilefinchCancelTimer(state.task);
-      state.task = 0;
-      state.readyState = 2;
-      state.result = null;
-      state.error = new DOMException("Worker is terminated", "AbortError");
-      return true;
-    },
-  });
-  Object.defineProperty(globalThis, "__tilefinchBlobTextForWorker", {
-    configurable: false,
-    enumerable: false,
-    writable: false,
-    value(blob, encoding = "utf-8") {
-      return new TextDecoder(String(encoding || "utf-8")).decode(
-        tilefinchBlobBytes(blob));
-    },
-  });
   const markFocus = (target, on) => {
     if (!target?.__handle) return;
     if (on) __tilefinchSetAttribute(target.__handle, "data-tilefinch-focus", "");
@@ -3421,9 +3299,13 @@
       nativeDocuments().createNativeFrameDocument(standards);
     globalThis.__tilefinchBindFrameDocument = (doc, location, view) =>
       nativeDocuments().bindFrameDocument(doc, location, view);
+    /* dom.js's innerHTML getter for a native XML document's elements. */
+    domShared.markup = detachedMarkup;
     Object.defineProperty(Element.prototype, "outerHTML", Object.getOwnPropertyDescriptor({
       get outerHTML() {
-        if (this.__handle === undefined && this.__detachedChildren)
+        const owner = this.ownerDocument;
+        if (this.__handle === undefined ? this.__detachedChildren
+            : owner !== document && owner.contentType !== "text/html")
           return detachedMarkup(this, true);
         const container = (
           this.__handle !== undefined ? document : this.ownerDocument || document
@@ -3433,11 +3315,13 @@
       },
       /* The parent is the parser's context (domShared.contextFragment). */
       set outerHTML(value) {
+        /* A native secondary document's root has no parentNode. */
         const parent = this.parentNode;
-        if (!parent) return;
-        if (parent.nodeType === Node.DOCUMENT_NODE)
+        if (parent ? parent.nodeType === Node.DOCUMENT_NODE
+            : this.ownerDocument?.documentElement === this)
           throw new DOMException("The element's parent is a document",
             "NoModificationAllowedError");
+        if (!parent) return;
         const fragment = contextFragment(parent, String(value), this),
           added = [...fragment.childNodes];
         const previousSibling = this.previousSibling,
@@ -3993,8 +3877,55 @@
       const headers = new Headers();
       trustedWeakMapSet(noCorsHeaderMaps, headerMap(headers), true);
       for (const [key, value] of trustedMapEntries(headerMap(source)))
-        if (key !== "set-cookie") headers.set(key, value);
+        if (key !== "set-cookie") setHeader(headers, key, value);
       return headers;
+    };
+  /* Fetch's append, which the constructor's fill uses too: never the
+     page-replaceable Headers.prototype.append, which would otherwise see
+     (and could drop) every transport header block. */
+  const appendHeader = (headers, name, value) => {
+    name = normalizeHeaderName(name);
+    value = normalizeHeaderValue(value);
+    const map = writableHeaderMap(headers),
+      old = trustedMapGet(map, name);
+    if (name === "set-cookie") {
+      if (trustedWeakMapHas(noCorsHeaderMaps, map)) return;
+      checkHeaderEntryLimit(map);
+      if (old) old[old.length] = value;
+      else trustedMapSet(map, name, [value]);
+      headerChanged(map);
+      return;
+    }
+    const combined = old === undefined ? value : old + ", " + value;
+    if (trustedWeakMapHas(noCorsHeaderMaps, map)
+        && !noCorsSafelisted(name, combined)) return;
+    if (old === undefined) checkHeaderEntryLimit(map);
+    trustedMapSet(map, name, combined);
+    headerChanged(map);
+  },
+    /* Fetch's own set, get and has, for the same reason: the fetch and XHR
+       pipeline never calls a page-replaceable Headers method. */
+    setHeader = (headers, name, value) => {
+      name = normalizeHeaderName(name);
+      value = normalizeHeaderValue(value);
+      const map = writableHeaderMap(headers);
+      if (trustedWeakMapHas(noCorsHeaderMaps, map)
+          && !noCorsSafelisted(name, value)) return;
+      if (!trustedMapHas(map, name)) checkHeaderEntryLimit(map);
+      trustedMapSet(map, name, name === "set-cookie" ? [value] : value);
+      headerChanged(map);
+    },
+    getHeader = (headers, name) => {
+      name = normalizeHeaderName(name);
+      const value = trustedMapGet(headerMap(headers), name);
+      return value === undefined ? null :
+        name === "set-cookie" ? joinHeaderValues(value, ", ") : value;
+    },
+    hasHeader = (headers, name) =>
+      trustedMapHas(headerMap(headers), normalizeHeaderName(name)),
+    /* Sets `name` unless the headers have it (an inferred Content-Type). */
+    defaultHeader = (headers, name, value) => {
+      if (!hasHeader(headers, name)) setHeader(headers, name, value);
     };
   class Headers {
     constructor(init = {}) {
@@ -4009,7 +3940,7 @@
           if (!line) continue;
           const at = line.indexOf(":");
           if (at <= 0) throw new TypeError("Invalid HTTP header block");
-          this.append(line.slice(0, at), line.slice(at + 1));
+          appendHeader(this, line.slice(0, at), line.slice(at + 1));
         }
       } else if (init !== null
                  && typeof init?.[Symbol.iterator] === "function") {
@@ -4028,57 +3959,30 @@
           }
           if (values.length !== 2)
             throw new TypeError("Header pair must contain two values");
-          this.append(values[0], values[1]);
+          appendHeader(this, values[0], values[1]);
         }
       } else if (init && typeof init === "object") {
         const keys = Object.keys(init);
         if (keys.length > headerEntryLimit)
           throw new RangeError("Header entry limit exceeded");
-        for (const key of keys) this.set(key, init[key]);
+        for (const key of keys) appendHeader(this, key, init[key]);
       }
     }
     append(name, value) {
-      name = normalizeHeaderName(name);
-      value = normalizeHeaderValue(value);
-      const map = writableHeaderMap(this),
-        old = trustedMapGet(map, name);
-      if (name === "set-cookie") {
-        if (trustedWeakMapHas(noCorsHeaderMaps, map)) return;
-        checkHeaderEntryLimit(map);
-        if (old) old[old.length] = value;
-        else trustedMapSet(map, name, [value]);
-        headerChanged(map);
-        return;
-      }
-      const combined = old === undefined ? value : old + ", " + value;
-      if (trustedWeakMapHas(noCorsHeaderMaps, map)
-          && !noCorsSafelisted(name, combined)) return;
-      if (old === undefined) checkHeaderEntryLimit(map);
-      trustedMapSet(map, name, combined);
-      headerChanged(map);
+      appendHeader(this, name, value);
     }
     set(name, value) {
-      name = normalizeHeaderName(name);
-      value = normalizeHeaderValue(value);
-      const map = writableHeaderMap(this);
-      if (trustedWeakMapHas(noCorsHeaderMaps, map)
-          && !noCorsSafelisted(name, value)) return;
-      if (!trustedMapHas(map, name)) checkHeaderEntryLimit(map);
-      trustedMapSet(map, name, name === "set-cookie" ? [value] : value);
-      headerChanged(map);
+      setHeader(this, name, value);
     }
     get(name) {
-      name = normalizeHeaderName(name);
-      const value = trustedMapGet(headerMap(this), name);
-      return value === undefined ? null :
-        name === "set-cookie" ? joinHeaderValues(value, ", ") : value;
+      return getHeader(this, name);
     }
     getSetCookie() {
       const values = trustedMapGet(headerMap(this), "set-cookie");
       return values ? copyHeaderValues(values) : [];
     }
     has(name) {
-      return trustedMapHas(headerMap(this), normalizeHeaderName(name));
+      return hasHeader(this, name);
     }
     delete(name) {
       name = normalizeHeaderName(name);
@@ -4121,9 +4025,9 @@
     return "text/plain;charset=UTF-8";
   },
     ensureRequestBodyContentType = (headers, source) => {
-      if (headers.has("content-type")) return;
+      if (hasHeader(headers, "content-type")) return;
       const inferredType = inferredRequestBodyContentType(source);
-      if (inferredType) headers.set("content-type", inferredType);
+      if (inferredType) setHeader(headers, "content-type", inferredType);
     },
     requestBodyByteLimit = 256 * 1024,
     requestReferrerPolicies = new Set([
@@ -4146,7 +4050,7 @@
         fragment = href.indexOf("#");
       return fragment < 0 ? href : href.slice(0, fragment);
     },
-    snapshotRequestBody = (source, headers) => {
+    snapshotRequestBody = (source, headers, navigationForm = false) => {
       if (source === null || source === undefined) return null;
       const encoder = new TextEncoder(),
         admit = (bytes) => {
@@ -4158,79 +4062,11 @@
         ensureRequestBodyContentType(headers, source);
         return admit(encoder.encode(source.toString()));
       }
-      if (source instanceof FormData) {
-        const entries = [], random = new Uint8ArrayCtor(18);
-        let total = 0;
-        for (const [name, value] of source) {
-          const bytes = value instanceof Blob
-            ? tilefinchBlobBytes(value) : encoder.encode(String(value));
-          if (bytes.byteLength > requestBodyByteLimit - total)
-            throw new RangeError("FormData body exceeds bounded size");
-          entries.push({ name: String(name), value, bytes });
-          total += bytes.byteLength;
-        }
-        const contains = (bytes, text) => {
-          const needle = encoder.encode(text);
-          if (needle.byteLength > bytes.byteLength) return false;
-          outer: for (let at = 0;
-               at <= bytes.byteLength - needle.byteLength; at++) {
-            for (let index = 0; index < needle.byteLength; index++)
-              if (bytes[at + index] !== needle[index]) continue outer;
-            return true;
-          }
-          return false;
-        };
-        let boundary = "";
-        for (let attempt = 0; attempt < 8 && !boundary; attempt++) {
-          trustedCryptoRandomFill(random);
-          let suffix = "";
-          for (let index = 0; index < random.length; index++)
-            suffix += random[index].toString(16).padStart(2, "0");
-          const candidate = "----tilefinch-" + suffix;
-          if (!entries.some((entry) => contains(entry.bytes, candidate)))
-            boundary = candidate;
-        }
-        if (!boundary)
-          throw new RangeError("Unable to choose multipart boundary");
-        if (!headers.has("content-type"))
-          headers.set("content-type", "multipart/form-data; boundary=" + boundary);
-        const chunks = [];
-        total = 0;
-        const append = (bytes) => {
-          if (!(bytes instanceof Uint8Array)) bytes = encoder.encode(String(bytes));
-          if (bytes.byteLength > requestBodyByteLimit - total)
-            throw new RangeError("FormData body exceeds bounded size");
-          chunks.push(bytes);
-          total += bytes.byteLength;
-        },
-          quote = (value) => String(value)
-            .replaceAll("\r", "%0D")
-            .replaceAll("\n", "%0A")
-            .replaceAll('"', "%22"),
-          normalizeLineBreaks = (value) => String(value)
-            .replace(/\r\n|\r|\n/g, "\r\n");
-        for (const entry of entries) {
-          const { name, value } = entry;
-          append("--" + boundary +
-            "\r\nContent-Disposition: form-data; name=\"" + quote(name) + "\"");
-          if (value instanceof File)
-            append('; filename="' + quote(value.name) + '"');
-          append("\r\n");
-          if (value instanceof Blob && value.type)
-            append("Content-Type: " + value.type + "\r\n");
-          append("\r\n");
-          append(value instanceof Blob ? entry.bytes : normalizeLineBreaks(value));
-          append("\r\n");
-        }
-        append("--" + boundary + "--\r\n");
-        const bytes = new Uint8Array(total);
-        let offset = 0;
-        for (const chunk of chunks) {
-          bytes.set(chunk, offset);
-          offset += chunk.byteLength;
-        }
-        return bytes;
-      }
+      if (source instanceof FormData)
+        return domShared.formCollections().encodeMultipart(source, headers,
+          navigationForm, requestBodyByteLimit, encoder, String, RangeError,
+          Uint8Array, Uint8ArrayCtor, Blob, domShared.fileName, tilefinchBlobBytes,
+          trustedCryptoRandomFill, defaultHeader);
       ensureRequestBodyContentType(headers, source);
       if (source instanceof Blob)
         return admit(tilefinchBlobBytes(source).slice());
@@ -4239,19 +4075,27 @@
         return admit(copyArrayBufferViewBytes(source));
       return admit(encoder.encode(String(source)));
     };
+  domShared.multipartSubmission = (data) =>
+    snapshotRequestBody(data, null, true).buffer;
   const requestBodyStorage = new TrustedWeakMap(),
     requestBodyState = (request) => {
       if (!trustedWeakMapHas(requestBodyStorage, request))
         throw new TrustedTypeError("Illegal invocation");
       return trustedWeakMapGet(requestBodyStorage, request);
     },
+    bufferedRequestStream = (bytes) => new ReadableStream({
+      start(controller) {
+        controller.enqueue(bytes);
+        /* The queue is the sole owner until it is drained or cancelled. */
+        bytes = null;
+        controller.close();
+      },
+    }),
     consumeRequestBody = async (request, signal = null, release = false) => {
       const state = requestBodyState(request);
       if (state.body === null) return new Uint8Array();
-      const bytes = await __tilefinchConsumeReadableByteStream(
+      return await __tilefinchConsumeReadableByteStream(
         state.body, requestBodyByteLimit, signal, release);
-      state.bytes = null;
-      return bytes;
     },
     proxyRequestBody = (source) => {
       const reader = source.getReader();
@@ -4379,7 +4223,7 @@
       return data;
     },
     parseFormBody = (bytes, headers) => {
-      const type = headers.get("content-type") || "";
+      const type = getHeader(headers, "content-type") || "";
       if (type.length > 8192) throw new TypeError("Form data MIME type exceeds bound");
       const essence = mimeEssence(type);
       if (essence !== "application/x-www-form-urlencoded" &&
@@ -4396,6 +4240,16 @@
       return data;
     };
   let Response;
+  /* Chrome's wording for a URL that does not parse. */
+  const requestURL = (input, operation) => {
+    const text = String(input);
+    try {
+      return new URL(text, location.href).href;
+    } catch (_) {
+      throw new TypeError(
+        `Failed to ${operation}: Failed to parse URL from ${text}`);
+    }
+  };
   class Request {
     constructor(input, init = {}) {
       init ??= {};
@@ -4405,9 +4259,7 @@
         priorBody = prior ? requestBodyState(prior) : null;
       if (inheritsBody && (prior.bodyUsed || prior.body?.locked))
         throw new TypeError("Body has already been consumed");
-      const url = prior
-        ? prior.url
-        : new URL(String(input), location.href).href;
+      const url = prior ? prior.url : requestURL(input, "construct 'Request'");
       const method = String(
         init.method === undefined
           ? prior
@@ -4511,7 +4363,6 @@
             ? null
             : __tilefinchConsumeBufferedReadableByteStream(
                 priorBody.body, requestBodyByteLimit);
-          priorBody.bytes = null;
           body = priorBody.body === null
             ? null
             : bodyBytesSnapshot === null
@@ -4519,14 +4370,9 @@
               : null;
         }
         if (body === null && bodyBytesSnapshot !== null)
-          body = new ReadableStream({
-            start: (controller) => {
-              controller.enqueue(bodyBytesSnapshot);
-              controller.close();
-            },
-          });
+          body = bufferedRequestStream(bodyBytesSnapshot);
         const requestState = {
-          bytes: bodyBytesSnapshot,
+          buffered: bodyBytesSnapshot !== null,
           body,
           signal: requestSignal,
         };
@@ -4574,7 +4420,7 @@
     blob() {
       return consumeRequestBody(this).then(
         (bytes) => new Blob([bytes], {
-            type: this.headers.get("content-type") || "",
+            type: getHeader(this.headers, "content-type") || "",
           }));
     }
     formData() {
@@ -4587,7 +4433,7 @@
       const state = requestBodyState(this),
         branches = this.body.tee(true);
       state.body = branches[0];
-      state.bytes = null;
+      state.buffered = false;
       return new Request(this, { body: branches[1], duplex: "half" });
     }
   }
@@ -4602,6 +4448,11 @@
          would keep the realm, its Crypto key and all globals alive. */
       subtleBufferNormalizers = domShared.createPrivateSlot(),
       cryptoSubtleInstances = domShared.createPrivateSlot(),
+      /* The natives that hold a key's secret and run the primitives, for
+         subtle-crypto.js. */
+      cryptoKeyNative = globalThis.__tilefinchCryptoKey,
+      cryptoRunNative = globalThis.__tilefinchCryptoRun,
+      zeroCryptoBytes = Function.call.bind(Uint8Array.prototype.fill),
       integerRandomViews = new Set([
         "[object Int8Array]",
         "[object Uint8Array]",
@@ -4613,6 +4464,24 @@
         "[object BigInt64Array]",
         "[object BigUint64Array]",
       ]);
+    let ensureSubtleCryptoBootstrap =
+        globalThis.__tilefinchEnsureSubtleCryptoBootstrap,
+      /* subtle-crypto.js's factory, then the step it returns that adds the
+         operations: each is kept until it completes. */
+      createSubtleCrypto = null,
+      installSubtleCrypto = null;
+    delete globalThis.__tilefinchCryptoKey;
+    delete globalThis.__tilefinchCryptoRun;
+    /* Keys come only from subtle-crypto.js, which adds the attributes. */
+    class CryptoKey {
+      constructor() {
+        throw new TypeError("Illegal constructor");
+      }
+    }
+    Object.defineProperty(CryptoKey.prototype, Symbol.toStringTag, {
+      configurable: true,
+      value: "CryptoKey",
+    });
     class SubtleCrypto {
       constructor(token) {
         if (token !== subtleToken) throw new TypeError("Illegal constructor");
@@ -4662,8 +4531,13 @@
           /* Native admission handles a raw ArrayBuffer originating in another
              bounded same-origin Window realm. Worker-local raw buffers were
              normalized to a local view above before crossing realms. */
-          const result = trustedPromiseResolve(
-            __tilefinchCryptoDigest(source, algorithmIndex));
+          /* subtle-crypto.js orders a scope's results and runs a digest
+             over a slice's work in slices. */
+          const order = domShared.orderCrypto,
+            result = trustedPromiseResolve(order
+              ? order(this, __tilefinchCryptoDigest(source, algorithmIndex,
+                true))
+              : __tilefinchCryptoDigest(source, algorithmIndex));
           return normalizers
             ? trustedPromiseThen(result, normalizers.output) : result;
         } catch (error) {
@@ -4683,15 +4557,48 @@
       get subtle() {
         if (!cryptoInstances.has(this))
           throw new TypeError("Illegal invocation");
+        /* The first read adds SubtleCrypto's operations other than digest
+           and CryptoKey's attributes (subtle-crypto.js), so a realm that
+           never reads it holds none of them. A read that runs out of memory
+           building or adding them leaves digest, and the next read goes on
+           from the step that failed; a failed module load is not retried
+           (the loader marks it failed). */
+        if (ensureSubtleCryptoBootstrap) {
+          try {
+            /* The operations are added in the module's marking window, so
+               they get the receiver and argument checks. The factory is
+               read in the load's own call, before page code can run. */
+            ensureSubtleCryptoBootstrap(() => {
+              if (!installSubtleCrypto) {
+                createSubtleCrypto ||=
+                  __tilefinchRealmGlobal.__tilefinchCreateSubtleCrypto;
+                delete __tilefinchRealmGlobal.__tilefinchCreateSubtleCrypto;
+                installSubtleCrypto = createSubtleCrypto(
+                  SubtleCrypto, CryptoKey, subtleInstances,
+                  subtleBufferNormalizers, cryptoKeyNative, cryptoRunNative,
+                  trustedCryptoRandomFill, isArrayBuffer, arrayBufferIsView,
+                  copyArrayBufferBytes, copyArrayBufferViewBytes,
+                  trustedTypedArrayByteLength, trustedTypedArrayBuffer,
+                  zeroCryptoBytes,
+                  trustedPromiseResolve, trustedPromiseThen,
+                  trustedPromiseReject,
+                  domShared.createPrivateSlot(), domShared,
+                );
+                createSubtleCrypto = null;
+              }
+              installSubtleCrypto();
+              ensureSubtleCryptoBootstrap = installSubtleCrypto = null;
+            });
+          } catch (_) {}
+        }
         return cryptoSubtleInstances.get(this);
       }
       getRandomValues(array) {
         if (!cryptoInstances.has(this))
           throw new TypeError("Illegal invocation");
-        if (
-          !ArrayBuffer.isView(array) ||
-          !integerRandomViews.has(Object.prototype.toString.call(array))
-        )
+        if (!ArrayBuffer.isView(array))
+          throw new TypeError("parameter 1 is not of type 'ArrayBufferView'.");
+        if (!integerRandomViews.has(Object.prototype.toString.call(array)))
           throw new DOMException(
             "An integer TypedArray is required",
             "TypeMismatchError",
@@ -4734,11 +4641,23 @@
       return value;
     };
     globalThis.Crypto = Crypto;
+    globalThis.CryptoKey = CryptoKey;
     globalThis.SubtleCrypto = SubtleCrypto;
-    globalThis.crypto = createCrypto();
-    /* Dedicated workers get a distinct platform object. Sharing the owner
-       object's mutable own properties would violate realm isolation. */
+    const realmCrypto = createCrypto();
+    globalThis.crypto = realmCrypto;
+    /* A receiving realm may not have touched crypto.subtle yet. */
+    domShared.ensureSubtleOperations =
+      Object.getOwnPropertyDescriptor(Crypto.prototype, "subtle").get.bind(realmCrypto);
+    /* Dedicated workers and frame windows get a distinct platform object.
+       Sharing the owner object's mutable own properties would violate
+       realm isolation, and its SubtleCrypto names the scope that owns a
+       pending derivation. */
     globalThis.__tilefinchCreateWorkerCrypto = createCrypto;
+    /* A worker or frame that goes away stops its derivations: rejected
+       when the scope can still see them, otherwise dropped. */
+    domShared.stopCryptoScope = (crypto, observable) =>
+      domShared.stopCryptoJobs?.(cryptoSubtleInstances.get(crypto),
+        observable);
     globalThis.__tilefinchSetCryptoBufferNormalizer = (
       crypto, input, output,
     ) => {
@@ -4756,13 +4675,9 @@
     /* Computed keys give every console method its own name. */
     const emit = (level) =>
         ({
-          [level]: (...args) =>
-            __tilefinchConsoleLog(
-              level,
-              ...args.map((value) =>
-                value && value.stack ? String(value) + "\n" + value.stack : value,
-              ),
-            ),
+          /* The values go untouched: only a console trace reads them
+             (js_console_log), so a getter fires as with DevTools closed. */
+          [level]: (...args) => __tilefinchConsoleLog(level, ...args),
         })[level],
       noop = (name) => ({ [name]: () => {} })[name];
     globalThis.console = {
@@ -4860,7 +4775,6 @@
         state.body, requestBodyByteLimit);
       if (bytes === null)
         throw new TypeError("Streaming body requires asynchronous consumption");
-      state.bytes = null;
       return bytes === null
         ? undefined
         : bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
@@ -5005,7 +4919,7 @@
       const entry = waitingNetwork.shift();
       if (!entry || entry.state !== "waiting") continue;
       networkQueueStats.waiting = Math.max(0, networkQueueStats.waiting - 1);
-      if (entry.nativeId) __tilefinchRealmGlobal.__tilefinchCancelTimer(entry.nativeId);
+      if (entry.nativeId) domShared.cancelTimer(entry.nativeId);
       entry.state = "launching";
       try {
         const nativeId = Number(entry.start());
@@ -5375,7 +5289,7 @@
     Response.prototype.blob = function blob() {
       return takeBytes(this).then(
         (bytes) => new Blob([bytes], {
-          type: this.headers.get("content-type") || "",
+          type: getHeader(this.headers, "content-type") || "",
         }));
     };
     Response.prototype.formData = function formData() {
@@ -5417,8 +5331,7 @@
       if (serialized === undefined)
         throw new TypeError("Response data cannot be serialized as JSON");
       const headers = new Headers(init.headers);
-      if (!headers.has("content-type"))
-        headers.set("content-type", "application/json");
+      defaultHeader(headers, "content-type", "application/json");
       return new Response(serialized, { ...init, headers });
     };
     const trustedResponseArrayBuffer = Response.prototype.arrayBuffer,
@@ -5453,14 +5366,16 @@
     workerScript = false,
   ) => {
     try {
-      const request =
-        input instanceof Request
-          ? new Request(input, init)
-          : new Request(input, init);
+      /* The URL is parsed first, as the Request constructor's first step,
+         and a URL that does not parse never reaches the network. */
+      if (!(input instanceof Request))
+        input = requestURL(input, "execute 'fetch' on '"
+          + (timingRecorder ? "Window" : "WorkerGlobalScope") + "'");
+      const request = new Request(input, init);
       request.signal.throwIfAborted();
       if (
         request.body !== null &&
-        requestBodyState(request).bytes === null
+        !requestBodyState(request).buffered
       )
         return serializeRequestBodyAsync(request).then((bytes) =>
           fetchInternal(request, {
@@ -5468,8 +5383,8 @@
             duplex: "half",
           }));
       const body = serializeRequestBody(request),
-        contentType = request.headers.get("content-type") || "",
-        accept = request.headers.get("accept") || "*/*",
+        contentType = getHeader(request.headers, "content-type") || "",
+        accept = getHeader(request.headers, "accept") || "*/*",
         authorHeaderBlock = nativeHeaderBlock(request.headers),
         headerBlock = authorHeaderBlock,
         signal = request.signal,
@@ -5680,7 +5595,7 @@
               "POST",
               target.href,
               body,
-              headers.get("content-type") || "",
+              getHeader(headers, "content-type") || "",
               nativeHeaderBlock(headers),
               "cors",
               "include",
@@ -5701,258 +5616,6 @@
       }
     },
   });
-  {
-    const eventSources = new Map(),
-      eventSourceLimit = 2,
-      eventSourceDispatch = EventTarget.prototype.dispatchEvent;
-    let deferredSources = null;
-    const scheduleSourceReconnect = (source) => {
-      if (source._closed || source._nativeId || source._reconnectTask) return true;
-      source._reconnectTask = __tilefinchRealmGlobal.__tilefinchScheduleTask(() => {
-        source._reconnectTask = 0;
-        source._connect();
-      }, Math.max(0, source._reconnectAt - __tilefinchRealmGlobal.__tilefinchSchedulerTime()));
-      return !!source._reconnectTask;
-    };
-    const deferSourceReconnect = (source) => {
-      if (!deferredSources) {
-        deferredSources = new Set();
-        __tilefinchTimerCapacity[5] = () => {
-          let remaining = 128;
-          for (const pending of deferredSources) {
-            if (!remaining--) break;
-            if (scheduleSourceReconnect(pending)) deferredSources.delete(pending);
-          }
-          if (deferredSources.size) __tilefinchTimerCapacity[4] |= 16;
-        };
-      }
-      /* Retain bounded owners, not another unbounded task queue. */
-      if (deferredSources.size >= 128 && !deferredSources.has(source)) {
-        source.close();
-        return;
-      }
-      deferredSources.add(source);
-      __tilefinchTimerCapacity[4] |= 16;
-    };
-    class EventSource extends EventTarget {
-      constructor(url, options = {}) {
-        super();
-        if (arguments.length < 1)
-          throw new TypeError("EventSource requires a URL");
-        this.url = new URL(String(url), location.href).href;
-        if (!/^https?:/.test(this.url))
-          throw new DOMException(
-            "EventSource requires HTTP or HTTPS",
-            "SecurityError",
-          );
-        this.withCredentials = !!options.withCredentials;
-        this.readyState = EventSource.CONNECTING;
-        this.onopen = null;
-        this.onmessage = null;
-        this.onerror = null;
-        this._nativeId = 0;
-        this._closed = false;
-        this._lastEventId = "";
-        this._retry = 3000;
-        this._decoder = null;
-        this._text = "";
-        this._data = [];
-        this._dataBytes = 0;
-        this._eventType = "";
-        this._idBuffer = "";
-        this._skipLF = false;
-        this._reconnectTask = 0;
-        this._reconnectAt = 0;
-        this._connect();
-      }
-      _emit(event) {
-        trustedFunctionApply(eventSourceDispatch, this, [event]);
-        try {
-          const handler = this["on" + event.type];
-          if (typeof handler === "function")
-            globalThis.__tilefinchRunTask(
-              "event-source:" + String(event.type), handler, this, [event],
-            );
-        } catch (error) {
-          globalThis.__tilefinchReportUncaught(error, "event-source:" + event.type);
-        }
-      }
-      _resetParser() {
-        this._decoder = null;
-        this._text = "";
-        this._data = [];
-        this._dataBytes = 0;
-        this._eventType = "";
-        this._idBuffer = "";
-        this._skipLF = false;
-      }
-      _connect() {
-        if (this._closed || this._nativeId) return;
-        deferredSources?.delete(this);
-        const task = this._reconnectTask;
-        this._reconnectTask = 0;
-        __tilefinchRealmGlobal.__tilefinchCancelTimer(task);
-        this._resetParser();
-        if (eventSources.size >= eventSourceLimit) {
-          this._failAndReconnect();
-          return;
-        }
-        try {
-          this._decoder = new TextDecoder();
-          const id = Number(
-            __tilefinchEventSourceStart(
-              this.url,
-              this.withCredentials,
-              this._lastEventId,
-            ),
-          );
-          if (!(id > 0)) throw new Error("EventSource admission failed");
-          this._nativeId = id;
-          eventSources.set(id, this);
-        } catch (_) {
-          this._failAndReconnect();
-        }
-      }
-      _line(line) {
-        if (line === "") {
-          this._lastEventId = this._idBuffer;
-          const data = this._data, type = this._eventType;
-          /* Consume the event before author code can throw or reenter. */
-          this._data = [];
-          this._dataBytes = 0;
-          this._eventType = "";
-          if (data.length) {
-            const event = browserEvent(messageEventConstructor, type || "message", {
-              data: data.join("\n"),
-              origin: new TrustedURL(this.url)._origin,
-              lastEventId: this._lastEventId,
-              source: null,
-            });
-            this._emit(event);
-          }
-          return;
-        }
-        if (line.startsWith(":")) return;
-        const colon = line.indexOf(":"),
-          field = colon < 0 ? line : line.slice(0, colon);
-        let value = colon < 0 ? "" : line.slice(colon + 1);
-        if (value.startsWith(" ")) value = value.slice(1);
-        if (field === "data") {
-          const separator = this._data.length ? 1 : 0;
-          if (
-            value.length > 64 * 1024 - separator ||
-            this._dataBytes > 64 * 1024 - separator - value.length
-          ) {
-            this._data = [];
-            this._dataBytes = 0;
-            this.close();
-            this._emit(browserEvent(EventInterface, "error"));
-            return;
-          }
-          this._data.push(value);
-          this._dataBytes += separator + value.length;
-        }
-        else if (field === "event") this._eventType = value;
-        else if (field === "id" && !value.includes("\0"))
-          this._idBuffer = value;
-        else if (field === "retry" && /^\d+$/.test(value))
-          this._retry = Math.min(30000, Math.max(250, Number(value)));
-      }
-      _chunk(bytes) {
-        let text =
-          bytes instanceof ArrayBuffer
-            ? this._decoder.decode(new Uint8Array(bytes), { stream: true })
-            : String(bytes);
-        if (this._skipLF && text.length) {
-          if (text[0] === "\n") text = text.slice(1);
-          this._skipLF = false;
-        }
-        this._text += text;
-        for (;;) {
-          let newline = -1;
-          for (let index = 0; index < this._text.length; index++) {
-            if (this._text[index] === "\n" || this._text[index] === "\r") {
-              newline = index;
-              break;
-            }
-          }
-          if (newline < 0) {
-            if (this._text.length > 64 * 1024) {
-              this.close();
-              this._emit(browserEvent(EventInterface, "error"));
-            }
-            return;
-          }
-          this._skipLF = this._text[newline] === "\r" &&
-            newline + 1 === this._text.length;
-          const line = this._text.slice(0, newline),
-            consumed =
-              this._text[newline] === "\r" &&
-              this._text[newline + 1] === "\n"
-                ? newline + 2
-                : newline + 1;
-          this._text = this._text.slice(consumed);
-          this._line(line);
-          if (this._closed) return;
-        }
-      }
-      _failAndReconnect() {
-        if (this._closed) return;
-        this._resetParser();
-        this.readyState = EventSource.CONNECTING;
-        this._reconnectAt = __tilefinchRealmGlobal.__tilefinchSchedulerTime() + this._retry;
-        if (!scheduleSourceReconnect(this)) deferSourceReconnect(this);
-        this._emit(browserEvent(EventInterface, "error"));
-      }
-      close() {
-        if (this._closed) return;
-        this._closed = true;
-        this.readyState = EventSource.CLOSED;
-        deferredSources?.delete(this);
-        const task = this._reconnectTask;
-        this._reconnectTask = 0;
-        this._resetParser();
-        __tilefinchRealmGlobal.__tilefinchCancelTimer(task);
-        if (this._nativeId) {
-          eventSources.delete(this._nativeId);
-          __tilefinchEventSourceClose(this._nativeId);
-          this._nativeId = 0;
-        }
-      }
-    }
-    for (const [name, value] of Object.entries({
-      CONNECTING: 0,
-      OPEN: 1,
-      CLOSED: 2,
-    })) {
-      Object.defineProperty(EventSource, name, { value });
-      Object.defineProperty(EventSource.prototype, name, { value });
-    }
-    globalThis.EventSource = EventSource;
-    globalThis.__tilefinchDeliverEventSource = (
-      id,
-      kind,
-      payload,
-      origin,
-    ) => {
-      const source = eventSources.get(Number(id));
-      if (!source || source._closed) return false;
-      if (kind === "open") {
-        source.readyState = EventSource.OPEN;
-        source._emit(browserEvent(EventInterface, "open"));
-      } else if (kind === "chunk") {
-        source._chunk(payload);
-      } else {
-        eventSources.delete(Number(id));
-        source._nativeId = 0;
-        if (kind === "terminal") {
-          source.close();
-          source._emit(browserEvent(EventInterface, "error"));
-        } else source._failAndReconnect();
-      }
-      return true;
-    };
-  }
   {
     const webSockets = new Map(),
       webSocketLimit = 2,
@@ -6241,169 +5904,20 @@
     }),
   });
   {
-    const channels = new Map(),
-      messageLimit = 512,
-      queueLimit = 8,
-      bufferedLimit = messageLimit * queueLimit,
-      multiplayerDispatch = EventTarget.prototype.dispatchEvent;
-    const multiplayerEvent = (type, fields = {}) => {
-      const event = browserEvent(EventInterface, type);
-      for (const [name, value] of Object.entries(fields))
-        Object.defineProperty(event, name, {
-          value, enumerable: true, configurable: true,
-        });
-      return event;
-    };
-    class TilefinchMultiplayerChannel extends EventTarget {
-      constructor(mode, options, inviteCode = "") {
-        super();
-        options = options && typeof options === "object" ? options : {};
-        this.label = String(options.gameId || "").slice(0, 32);
-        this.protocol = "tilefinch-game-v1";
-        this.ordered = false;
-        this.maxPacketLifeTime = null;
-        this.maxRetransmits = 0;
-        this.negotiated = false;
-        this.id = null;
-        this.readyState = "connecting";
-        this.bufferedAmount = 0;
-        this.bufferedAmountLowThreshold = 0;
-        this.binaryType = "arraybuffer";
-        this.onopen = null;
-        this.onmessage = null;
-        this.onbufferedamountlow = null;
-        this.onclose = null;
-        this.onerror = null;
-        this.onstatus = null;
-        this.oninvitecode = null;
-        this.ondiscovered = null;
-        this.onpeerrequest = null;
-        this._queue = [];
-        this._sending = false;
-        this._closeRequest = null;
-        const name = String(options.name || "Player").slice(0, 24);
-        try {
-          this._nativeId = Number(__tilefinchMultiplayerStart(
-            String(mode), this.label, name, String(inviteCode || ""),
-          ));
-        } catch (_) {
-          this._nativeId = 0;
-        }
-        if (this._nativeId > 0) channels.set(this._nativeId, this);
-        else if (!__tilefinchRealmGlobal.__tilefinchScheduleTask(
-          () => this._fail("multiplayer unavailable"), 0)) {
-          this.readyState = "closed";
-          throw new DOMException("Multiplayer task queue is full", "QuotaExceededError");
-        }
-      }
-      _emit(event) {
-        trustedFunctionApply(multiplayerDispatch, this, [event]);
-        try {
-          const handler = this["on" + event.type];
-          if (typeof handler === "function")
-            globalThis.__tilefinchRunTask(
-              "multiplayer:" + String(event.type), handler, this, [event],
-            );
-        } catch (error) {
-          globalThis.__tilefinchReportUncaught(error, "multiplayer:" + event.type);
-        }
-      }
-      _fail(detail) {
-        if (this.readyState === "closed") return;
-        this._finish(1006, String(detail || ""), false, true);
-      }
-      _finish(code, reason, clean, withError = false) {
-        if (this.readyState === "closed") return;
-        if (this._nativeId) channels.delete(this._nativeId);
-        this._nativeId = 0;
-        this.readyState = "closed";
-        this._queue.length = 0;
-        this._sending = false;
-        this._closeRequest = null;
-        this.bufferedAmount = 0;
-        if (withError)
-          this._emit(multiplayerEvent("error", { detail: String(reason || "") }));
-        this._emit(browserEvent(CloseEventInterface, "close", {
-          code: Number(code) || 0,
-          reason: String(reason || ""),
-          wasClean: !!clean,
-        }));
-      }
-      _pump() {
-        if (!this._nativeId || this._sending || !this._queue.length) {
-          if (!this._sending && !this._queue.length && this._closeRequest
-              && this._nativeId) {
-            const close = this._closeRequest;
-            this._closeRequest = null;
-            if (!__tilefinchMultiplayerClose(
-                this._nativeId, close.code, close.reason))
-              this._fail("close admission failed");
-          }
-          return;
-        }
-        if (this.readyState !== "open" && this.readyState !== "closing")
-          return;
-        const item = this._queue[0];
-        if (__tilefinchMultiplayerSend(
-            this._nativeId, item.bytes.buffer, item.binary))
-          this._sending = true;
-      }
-      send(data) {
-        if (this.readyState !== "open")
-          throw new DOMException("Multiplayer channel is not open", "InvalidStateError");
-        let bytes, binary = true;
-        if (typeof data === "string") {
-          bytes = new TextEncoder().encode(data);
-          binary = false;
-        } else if (data instanceof ArrayBuffer) {
-          bytes = new Uint8Array(data.slice(0));
-        } else if (ArrayBuffer.isView(data)) {
-          bytes = new Uint8Array(
-            data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength),
-          );
-        } else {
-          throw new TypeError("Unsupported multiplayer message type");
-        }
-        if (bytes.byteLength > messageLimit)
-          throw new DOMException("Multiplayer message is too large", "QuotaExceededError");
-        if (this._queue.length >= queueLimit
-            || bytes.byteLength > bufferedLimit - this.bufferedAmount)
-          throw new DOMException("Multiplayer send queue is full", "QuotaExceededError");
-        this._queue.push({ bytes, binary });
-        this.bufferedAmount += bytes.byteLength;
-        this._pump();
-      }
-      accept(peerIdentity, accepted = true) {
-        if (!this._nativeId || this.readyState !== "connecting") return false;
-        return !!__tilefinchMultiplayerAccept(
-          this._nativeId, Number(peerIdentity) >>> 0, !!accepted,
-        );
-      }
-      addRemoteCode(code) {
-        if (!this._nativeId || this.readyState !== "connecting") return false;
-        return !!__tilefinchMultiplayerAddRemoteCode(
-          this._nativeId, String(code || ""),
-        );
-      }
-      close(code = 1000, reason = "") {
-        code = Number(code);
-        reason = String(reason);
-        if (!Number.isInteger(code)
-            || (code !== 1000 && (code < 3000 || code > 4999)))
-          throw new DOMException("Invalid close code", "InvalidAccessError");
-        if (new TextEncoder().encode(reason).length > 63)
-          throw new DOMException("Close reason is too long", "SyntaxError");
-        if (this.readyState === "closed" || this.readyState === "closing") return;
-        this.readyState = "closing";
-        this._closeRequest = { code, reason };
-        this._pump();
-      }
-    }
+    /* The channel is multiplayer.js's, built on the first host(), join()
+       or discover(): the native loads it, and the factory it leaves on the
+       global is read and deleted in that same call, before page code can
+       run (Interface snapshot in docs/engineering/JS_RUNTIME.md). */
+    const ensureMultiplayer =
+      globalThis.__tilefinchEnsureMultiplayerBootstrap;
+    let createChannel = null;
     const openChannel = (mode, code, options) => {
-      options = options && typeof options === "object" ? options : {};
-      if (!String(options.gameId || ""))
-        throw new TypeError("gameId is required");
-      return new TilefinchMultiplayerChannel(mode, options, code);
+      if (!createChannel)
+        ensureMultiplayer(() => {
+          createChannel = __tilefinchRealmGlobal.__tilefinchCreateMultiplayer;
+          delete __tilefinchRealmGlobal.__tilefinchCreateMultiplayer;
+        });
+      return createChannel(mode, code, options);
     };
     Object.defineProperty(navigator, "tilefinchMultiplayer", {
       configurable: false,
@@ -6413,57 +5927,9 @@
         join(code, options) { return openChannel("join", code, options); },
         discover(options) { return openChannel("discover", "", options); },
         supported: true,
-        maxMessageSize: messageLimit,
+        maxMessageSize: 512,
       }),
     });
-    globalThis.__tilefinchDeliverMultiplayer = (
-      id, kind, payload, detail, code, clean, peerIdentity, inviteCode, peerName,
-    ) => {
-      const channel = channels.get(Number(id));
-      if (!channel || channel.readyState === "closed") return false;
-      if (kind === "open") {
-        if (channel.readyState !== "connecting") return false;
-        channel.readyState = "open";
-        channel._emit(browserEvent(EventInterface, "open"));
-        channel._pump();
-      } else if (kind === "binary" || kind === "text") {
-        if (channel.readyState !== "open") return false;
-        const buffer = payload instanceof ArrayBuffer
-          ? payload : new Uint8Array(payload).buffer;
-        const data = kind === "text"
-          ? new TextDecoder().decode(buffer) : buffer;
-        channel._emit(browserEvent(messageEventConstructor, "message", {
-          data, origin: "", source: null,
-        }));
-      } else if (kind === "drain") {
-        const before = channel.bufferedAmount;
-        const item = channel._queue.shift();
-        channel._sending = false;
-        if (item) channel.bufferedAmount = Math.max(
-          0, channel.bufferedAmount - item.bytes.byteLength,
-        );
-        if (before > channel.bufferedAmountLowThreshold
-            && channel.bufferedAmount <= channel.bufferedAmountLowThreshold)
-          channel._emit(browserEvent(EventInterface, "bufferedamountlow"));
-        channel._pump();
-      } else if (kind === "status") {
-        channel._emit(multiplayerEvent("status", { detail: String(detail || "") }));
-      } else if (kind === "invitecode") {
-        channel._emit(multiplayerEvent("invitecode", {
-          code: String(inviteCode || ""), detail: String(detail || ""),
-        }));
-      } else if (kind === "discovered" || kind === "peerrequest") {
-        channel._emit(multiplayerEvent(kind, {
-          peerIdentity: Number(peerIdentity) >>> 0,
-          code: String(inviteCode || ""),
-          name: String(peerName || ""),
-          detail: String(detail || ""),
-        }));
-      } else {
-        channel._finish(code, detail, clean);
-      }
-      return true;
-    };
   }
   let xhrEventTargetState, xhrPublicState, xhrPrivateState;
   /* The optional native recorder retains numeric metadata only. */
@@ -6658,7 +6124,7 @@
           new DOMException("Request reopened", "AbortError"),
           false,
         );
-      if (state.timeoutId) __tilefinchRealmGlobal.__tilefinchCancelTimer(state.timeoutId);
+      if (state.timeoutId) domShared.cancelTimer(state.timeoutId);
       state.timeoutId = 0;
       state.generation += 1;
       state.method = nextMethod;
@@ -6681,7 +6147,7 @@
       const state = xhrPrivateState(this);
       if (this.readyState !== 1 || state.sent)
         throw new DOMException("Request is not open", "InvalidStateError");
-      state.headers.append(name, value);
+      appendHeader(state.headers, name, value);
     }
     overrideMimeType(type) {
       if (this.readyState === 3 || this.readyState === 4)
@@ -6707,7 +6173,7 @@
       const state = xhrPrivateState(this);
       if (state.done || state.generation !== generation) return false;
       state.done = true;
-      if (state.timeoutId) __tilefinchRealmGlobal.__tilefinchCancelTimer(state.timeoutId);
+      if (state.timeoutId) domShared.cancelTimer(state.timeoutId);
       state.timeoutId = 0;
       state.requestId = 0;
       const loaded = state.responseBytes,
@@ -6827,7 +6293,7 @@
       yield [this, "readystatechange", 0, 0, false];
       if (state.done || state.generation !== generation) return;
       state.done = true;
-      if (state.timeoutId) __tilefinchRealmGlobal.__tilefinchCancelTimer(state.timeoutId);
+      if (state.timeoutId) domShared.cancelTimer(state.timeoutId);
       state.timeoutId = 0;
       state.requestId = 0;
       yield [this, "load", byteLength, byteLength, true];
@@ -6854,6 +6320,8 @@
       if (this.readyState !== 1 || state.sent)
         throw new DOMException("Request is not open", "InvalidStateError");
       if (testProbes) globalThis.__tilefinchXHRSendCalls++;
+      /* XHR drops the body of a GET or HEAD (pages pass "" to every send). */
+      if (state.method === "GET" || state.method === "HEAD") body = null;
       if (xhrDiagnosticRecord)
         state.diagnosticSequence = xhrDiagnosticRecord(0, 0, 0, false);
       state.sent = true;
@@ -6866,8 +6334,8 @@
           serialized = serializeRequestBody(request),
           method = state.method || "GET",
           url = state.url,
-          contentType = state.headers.get("content-type") || "",
-          accept = state.headers.get("accept") || "*/*",
+          contentType = getHeader(state.headers, "content-type") || "",
+          accept = getHeader(state.headers, "accept") || "*/*",
           headerBlock = nativeHeaderBlock(state.headers),
           credentials = this.withCredentials ? "include" : "same-origin",
           timeout = Math.max(0, Number(this.timeout) || 0);
@@ -6990,7 +6458,7 @@
       xhrDiagnosticAdd(state, 4, 7, true);
       state.generation += 1;
       const generation = state.generation;
-      if (state.timeoutId) __tilefinchRealmGlobal.__tilefinchCancelTimer(state.timeoutId);
+      if (state.timeoutId) domShared.cancelTimer(state.timeoutId);
       state.timeoutId = 0;
       if (state.requestId)
         cancelNetwork(
@@ -7283,7 +6751,7 @@
       const state = xhrPrivateState(xhr);
       if (!state) return false;
       state.generation += 1;
-      if (state.timeoutId) __tilefinchRealmGlobal.__tilefinchCancelTimer(state.timeoutId);
+      if (state.timeoutId) domShared.cancelTimer(state.timeoutId);
       state.timeoutId = 0;
       if (state.requestId)
         cancelNetwork(

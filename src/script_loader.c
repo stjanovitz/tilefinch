@@ -2027,9 +2027,35 @@ static bool execute_external_node(
         script_cache_source_release(&cached_source);
         return false;
     }
-    if (request == NULL || !script_fetch_awaited(scheduler, resolved, request,
-                                                 response_limit, timeout_ms,
-                                                 fetch)) {
+    /* An in-flight modulepreload (or the scanner's speculative request) of
+       this module with the script's key is its fetch: waited for in place
+       of a request of its own, and checked below as that would be. */
+    bool fetched = false;
+    if (module && request != NULL) {
+        size_t integrity_length = 0;
+        const char *integrity = document_attribute(
+            node, "integrity", &integrity_length);
+        FetchScheduler *preload_scheduler = NULL;
+        uint64_t preloaded = script_runtime_take_module_preload(
+            runtime, resolved, module_credentials, integrity,
+            integrity_length, csp_grant, &preload_scheduler);
+        fetched = preloaded != 0
+            && fetch_scheduler_wait(preload_scheduler, preloaded, fetch)
+            && fetch->length <= response_limit;
+        if (preloaded != 0 && !fetched) {
+            fetch_result_free(fetch);
+            fetch = fetch_result_create(budget);
+            if (fetch == NULL) {
+                script_runtime_script_quota_abort(runtime, &quota);
+                script_cache_source_release(&cached_source);
+                return false;
+            }
+        }
+    }
+    if (request == NULL
+        || (!fetched && !script_fetch_awaited(scheduler, resolved, request,
+                                              response_limit, timeout_ms,
+                                              fetch))) {
         if (tilefinch_trace_script_failures()) {
             fprintf(stderr,
                     "script-fetch-failure url=\"%s\" limit=%zu "
@@ -2498,13 +2524,18 @@ static void module_prefetch_dependencies(
                 context->session, resolved, initiator_origin,
                 context->top_level_url, initiator_opaque, credentials,
                 &cached) == BROWSER_CACHE_FRESH) continue;
+        uint8_t csp_grant = script_runtime_module_csp_grant(
+            context->runtime, module_url);
+        /* A modulepreload in flight is the import's request already. */
+        if (script_runtime_module_preload_pending(
+                context->runtime, resolved, credentials, csp_grant))
+            continue;
         if (fetch_scheduler_enqueue_would_block(
                 scheduler, MODULE_PREFETCH_BYTES)) return;
         TilefinchRequestContext request_context = script_request_context(
             document_url, context->top_level_url, resolved, true,
             credentials, initiator_opaque);
-        request_context.csp_grant = script_runtime_module_csp_grant(
-            context->runtime, module_url);
+        request_context.csp_grant = csp_grant;
         FetchRequest transport = {
             .allow_http_errors = true,
             .send_low_client_hints = true,
@@ -2673,21 +2704,34 @@ static bool pipeline_module_load(void *opaque,
         const FetchRequest *request = request_ready
             ? fetch_prepared_page_request(&prepared) : NULL;
         size_t prefetched = module_prefetch_find(context, url);
+        /* An in-flight modulepreload of this URL is this fetch's request,
+           waited for as a prefetch is (when the fetch could make one of
+           its own). */
+        FetchScheduler *preload_scheduler = scheduler;
+        uint64_t preloaded = prefetched != SIZE_MAX || request == NULL ? 0
+            : script_runtime_take_module_preload(
+                  context->runtime, url, credentials, NULL, 0,
+                  module_request->csp_grant, &preload_scheduler);
         bool fetched = false;
         /* A failure that delivered no body is usually a dead or stalled
            connection (every HTTP/2 stream on it stalls), so the next
            attempt opens a new one. */
         FetchRequest fresh_request = {0};
         bool use_fresh_connection = false;
-        if (prefetched != SIZE_MAX) {
-            uint64_t prefetch_id = context->prefetches[prefetched].id;
-            module_prefetch_remove(context, prefetched);
-            fetched = fetch_scheduler_wait(scheduler, prefetch_id, fetch)
+        if (prefetched != SIZE_MAX || preloaded != 0) {
+            uint64_t prefetch_id = preloaded;
+            if (prefetched != SIZE_MAX) {
+                preload_scheduler = scheduler;
+                prefetch_id = context->prefetches[prefetched].id;
+                module_prefetch_remove(context, prefetched);
+            }
+            fetched = fetch_scheduler_wait(preload_scheduler, prefetch_id,
+                                           fetch)
                 && fetch->status_code >= 200 && fetch->status_code < 300;
-            if (fetched) {
+            if (fetched && prefetched != SIZE_MAX) {
                 context->metrics->module_prefetch_hits++;
                 module_prefetch_hit_total++;
-            } else {
+            } else if (!fetched) {
                 use_fresh_connection = fetch->length == 0;
                 fetch_result_free(fetch);
                 fetch = fetch_result_create(context->budget);

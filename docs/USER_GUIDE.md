@@ -3,8 +3,8 @@
 This guide is for PSP owners. It covers everyday use beyond the basics in the
 [README](../README.md): tabs, bookmarks and history, typing, finding text,
 text size and page zoom, Reader mode and Basic view, saving and downloads, video and YouTube, language
-packs, games and page controls, screenshots, reading a page while it loads,
-what happens when a page will not load, faster revisits, and the per-site
+packs, games and page controls, screenshots, scrolling, reading a page while
+it loads, what happens when a page will not load, faster revisits, and the per-site
 controls. The button map is in the README's
 [Controls](../README.md#controls) table.
 
@@ -19,7 +19,13 @@ in page** means press Select, choose **Page tools**, then **Find in page**.
   cache where possible. **Menu → Settings → Browsing & input → Restore page**
   reopens your tabs after you exit normally, and **Hibernate tab** moves one
   inactive tab's record to the Memory Stick to free RAM; that tab is marked
-  `[Z]`.
+  `[Z]`. Tilefinch keeps small edits to recognizable text fields in memory
+  when you switch tabs or return with Back. These drafts don't survive a
+  restart, and password and file fields aren't saved. A tab with a draft
+  stays in memory instead of hibernating. If the edits can't fit and you
+  follow a link, use Back, or switch tabs, Tilefinch asks first. Press
+  **Circle** to stay and keep typing, or **Cross** to leave without saving
+  the edits that didn't fit. Submitting the form doesn't need this confirmation.
 - **Bookmarks.** **Menu → Page tools → Add/remove bookmark** bookmarks the
   current page, or removes its bookmark, and the status line confirms it.
   **Menu → Library** lists your bookmarks under **Bookmarks**.
@@ -620,6 +626,19 @@ a level meter or tuner on the page works either way.
 Tilefinch remembers the answers of up to 16 sites, and only the site's
 address and the answer; when that is full, **Always allow** is greyed out
 and **Block** refuses only this time.
+
+## Scrolling
+
+L and R move a page up and down by a screen, less a few lines of overlap
+and less any header or footer the page keeps fixed on screen. When the bars
+a page keeps fixed at the top and bottom would together cover more than
+half the screen, the top ones stay at the top of the page and scroll away
+with it instead, and L and R move a full screen less the overlap. A fixed
+footer stays on screen unless it alone covers more than half. Some pages
+keep their content in a scrolling box under their header instead of
+scrolling as a whole. When the page itself cannot move any further, L and R
+and the analog stick scroll the box that fills most of the screen. To
+scroll a smaller box, point the cursor at it first.
 
 ## While a page loads
 

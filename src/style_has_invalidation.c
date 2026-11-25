@@ -34,6 +34,9 @@ typedef struct {
     uint8_t relation;
     uint8_t region;
     bool escapes;
+    /* Relation other: a descendant or child combinator follows the anchor,
+       so every subject lies under the anchor, not only under its parent. */
+    bool below_anchor;
     /* An identity the tokens cannot represent, or a [class]/[id] test. */
     bool any_identity;
     /* An argument element no key can find (`> *`, `:not(.a)`): any element
@@ -44,11 +47,19 @@ typedef struct {
        (or the marker on the anchor itself), so only a focus move, or a
        tree change carrying the marker, can move it. */
     bool focus;
+    /* subject_key is the first of a key set (the subject compound has no
+       key of its own); the placement rules treat the subject as unkeyed. */
+    bool subject_set;
     /* The declared name of a custom-property rule (name bits), else 0. */
     uint64_t custom_names;
 } StyleHasPlanEntry;
 
-enum { HAS_ROLE_ANCHOR = 1, HAS_ROLE_SUBJECT = 2 };
+/* A compound with no key of its own is keyed by a set (an :is() of keyed
+   options, or an nth-child `of S` list): every element it matches carries
+   one of them. The first is the entry's key; each further one adds a row.
+   An entry the walk does not place indexes its further anchor keys as
+   HAS_ROLE_UNPLACED, read only by the head-change test. */
+enum { HAS_ROLE_ANCHOR = 1, HAS_ROLE_SUBJECT = 2, HAS_ROLE_UNPLACED = 4 };
 /* Argument features (keys of the elements an argument's relative selectors
    end on): searched in an inserted or removed subtree (narrow), among its
    siblings when the argument tests positions or adjacency (sibling: a new
@@ -96,6 +107,9 @@ struct StyleHasPlan {
     uint64_t analyzing_custom_names;
     /* Distinguishes this build from any other (entry indices differ). */
     uint32_t serial;
+    /* Further keys of key sets, until has_plan_index copies them. */
+    StyleHasPlanKey *extra;
+    size_t extra_count, extra_capacity;
 };
 
 #define HAS_KEY_TAG 't'
@@ -547,11 +561,20 @@ static bool has_argument_escapes(const char *text, size_t at, size_t end,
 
 /* ---- Classification. -------------------------------------------------- */
 
+#define HAS_FEATURE_ALTERNATIVES 16u
+
+typedef struct {
+    uint32_t keys[HAS_FEATURE_ALTERNATIVES];
+    size_t count;
+} HasKeySet;
+
 typedef struct {
     StyleHasPlan *plan;
     const char *text;
     uint32_t rule;
     uint32_t subject_key;
+    /* The subject compound's key set when it has no key of its own. */
+    HasKeySet subject;
     bool other;
 } HasAnalysis;
 
@@ -624,8 +647,6 @@ static void has_collect_tokens(HasAnalysis *analysis,
     }
 }
 
-#define HAS_FEATURE_ALTERNATIVES 16u
-
 /* Keys one of which every element matching the compound carries: its own
    key, or every alternative of a top-level :is()/:where() whose items all
    end on keyed compounds. False when there are none. */
@@ -665,6 +686,70 @@ static bool has_compound_features(StyleHasPlan *plan, const char *text,
         *count = saved;
     }
     return false;
+}
+
+/* The key set of a compound with no key of its own: the keys of a
+   logical pseudo-class's options, or of the items of an nth-child `of S`
+   list (an element it matches matches S). Empty when an option or item
+   ends on no key, or past HAS_FEATURE_ALTERNATIVES keys. */
+static void has_compound_key_set(StyleHasPlan *plan, const char *text,
+                                 size_t at, size_t end, HasKeySet *set)
+{
+    set->count = 0;
+    if (has_compound_features(plan, text, at, end, set->keys, &set->count,
+                              0)) return;
+    HasPseudo pseudo;
+    size_t cursor = at;
+    while (has_next_pseudo(text, &cursor, end, &pseudo)) {
+        size_t b = pseudo.name_begin, e = pseudo.name_end;
+        if (!pseudo.functional
+            || !(has_name_is(text, b, e, "nth-child")
+                 || has_name_is(text, b, e, "nth-last-child"))) continue;
+        size_t item = has_nth_of(text, pseudo.argument_begin,
+                                 pseudo.argument_end);
+        bool keyed = item < pseudo.argument_end;
+        while (keyed && item < pseudo.argument_end) {
+            size_t item_end = has_item_end(text, item, pseudo.argument_end);
+            HasCompound compounds[HAS_COMPOUND_LIMIT];
+            bool overflow = false;
+            size_t n = has_compounds(text, item, item_end, compounds,
+                                     HAS_COMPOUND_LIMIT, &overflow);
+            keyed = !overflow && n != 0
+                && has_compound_features(plan, text, compounds[n - 1].begin,
+                                         compounds[n - 1].end, set->keys,
+                                         &set->count, 1);
+            item = item_end + 1;
+        }
+        if (keyed) return;
+        set->count = 0;
+    }
+}
+
+static void has_add_extra(StyleHasPlan *plan, uint32_t hash, size_t entry,
+                          uint8_t role)
+{
+    if (!has_plan_reserve(plan->budget, (void **) &plan->extra,
+                          &plan->extra_capacity, plan->extra_count,
+                          sizeof(*plan->extra))) {
+        plan->bounded = true;
+        return;
+    }
+    plan->extra[plan->extra_count++] =
+        (StyleHasPlanKey) {hash, (uint16_t) entry, role};
+}
+
+/* The rows of the further keys of the entry's subject and anchor sets
+   (`anchors`: NULL when the anchor has one key or none). */
+static void has_add_key_sets(HasAnalysis *analysis, size_t index,
+                             const HasKeySet *anchors)
+{
+    StyleHasPlan *plan = analysis->plan;
+    const HasKeySet *subject = &analysis->subject;
+    plan->entries[index].subject_set = subject->count != 0;
+    for (size_t k = 1; k < subject->count; k++)
+        has_add_extra(plan, subject->keys[k], index, HAS_ROLE_SUBJECT);
+    for (size_t k = 1; anchors != NULL && k < anchors->count; k++)
+        has_add_extra(plan, anchors->keys[k], index, HAS_ROLE_ANCHOR);
 }
 
 static void has_add_feature(StyleHasPlan *plan, uint32_t hash, size_t entry,
@@ -769,7 +854,8 @@ static void has_collect_features(HasAnalysis *analysis, size_t index,
 }
 
 static void has_add_entry(HasAnalysis *analysis, uint8_t relation,
-                          uint32_t anchor_key, size_t argument_begin,
+                          uint32_t anchor_key, const HasKeySet *anchors,
+                          bool below_anchor, size_t argument_begin,
                           size_t argument_end)
 {
     StyleHasPlan *plan = analysis->plan;
@@ -789,6 +875,11 @@ static void has_add_entry(HasAnalysis *analysis, uint8_t relation,
     entry->subject_key = analysis->subject_key;
     entry->anchor_key = relation == STYLE_HAS_RELATION_SELF && anchor_key == 0
         ? analysis->subject_key : anchor_key;
+    entry->below_anchor = below_anchor;
+    has_add_key_sets(analysis, plan->entry_count - 1,
+                     relation == STYLE_HAS_RELATION_SELF && anchor_key == 0
+                         ? &analysis->subject : anchors);
+    entry = &plan->entries[plan->entry_count - 1];
     if (argument_end <= argument_begin) {
         /* A rule the classifier could not place: any change concerns it. */
         entry->any_identity = true;
@@ -798,7 +889,6 @@ static void has_add_entry(HasAnalysis *analysis, uint8_t relation,
     has_collect_tokens(analysis, entry, argument_begin, argument_end);
     has_collect_features(analysis, plan->entry_count - 1, argument_begin,
                          argument_end);
-    if (relation == STYLE_HAS_RELATION_OTHER) return;
     entry->region = has_argument_region(analysis->text, argument_begin,
                                         argument_end);
     entry->escapes = has_argument_escapes(
@@ -811,7 +901,8 @@ static void has_add_entry(HasAnalysis *analysis, uint8_t relation,
    anchor included): the walk from the focus change's node visits exactly
    those anchors. */
 static void has_add_focus_entry(HasAnalysis *analysis, uint8_t relation,
-                                uint32_t anchor_key)
+                                uint32_t anchor_key, const HasKeySet *anchors,
+                                bool below_anchor)
 {
     StyleHasPlan *plan = analysis->plan;
     if (plan->bounded) return;
@@ -830,6 +921,11 @@ static void has_add_focus_entry(HasAnalysis *analysis, uint8_t relation,
     entry->subject_key = analysis->subject_key;
     entry->anchor_key = relation == STYLE_HAS_RELATION_SELF && anchor_key == 0
         ? analysis->subject_key : anchor_key;
+    entry->below_anchor = below_anchor;
+    has_add_key_sets(analysis, index,
+                     relation == STYLE_HAS_RELATION_SELF && anchor_key == 0
+                         ? &analysis->subject : anchors);
+    entry = &plan->entries[index];
     entry->token_first = (uint32_t) plan->token_count;
     entry->region = STYLE_HAS_REGION_DESCENDANTS;
     entry->focus = true;
@@ -885,29 +981,44 @@ static void has_analyze_complex(HasAnalysis *analysis, size_t at, size_t end,
                 inner = STYLE_HAS_RELATION_ANCESTOR;
         }
         uint8_t relation = has_relation_combine(inner, outer_relation);
+        /* The first combinator after the anchor: below it (descendant or
+           child), the subject is under the anchor, whatever follows. */
+        bool below_anchor = i + 1 < count
+            && compounds[i + 1].combinator != '+'
+            && compounds[i + 1].combinator != '~';
         uint32_t key = has_compound_key(text, compounds[i].begin,
                                         compounds[i].end,
                                         &analysis->plan->attribute_keys);
         if (key == 0 && inner == STYLE_HAS_RELATION_SELF) key = outer_key;
+        HasKeySet anchors = {.count = 0};
+        if (key == 0) {
+            has_compound_key_set(analysis->plan, text, compounds[i].begin,
+                                 compounds[i].end, &anchors);
+            if (anchors.count != 0) key = anchors.keys[0];
+        }
+        const HasKeySet *set = anchors.count > 1 ? &anchors : NULL;
         HasPseudo pseudo;
         size_t cursor = compounds[i].begin;
         while (has_next_pseudo(text, &cursor, compounds[i].end, &pseudo)) {
             if (!pseudo.functional) {
                 if (has_name_is(text, pseudo.name_begin, pseudo.name_end,
                                 "focus-within"))
-                    has_add_focus_entry(analysis, relation, key);
+                    has_add_focus_entry(analysis, relation, key, set,
+                                        below_anchor);
                 continue;
             }
             size_t ab = pseudo.argument_begin, ae = pseudo.argument_end;
             if (has_name_is(text, pseudo.name_begin, pseudo.name_end, "has")) {
                 /* The :has() entry also covers a :focus-within inside. */
-                has_add_entry(analysis, relation, key, ab, ae);
+                has_add_entry(analysis, relation, key, set, below_anchor, ab,
+                              ae);
             } else if (has_text_contains(text, ab, ae, ":has(")
                        || has_text_contains(text, ab, ae, ":focus-within")) {
                 if (has_pseudo_is_logical(text, &pseudo)) {
-                    /* Each item's subject is this compound's element. */
-                    has_analyze_list(analysis, ab, ae, relation, key,
-                                     depth + 1);
+                    /* Each item's subject is this compound's element
+                       (a set's keys are not passed down). */
+                    has_analyze_list(analysis, ab, ae, relation,
+                                     set != NULL ? 0 : key, depth + 1);
                 } else {
                     analysis->other = true;
                 }
@@ -941,15 +1052,24 @@ static void has_analyze_rule(StyleHasPlan *plan, uint32_t rule,
         bool overflow = false;
         size_t count = has_compounds(text, 0, length, compounds,
                                      HAS_COMPOUND_LIMIT, &overflow);
-        if (!overflow && count != 0)
+        if (!overflow && count != 0) {
             analysis.subject_key = has_compound_key(
                 text, compounds[count - 1].begin, compounds[count - 1].end,
                 &plan->attribute_keys);
+            if (analysis.subject_key == 0) {
+                has_compound_key_set(plan, text, compounds[count - 1].begin,
+                                     compounds[count - 1].end,
+                                     &analysis.subject);
+                if (analysis.subject.count != 0)
+                    analysis.subject_key = analysis.subject.keys[0];
+            }
+        }
     }
     size_t before = plan->entry_count;
     has_analyze_list(&analysis, 0, length, STYLE_HAS_RELATION_SELF, 0, 0);
     if (analysis.other || plan->entry_count == before)
-        has_add_entry(&analysis, STYLE_HAS_RELATION_OTHER, 0, 0, 0);
+        has_add_entry(&analysis, STYLE_HAS_RELATION_OTHER, 0, NULL, false, 0,
+                      0);
 }
 
 static int has_key_compare(const void *left, const void *right)
@@ -959,18 +1079,40 @@ static int has_key_compare(const void *left, const void *right)
     return (int) a->entry - (int) b->entry;
 }
 
+/* A relation-other entry the walk places by its anchor: one with no
+   subject key of its own (a keyed subject is selected by its key
+   anywhere; one keyed by a set stays placed, and is selected by its keys
+   under the anchor) whose anchor carries a key and whose argument was
+   classified. Its subjects lie under the anchor's parent (or the anchor,
+   below_anchor): the combinators from the anchor to the subject only
+   descend or move among siblings. */
+static bool has_entry_placed_other(const StyleHasPlanEntry *entry)
+{
+    return entry->relation == STYLE_HAS_RELATION_OTHER
+        && (entry->subject_key == 0 || entry->subject_set)
+        && entry->anchor_key != 0 && entry->region != 0;
+}
+
+/* Whether the walk finds the entry's anchors. */
+static bool has_entry_walked(const StyleHasPlanEntry *entry)
+{
+    return entry->relation != STYLE_HAS_RELATION_OTHER
+        || has_entry_placed_other(entry);
+}
+
 static void has_plan_index(StyleHasPlan *plan)
 {
     size_t keys = 0, unkeyed_anchors = 0, unkeyed_subjects = 0;
     for (size_t i = 0; i < plan->entry_count; i++) {
         const StyleHasPlanEntry *entry = &plan->entries[i];
-        if (entry->relation != STYLE_HAS_RELATION_OTHER) {
+        if (has_entry_walked(entry)) {
             if (entry->anchor_key != 0) keys++;
             else unkeyed_anchors++;
         }
         if (entry->subject_key != 0) keys++;
         else unkeyed_subjects++;
     }
+    keys += plan->extra_count;
     plan->keys = keys == 0 ? NULL
         : budget_malloc(plan->budget, keys * sizeof(*plan->keys));
     plan->unkeyed_anchors = unkeyed_anchors == 0 ? NULL
@@ -987,7 +1129,7 @@ static void has_plan_index(StyleHasPlan *plan)
     }
     for (size_t i = 0; i < plan->entry_count; i++) {
         const StyleHasPlanEntry *entry = &plan->entries[i];
-        if (entry->relation != STYLE_HAS_RELATION_OTHER) {
+        if (has_entry_walked(entry)) {
             if (entry->anchor_key != 0) {
                 plan->keys[plan->key_count++] = (StyleHasPlanKey) {
                     entry->anchor_key, (uint16_t) i, HAS_ROLE_ANCHOR};
@@ -1004,6 +1146,16 @@ static void has_plan_index(StyleHasPlan *plan)
                 (uint16_t) i;
         }
     }
+    for (size_t i = 0; i < plan->extra_count; i++) {
+        StyleHasPlanKey row = plan->extra[i];
+        if (row.role == HAS_ROLE_ANCHOR
+            && !has_entry_walked(&plan->entries[row.entry]))
+            row.role = HAS_ROLE_UNPLACED;
+        plan->keys[plan->key_count++] = row;
+    }
+    budget_free(plan->budget, plan->extra);
+    plan->extra = NULL;
+    plan->extra_count = plan->extra_capacity = 0;
     qsort(plan->keys, plan->key_count, sizeof(*plan->keys), has_key_compare);
     qsort(plan->features, plan->feature_count, sizeof(*plan->features),
           has_key_compare);
@@ -1023,6 +1175,7 @@ void style_has_plan_destroy(Stylesheet *sheet)
     budget_free(budget, plan->unkeyed_anchors);
     budget_free(budget, plan->unkeyed_subjects);
     budget_free(budget, plan->features);
+    budget_free(budget, plan->extra);
     budget_free(budget, plan);
 }
 
@@ -1036,7 +1189,8 @@ size_t style_has_plan_bytes(const Stylesheet *sheet)
         + plan->key_count * sizeof(*plan->keys)
         + plan->unkeyed_anchor_count * sizeof(*plan->unkeyed_anchors)
         + plan->unkeyed_subject_count * sizeof(*plan->unkeyed_subjects)
-        + plan->feature_capacity * sizeof(*plan->features);
+        + plan->feature_capacity * sizeof(*plan->features)
+        + plan->extra_capacity * sizeof(*plan->extra);
 }
 
 static const StyleHasPlan *has_plan_prepare(const Stylesheet *const_sheet)
@@ -1073,18 +1227,23 @@ static const StyleHasPlan *has_plan_prepare(const Stylesheet *const_sheet)
         }
         /* :focus-within outside any :has() (those were analyzed above). */
         for (size_t i = 0; i < sheet->count && !plan->bounded; i++) {
-            const StyleRule *rule = &sheet->rules[i];
+            StyleRule *rule = &sheet->rules[i];
             if (rule->selector != NULL
-                && strstr(rule->selector, ":focus-within") != NULL
-                && strstr(rule->selector, ":has(") == NULL)
+                && (style_rule_selector_facts(rule)
+                    & (STYLE_SELECTOR_FACTS_FOCUS_WITHIN
+                       | STYLE_SELECTOR_FACTS_HAS))
+                       == STYLE_SELECTOR_FACTS_FOCUS_WITHIN)
                 has_analyze_rule(plan, (uint32_t) i, rule->selector,
                                  rule->selector_length);
         }
         for (size_t i = 0; i < sheet->custom_rule_count && !plan->bounded;
              i++) {
             const char *selector = sheet->custom_rules[i].selector;
-            if (selector == NULL || strstr(selector, ":focus-within") == NULL
-                || strstr(selector, ":has(") != NULL) continue;
+            if (selector == NULL
+                || (style_custom_rule_selector_facts(&sheet->custom_rules[i])
+                    & (STYLE_SELECTOR_FACTS_FOCUS_WITHIN
+                       | STYLE_SELECTOR_FACTS_HAS))
+                       != STYLE_SELECTOR_FACTS_FOCUS_WITHIN) continue;
             plan->analyzing_custom_names =
                 stylesheet_custom_property_name_bits(
                     sheet->custom_rules[i].name,
@@ -1382,6 +1541,13 @@ static void has_visit_entry(HasVisit *visit, size_t index)
     } else if (entry->relation == STYLE_HAS_RELATION_ANCESTOR) {
         has_add_root(walk->pending, visit->node);
         has_mark(walk->pending, walk->plan, index, false);
+    } else {
+        /* A placed relation-other entry (only those are walked). With no
+           parent the anchor has no siblings: its subjects lie under it. */
+        has_add_root(walk->pending,
+                     entry->below_anchor || visit->node->parent == NULL
+                         ? visit->node : visit->node->parent);
+        has_mark(walk->pending, walk->plan, index, false);
     }
 }
 
@@ -1463,13 +1629,16 @@ static bool has_note_change(const Stylesheet *sheet, lxb_dom_node_t *node,
             pending->active = true;
             pending->plan = plan;
         }
-        if (entry->relation == STYLE_HAS_RELATION_OTHER) {
+        if (!has_entry_walked(entry)) {
             if (entry->subject_key == 0)
                 has_unplaced(pending, plan, i, walk.stats, &wiped);
             else
                 has_mark(pending, plan, i, true);
             continue;
         }
+        /* An escaping argument's anchors under `base` style only elements
+           under it: their subjects are themselves, their descendants, or
+           (relation other) their parent's descendants. */
         if (entry->escapes) {
             has_add_root(pending, base);
             has_mark(pending, plan, i, false);
@@ -1507,8 +1676,7 @@ static bool has_note_change(const Stylesheet *sheet, lxb_dom_node_t *node,
     if (walk.sibling_overflow) {
         for (size_t i = 0; i < plan->entry_count; i++) {
             const StyleHasPlanEntry *entry = &plan->entries[i];
-            if (!HAS_BIT(walk.relevant, i)
-                || entry->relation == STYLE_HAS_RELATION_OTHER
+            if (!HAS_BIT(walk.relevant, i) || !has_entry_walked(entry)
                 || (entry->region & STYLE_HAS_REGION_SIBLINGS) == 0) continue;
             if (entry->subject_key == 0)
                 has_unplaced(pending, plan, i, walk.stats, &wiped);
@@ -1680,16 +1848,16 @@ static bool has_tree_feature(void *context, uint32_t hash)
     return false;
 }
 
-/* Probes `root`'s elements (itself when `inclusive`). False past the
-   bound. */
-static bool has_tree_subtree(HasTreeProbe *probe, lxb_dom_node_t *root,
-                             bool inclusive)
+/* Probes `root`'s elements (itself when `inclusive`), counting them in
+   *visited. False past the bound. */
+static bool has_tree_subtree_counted(HasTreeProbe *probe,
+                                     lxb_dom_node_t *root, bool inclusive,
+                                     size_t *visited)
 {
-    size_t visited = 0;
     lxb_dom_node_t *node = inclusive ? root : root->first_child;
     while (node != NULL) {
         if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
-            if (++visited > HAS_TREE_SUBTREE_LIMIT) return false;
+            if (++*visited > HAS_TREE_SUBTREE_LIMIT) return false;
             (void) has_element_keys(probe->plan, node, has_tree_feature,
                                     probe);
         }
@@ -1702,6 +1870,13 @@ static bool has_tree_subtree(HasTreeProbe *probe, lxb_dom_node_t *root,
         node = node == NULL || node == root ? NULL : node->next;
     }
     return true;
+}
+
+static bool has_tree_subtree(HasTreeProbe *probe, lxb_dom_node_t *root,
+                             bool inclusive)
+{
+    size_t visited = 0;
+    return has_tree_subtree_counted(probe, root, inclusive, &visited);
 }
 
 static bool has_tree_anchor(void *context, uint32_t hash)
@@ -1717,21 +1892,34 @@ static bool has_tree_anchor(void *context, uint32_t hash)
 }
 
 /* The entries whose argument a tree change at `node` under `parent` can
-   reach, in probe->hit. False past the probe's bounds. */
+   reach, in probe->hit; with no `node`, every child of `parent` changing at
+   once (innerHTML), the children's subtrees, the siblings and the parent
+   each probed once under one element bound. False past the bounds. */
 static bool has_tree_probe(HasTreeProbe *probe, lxb_dom_node_t *node,
                            lxb_dom_node_t *parent)
 {
     const StyleHasPlan *plan = probe->plan;
-    bool element = node->type == LXB_DOM_NODE_TYPE_ELEMENT;
-    for (size_t i = 0; i < plan->entry_count; i++) {
-        if (element ? plan->entries[i].tree_keyless
-                    : plan->entries[i].text_keyless) has_tree_hit(probe, i);
+    bool elements = false, text = false;
+    size_t visited = 0;
+    /* Elements the change adds or removes. */
+    probe->role = HAS_FEATURE_NARROW;
+    for (lxb_dom_node_t *child = node != NULL ? node : parent->first_child;
+         child != NULL; child = node != NULL ? NULL : child->next) {
+        if (child->type != LXB_DOM_NODE_TYPE_ELEMENT) {
+            text = true;
+            continue;
+        }
+        elements = true;
+        if (!has_tree_subtree_counted(probe, child, true, &visited))
+            return false;
     }
-    if (element) {
-        /* Elements the change adds or removes, and the siblings whose
-           positions and adjacency move with them. */
-        probe->role = HAS_FEATURE_NARROW;
-        if (!has_tree_subtree(probe, node, true)) return false;
+    for (size_t i = 0; i < plan->entry_count; i++) {
+        if ((elements && plan->entries[i].tree_keyless)
+            || (text && plan->entries[i].text_keyless))
+            has_tree_hit(probe, i);
+    }
+    if (elements) {
+        /* The siblings whose positions and adjacency move with them. */
         probe->role = HAS_FEATURE_SIBLING;
         size_t siblings = 0;
         for (lxb_dom_node_t *child = parent->first_child; child != NULL;
@@ -1762,6 +1950,9 @@ bool stylesheet_tree_change_may_affect_has(const Stylesheet *sheet,
                                               &serial);
 }
 
+static bool has_tree_reach(HasTreeProbe *probe, lxb_dom_node_t *parent,
+                           uint64_t *entries, uint32_t *serial);
+
 bool stylesheet_tree_change_has_entries(const Stylesheet *sheet,
                                         lxb_dom_node_t *node,
                                         lxb_dom_node_t *parent,
@@ -1769,7 +1960,7 @@ bool stylesheet_tree_change_has_entries(const Stylesheet *sheet,
 {
     *entries = UINT64_MAX;
     *serial = 0;
-    if (sheet == NULL || node == NULL || parent == NULL) return true;
+    if (sheet == NULL || parent == NULL) return true;
     const StyleHasPlan *plan = has_plan_prepare(sheet);
     if (plan == NULL || plan->bounded) return true;
     if (plan->entry_count == 0) {
@@ -1778,12 +1969,50 @@ bool stylesheet_tree_change_has_entries(const Stylesheet *sheet,
     }
     HasTreeProbe probe = {.plan = plan};
     if (!has_tree_probe(&probe, node, parent)) return true;
+    return has_tree_reach(&probe, parent, entries, serial);
+}
+
+bool stylesheet_children_change_has_entries(const Stylesheet *sheet,
+                                            lxb_dom_node_t *parent,
+                                            uint64_t *entries,
+                                            uint32_t *serial)
+{
+    uint64_t first = *entries;
+    uint32_t merge = *serial;
+    bool reached = stylesheet_tree_change_has_entries(sheet, NULL, parent,
+                                                      entries, serial);
+#ifndef TILEFINCH_NO_TRACE
+    static int disabled = -1;
+    if (disabled < 0)
+        disabled = getenv("TILEFINCH_DISABLE_INNER_HTML_HAS_PROBE") != NULL;
+    if (disabled) {
+        *entries = UINT64_MAX;
+        *serial = 0;
+        reached = true;
+    }
+#endif
+    if (merge == 0) return reached;
+    if (*serial != merge) {
+        *entries = UINT64_MAX;
+        *serial = 0;
+        return true;
+    }
+    *entries |= first;
+    return reached;
+}
+
+/* The entries `probe` hit, in *entries, and whether an anchor they could
+   concern is reachable from `parent`. */
+static bool has_tree_reach(HasTreeProbe *probe, lxb_dom_node_t *parent,
+                           uint64_t *entries, uint32_t *serial)
+{
+    const StyleHasPlan *plan = probe->plan;
     *serial = plan->serial;
     *entries = 0;
     for (size_t i = 0; i < plan->entry_count; i++)
-        if (HAS_BIT(probe.hit, i)) *entries |= style_has_entry_bloom_bit(i);
-    if (!probe.any) return false;
-    if (probe.unbounded) return true;
+        if (HAS_BIT(probe->hit, i)) *entries |= style_has_entry_bloom_bit(i);
+    if (!probe->any) return false;
+    if (probe->unbounded) return true;
     /* Only an anchor the change can reach moves: the parent and its
        ancestors, and for sibling arguments the siblings of each. */
     size_t depth = 0, siblings = 0;
@@ -1792,25 +2021,25 @@ bool stylesheet_tree_change_has_entries(const Stylesheet *sheet,
          at = at->parent) {
         if (++depth > HAS_DEPTH_LIMIT) return true;
         if (at->type == LXB_DOM_NODE_TYPE_ELEMENT
-            && has_element_keys(plan, at, has_tree_anchor, &probe))
+            && has_element_keys(plan, at, has_tree_anchor, probe))
             return true;
-        if (!probe.sibling_region) continue;
+        if (!probe->sibling_region) continue;
         lxb_dom_node_t *first = at->parent == NULL ? at
                                                    : at->parent->first_child;
         for (lxb_dom_node_t *other = first; other != NULL;
              other = other->next) {
             if (other->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
             if (++siblings > HAS_SIBLING_LIMIT) return true;
-            if (has_element_keys(plan, other, has_tree_anchor, &probe))
+            if (has_element_keys(plan, other, has_tree_anchor, probe))
                 return true;
         }
     }
-    if (probe.sibling_region) {
+    if (probe->sibling_region) {
         for (lxb_dom_node_t *child = parent->first_child; child != NULL;
              child = child->next) {
             if (child->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
             if (++siblings > HAS_SIBLING_LIMIT) return true;
-            if (has_element_keys(plan, child, has_tree_anchor, &probe))
+            if (has_element_keys(plan, child, has_tree_anchor, probe))
                 return true;
         }
     }
@@ -1829,13 +2058,15 @@ typedef struct {
     uint32_t key;             /* an OTHER entry's anchor (see below) */
 } HasOutsideAnchor;
 
+/* Anchor rows, and the further keys of an unplaced entry's anchor set
+   (its first key is tested below). */
 static bool has_outside_anchor(void *context, uint32_t hash)
 {
     const HasOutsideAnchor *search = context;
     const StyleHasPlan *plan = search->plan;
     for (size_t k = has_key_lower_bound(plan, hash);
          k < plan->key_count && plan->keys[k].hash == hash; k++) {
-        if (plan->keys[k].role == HAS_ROLE_ANCHOR
+        if ((plan->keys[k].role & (HAS_ROLE_ANCHOR | HAS_ROLE_UNPLACED)) != 0
             && (search->relevant == NULL
                 || HAS_BIT(search->relevant, plan->keys[k].entry)))
             return true;
@@ -1911,9 +2142,9 @@ bool stylesheet_head_change_reaches_outside(const Stylesheet *sheet,
         const StyleHasPlanEntry *entry = &plan->entries[i];
         if (!all && !HAS_BIT(probe.hit, i)) continue;
         if (entry->anchor_key != 0) {
-            /* The plan indexes no anchor row for an unclassified relation:
-               test that entry's key directly. */
-            if (entry->relation != STYLE_HAS_RELATION_OTHER) continue;
+            /* The plan indexes no anchor row for an entry the walk does
+               not place: test that entry's key directly. */
+            if (has_entry_walked(entry)) continue;
             anchors.key = entry->anchor_key;
             if (has_element_keys(plan, head, has_outside_key, &anchors)
                 || has_element_keys(plan, html, has_outside_key, &anchors))
@@ -2099,32 +2330,47 @@ bool style_element_carries_any_key(const lxb_dom_node_t *node,
 /* ---- Structural reach, for layout's child-list scope. ----------------- */
 
 static void has_structure_add(StyleStructureKeys *out, uint32_t key,
-                              bool predecessor)
+                              uint32_t subject, bool predecessor)
 {
     if (key == 0) {
         out->any = true;
         return;
     }
+    size_t same_key = SIZE_MAX;
     for (size_t i = 0; i < out->count; i++) {
-        if (out->keys[i] == key) {
+        if (out->keys[i] != key) continue;
+        if (out->subjects[i] == subject) {
             out->predecessor[i] = out->predecessor[i] || predecessor;
             return;
         }
+        if (same_key == SIZE_MAX) same_key = i;
     }
     if (out->count == STYLE_STRUCTURE_KEY_LIMIT) {
-        out->any = true;
+        /* Full: widen an entry for the same key to every descendant. */
+        if (same_key == SIZE_MAX) {
+            out->any = true;
+            return;
+        }
+        out->subjects[same_key] = 0;
+        out->predecessor[same_key] = out->predecessor[same_key]
+                                     || predecessor;
         return;
     }
     out->keys[out->count] = key;
+    out->subjects[out->count] = subject;
     out->predecessor[out->count] = predecessor;
     out->count++;
 }
 
 static void has_complex_structure(const char *text, size_t at, size_t end,
-                                  unsigned depth, StyleStructureKeys *out);
+                                  unsigned depth, uint32_t subject,
+                                  StyleStructureKeys *out);
 
+/* `subject`: the enclosing selector's subject key, for a nested list
+   (`depth` above 0); a top-level item names its own. */
 static void has_list_structure(const char *text, size_t at, size_t end,
-                               unsigned depth, StyleStructureKeys *out)
+                               unsigned depth, uint32_t subject,
+                               StyleStructureKeys *out)
 {
     if (depth > HAS_NESTING_LIMIT) {
         out->reaches = out->any = true;
@@ -2132,7 +2378,7 @@ static void has_list_structure(const char *text, size_t at, size_t end,
     }
     while (at < end) {
         size_t item_end = has_item_end(text, at, end);
-        has_complex_structure(text, at, item_end, depth, out);
+        has_complex_structure(text, at, item_end, depth, subject, out);
         at = item_end + 1;
     }
 }
@@ -2142,10 +2388,12 @@ static void has_list_structure(const char *text, size_t at, size_t end,
    child list restyle a sibling's descendants. The keys name the children
    that can carry such a test: the positional compound's, the compound
    after a sibling combinator, or, when that one has none, the compound
-   before it (a predecessor, possibly the child that left). :has()
-   arguments are the :has() plan's and are skipped. */
+   before it (a predecessor, possibly the child that left). Only elements
+   matching the selector restyle, so each key notes the subject compound's
+   key. :has() arguments are the :has() plan's and are skipped. */
 static void has_complex_structure(const char *text, size_t at, size_t end,
-                                  unsigned depth, StyleStructureKeys *out)
+                                  unsigned depth, uint32_t subject,
+                                  StyleStructureKeys *out)
 {
     HasCompound compounds[HAS_COMPOUND_LIMIT];
     bool overflow = false, unused = false;
@@ -2155,6 +2403,10 @@ static void has_complex_structure(const char *text, size_t at, size_t end,
         out->reaches = out->any = true;
         return;
     }
+    if (depth == 0)
+        subject = count == 0 ? 0 : has_compound_key(
+            text, compounds[count - 1].begin, compounds[count - 1].end,
+            &unused);
     for (size_t i = 0; i < count; i++) {
         bool descends_after = false;
         for (size_t j = i + 1; j < count && !descends_after; j++)
@@ -2177,19 +2429,21 @@ static void has_complex_structure(const char *text, size_t at, size_t end,
                                             pseudo.argument_end))
                     positional = true;
                 has_list_structure(text, pseudo.argument_begin,
-                                   pseudo.argument_end, depth + 1, out);
+                                   pseudo.argument_end, depth + 1, subject,
+                                   out);
             } else if (e - b > 4 && strncasecmp(text + b, "nth-", 4) == 0) {
                 size_t of = has_nth_of(text, pseudo.argument_begin,
                                        pseudo.argument_end);
                 if (of < pseudo.argument_end)
                     has_list_structure(text, of, pseudo.argument_end,
-                                       depth + 1, out);
+                                       depth + 1, subject, out);
             }
         }
         if (positional && descends_after) {
             out->reaches = true;
             has_structure_add(out, has_compound_key(
-                text, compounds[i].begin, compounds[i].end, &unused), false);
+                text, compounds[i].begin, compounds[i].end, &unused),
+                subject, false);
         }
         if (i + 1 < count && (compounds[i + 1].combinator == '+'
                               || compounds[i + 1].combinator == '~')) {
@@ -2202,11 +2456,11 @@ static void has_complex_structure(const char *text, size_t at, size_t end,
             uint32_t next = has_compound_key(text, compounds[i + 1].begin,
                                              compounds[i + 1].end, &unused);
             if (next != 0) {
-                has_structure_add(out, next, false);
+                has_structure_add(out, next, subject, false);
             } else {
                 has_structure_add(out, has_compound_key(
                     text, compounds[i].begin, compounds[i].end, &unused),
-                    true);
+                    subject, true);
             }
         }
     }
@@ -2216,7 +2470,7 @@ void style_selector_structure_keys(const char *selector, size_t length,
                                    StyleStructureKeys *keys)
 {
     if (selector != NULL && keys != NULL)
-        has_list_structure(selector, 0, length, 0, keys);
+        has_list_structure(selector, 0, length, 0, 0, keys);
 }
 
 /* ---- Tests counting from the end, for appended hidden siblings. ------- */
@@ -2252,6 +2506,30 @@ static bool has_text_trailing(const char *text, size_t at, size_t end)
     static const char *const names[] = {"last-", "nth-last-", "only-"};
     return has_text_pseudo(text, at, end, names,
                            sizeof(names) / sizeof(names[0]));
+}
+
+uint8_t style_selector_text_facts(const char *selector)
+{
+    uint8_t facts = STYLE_SELECTOR_FACTS_KNOWN;
+    if (selector == NULL) return facts;
+    /* Most selectors hold no pseudo-class: one strchr answers the rest. */
+    const char *colon = strchr(selector, ':');
+    if (colon == NULL) return facts;
+    for (const char *at = colon; at != NULL; at = strchr(at + 1, ':')) {
+        /* As has_text_trailing. */
+        if (strncasecmp(at + 1, "last-", 5) == 0
+            || strncasecmp(at + 1, "nth-last-", 9) == 0
+            || strncasecmp(at + 1, "only-", 5) == 0)
+            facts |= STYLE_SELECTOR_FACTS_TRAILING;
+        if (strncasecmp(at + 1, "has(", 4) == 0) {
+            facts |= STYLE_SELECTOR_FACTS_HAS_ANY_CASE;
+            if (strncmp(at + 1, "has(", 4) == 0)
+                facts |= STYLE_SELECTOR_FACTS_HAS;
+        }
+        if (strncmp(at + 1, "focus-within", 12) == 0)
+            facts |= STYLE_SELECTOR_FACTS_FOCUS_WITHIN;
+    }
+    return facts;
 }
 
 static bool has_text_positional_or_has(const char *text, size_t at,
@@ -2410,6 +2688,7 @@ static void has_argument_anchor_add(StyleHasArgumentKeys *keys,
         keys->any = true;
         return;
     }
+    keys->regions |= region;
     for (size_t i = 0; i < keys->anchor_count; i++) {
         if (keys->anchors[i] == key) {
             keys->anchor_regions[i] |= region;
@@ -2601,6 +2880,29 @@ static bool has_anchor_visit(void *context, uint32_t hash)
     return false;
 }
 
+typedef struct {
+    const StyleHasArgumentKeys *keys;
+    bool last, first;
+} HasArgumentPair;
+
+/* Both Bloom sets in one pass over an element's keys. */
+static bool has_argument_pair_visit(void *context, uint32_t hash)
+{
+    HasArgumentPair *pair = context;
+    pair->last = pair->last || has_argument_bloom_test(pair->keys->last, hash);
+    pair->first = pair->first
+        || has_argument_bloom_test(pair->keys->first, hash);
+    return pair->last && pair->first;
+}
+
+static bool has_argument_bloom_empty(const uint32_t *bloom)
+{
+    uint32_t bits = 0;
+    for (size_t i = 0; i < STYLE_HAS_ARGUMENT_BLOOM_WORDS; i++)
+        bits |= bloom[i];
+    return bits == 0;
+}
+
 bool style_has_argument_keys_reach(const StyleHasArgumentKeys *keys,
                                    const lxb_dom_node_t *subtree,
                                    const lxb_dom_node_t *parent)
@@ -2609,17 +2911,17 @@ bool style_has_argument_keys_reach(const StyleHasArgumentKeys *keys,
         || parent->type != LXB_DOM_NODE_TYPE_ELEMENT) return true;
     StyleHasPlan plan = {.attribute_keys = true};
     size_t visited = 0;
-    bool last = false, first = false;
-    const lxb_dom_node_t *at = subtree;
-    while (at != NULL && !(last && first)) {
+    /* A plain argument needs both its last and its first key: with either
+       set empty, no element's keys can answer one. */
+    HasArgumentPair pair = {keys, false, false};
+    bool plain = !has_argument_bloom_empty(keys->last)
+        && !has_argument_bloom_empty(keys->first);
+    const lxb_dom_node_t *at = plain ? subtree : NULL;
+    while (at != NULL && !(pair.last && pair.first)) {
         if (at->type == LXB_DOM_NODE_TYPE_ELEMENT) {
             if (++visited > 256u) return true;
-            last = last || has_element_keys(&plan, at,
-                                            has_argument_bloom_visit,
-                                            (void *) keys->last);
-            first = first || has_element_keys(&plan, at,
-                                              has_argument_bloom_visit,
-                                              (void *) keys->first);
+            (void) has_element_keys(&plan, at, has_argument_pair_visit,
+                                    &pair);
         }
         if (at->first_child != NULL && at->type == LXB_DOM_NODE_TYPE_ELEMENT) {
             at = at->first_child;
@@ -2633,17 +2935,21 @@ bool style_has_argument_keys_reach(const StyleHasArgumentKeys *keys,
                     siblings = {keys, STYLE_HAS_REGION_SIBLINGS};
     size_t steps = 0;
     for (const lxb_dom_node_t *node = parent; node != NULL
-         && node->type == LXB_DOM_NODE_TYPE_ELEMENT; node = node->parent) {
+         && node->type == LXB_DOM_NODE_TYPE_ELEMENT
+         && ((pair.last && !pair.first)
+             || (keys->regions & STYLE_HAS_REGION_DESCENDANTS) != 0);
+         node = node->parent) {
         if (++steps > HAS_DEPTH_LIMIT) return true;
-        if (last && !first)
-            first = has_element_keys(&plan, node, has_argument_bloom_visit,
-                                     (void *) keys->first);
-        if (keys->anchor_count != 0
+        if (pair.last && !pair.first)
+            pair.first = has_element_keys(&plan, node,
+                                          has_argument_bloom_visit,
+                                          (void *) keys->first);
+        if ((keys->regions & STYLE_HAS_REGION_DESCENDANTS) != 0
             && has_element_keys(&plan, node, has_anchor_visit, &descendants))
             return true;
     }
-    if (last && first) return true;
-    if (keys->anchor_count == 0) return false;
+    if (pair.last && pair.first) return true;
+    if ((keys->regions & STYLE_HAS_REGION_SIBLINGS) == 0) return false;
     /* Sibling arguments: anchors before the subtree in place, or (for a
        change among the parent's children it cannot place) any child. */
     steps = 0;
@@ -2669,27 +2975,65 @@ bool style_has_argument_keys_reach(const StyleHasArgumentKeys *keys,
     return false;
 }
 
-bool style_trailing_keys_reach(const StyleTrailingKeys *keys,
-                               const lxb_dom_node_t *sibling,
-                               const lxb_dom_node_t *parent)
+typedef struct {
+    const StyleTrailingKeys *keys;
+    size_t level;
+} HasTrailingSearch;
+
+/* Whether a key of the element `level` levels above the sibling (0: the
+   sibling) places a trailing test: an entry at that depth, or one at a
+   shallower ancestor depth reaching up through a descendant combinator. */
+static bool has_trailing_search(void *context, uint32_t hash)
 {
-    if (keys == NULL) return true;
-    if (keys->any) return true;
+    const HasTrailingSearch *search = context;
+    const StyleTrailingKeys *keys = search->keys;
     for (size_t i = 0; i < keys->count; i++) {
-        if (keys->depth[i] == 0) {
-            if (style_element_carries_key(sibling, keys->keys[i]))
-                return true;
-            continue;
-        }
-        size_t level = 1;
-        for (const lxb_dom_node_t *at = parent;
-             at != NULL && at->type == LXB_DOM_NODE_TYPE_ELEMENT
-             && level <= HAS_DEPTH_LIMIT;
-             at = at->parent, level++) {
-            if (level < keys->depth[i]) continue;
-            if (style_element_carries_key(at, keys->keys[i])) return true;
-            if (!keys->at_least[i]) break;
-        }
+        if (keys->keys[i] != hash) continue;
+        size_t depth = keys->depth[i];
+        if (depth == search->level
+            || (keys->at_least[i] && depth != 0 && depth < search->level))
+            return true;
+    }
+    return false;
+}
+
+/* Each element's keys are enumerated (and hashed) once, not once per
+   entry. */
+bool style_trailing_keys_reach_sibling(const StyleTrailingKeys *keys,
+                                       const lxb_dom_node_t *sibling)
+{
+    if (keys == NULL || keys->any) return true;
+    bool own = false;
+    for (size_t i = 0; i < keys->count && !own; i++)
+        own = keys->depth[i] == 0;
+    if (!own || sibling == NULL
+        || sibling->type != LXB_DOM_NODE_TYPE_ELEMENT) return false;
+    StyleHasPlan plan = {.attribute_keys = true};
+    HasTrailingSearch search = {.keys = keys, .level = 0};
+    return has_element_keys(&plan, sibling, has_trailing_search, &search);
+}
+
+bool style_trailing_keys_reach_parent(const StyleTrailingKeys *keys,
+                                      const lxb_dom_node_t *parent)
+{
+    if (keys == NULL || keys->any) return true;
+    size_t deepest = 0;
+    bool upward = false;
+    for (size_t i = 0; i < keys->count; i++) {
+        if (keys->depth[i] == 0) continue;
+        if (keys->depth[i] > deepest) deepest = keys->depth[i];
+        upward = upward || keys->at_least[i];
+    }
+    if (deepest == 0) return false;
+    StyleHasPlan plan = {.attribute_keys = true};
+    HasTrailingSearch search = {.keys = keys, .level = 1};
+    for (const lxb_dom_node_t *at = parent;
+         at != NULL && at->type == LXB_DOM_NODE_TYPE_ELEMENT
+         && search.level <= HAS_DEPTH_LIMIT
+         && (upward || search.level <= deepest);
+         at = at->parent, search.level++) {
+        if (has_element_keys(&plan, at, has_trailing_search, &search))
+            return true;
     }
     return false;
 }

@@ -352,5 +352,17 @@ StyleRetainedGate style_retained_gate_begin(const Stylesheet *sheet,
                                             lxb_dom_node_t *node);
 void style_retained_gate_end(const Stylesheet *sheet,
                              StyleRetainedGate previous);
+/* The gate bit of a retained (non-custom) property name, and, inside
+   `node`'s gate bracket, the bits no sheet rule that can select `node`
+   declares (0 when the gate is not trusted): a lookup of a name whose bit
+   is set can find only the style attribute's declarations. The answer
+   depends only on the element's tag, id, classes and attribute names and
+   on the gate build (retained_gate_generation). */
+uint64_t style_retained_gate_name_bit(const char *name, size_t length);
+uint64_t style_retained_gate_absent_bits(const Stylesheet *sheet,
+                                         const lxb_dom_node_t *node);
+/* Whether retained-property lookups on `node` read a style attribute. */
+bool style_inline_style_readable(const Stylesheet *sheet,
+                                 lxb_dom_node_t *node);
 
 #endif /* TILEFINCH_STYLE_SHEET_INTERNAL_H */

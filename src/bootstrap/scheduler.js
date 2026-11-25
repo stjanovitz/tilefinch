@@ -5,6 +5,12 @@
      global. */
   const { String, Number, Map, Set, Error, TypeError, RangeError,
     DOMException } = globalThis;
+  /* WebIDL: postMessage's message argument is required. */
+  const requireMessage = (count, owner) => {
+    if (!count)
+      throw new TypeError(
+        `Failed to execute 'postMessage' on '${owner}': 1 argument required, but only 0 present.`);
+  };
   /* See dom.js: the timer clock mirror is written on the first pump, which
      is well after hardening.js has taken its snapshot. */
   Object.defineProperty(__tilefinchRealmGlobal, "__tilefinchNow", {
@@ -121,9 +127,10 @@
   const limit = 128,
     /* Browser-owned clocks that each keep at most one timer pending (the CSS
        transition event clock, the property-effect frame, the CSS animation
-       event clock and the motion scan's next chunk) draw on these slots above
-       the author limit, so a page that fills the table cannot strand one. */
-    reservedLimit = limit + 4;
+       event clock, the motion scan's next chunk and the PBKDF2 slice task)
+       draw on these slots above the author limit, so a page that fills the
+       table cannot strand one. */
+    reservedLimit = limit + 5;
   /* The frame loop registers an animation-frame timer every presented frame.
      Reusing retired records and one shared empty argument list keeps the
      steady game loop free of per-frame allocations, which would otherwise
@@ -213,7 +220,7 @@
     timer.owner = 0;
     if (timerPool.length < limit) timerPool.push(timer);
   }
-  /* 0 is private teardown; 1/2 identify Window timers/frames. A Worker's
+  /* 0 is private teardown; 1/2/3 identify Window timers/frames/idle. A Worker's
      existing timer set is its opaque author-timer owner token. Nesting > 0
      already identifies HTML timer algorithms, so ownership replaces the old
      redundant boolean rather than growing every pooled timer record. */
@@ -301,12 +308,20 @@
       callback, delay, repeat, EMPTY_TIMER_ARGS, repeat ? "interval" : "timeout", false, owner);
   __tilefinchRealmGlobal.__tilefinchScheduleFrame = (callback) =>
     schedule(callback, 16, false, EMPTY_TIMER_ARGS, "animation-frame");
-  __tilefinchRealmGlobal.__tilefinchCancelTimer = clear;
   __tilefinchRealmGlobal.__tilefinchSchedulerTime = currentSchedulerTime;
-  __tilefinchRealmGlobal.__tilefinchScheduleReservedTask = (callback, delay) =>
+  /* The slots above the page's timer quota, and the cancel that reaches
+     them, are the browser's alone: they go in dom.js's private share, never
+     on the global, so a page cannot fill them and stall the clocks that
+     need one (PBKDF2 slices, CSS transitions, motion lifecycles). */
+  const domShared = __tilefinchRealmGlobal.__tilefinchDomShared;
+  domShared.cancelTimer = clear;
+  domShared.scheduleReservedTask = (callback, delay) =>
     schedule(callback, delay, false, EMPTY_TIMER_ARGS, "platform-task", true);
-  __tilefinchRealmGlobal.__tilefinchScheduleReservedFrame = (callback) =>
+  domShared.scheduleReservedFrame = (callback) =>
     schedule(callback, 16, false, EMPTY_TIMER_ARGS, "animation-frame", true);
+  /* Host and validation realms only: tests fill the reserved slots with it. */
+  if (__tilefinchRealmGlobal.__tilefinchTestProbes)
+    __tilefinchRealmGlobal.__tilefinchTestDomShared = domShared;
   /* The public timer functions are distinct objects whose name and length
      match WebIDL (the optional timeout/handle arguments do not count), as
      page scripts and fingerprinting probes read both. */
@@ -472,6 +487,7 @@
           this, event, complete);
       }
       postMessage(value, transfer = []) {
+        requireMessage(arguments.length, "MessagePort");
         if (this._closed) return;
         const ports = [],
           copied = __tilefinchRealmGlobal.__tilefinchCloneWorkerValue(
@@ -596,6 +612,7 @@
         return this.__name;
       }
       postMessage(value) {
+        requireMessage(arguments.length, "BroadcastChannel");
         if (this.__closed)
           throw new DOMException(
             "Broadcast channel is closed",
@@ -688,9 +705,11 @@
       false,
       [],
       "idle",
+      false,
+      3,
     );
   };
-  const cancelIdleCallback = (handle) => clear(handle);
+  const cancelIdleCallback = (handle) => { clear(handle, 3); };
   __tilefinchRealmGlobal.requestIdleCallback = requestIdleCallback;
   __tilefinchRealmGlobal.cancelIdleCallback = cancelIdleCallback;
   const deliverViewportEvent = (viewport, event) => {
@@ -1094,9 +1113,16 @@
     }
     return browserDispatch(target, tilefinchEvent(name));
   };
+  /* A label activates its control for a click on the label or on a
+     descendant, unless interactive content between them (the control
+     itself, a link, a button) takes the click. */
   __tilefinchRealmGlobal.__tilefinchLabelDefault = (target, native = false) => {
-    if (!(target instanceof HTMLLabelElement)) return false;
-    const control = target.control;
+    let label = target;
+    for (; !(label instanceof HTMLLabelElement); label = label.parentElement)
+      if (!label || label.matches("a[href],button,details,embed,iframe," +
+          "input:not([type=hidden]),select,textarea,audio[controls]," +
+          "video[controls],img[usemap]")) return false;
+    const control = label.control;
     if (!control || control.disabled) return false;
     focusElement(control);
     if (!native) {
@@ -1441,14 +1467,14 @@
     );
     /* Native submission sends the same entry list a script submission does:
        values native control state cannot hold, plus `formdata` additions. A
-       list that fails to build leaves the DOM serializer to send the form. */
+       list that fails to build must not send the stale native values. */
     if (proceed) {
       try {
-        __tilefinchRealmGlobal.__tilefinchSubmittedBody =
+        __tilefinchRealmGlobal.__tilefinchNativeSubmittedBody =
           __tilefinchRealmGlobal.__tilefinchSubmissionBody?.(form, submitter) ??
-          null;
+          false;
       } catch {
-        __tilefinchRealmGlobal.__tilefinchSubmittedBody = null;
+        __tilefinchRealmGlobal.__tilefinchNativeSubmittedBody = false;
       }
     }
     return proceed;

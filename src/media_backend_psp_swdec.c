@@ -2567,6 +2567,21 @@ static bool swdec_audio_cursor(const void *opaque, uint64_t *cursor_us)
     return true;
 }
 
+/* With no video receipt to prove playback, the audio-only clock must not
+   report the placeholder zero during startup or a pending reset. */
+static bool swdec_audio_only_cursor(const void *opaque, uint64_t *cursor_us)
+{
+    const PspSwdecBackend *backend = opaque;
+    return backend != NULL && !backend->reset_gate.pending
+        && !atomic_load_explicit(&backend->audio_failed, memory_order_acquire)
+        && atomic_load_explicit(&backend->worker_error, memory_order_acquire) == 0
+        && atomic_load_explicit(&backend->audio_output, memory_order_acquire) != 0
+        /* The end of a real block is nonzero even when the interpolated
+           DAC position is at the very beginning of the first block. */
+        && swdec_published_read(&backend->audio_cursor_us, 0) != 0
+        && swdec_audio_cursor(opaque, cursor_us);
+}
+
 static unsigned swdec_ready_frames(const void *opaque)
 {
     const PspSwdecBackend *backend = opaque;
@@ -4284,7 +4299,7 @@ bool media_psp_swdec_backend_create_audio(
         .drain = swdec_drain,
         .advance = swdec_advance,
         .stats = swdec_stats,
-        .audio_cursor_us = swdec_audio_cursor,
+        .audio_cursor_us = swdec_audio_only_cursor,
         .set_presentation_clock_us = swdec_set_clock,
         .set_playing = swdec_set_playing,
         .set_buffering = swdec_set_buffering,

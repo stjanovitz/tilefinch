@@ -63,6 +63,7 @@ int main(void)
         failures++;
     }
     if (!test_concurrent_dynamic_module_quota_progress(&budget)) failures++;
+    if (!test_refused_response_take_keeps_visit(&budget)) failures++;
     size_t module_quota_bytes = strlen(quota_module_source)
         + strlen(quota_module_dependency_source);
     if (!run_dynamic_module_quota_case(

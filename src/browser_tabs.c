@@ -14,6 +14,18 @@ typedef struct {
     bool hibernated;
 } BrowserTabSlot;
 
+struct BrowserTabControls {
+    size_t capacity;
+    size_t counts[BROWSER_TAB_HISTORY_LIMIT];
+    size_t offsets[BROWSER_TAB_HISTORY_LIMIT];
+    NavigationHistoryControl values[];
+};
+
+static size_t tab_controls_bytes(size_t capacity)
+{
+    return sizeof(BrowserTabControls) + capacity * sizeof(NavigationHistoryControl);
+}
+
 struct BrowserTabs {
     Budget *budget;
     BrowserSession *session; /* borrowed from the engine */
@@ -21,8 +33,13 @@ struct BrowserTabs {
     BrowserTabSlot slots[BROWSER_TAB_LIMIT];
     size_t count;
     size_t active_index;
-    /* Do not autosave the fallback tab over a session we could not read. */
-    bool session_restore_unavailable;
+    /* Do not autosave the fallback tab over a session we could not read
+       (TAB_UNREAD_* bits). */
+    uint8_t session_unread;
+};
+
+enum {
+    TAB_UNREAD_PRIMARY = 1u, TAB_UNREAD_BACKUP = 2u, TAB_UNREAD_KEEP = 4u
 };
 
 static void tabs_select_slot(BrowserTabs *tabs, size_t index)
@@ -42,6 +59,8 @@ static BrowserTabSnapshot *tab_snapshot_create(BrowserTabs *tabs)
 static void tab_slot_release(BrowserTabs *tabs, BrowserTabSlot *slot)
 {
     if (tabs == NULL || slot == NULL) return;
+    if (slot->snapshot != NULL)
+        budget_free(tabs->budget, slot->snapshot->controls);
     budget_free(tabs->budget, slot->snapshot);
     memset(slot, 0, sizeof(*slot));
 }
@@ -118,7 +137,7 @@ void browser_tabs_destroy(BrowserTabs *tabs)
     if (tabs == NULL) return;
     Budget *budget = tabs->budget;
     for (size_t index = 0; index < tabs->count; index++)
-        budget_free(budget, tabs->slots[index].snapshot);
+        tab_slot_release(tabs, &tabs->slots[index]);
     memset(tabs, 0, sizeof(*tabs));
     budget_free(budget, tabs);
 }
@@ -174,6 +193,7 @@ bool browser_tabs_capture_active(
         const char *url = navigation->page.document_url;
         const char *title = navigation->page.document.title;
         if (!tab_url_valid(url) || title == NULL) return false;
+        budget_free(tabs->budget, slot->snapshot->controls);
         if (!tab_reset(slot->snapshot, url, title)) return false;
         tab_slot_title_from_snapshot(slot);
         return true;
@@ -194,21 +214,50 @@ bool browser_tabs_capture_active(
     if (count > BROWSER_TAB_HISTORY_LIMIT) count = BROWSER_TAB_HISTORY_LIMIT;
     if (navigation->history_index < start
         || navigation->history_index - start >= count) return false;
+    size_t counts[BROWSER_TAB_HISTORY_LIMIT] = {0};
+    size_t total = 0;
     for (size_t index = 0; index < count; index++) {
         const NavigationEntry *source = &navigation->history[start + index];
-        if (!tab_url_valid(source->url) || source->title == NULL) return false;
+        if (!tab_url_valid(source->url) || source->title == NULL
+            || source->control_count > NAVIGATION_HISTORY_CONTROL_LIMIT) return false;
+        /* Ordinary disclosure markup alone does not require a live tab. */
+        if (source->control_count != 1u
+            || source->controls[0].value_length != NAVIGATION_HISTORY_CONTROL_DISCLOSURES)
+            counts[index] = source->control_count;
+        total += counts[index];
     }
 
     BrowserTabSnapshot *snapshot = slot->snapshot;
+    BrowserTabControls *controls = snapshot->controls;
+    if (total != 0 && (controls == NULL || controls->capacity != total)) {
+        BrowserTabControls *replacement = budget_calloc_category(
+            tabs->budget, BUDGET_CATEGORY_SESSION, 1u, tab_controls_bytes(total));
+        if (replacement == NULL) return false;
+        budget_free(tabs->budget, controls);
+        controls = replacement;
+        controls->capacity = total;
+    } else if (total == 0) {
+        budget_free(tabs->budget, controls);
+        controls = NULL;
+    }
     memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->controls = controls;
     snapshot->history_count = count;
     snapshot->history_index = navigation->history_index - start;
+    size_t offset = 0;
     for (size_t index = 0; index < count; index++) {
         const NavigationEntry *source = &navigation->history[start + index];
         tab_entry_set(
             &snapshot->history[index], source->url, source->title,
             source->scroll_y, source->focus_kind, source->focus_index);
         snapshot->history[index].focus_identity = source->focus_identity;
+        if (controls != NULL) {
+            controls->counts[index] = counts[index];
+            controls->offsets[index] = offset;
+            memcpy(controls->values + offset, source->controls,
+                   counts[index] * sizeof(*source->controls));
+            offset += counts[index];
+        }
     }
     tab_slot_title_from_snapshot(slot);
     return true;
@@ -395,6 +444,8 @@ bool browser_tabs_hibernate(
     if (tabs == NULL || path == NULL || path[0] == '\0'
         || index >= tabs->count || index == tabs->active_index
         || tabs->slots[index].snapshot == NULL
+        /* Form state is never serialized. Keep this bounded snapshot live. */
+        || tabs->slots[index].snapshot->controls != NULL
         || tabs->slots[index].hibernated) return false;
     for (size_t at = 0; at < tabs->count; at++)
         if (tabs->slots[at].hibernated) return false;
@@ -430,20 +481,10 @@ bool browser_tabs_hibernate(
         return false;
     }
     bool okay = fwrite(header, 1, sizeof(header), file) == sizeof(header)
-        && fwrite(payload, 1, payload_length, file) == payload_length
-        && fflush(file) == 0 && ferror(file) == 0;
-    if (fclose(file) != 0) okay = false;
-    if (!okay) {
-        remove(temporary);
-        budget_free(tabs->budget, payload);
-        return false;
-    }
-    if (!tilefinch_platform_replace_file(temporary, path, NULL)) {
-        remove(temporary);
-        budget_free(tabs->budget, payload);
-        return false;
-    }
+        && fwrite(payload, 1, payload_length, file) == payload_length;
+    okay = tilefinch_platform_finish_file(file, okay, temporary, path, NULL);
     budget_free(tabs->budget, payload);
+    if (!okay) return false;
     BrowserTabSlot *slot = &tabs->slots[index];
     budget_free(tabs->budget, slot->snapshot);
     slot->snapshot = NULL;
@@ -477,16 +518,11 @@ bool browser_tabs_rehydrate(
     return true;
 }
 
-static bool tab_session_replace(const char *path, const char *temporary)
-{
-    char backup[1024];
-    int written = snprintf(backup, sizeof(backup), "%s.bak", path);
-    return written >= 0 && (size_t) written < sizeof(backup)
-        && tilefinch_platform_replace_file(temporary, path, backup);
-}
+static bool tab_session_recheck(BrowserTabs *tabs, const char *path);
+static bool tab_session_backup_path(char backup[1024], const char *path);
 
 bool browser_tabs_save_session(
-    const BrowserTabs *tabs, const char *path, const char *hibernation_path)
+    BrowserTabs *tabs, const char *path, const char *hibernation_path)
 {
     static const unsigned char magic[8] = {
         'T', 'F', 'S', 'E', 'S', '0', '1', 0
@@ -494,17 +530,17 @@ bool browser_tabs_save_session(
     if (tabs == NULL || path == NULL || path[0] == '\0'
         || tabs->count == 0 || tabs->count > BROWSER_TAB_LIMIT
         || tabs->active_index >= tabs->count
-        || tabs->session_restore_unavailable) return false;
-    char temporary[1024];
+        || (tabs->session_unread != 0 && !tab_session_recheck(tabs, path)))
+        return false;
+    char temporary[1024], backup[1024];
     int written = snprintf(temporary, sizeof(temporary), "%s.tmp", path);
-    if (written < 0 || (size_t) written >= sizeof(temporary)) return false;
+    if (written < 0 || (size_t) written >= sizeof(temporary)
+        || !tab_session_backup_path(backup, path)) return false;
     FILE *file = fopen(temporary, "wb");
     if (file == NULL) return false;
     unsigned char *payload = tab_payload_create(tabs);
     if (payload == NULL) {
-        fclose(file);
-        (void) remove(temporary);
-        return false;
+        return tilefinch_platform_finish_file(file, false, temporary, path, backup);
     }
     unsigned char header[16];
     memcpy(header, magic, sizeof(magic));
@@ -553,13 +589,7 @@ bool browser_tabs_save_session(
             && fwrite(slot->find_query, 1, find_length, file) == find_length;
     }
     budget_free(tabs->budget, payload);
-    if (okay) okay = fflush(file) == 0 && ferror(file) == 0;
-    if (fclose(file) != 0) okay = false;
-    if (!okay || !tab_session_replace(path, temporary)) {
-        (void) remove(temporary);
-        return false;
-    }
-    return true;
+    return tilefinch_platform_finish_file(file, okay, temporary, path, backup);
 }
 
 typedef enum {
@@ -568,8 +598,10 @@ typedef enum {
     TAB_SESSION_UNAVAILABLE,
 } TabSessionRestore;
 
+/* adopt false only classifies the file and leaves *tabs alone. */
 static TabSessionRestore tab_session_restore_file(BrowserTabs *tabs,
-                                                  const char *path)
+                                                  const char *path,
+                                                  bool adopt)
 {
     static const unsigned char magic[8] = {
         'T', 'F', 'S', 'E', 'S', '0', '1', 0
@@ -650,6 +682,10 @@ static TabSessionRestore tab_session_restore_file(BrowserTabs *tabs,
             ? TAB_SESSION_UNAVAILABLE : TAB_SESSION_MISSING_OR_INVALID;
     }
     budget_free(tabs->budget, payload);
+    if (!adopt) {
+        browser_tabs_destroy(staged);
+        return TAB_SESSION_RESTORED;
+    }
     /* Stored tab snapshots never include sessionStorage. Give each restored
        tab a fresh identity, preserving only the scope of the already
        selected boot realm until its replacement commits. */
@@ -676,18 +712,27 @@ static TabSessionRestore tab_session_restore_file(BrowserTabs *tabs,
     return TAB_SESSION_RESTORED;
 }
 
+static bool tab_session_backup_path(char backup[1024], const char *path)
+{
+    int written = snprintf(backup, 1024, "%s.bak", path);
+    return written >= 0 && written < 1024;
+}
+
 bool browser_tabs_restore_session(BrowserTabs *tabs, const char *path)
 {
     if (tabs == NULL || path == NULL || path[0] == '\0') return false;
-    TabSessionRestore result = tab_session_restore_file(tabs, path);
-    tabs->session_restore_unavailable = result == TAB_SESSION_UNAVAILABLE;
+    TabSessionRestore result = tab_session_restore_file(tabs, path, true);
+    /* An unread primary leaves the backup unread too: the next save's
+       rotation would replace it. */
+    tabs->session_unread = result == TAB_SESSION_UNAVAILABLE
+        ? TAB_UNREAD_PRIMARY | TAB_UNREAD_BACKUP : 0u;
     if (result != TAB_SESSION_MISSING_OR_INVALID)
         return result == TAB_SESSION_RESTORED;
     char backup[1024];
-    int written = snprintf(backup, sizeof(backup), "%s.bak", path);
-    result = written < 0 || (size_t) written >= sizeof(backup)
-        ? TAB_SESSION_UNAVAILABLE : tab_session_restore_file(tabs, backup);
-    tabs->session_restore_unavailable = result == TAB_SESSION_UNAVAILABLE;
+    result = !tab_session_backup_path(backup, path)
+        ? TAB_SESSION_UNAVAILABLE : tab_session_restore_file(tabs, backup, true);
+    tabs->session_unread = result == TAB_SESSION_UNAVAILABLE
+        ? TAB_UNREAD_BACKUP : 0u;
     if (result != TAB_SESSION_RESTORED) return false;
     /* A known-missing or corrupt primary must not replace the recovered
        generation during the next save's rotation. */
@@ -695,13 +740,61 @@ bool browser_tabs_restore_session(BrowserTabs *tabs, const char *path)
     return true;
 }
 
+bool browser_tabs_clear_session(BrowserTabs *tabs, const char *path)
+{
+    char sidecar[1024];
+    if (path == NULL || path[0] == '\0'
+        || !tab_session_backup_path(sidecar, path)) return false;
+    bool cleared = remove(path) == 0 || errno == ENOENT;
+    cleared = (remove(sidecar) == 0 || errno == ENOENT) && cleared;
+    int written = snprintf(sidecar, sizeof(sidecar), "%s.tmp", path);
+    if (written < 0 || (size_t) written >= sizeof(sidecar)) return false;
+    cleared = (remove(sidecar) == 0 || errno == ENOENT) && cleared;
+    if (cleared && tabs != NULL) tabs->session_unread = 0;
+    return cleared;
+}
+
+/* Reads the unread generations again before a save. One now missing or
+   invalid holds nothing to lose; one that reads intact was never restored,
+   so this run keeps refusing and the next boot restores it. */
+static bool tab_session_recheck(BrowserTabs *tabs, const char *path)
+{
+    char backup[1024];
+    if ((tabs->session_unread & TAB_UNREAD_KEEP) != 0
+        || !tab_session_backup_path(backup, path)) return false;
+    for (unsigned bit = TAB_UNREAD_PRIMARY; bit <= TAB_UNREAD_BACKUP;
+         bit <<= 1) {
+        if ((tabs->session_unread & bit) == 0) continue;
+        const char *file = bit == TAB_UNREAD_PRIMARY ? path : backup;
+        TabSessionRestore read = tab_session_restore_file(tabs, file, false);
+        if (read == TAB_SESSION_RESTORED) {
+            tabs->session_unread = TAB_UNREAD_KEEP;
+            return false;
+        }
+        /* Boot reads the backup only once the primary is known invalid. */
+        if (read == TAB_SESSION_UNAVAILABLE) break;
+        tabs->session_unread &= (uint8_t) ~bit;
+    }
+    return tabs->session_unread == 0;
+}
+
+bool browser_tabs_session_save_blocked(const BrowserTabs *tabs)
+{
+    return tabs != NULL && tabs->session_unread != 0;
+}
+
 size_t browser_tabs_resident_bytes(const BrowserTabs *tabs)
 {
     if (tabs == NULL) return 0;
     size_t bytes = sizeof(*tabs);
-    for (size_t index = 0; index < tabs->count; index++)
-        if (tabs->slots[index].snapshot != NULL)
+    for (size_t index = 0; index < tabs->count; index++) {
+        const BrowserTabSnapshot *snapshot = tabs->slots[index].snapshot;
+        if (snapshot != NULL) {
             bytes += sizeof(BrowserTabSnapshot);
+            if (snapshot->controls != NULL)
+                bytes += tab_controls_bytes(snapshot->controls->capacity);
+        }
+    }
     return bytes;
 }
 
@@ -757,6 +850,8 @@ bool browser_tabs_reset(
     if (tabs == NULL || index >= tabs->count) return false;
     BrowserTabSlot *slot = &tabs->slots[index];
     if (slot->snapshot == NULL || slot->hibernated) return false;
+    if (!tab_url_valid(url) || title == NULL) return false;
+    budget_free(tabs->budget, slot->snapshot->controls);
     bool reset = tab_reset(slot->snapshot, url, title);
     if (reset) tab_slot_title_from_snapshot(slot);
     return reset;
@@ -780,6 +875,8 @@ bool browser_tabs_update_active_document(
         snprintf(entry->url, sizeof(entry->url), "%s", url);
         entry->scroll_y = entry->focus_kind = 0;
         entry->focus_index = entry->focus_identity = 0;
+        if (tab->controls != NULL)
+            tab->controls->counts[tab->history_index] = 0;
     }
     snprintf(entry->title, sizeof(entry->title), "%s", title);
     tab_slot_title_from_snapshot(slot);
@@ -821,7 +918,10 @@ bool browser_tab_history_records(
             .scroll_y = tab->history[index].scroll_y,
             .focus_kind = tab->history[index].focus_kind,
             .focus_index = tab->history[index].focus_index,
-            .focus_identity = tab->history[index].focus_identity
+            .focus_identity = tab->history[index].focus_identity,
+            .controls = tab->controls == NULL ? NULL
+                : tab->controls->values + tab->controls->offsets[index],
+            .control_count = tab->controls == NULL ? 0 : tab->controls->counts[index]
         };
     }
     if (count != NULL) *count = tab->history_count;
@@ -832,5 +932,6 @@ bool browser_tab_history_records(
 size_t browser_tabs_owned_bytes(void)
 {
     return sizeof(BrowserTabs)
-        + BROWSER_TAB_LIMIT * sizeof(BrowserTabSnapshot);
+        + BROWSER_TAB_LIMIT * (sizeof(BrowserTabSnapshot) + tab_controls_bytes(
+              BROWSER_TAB_HISTORY_LIMIT * NAVIGATION_HISTORY_CONTROL_LIMIT));
 }

@@ -670,6 +670,34 @@ static bool test_javascript_credentials(Budget *budget, unsigned port)
     }
     CHECK(post_valid);
 
+    /* XHR send() ignores its body for GET and HEAD: a page that passes ""
+       (or any value) to every send() must still get its GET, with no
+       Content-Type added. */
+    static const char get_body_source[] =
+        "globalThis.pocSummary='pending';"
+        "(()=>{const sync=new XMLHttpRequest;"
+        "sync.open('GET','/method?sync',false);sync.send('ignored');"
+        "const xhr=new XMLHttpRequest;xhr.open('GET','/method?async');"
+        "xhr.onload=()=>{globalThis.pocSummary='sync='+sync.status+':'"
+        "+sync.responseText+'|async='+xhr.status+':'+xhr.responseText};"
+        "xhr.onerror=()=>{globalThis.pocSummary='sync='+sync.status"
+        "+'|async=error'};xhr.send('')})()";
+    bool get_body_evaluated = script_runtime_evaluate_diagnostic(
+        runtime, get_body_source, "<xhr-get-body>", &result)
+        && pump_script_network(runtime, &result);
+    bool get_body_valid = get_body_evaluated
+        && strstr(result.summary, "sync=200:method=GET;") != NULL
+        && strstr(result.summary, "async=200:method=GET;") != NULL
+        && strstr(result.summary, "content-type=text") == NULL
+        && strstr(result.summary, "query=sync;") != NULL
+        && strstr(result.summary, "query=async;") != NULL;
+    if (!get_body_valid) {
+        fprintf(stderr,
+                "xhr-get-body evaluated=%d summary=\"%s\" error=\"%s\"\n",
+                get_body_evaluated, result.summary, result.error);
+    }
+    CHECK(get_body_valid);
+
     script_runtime_destroy(runtime);
     char redirect_document_url[256];
     snprintf(redirect_document_url, sizeof(redirect_document_url),

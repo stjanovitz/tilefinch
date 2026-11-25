@@ -335,6 +335,15 @@ bool budget_make_room(Budget *budget, size_t free_bytes)
     return budget_admit_charge(budget, free_bytes);
 }
 
+bool budget_make_room_between_builds(Budget *budget, size_t free_bytes)
+{
+    if (budget == NULL) return false;
+    budget->reclaim_between_builds = true;
+    bool room = budget_make_room(budget, free_bytes);
+    budget->reclaim_between_builds = false;
+    return room;
+}
+
 void budget_inject_failure_after(Budget *budget, size_t successful_attempts)
 {
     if (budget == NULL) return;
@@ -362,6 +371,13 @@ static bool budget_should_inject_failure(Budget *budget)
     return true;
 }
 
+size_t budget_malloc_charge(size_t size)
+{
+    if (size == 0) size = 1;
+    return size > SIZE_MAX - sizeof(AllocationHeader)
+        ? SIZE_MAX : sizeof(AllocationHeader) + size;
+}
+
 void *budget_malloc_category(Budget *budget, BudgetCategory category,
                              size_t size)
 {
@@ -380,7 +396,7 @@ void *budget_malloc_category(Budget *budget, BudgetCategory category,
         budget->failure_count++;
         return NULL;
     }
-    size_t charge = sizeof(AllocationHeader) + size;
+    size_t charge = budget_malloc_charge(size);
     if (!budget_admit_charge(budget, charge)) {
         budget->failure_count++;
         return NULL;

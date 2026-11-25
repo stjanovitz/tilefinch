@@ -1,0 +1,6 @@
+<!doctype html><style>html,body{margin:0}img,div{display:block;width:40px;height:20px}</style><body>
+<p>Placeholders</p>
+<img id=f alt=""><noscript><img src=/missing-f.svg></noscript>
+<div id=g></div><noscript><img src=/missing-g.svg></noscript>
+<p style="height:2000px">Tall</p>
+<script>globalThis.errors=0;document.getElementById('f').onerror=()=>errors++</script>

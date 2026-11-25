@@ -263,12 +263,19 @@ def extract_metrics(log):
     # has no elapsed= because the page owes its complete frame later. It is
     # kept apart as scroll.preview_first_visible_*.
     visible, complete, noop, preview = [], [], [], []
+    direct_visible, replacement_visible = [], []
     for line in log.splitlines():
         if line.startswith("tilefinch-scroll-feedback:"):
             elapsed = field(line, "elapsed")
             first_visible = field(line, "first-visible")
             is_preview = re.search(r"\baction=preview\b", line)
-            if first_visible is None or (elapsed is None and not is_preview):
+            is_noop = re.search(r"\bnoop=1\b", line)
+            superseded = re.search(r"\bsuperseded=1\b", line)
+            visible_source = re.search(r"\bvisible-source=(\S*)", line)
+            source = visible_source.group(1) if visible_source else None
+            if (first_visible is None or (elapsed is None and not is_preview)
+                    or (source is not None and (not superseded or is_preview
+                        or is_noop or source not in ("press", "replacement")))):
                 # A line of a shape this reader does not know would
                 # otherwise drop out of the percentiles unnoticed.
                 raise MetricShapeError("unrecognised scroll feedback: "
@@ -276,16 +283,24 @@ def extract_metrics(log):
             if is_preview:
                 preview.append(first_visible / 1000.0)
                 continue
-            if re.search(r"\bnoop=1\b", line):
+            if is_noop:
                 noop.append(elapsed / 1000.0)
                 continue
             visible.append(first_visible / 1000.0)
             complete.append(elapsed / 1000.0)
+            # Preserve historical percentiles above. Old superseded lines
+            # don't say whether their own or a replacement's frame was seen.
+            if not superseded or source == "press":
+                direct_visible.append(first_visible / 1000.0)
+            elif source == "replacement":
+                replacement_visible.append(first_visible / 1000.0)
     if noop:
         metrics["scroll.noop_max_ms"] = round(max(noop), 1)
     for label, values in (("first_visible", visible),
                           ("complete", complete),
-                          ("preview_first_visible", preview)):
+                          ("preview_first_visible", preview),
+                          ("direct_first_visible", direct_visible),
+                          ("replacement_first_visible", replacement_visible)):
         if not values:
             continue
         metrics["scroll.%s_p50_ms" % label] = round(
@@ -312,6 +327,12 @@ def extract_metrics(log):
     if activations:
         metrics["control.activation_max_ms"] = round(
             max(activations) / 1000.0, 1)
+    previews = [field(line, "press-to-present-us") for line in log.splitlines()
+                if line.startswith("tilefinch-details-preview:")]
+    if any(value is None or value <= 0 for value in previews):
+        raise MetricShapeError("invalid Details presentation time")
+    if previews:
+        metrics["control.details_preview_max_ms"] = round(max(previews) / 1000.0, 1)
     # Where each mark's page stylesheet came from (tilefinch-input-stylesheets):
     # sheet_compiles counts the session's loads that compiled their sheet
     # from scratch (compiled-cache misses not served by a <head> cut);

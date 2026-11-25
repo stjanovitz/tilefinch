@@ -346,6 +346,28 @@ void layout_stretch_grid_item(LayoutContext *context, const FlatItem *item,
     stretch_definite_item(context, item, target_height, 0, false, false);
 }
 
+/* A scroll container in a grid row that final fr sizing shrank takes the
+   row's height (stretched) or its percentage of the area (`percent_of_area`
+   with the area height); its content keeps its extent and scrolls. */
+void layout_shrink_grid_scroller(LayoutContext *context, const FlatItem *item,
+                                 int target_height, bool percent_of_area)
+{
+    const LayoutNodeBox *box = flex_item_box(context->layout, item);
+    if (box == NULL || !item->style.overflow_y_scroll
+        || item->style.overflow_y_clip_only) return;
+    ComputedStyle style = item->style;
+    resolve_padding(context->sheet, &style, box->width);
+    int edges = style.padding.top + style.padding.bottom
+        + style.border.top + style.border.bottom;
+    if (percent_of_area)
+        target_height = style_content_height(context->sheet, &style,
+                                             box->width, target_height)
+            + edges;
+    if (target_height < edges) target_height = edges;
+    if (target_height >= box->height) return;
+    stretch_flex_item_cross(context, item, &style, target_height, false);
+}
+
 void layout_expand_table_cell(LayoutContext *context, lxb_dom_node_t *cell,
                               const ComputedStyle *style, int height)
 {
@@ -513,42 +535,32 @@ bool flat_iterator_next(FlatItemIterator *iterator, FlatItem *item)
             ? !iterator->include_whitespace && !text_has_content(node)
             : node->type != LXB_DOM_NODE_TYPE_ELEMENT
               || layout_node_is_hidden_input(node)) continue;
-        ComputedStyle parent_style;
         if (!flat_parent_style(iterator->context, iterator->container,
                                &iterator->container_style,
                                document_flat_parent(node),
-                               &parent_style)) continue;
-        if (node->type == LXB_DOM_NODE_TYPE_TEXT) {
-            *item = (FlatItem) {
-                .node = node,
-                .parent_style = parent_style,
-                .style = layout_style_for_node(iterator->context, node,
-                                               &parent_style),
-                .anonymous_text = true
-            };
-            iterator->context->flat_iterator_yields++;
-            return true;
+                               &item->parent_style)) continue;
+        /* The caller already owns both style records. Resolve into them:
+           streaming sizing and placement revisit a row several times. */
+        layout_style_for_node_into(iterator->context, node,
+                                   &item->parent_style, &item->style);
+        bool text = node->type == LXB_DOM_NODE_TYPE_TEXT;
+        if (!text) {
+            if (item->style.display == DISPLAY_NONE
+                || item->style.display == DISPLAY_TABLE_COLUMN || item->style.hidden)
+                continue;
+            if (item->style.display == DISPLAY_CONTENTS
+                || item->style.display == DISPLAY_TABLE_ROW_GROUP
+                || item->style.display == DISPLAY_TABLE_HEADER_GROUP
+                || item->style.display == DISPLAY_TABLE_FOOTER_GROUP) {
+                lxb_dom_node_t *inside = document_flat_first_child(node);
+                if (inside != NULL) iterator->cursor = inside;
+                continue;
+            }
         }
-        ComputedStyle style = layout_style_for_node(
-            iterator->context, node, &parent_style);
-        if (style.display == DISPLAY_NONE
-            || style.display == DISPLAY_TABLE_COLUMN || style.hidden) {
-            continue;
-        }
-        if (style.display == DISPLAY_CONTENTS
-            || style.display == DISPLAY_TABLE_ROW_GROUP
-            || style.display == DISPLAY_TABLE_HEADER_GROUP
-            || style.display == DISPLAY_TABLE_FOOTER_GROUP) {
-            lxb_dom_node_t *inside = document_flat_first_child(node);
-            if (inside != NULL) iterator->cursor = inside;
-            continue;
-        }
-        *item = (FlatItem) {
-            .node = node,
-            .parent_style = parent_style,
-            .style = style,
-            .anonymous_text = false
-        };
+        item->node = node;
+        item->anonymous_text = text;
+        item->generated_pseudo = PSEUDO_NONE;
+        item->generated_box = NULL;
         iterator->context->flat_iterator_yields++;
         return true;
     }
@@ -584,6 +596,13 @@ bool flex_order_plan_build(FlexOrderPlan *plan,
                                   const ComputedStyle *style)
 {
     *plan = (FlexOrderPlan) {.budget = context->layout->budget};
+    /* One proof per plan, not two empty ComputedStyles per iterator pass.
+       CSSOM changes produce a fresh plan on the next layout. */
+    bool row = (style->display == DISPLAY_FLEX || style->display == DISPLAY_INLINE_FLEX)
+        && (style->flex_direction == FLEX_ROW || style->flex_direction == FLEX_ROW_REVERSE);
+    plan->no_generated_row_items = !row
+        || (!style_pseudo_may_generate(context->sheet, PSEUDO_BEFORE)
+            && !style_pseudo_may_generate(context->sheet, PSEUDO_AFTER));
     plan->generated_boxes = plan->inline_generated_boxes;
     plan->values = plan->inline_values;
     plan->capacity = sizeof(plan->inline_values)
@@ -594,6 +613,8 @@ bool flex_order_plan_build(FlexOrderPlan *plan,
     while (flex_iterator_next(&scan, &item)) {
         if (item.style.out_of_flow || item.style.fixed_position) continue;
         plan->item_count++;
+        /* Rows borrow the iterator, not flex ordering. The count is enough. */
+        if (style->display == DISPLAY_TABLE_ROW) continue;
         size_t insert = 0;
         while (insert < plan->count && plan->values[insert] < item.style.order) {
             insert++;
@@ -652,6 +673,8 @@ bool flex_order_plan_build(FlexOrderPlan *plan,
 static bool flex_source_next(FlexItemIterator *iterator, FlatItem *item)
 {
     FlatItemIterator *source = &iterator->source;
+    if (iterator->plan != NULL && iterator->plan->no_generated_row_items)
+        return flat_iterator_next(source, item);
     const ComputedStyle *parent = &source->container_style;
     bool row = (parent->display == DISPLAY_FLEX
                  || parent->display == DISPLAY_INLINE_FLEX)
@@ -687,7 +710,9 @@ void flex_iterator_init(FlexItemIterator *iterator,
                                const FlexOrderPlan *plan)
 {
     if (context != NULL) context->flex_iterator_passes++;
-    *iterator = (FlexItemIterator) {.plan = plan};
+    iterator->plan = plan;
+    iterator->order_index = 0;
+    iterator->generated_phase = 0;
     flat_iterator_init(&iterator->source, context, container, style);
 }
 
@@ -1233,9 +1258,12 @@ int flex_child_row_minimum(LayoutContext *context,
                                   bool css_table_row)
 {
     if (css_table_row && item->style.has_width
-        && item->style.width_percent) {
-        /* Percentage cell widths participate in table distribution; they do
-           not cap the cell's content minimum as a definite width would. */
+        && (item->style.width_percent || !item->style.width_max_content)) {
+        /* Percentage and fixed cell widths participate in table
+           distribution (CSS Tables 3 column minimums are content
+           minimums); they do not cap the cell's content minimum as a
+           definite flex width would. The row's fixed-cell paths decide
+           when a fixed width still holds. */
         return intrinsic_min_text_width_internal(
             context, item->node, &item->parent_style,
             content_width, true);

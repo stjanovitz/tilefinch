@@ -117,7 +117,8 @@ def psp_media_session_sources():
     )
     return "\n".join(
         (ROOT / "src" / name).read_text(encoding="utf-8")
-        for name in names)
+        for name in names).replace('#include "psp_media_playlist.inc"',
+            (ROOT / "src/psp_media_playlist.inc").read_text(encoding="utf-8"))
 
 
 def psp_firmware_backend_create(source: str):
@@ -3601,17 +3602,8 @@ int main(void) {
                 "youtube_resolve_progressive_mp4_cancelable_with_preferences("))
 
     def test_media_resume_writes_use_debounced_profile_store(self):
-        session = without_comments(
-            psp_media_session_sources())
-        record = session[session.index("bool psp_media_record_resume("):
-                         session.index("void psp_media_suspend(")]
-        self.assertIn("psp_media_finish_resume_update(", record)
-        pending = session[
-            session.index("static bool psp_media_finish_resume_update("):
-            session.index("void psp_media_pipeline_destroy(")]
-        self.assertIn("media->resume_profile_dirty = dirty", pending)
-        self.assertIn("if (dirty) psp_media_persist_profile_change(media)", pending)
-        self.assertIn("media->resume_profile_dirty = false", pending)
+        # Recorder batching and cancellation are covered behaviorally by
+        # tilefinch-psp-media-resume-tests. Keep the device-only wiring check.
         main = without_comments(
             (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
         self.assertIn(
@@ -4281,16 +4273,6 @@ int main(void) {
         self.assertLess(
             present.index("psp_media_seek_holds_scanout("),
             present.index("psp_display_back_buffer("))
-
-    def test_restarting_ended_media_rearms_resume_tracking(self):
-        source = without_comments(
-            psp_media_session_sources())
-        seek = source[
-            source.index("bool psp_media_request_seek_with_resume("):
-            source.index("static bool psp_media_copy_preview(")]
-        self.assertIn("!preview", seek)
-        self.assertIn("media->last_resume_saved_us == UINT64_MAX", seek)
-        self.assertIn("media->last_resume_saved_us = 0", seek)
 
     def test_the_video_surface_is_left_by_every_path_that_draws_16_bit(self):
         """Fullscreen video scans out 8888 so the decoder's bytes reach the
@@ -5785,10 +5767,16 @@ static PspDisplay psp_display;
 typedef struct {
     bool use_swdec,audio_only;
     void *playback;
-    uint64_t clock_us;
+    uint64_t clock_us,first_frame_opened_us;
     struct { uint64_t duration_us; } frame;
 } PspMediaSession;
 static PspMediaSession media;
+/* Startup eligibility is covered by the real session in media-retry-tests;
+   this fixture starts after startup and exercises presentation credit. */
+static uint64_t sceKernelGetSystemTimeWide(void) {return 0;}
+static bool psp_media_first_picture_poll(const PspMediaSession *m,uint64_t now) {
+    (void)m;(void)now;return false;
+}
 static bool have_ready;
 static uint64_t ready_us,audio_us;
 static bool media_playback_ready_video_start_us(void *p,uint64_t *out) {
@@ -8879,7 +8867,7 @@ int main(void) {
         open_step = session[
             open_start:session.index(
                 "bool psp_media_open_work_pending(", open_start)]
-        self.assertIn("youtube_resolve_job_pump(", open_step)
+        self.assertIn("youtube_resolve_job_pump_playback(", open_step)
         self.assertIn("YOUTUBE_RESOLVE_JOB_PENDING", open_step)
         self.assertIn("fetch_background_transport_available()", open_step)
         self.assertIn("youtube_lite_resolver_identity_get(", resolver)
@@ -11544,12 +11532,13 @@ class QuickJsVariantPreparationTests(unittest.TestCase):
             result = subprocess.run(command, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(header.read_bytes(), (vendor / "quickjs.h").read_bytes())
-            support = vendor / "cutils.h"
+            # cutils.h now defines checked bounds and is fingerprinted.
+            support = vendor / "list.h"
             support.write_text(support.read_text() + "\n/* vendor update */\n")
             # No explicit configure: the ordinary build must refresh the copy.
             result = subprocess.run(["cmake", "--build", str(build)], capture_output=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual((build / "quickjs-variant/cutils.h").read_bytes(), support.read_bytes())
+            self.assertEqual((build / "quickjs-variant/list.h").read_bytes(), support.read_bytes())
             cache = (build / "CMakeCache.txt").read_text()
             self.assertIn(f"TILEFINCH_QUICKJS_COMPILE_SOURCE_DIR:INTERNAL={build}/quickjs-variant", cache)
             # Baseline engine changes must refresh every variant pin, not only

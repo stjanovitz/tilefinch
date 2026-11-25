@@ -482,6 +482,8 @@ static const LabCommand lab_commands[] = {
     {"until", 0u, "until MAX-TURNS MS EXPRESSION"},
     {"idle", LAB_PRIVATE, "idle [COUNT]"},
     {"drain", LAB_PRIVATE, "drain [MAX-TURNS [SETTLE-MS]]"},
+    /* Not private: at its cap it prints the pending request URLs. */
+    {"drain-fetches", 0u, "drain-fetches [CAP-MS]"},
     {"media-status", 0u,
         "media-status|media-play|media-pause|media-seek SECONDS|"
         "media-open|media-close|media-run [COUNT [MS]]|play-page-media"},
@@ -737,6 +739,112 @@ static bool loop_drain_until_idle(BrowserEngine *engine,
              ? "pending" : "idle",
            browser_engine_navigation_pending(engine) ? "pending" : "idle",
            navigation->incremental_relayouts);
+    return ok;
+}
+
+/* Requests on the wire for the page: admitted and not yet complete. A
+   capture writes a request's trace record when it completes, so these are
+   the ones a quit would cancel and record as failed. `resources` is the
+   page resource scheduler (images, stylesheets, fonts); `scripts` the
+   native requests behind the page realm's and its frames' fetch queue.
+   `waiting` counts script requests not yet admitted: they hold no request
+   and no record, so a drain does not wait for them. */
+static size_t loop_fetches_in_flight(const NavigationSession *navigation,
+                                     size_t *resources, size_t *scripts,
+                                     size_t *waiting)
+{
+    const NavigationPage *page = &navigation->page;
+    *resources = fetch_scheduler_pending(page->resource_scheduler);
+    *scripts = page->runtime == NULL
+        ? 0 : page->script_result.async_network_active_native;
+    *waiting = page->runtime == NULL
+        ? 0 : page->script_result.async_network_pending_logical;
+    for (size_t i = 0; i < page->frame_count
+                       && i < NAVIGATION_FRAME_LIMIT; i++) {
+        const NavigationFrame *frame = &page->frames[i];
+        if (frame->runtime == NULL) continue;
+        *scripts += frame->script_result.async_network_active_native;
+        *waiting += frame->script_result.async_network_pending_logical;
+    }
+    return *resources + *scripts;
+}
+
+/* drain-fetches [CAP-MS]: let the page's in-flight requests finish before
+   the run ends (a census capture runs it before quit, so the trace holds
+   their responses instead of the cancellations a quit records). The page's
+   fetch domain is held for the drain, so it admits nothing new and the
+   in-flight set only shrinks; loop turns (no page clock: timers stay put)
+   take the results as the PSP loop would. It stops when nothing is in
+   flight (reason=idle) or at CAP-MS of drain time (reason=cap): wall time
+   against a live network, with a LOOP_DRAIN_QUANTUM_MS sleep after each
+   turn that leaves work, and LOOP_DRAIN_QUANTUM_MS per turn in a replay,
+   which completes requests by turns, not time, so a replayed drain is
+   deterministic. At the cap, the resource scheduler's slots go to stderr
+   (scheduler-slot label=drain-fetches; complete=0 is still in flight). */
+#define LOOP_FETCH_DRAIN_DEFAULT_MS 10000u
+#define LOOP_FETCH_DRAIN_MAXIMUM_MS 600000u
+
+static bool loop_drain_fetches(BrowserEngine *engine,
+                               NavigationSession *navigation,
+                               InteractiveMediaSession *media,
+                               TileCache *cache, unsigned cap_ms)
+{
+    FetchScheduler *resources_scheduler = navigation->page.resource_scheduler;
+    bool replay = fetch_scheduler_uses_virtual_replay(resources_scheduler);
+    /* Retained, so the release reaches this domain even if the page that
+       owns it is replaced during the drain; a hold someone else set is
+       theirs to release. */
+    FetchSchedulerDomain *held_domain = NULL;
+    if (!browser_engine_page_network_held(engine)
+        && !fetch_scheduler_held(resources_scheduler)) {
+        held_domain =
+            fetch_scheduler_domain_retain(navigation->page.fetch_domain);
+        fetch_scheduler_domain_set_held(held_domain, true);
+    }
+    uint64_t started_us = tilefinch_platform_monotonic_time_us();
+    unsigned turns = 0;
+    uint64_t drain_ms = 0;
+    size_t resources = 0, scripts = 0, waiting = 0;
+    size_t in_flight_at_start =
+        loop_fetches_in_flight(navigation, &resources, &scripts, &waiting);
+    size_t in_flight = in_flight_at_start;
+    bool ok = true;
+    /* Bounded by the drain clock: each turn adds at least one quantum in a
+       replay and sleeps one against a live network. */
+    while (ok && in_flight != 0 && drain_ms < cap_ms) {
+        bool quiet = false;
+        ok = loop_drain_turn(engine, navigation, media, cache, 0, &quiet);
+        turns++;
+        in_flight = loop_fetches_in_flight(navigation, &resources, &scripts,
+                                           &waiting);
+        if (replay) {
+            drain_ms = (uint64_t) turns * LOOP_DRAIN_QUANTUM_MS;
+            continue;
+        }
+        if (in_flight != 0) {
+            struct timespec delay = {
+                .tv_sec = 0,
+                .tv_nsec = (long) LOOP_DRAIN_QUANTUM_MS * 1000000L
+            };
+            nanosleep(&delay, NULL);
+        }
+        drain_ms = (tilefinch_platform_monotonic_time_us() - started_us)
+                   / 1000u;
+    }
+    if (held_domain != NULL) {
+        fetch_scheduler_domain_set_held(held_domain, false);
+        fetch_scheduler_domain_release(held_domain);
+    }
+    printf("drain-fetches drained=%s reason=%s clock=%s ms=%llu cap-ms=%u "
+           "turns=%u at-start=%zu in-flight=%zu resources=%zu scripts=%zu "
+           "waiting=%zu\n",
+           in_flight == 0 ? "yes" : "no",
+           !ok ? "failed" : in_flight == 0 ? "idle" : "cap",
+           replay ? "replay" : "live", (unsigned long long) drain_ms, cap_ms,
+           turns, in_flight_at_start, in_flight, resources, scripts,
+           waiting);
+    if (in_flight != 0)
+        fetch_scheduler_debug_dump(resources_scheduler, "drain-fetches");
     return ok;
 }
 
@@ -2631,6 +2739,14 @@ static bool run_command_loop(FILE *commands, bool interactive,
             }
             ok = loop_drain_until_idle(engine, navigation, media, cache,
                                        maximum, settle_ms);
+        } else if (strcmp(line, "drain-fetches") == 0) {
+            unsigned cap_ms = LOOP_FETCH_DRAIN_DEFAULT_MS;
+            if (argument != NULL) {
+                unsigned long requested = strtoul(argument, NULL, 10);
+                cap_ms = requested > LOOP_FETCH_DRAIN_MAXIMUM_MS
+                    ? LOOP_FETCH_DRAIN_MAXIMUM_MS : (unsigned) requested;
+            }
+            ok = loop_drain_fetches(engine, navigation, media, cache, cap_ms);
         } else if (lab_cmd_media(&command, line, argument, &changed,
                                    &reset_cache, &ok, &frame_number)) {
         } else if (strcmp(line, "page-zoom") == 0 && argument != NULL) {

@@ -17,6 +17,12 @@ typedef struct {
     /* An explicit numeric meta width, distinct from device-width or a
        viewport derived from initial-scale, even when numerically equal. */
     bool fixed_width_declared;
+    /* The screen the device-* media features describe, when it is not
+       device_width x device_height: a child browsing context draws at its
+       own size on its parent's screen. Zero for device_width x
+       device_height. */
+    int screen_width;
+    int screen_height;
 } ViewportContext;
 
 bool viewport_context_init(ViewportContext *viewport,

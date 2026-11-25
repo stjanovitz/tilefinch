@@ -353,6 +353,8 @@ typedef struct {
     const char *error;
     /* Scheduler pumps the replayed response waits before completing. */
     unsigned async_delay_pumps;
+    /* The capture saw the request cancelled by its caller. */
+    bool external_cancel;
 } StylesheetReplayRecord;
 
 static uint64_t stylesheet_replay_body_hash(const char *data, size_t length)
@@ -391,7 +393,7 @@ static bool write_stylesheet_replay_record(
         "psp-http-trace=10\n"
         "cookie-values=redacted\n"
         "method=GET\nurl=%s\nlogical-request-url=%s\nsuccess=%d\n"
-        "async-delay-pumps=%u\nexternal-cancel=0\n"
+        "async-delay-pumps=%u\nexternal-cancel=%d\n"
         "transport-timeout=0\nredirect-origin-tainted=0\nerror=%s\n"
         "request-body-length=0\n"
         "request-body-hash=cbf29ce484222325\n"
@@ -427,7 +429,7 @@ static bool write_stylesheet_replay_record(
         "set-cookie-count=0\nresponse-header-0=content-type: %s\n",
         record->url, record->url,
         record->error == NULL ? 1 : 0,
-        record->async_delay_pumps,
+        record->async_delay_pumps, record->external_cancel ? 1 : 0,
         record->error == NULL ? "" : record->error,
         record->request_cookie_bytes,
         record->request_if_none_match == NULL
@@ -1994,7 +1996,7 @@ static bool test_image_failure_records_follow_retries(void)
     size_t noted = 0;
     bool dropped = false;
     if (replaying) {
-        images_discard_nodes(&images, &bad, 1);
+        images_discard_nodes(&images, &bad, 1, 0);
         dropped = images.failure_count == failed_records - 1u;
         targets[0] = (ImagePriorityTarget) {
             .node = bad, .kind = IMAGE_PRIORITY_KIND_DOCUMENT
@@ -2131,6 +2133,331 @@ static bool test_priority_rollback_keeps_adopted_surface(void)
     if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
     if (directory[0] != '\0') remove_stylesheet_replay(directory, 1);
     return ok && clean;
+}
+
+/* A deferred job given up while its request is in flight (a relayout
+   releases the batch after committing what it published) kept that
+   request's attempt, and the batch that took the image up again started a
+   second request and spent a second attempt. The given-up request now runs
+   on, unpublished and holding no attempt, and the next job adopts it: one
+   request, one attempt and one unit of fetch work for the image. */
+static bool test_given_up_priority_request_is_adopted(void)
+{
+    static const char html[] =
+        "<!doctype html><body><img id=slow src='slow.svg'></body>";
+    static const char document_url[] = "https://adopt.example/page";
+    static const char slow_url[] = "https://adopt.example/slow.svg";
+    static const char image_accept[] =
+#if defined(TILEFINCH_DISABLE_GIF)
+        "image/png,image/jpeg,image/webp,image/svg+xml,image/*;q=0.8,"
+        "*/*;q=0.5";
+#else
+        "image/png,image/jpeg,image/gif,image/webp,image/svg+xml,"
+        "image/*;q=0.8,*/*;q=0.5";
+#endif
+    static const StylesheetReplayRecord slow[] = {{
+        .url = slow_url, .effective_url = slow_url,
+        .body = "<svg xmlns='http://www.w3.org/2000/svg' width='4' "
+                "height='3'><rect width='4' height='3'/></svg>",
+        .content_type = "image/svg+xml",
+        .request_accept = image_accept, .request_sec_fetch_dest = "image",
+        .request_sec_fetch_mode = "no-cors",
+        .request_referer = document_url,
+        .request_sec_fetch_site = "same-origin",
+        .request_credential_origin = document_url,
+        .request_initiator_url = document_url,
+        .request_referrer_source = document_url,
+        .request_referrer_policy = "strict-origin-when-cross-origin",
+        .status = 200, .request_send_low_client_hints = true,
+        .async_delay_pumps = 20
+    }};
+    char directory[128] = {0};
+    bool written = write_stylesheet_replay(directory, slow, 1);
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    PocDocument document = {0};
+    Stylesheet stylesheet = {0};
+    ImageResources images = {0};
+    char replay_error[256] = {0};
+    bool ok = written && installed
+        && document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+        && stylesheet_build(&stylesheet, &budget, &document, 480);
+    lxb_dom_node_t *root = ok ? lxb_dom_interface_node(document.html) : NULL;
+    lxb_dom_node_t *image = root ? find_element_id(root, "slow") : NULL;
+    ok = ok && image != NULL;
+    FetchScheduler *scheduler = ok
+        ? fetch_scheduler_create(&budget, 2, 1024 * 1024) : NULL;
+    bool replaying = scheduler != NULL && fetch_trace_replay_begin(
+        directory, replay_error, sizeof(replay_error));
+    ImagePriorityTarget target = {
+        .node = image, .kind = IMAGE_PRIORITY_KIND_DOCUMENT
+    };
+#define ADOPT_JOB() images_priority_load_begin(                               \
+        &document, &stylesheet, &images, &target, &budget, document_url,      \
+        document_url, "strict-origin-when-cross-origin", 8, 64 * 1024,        \
+        16 * 1024, 1024 * 1024, 5000, scheduler, NULL)
+    ImagePriorityLoadJob *job = replaying ? ADOPT_JOB() : NULL;
+    bool pending = job != NULL
+        && images_priority_load_pump(job) == IMAGE_PRIORITY_LOAD_PENDING
+        && images_priority_load_pump(job) == IMAGE_PRIORITY_LOAD_PENDING;
+    size_t attempted = images.stats.attempted, work = images.stats.work;
+    images_priority_load_commit_progress(job);
+    images_priority_load_destroy(job);
+    size_t given_up = images.stats.attempted;
+    job = pending ? ADOPT_JOB() : NULL;
+#undef ADOPT_JOB
+    ImagePriorityLoadStatus status = IMAGE_PRIORITY_LOAD_PENDING;
+    for (size_t pump = 0; job != NULL && pump < 100
+         && status == IMAGE_PRIORITY_LOAD_PENDING; pump++)
+        status = images_priority_load_pump(job);
+    images_priority_load_destroy(job);
+    bool loaded = image_resource_available(images_find_node(&images, image));
+    ok = ok && pending && attempted == 1u && given_up == 0u
+        && status == IMAGE_PRIORITY_LOAD_COMPLETE && loaded
+        && images.stats.attempted == 1u && images.stats.work == work
+        && images.stats.failed == 0;
+    if (!ok) {
+        fprintf(stderr,
+                "given-up request replay='%s' pending=%d attempted=%zu "
+                "given-up=%zu status=%d loaded=%d final=%zu work=%zu/%zu "
+                "failed=%zu\n", replay_error, pending, attempted, given_up,
+                (int) status, loaded, images.stats.attempted,
+                images.stats.work, work, images.stats.failed);
+    }
+    if (replaying) fetch_trace_end();
+    if (scheduler != NULL) fetch_scheduler_destroy(scheduler);
+    images_destroy(&images);
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
+    bool clean = budget.current == 0;
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    if (directory[0] != '\0') remove_stylesheet_replay(directory, 1);
+    return ok && clean;
+}
+
+/* Parked-request fixture: one document image, its replay records, a
+   scheduler and image jobs over one or more image tables. */
+static const char park_document_url[] = "https://adopt.example/page";
+static const char park_image_url[] = "https://adopt.example/slow.svg";
+
+static StylesheetReplayRecord park_record(unsigned delay_pumps)
+{
+    static const char image_accept[] =
+#if defined(TILEFINCH_DISABLE_GIF)
+        "image/png,image/jpeg,image/webp,image/svg+xml,image/*;q=0.8,"
+        "*/*;q=0.5";
+#else
+        "image/png,image/jpeg,image/gif,image/webp,image/svg+xml,"
+        "image/*;q=0.8,*/*;q=0.5";
+#endif
+    return (StylesheetReplayRecord) {
+        .url = park_image_url, .effective_url = park_image_url,
+        .body = "<svg xmlns='http://www.w3.org/2000/svg' width='4' "
+                "height='3'><rect width='4' height='3'/></svg>",
+        .content_type = "image/svg+xml",
+        .request_accept = image_accept, .request_sec_fetch_dest = "image",
+        .request_sec_fetch_mode = "no-cors",
+        .request_referer = park_document_url,
+        .request_sec_fetch_site = "same-origin",
+        .request_credential_origin = park_document_url,
+        .request_initiator_url = park_document_url,
+        .request_referrer_source = park_document_url,
+        .request_referrer_policy = "strict-origin-when-cross-origin",
+        .status = 200, .request_send_low_client_hints = true,
+        .async_delay_pumps = delay_pumps
+    };
+}
+
+typedef struct {
+    Budget budget;
+    bool installed;
+    bool replaying;
+    PocDocument document;
+    Stylesheet stylesheet;
+    lxb_dom_node_t *image;
+    FetchScheduler *scheduler;
+    char directory[128];
+    size_t records;
+} ParkFixture;
+
+static bool park_fixture_begin(ParkFixture *fixture,
+                               const StylesheetReplayRecord *records,
+                               size_t count, size_t scheduler_bytes)
+{
+    static const char html[] =
+        "<!doctype html><body><img id=slow src='slow.svg'></body>";
+    memset(fixture, 0, sizeof(*fixture));
+    bool written = write_stylesheet_replay(fixture->directory, records,
+                                           count);
+    if (written) fixture->records = count;
+    budget_init(&fixture->budget, 8u * MIB);
+    fixture->installed = budget_install_lexbor(&fixture->budget);
+    char error[256] = {0};
+    bool ok = written && fixture->installed
+        && document_parse(&fixture->document, &fixture->budget, html,
+                          sizeof(html) - 1u, 17)
+        && stylesheet_build(&fixture->stylesheet, &fixture->budget,
+                            &fixture->document, 480);
+    fixture->image = ok ? find_element_id(
+        lxb_dom_interface_node(fixture->document.html), "slow") : NULL;
+    fixture->scheduler = fixture->image == NULL ? NULL
+        : fetch_scheduler_create(&fixture->budget, 2, scheduler_bytes);
+    fixture->replaying = fixture->scheduler != NULL
+        && fetch_trace_replay_begin(fixture->directory, error, sizeof(error));
+    return fixture->replaying;
+}
+
+static ImagePriorityLoadJob *park_job(ParkFixture *fixture,
+                                      ImageResources *images,
+                                      size_t single_bytes)
+{
+    ImagePriorityTarget target = {
+        .node = fixture->image, .kind = IMAGE_PRIORITY_KIND_DOCUMENT
+    };
+    return images_priority_load_begin(
+        &fixture->document, &fixture->stylesheet, images, &target,
+        &fixture->budget, park_document_url, park_document_url,
+        "strict-origin-when-cross-origin", 8, 64 * 1024, single_bytes,
+        1024 * 1024, 5000, fixture->scheduler, NULL);
+}
+
+/* A job takes the image's request out, and a relayout gives it up. */
+static bool park_give_up(ParkFixture *fixture, ImageResources *images,
+                         size_t single_bytes)
+{
+    ImagePriorityLoadJob *job = park_job(fixture, images, single_bytes);
+    bool pending = job != NULL
+        && images_priority_load_pump(job) == IMAGE_PRIORITY_LOAD_PENDING
+        && fetch_scheduler_pending(fixture->scheduler) != 0;
+    images_priority_load_commit_progress(job);
+    images_priority_load_destroy(job);
+    return pending;
+}
+
+static bool park_load(ParkFixture *fixture, ImageResources *images,
+                      size_t single_bytes)
+{
+    ImagePriorityLoadJob *job = park_job(fixture, images, single_bytes);
+    ImagePriorityLoadStatus status = IMAGE_PRIORITY_LOAD_PENDING;
+    for (size_t pump = 0; job != NULL && pump < 100
+         && status == IMAGE_PRIORITY_LOAD_PENDING; pump++)
+        status = images_priority_load_pump(job);
+    images_priority_load_destroy(job);
+    return status == IMAGE_PRIORITY_LOAD_COMPLETE
+        && image_resource_available(images_find_node(images, fixture->image));
+}
+
+static bool park_fixture_end(ParkFixture *fixture, ImageResources *images,
+                             size_t image_tables)
+{
+    if (fixture->replaying) fetch_trace_end();
+    if (fixture->scheduler != NULL) fetch_scheduler_destroy(fixture->scheduler);
+    for (size_t i = 0; i < image_tables; i++) images_destroy(&images[i]);
+    stylesheet_destroy(&fixture->stylesheet);
+    document_destroy(&fixture->document);
+    bool clean = fixture->budget.current == 0;
+    if (fixture->installed)
+        clean = budget_uninstall_lexbor(&fixture->budget) && clean;
+    if (fixture->records != 0)
+        remove_stylesheet_replay(fixture->directory, fixture->records);
+    return clean;
+}
+
+/* A parked request frees only the bytes it holds when enqueue releases it.
+   With the rest of the byte pool reserved by a response its owner has not
+   taken, a request that still would not fit waits (it is not refused
+   outright), while one that fits once the parked request goes does not. */
+static bool test_parked_request_room_counts_for_waiting(void)
+{
+    StylesheetReplayRecord record = park_record(20);
+    ParkFixture fixture;
+    ImageResources images = {0};
+    bool ok = park_fixture_begin(&fixture, &record, 1, 32u * 1024u)
+        && park_give_up(&fixture, &images, 16u * 1024u);
+    fetch_inject_failure_once(FETCH_INJECT_TIMEOUT);
+    uint64_t held = ok ? fetch_scheduler_enqueue(
+        fixture.scheduler, "https://adopt.example/held", NULL,
+        16u * 1024u, 5000) : 0;
+    bool waits = fetch_scheduler_enqueue_would_block(fixture.scheduler,
+                                                     24u * 1024u);
+    bool fits = !fetch_scheduler_enqueue_would_block(fixture.scheduler,
+                                                     16u * 1024u);
+    ok = ok && held != 0 && waits && fits;
+    if (!ok)
+        fprintf(stderr, "parked room: held=%llu waits=%d fits=%d\n",
+                (unsigned long long) held, waits, fits);
+    bool success = false;
+    FetchResult *taken = fetch_result_create(&fixture.budget);
+    if (taken != NULL && held != 0)
+        (void) fetch_scheduler_take(fixture.scheduler, held, &success, taken);
+    fetch_result_free(taken);
+    return park_fixture_end(&fixture, &images, 1) && ok;
+}
+
+/* The adoption key is a hash of the request. A frame's table shares the
+   page's scheduler: the same image wanted under another top-level page is
+   a request of its own, so it does not adopt the parked one. */
+static bool test_parked_request_is_not_adopted_across_documents(void)
+{
+    StylesheetReplayRecord records[2] = { park_record(20), park_record(0) };
+    ParkFixture fixture;
+    ImageResources images[2] = {{0}, {0}};
+    bool ok = park_fixture_begin(&fixture, records, 2, 1024u * 1024u);
+    /* A frame's table, as frame loading sets it up. */
+    images[1].budget = &fixture.budget;
+    images[1].top_level_url = "https://top.example/";
+    ok = ok && park_give_up(&fixture, &images[0], 16u * 1024u);
+    ImagePriorityLoadJob *job = ok
+        ? park_job(&fixture, &images[1], 16u * 1024u) : NULL;
+    bool started = job != NULL
+        && images_priority_load_pump(job) == IMAGE_PRIORITY_LOAD_PENDING;
+    size_t in_flight = fetch_scheduler_pending(fixture.scheduler);
+    images_priority_load_destroy(job);
+    ok = ok && started && in_flight == 2u;
+    if (!ok)
+        fprintf(stderr, "cross-document adoption: started=%d in-flight=%zu\n",
+                started, in_flight);
+    return park_fixture_end(&fixture, images, 2) && ok;
+}
+
+/* A capture made before parking holds the given-up request as cancelled,
+   then the image's request again. Replay cancels the first as the capture
+   did, so the image takes the second record and loads. */
+static bool test_replayed_cancel_is_not_parked(void)
+{
+    StylesheetReplayRecord records[2] = { park_record(20), park_record(0) };
+    records[0].error = "image pipeline aborted";
+    records[0].external_cancel = true;
+    records[0].status = 0;
+    records[0].body = "";
+    ParkFixture fixture;
+    ImageResources images = {0};
+    bool ok = park_fixture_begin(&fixture, records, 2, 1024u * 1024u)
+        && park_give_up(&fixture, &images, 16u * 1024u);
+    bool loaded = ok && park_load(&fixture, &images, 16u * 1024u);
+    if (ok && !loaded)
+        fprintf(stderr, "replayed cancel: image not loaded (failed=%zu)\n",
+                images.stats.failed);
+    return park_fixture_end(&fixture, &images, 1) && ok && loaded;
+}
+
+/* An adopter with a larger bound parks the request again: it is still
+   bounded by what it was made with, so a third admission whose bound lies
+   between adopts it too. */
+static bool test_reparked_request_keeps_its_bound(void)
+{
+    StylesheetReplayRecord record = park_record(20);
+    ParkFixture fixture;
+    ImageResources images = {0};
+    bool ok = park_fixture_begin(&fixture, &record, 1, 1024u * 1024u)
+        && park_give_up(&fixture, &images, 16u * 1024u)
+        && park_give_up(&fixture, &images, 32u * 1024u);
+    bool loaded = ok && park_load(&fixture, &images, 24u * 1024u);
+    if (ok && !loaded)
+        fprintf(stderr, "re-parked bound: image not loaded (failed=%zu)\n",
+                images.stats.failed);
+    return park_fixture_end(&fixture, &images, 1) && ok && loaded;
 }
 
 /* A news header carries twenty-odd inline-SVG glyphs before its first
@@ -4027,6 +4354,70 @@ static bool test_dynamic_selector_census_is_bounded_and_retained(void)
     return okay;
 }
 
+/* The per-mutation sample stops after a fixed number of nodes, whitespace
+   text included, so a script appending many times to a long parent does a
+   bounded walk for each record. */
+static bool test_dynamic_selector_sample_counts_nodes(void)
+{
+    static const char item[] = "<p class=item>x</p>\n";
+    static const char head[] = "<!doctype html><body><div id=list>\n";
+    static const char tail[] =
+        "<p class='late-sample-name'>x</p></div>";
+    /* 200 items: about 600 nodes but only 200 elements before the late one. */
+    const size_t count = 200u;
+    size_t capacity = sizeof(head) + count * (sizeof(item) - 1u)
+        + sizeof(tail);
+    char *html = malloc(capacity);
+    if (html == NULL) return false;
+    size_t length = 0;
+    memcpy(html, head, sizeof(head) - 1u);
+    length += sizeof(head) - 1u;
+    for (size_t i = 0; i < count; i++) {
+        memcpy(html + length, item, sizeof(item) - 1u);
+        length += sizeof(item) - 1u;
+    }
+    memcpy(html + length, tail, sizeof(tail));
+    length += sizeof(tail) - 1u;
+    static const char near_html[] =
+        "<!doctype html><body><div id=list>"
+        "<p class='late-sample-name'>x</p></div>";
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    PocDocument far_document = {0}, near_document = {0};
+    StylesheetDocumentResources far = {0}, near = {0};
+    far.sampled_large_source = true;
+    near.sampled_large_source = true;
+    bool okay = installed
+        && document_parse(&far_document, &budget, html, length, 17)
+        && document_parse(&near_document, &budget, near_html,
+                          sizeof(near_html) - 1u, 17);
+    lxb_dom_node_t *far_list = okay ? find_element_id(
+        lxb_dom_interface_node(far_document.html), "list") : NULL;
+    lxb_dom_node_t *near_list = okay ? find_element_id(
+        lxb_dom_interface_node(near_document.html), "list") : NULL;
+    okay = okay && far_list != NULL && near_list != NULL
+        && stylesheet_document_resources_note_dynamic_tokens(&far, far_list)
+        && stylesheet_document_resources_note_dynamic_tokens(
+            &near, near_list);
+    /* The late class sets bits in the near sample; the far sample, which
+       stopped before it, must lack at least one of them. */
+    bool far_missed = false;
+    size_t words = sizeof(near.sampled_selector_tokens)
+        / sizeof(near.sampled_selector_tokens[0]);
+    for (size_t i = 0; okay && i < words; i++) {
+        far_missed |= (near.sampled_selector_tokens[i]
+                       & ~far.sampled_selector_tokens[i]) != 0;
+    }
+    okay = okay && far_missed;
+    document_destroy(&far_document);
+    document_destroy(&near_document);
+    okay = okay && budget.current == 0u;
+    if (installed) okay = budget_uninstall_lexbor(&budget) && okay;
+    free(html);
+    return okay;
+}
+
 /* A capture records a response that stopped at its byte cap as a failed
    transfer holding the bytes received. Only the complete rules of that
    prefix may apply: never the rule, declaration, string, comment or @media
@@ -4320,6 +4711,145 @@ static bool test_large_sheet_admitted_by_memory(void)
     }
     free(body);
     return all;
+}
+
+/* A large sheet past its source-order allowance keeps the rules whose tokens
+   appear among the document's first elements (the first screen). That window
+   counts elements: a header after a few hundred indented elements still sits
+   in it although whitespace text nodes put it past the 512th node. The body
+   is long enough to saturate the whole-document census, so only the priority
+   window can admit the header rule from the middle of the sheet. */
+/* Loads a 600 KB sheet whose header rule sits mid-sheet, past every bounded
+   allowance, against indented_count copies of indented, a header, and enough
+   filler to saturate the whole-document census. The header is styled only
+   when the priority census reaches it. */
+static bool large_sheet_priority_case(
+    const char *indented, size_t indented_count, bool expect_styled)
+{
+    static const char document_url[] = "https://document.example/page.html";
+    static const char stylesheet_url[] = "https://document.example/big.css";
+    static const char head[] =
+        "<!doctype html><link rel=stylesheet href=big.css><body>\n";
+    static const char header[] =
+        "<div class=hdr><ol class=hdr-list id=t><li>a</li></ol></div>\n";
+    static const char filler[] = "<p>x</p>";
+    const size_t filler_count = 8400u;
+    size_t indented_length = strlen(indented);
+    size_t markup_capacity = sizeof(head) + sizeof(header)
+        + indented_count * indented_length
+        + filler_count * (sizeof(filler) - 1u) + 1u;
+    char *markup = malloc(markup_capacity);
+    static const char header_rule[] = ".hdr .hdr-list{color:#0a0b0c}";
+    const size_t filler_rules = 600u * 1024u / 24u;
+    size_t body_capacity = filler_rules * 24u + sizeof(header_rule);
+    char *body = malloc(body_capacity);
+    if (markup == NULL || body == NULL) {
+        free(markup);
+        free(body);
+        return false;
+    }
+    size_t markup_length = 0;
+    memcpy(markup, head, sizeof(head) - 1u);
+    markup_length += sizeof(head) - 1u;
+    for (size_t i = 0; i < indented_count; i++) {
+        memcpy(markup + markup_length, indented, indented_length);
+        markup_length += indented_length;
+    }
+    memcpy(markup + markup_length, header, sizeof(header) - 1u);
+    markup_length += sizeof(header) - 1u;
+    for (size_t i = 0; i < filler_count; i++) {
+        memcpy(markup + markup_length, filler, sizeof(filler) - 1u);
+        markup_length += sizeof(filler) - 1u;
+    }
+    markup[markup_length] = '\0';
+    size_t length = 0;
+    for (size_t i = 0; i < filler_rules; i++) {
+        if (i == filler_rules / 2u) {
+            memcpy(body + length, header_rule, sizeof(header_rule) - 1u);
+            length += sizeof(header_rule) - 1u;
+        }
+        length += (size_t) snprintf(body + length, body_capacity - length,
+                                    ".f%06zu{color:#123456}", i);
+    }
+    body[length] = '\0';
+    StylesheetReplayRecord replay[] = {{
+        .url = stylesheet_url,
+        .body = body,
+        .effective_url = stylesheet_url,
+        .request_referer = document_url,
+        .request_sec_fetch_site = "same-origin",
+        .request_credential_origin = document_url,
+        .request_initiator_url = document_url,
+        .request_referrer_source = document_url,
+        .request_referrer_policy = "unsafe-url",
+        .response_cache_control = "max-age=3600",
+        .status = 200
+    }};
+    char replay_directory[128] = {0};
+    bool replay_written = write_stylesheet_replay(replay_directory, replay, 1);
+    Budget budget;
+    budget_init(&budget, 32u * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    BrowserSession session = {0};
+    bool session_ready = installed
+        && browser_session_init(&session, &budget, 64u * 1024u);
+    PocDocument document = {0};
+    Stylesheet stylesheet = {0};
+    StylesheetDocumentResources resources = {0};
+    ExternalStylesheetStats stats = {0};
+    bool replaying = false;
+    bool ok = replay_written && session_ready && length > 512u * 1024u
+        && document_parse(&document, &budget, markup, markup_length, 17)
+        && stylesheet_build(&stylesheet, &budget, &document, 480);
+    if (ok) {
+        char error[256] = {0};
+        replaying = fetch_trace_replay_begin(
+            replay_directory, error, sizeof(error));
+        ok = replaying && stylesheets_load_external_tracked_with_context(
+            &document, &stylesheet, &budget, document_url, document_url,
+            "unsafe-url", 4, 4u * MIB, 512u * 1024u, 5000, NULL,
+            &session, &resources, &stats);
+    }
+    lxb_dom_node_t *target = ok ? find_element_id(
+        lxb_dom_interface_node(document.html), "t") : NULL;
+    bool styled = target != NULL
+        && style_for_node(&stylesheet, target, NULL).color == 0x0a0b0c;
+    ok = ok && styled == expect_styled && stats.loaded == 1u;
+    if (replaying) fetch_trace_end();
+    stylesheet_document_resources_destroy(&resources);
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
+    if (session_ready) browser_session_destroy(&session);
+    bool clean = budget.current == 0;
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    if (replay_written) remove_stylesheet_replay(replay_directory, 1);
+    if (!ok || !clean) {
+        fprintf(stderr,
+                "priority window (%zu x %zu B): styled=%d expected=%d "
+                "loaded=%zu clean=%d\n", indented_count, indented_length,
+                (int) styled, (int) expect_styled, stats.loaded, (int) clean);
+    }
+    free(markup);
+    free(body);
+    return ok && clean;
+}
+
+static bool test_large_sheet_priority_window_counts_elements(void)
+{
+    /* About element 305 and node 905: past 512 nodes, within 512 elements. */
+    return large_sheet_priority_case("<p class=lead>x</p>\n", 300u, true);
+}
+
+static bool test_large_sheet_priority_window_walk_cap(void)
+{
+    /* Both headers fall within the first 512 elements. Five nodes per
+       element puts the first near node 1,960, inside the walk cap of four
+       nodes per counted element (2,048); seven puts the second near node
+       2,740, past it. */
+    return large_sheet_priority_case(
+               "<p class=lead>x</p>\n<!---->\n", 390u, true)
+        && large_sheet_priority_case(
+               "<p class=lead>x</p>\n<!---->\n<!---->\n", 390u, false);
 }
 
 static bool test_complete_rules_prefix_scanner(void)
@@ -5224,6 +5754,11 @@ int main(int argc, char **argv)
     RUN_TEST(test_image_limits_record_no_failure);
     RUN_TEST(test_image_failure_records_follow_retries);
     RUN_TEST(test_priority_rollback_keeps_adopted_surface);
+    RUN_TEST(test_given_up_priority_request_is_adopted);
+    RUN_TEST(test_parked_request_room_counts_for_waiting);
+    RUN_TEST(test_parked_request_is_not_adopted_across_documents);
+    RUN_TEST(test_replayed_cancel_is_not_parked);
+    RUN_TEST(test_reparked_request_keeps_its_bound);
     RUN_TEST(test_css_paint_layers_keep_distinct_resources);
     RUN_TEST(test_invalid_href_has_terminal_state);
     RUN_TEST(test_blocker_bypasses_fresh_cached_stylesheet);
@@ -5242,6 +5777,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_complete_rules_prefix_scanner);
     RUN_TEST(test_truncated_sheet_applies_only_complete_rules);
     RUN_TEST(test_large_sheet_admitted_by_memory);
+    RUN_TEST(test_large_sheet_priority_window_counts_elements);
+    RUN_TEST(test_large_sheet_priority_window_walk_cap);
+    RUN_TEST(test_dynamic_selector_sample_counts_nodes);
     RUN_TEST(test_evicting_one_of_two_lease_owners);
     RUN_TEST(test_evicting_owner_of_a_fetched_response);
     RUN_TEST(test_evicted_markup_follows_its_own_alias);

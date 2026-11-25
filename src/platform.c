@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 #define budget_malloc(b, s) budget_malloc_category((b), BUDGET_CATEGORY_RESOURCE, (s))
 #define budget_calloc(b, n, s) budget_calloc_category((b), BUDGET_CATEGORY_RESOURCE, (n), (s))
@@ -71,75 +72,125 @@ void tilefinch_platform_set_services(const TilefinchPlatformServices *services)
     else installed_services = *services;
 }
 
-#ifndef __PSP__
-/* Host tests can make rename refuse to replace a file, as FAT does. */
-static int replace_rename(const char *from, const char *to)
+/* Only the two speculative renames may overwrite an existing name.
+   Detect collisions on FAT without relying on a firmware-specific errno.
+   The other moves in the transaction have a known-vacant destination. */
+static int rename_over(const char *from, const char *to)
 {
     struct stat status;
-    if (tilefinch_test_faults()->replace_file_no_replace
-        && stat(from, &status) == 0 && stat(to, &status) == 0) {
+#ifndef __PSP__
+    if (tilefinch_test_faults()->replace_file_rename_io_error) {
+        tilefinch_test_faults()->replace_file_rename_io_error = false;
+        errno = EIO;
+        return -1;
+    }
+    if (!tilefinch_test_faults()->replace_file_no_replace) {
+        int result = rename(from, to);
+        if (result != 0 && (errno == EISDIR || errno == ENOTDIR)) errno = EEXIST;
+        return result;
+    }
+#endif
+    if (stat(to, &status) == 0) {
         errno = EEXIST;
         return -1;
     }
-    return rename(from, to);
+    return errno == ENOENT ? rename(from, to) : -1;
 }
 
+#ifndef __PSP__
 static bool replace_fault(bool *fault)
 {
     bool fire = *fault;
     *fault = false;
     return fire;
 }
-#else
-#define replace_rename rename
+
+/* Do not return to the caller: its cleanup would erase the crash state. */
+static void replace_process_cut(TilefinchReplaceProcessCut cut)
+{
+    if (tilefinch_test_faults()->replace_file_process_cut == cut)
+        _Exit(86); /* Checked by test_storage_restart_journey.py. */
+}
 #endif
 
 bool tilefinch_platform_replace_file(const char *temporary, const char *path,
                                      const char *backup)
 {
     if (temporary == NULL || path == NULL) return false;
-    if (backup == NULL) {
-        if (replace_rename(temporary, path) == 0) return true;
-        /* FAT cannot rename over a file. Move the destination aside rather
-           than removing it, so a failed second rename can put it back; a
-           power cut in between leaves it as PATH.old beside TEMPORARY. */
-        struct stat status;
-        char aside[1280];
-        int written = snprintf(aside, sizeof(aside), "%s.old", path);
-        if (stat(temporary, &status) != 0 || stat(path, &status) != 0
-            || written <= 0 || (size_t) written >= sizeof(aside))
-            return false;
-        (void) remove(aside);
-        if (replace_rename(path, aside) != 0) return false;
-        bool refuse = false;
-#ifndef __PSP__
-        refuse = replace_fault(
-            &tilefinch_test_faults()->replace_file_fail_install);
-#endif
-        if (!refuse && replace_rename(temporary, path) == 0) {
-            (void) remove(aside);
-            return true;
-        }
-        (void) replace_rename(aside, path);
-        return false;
+    char aside[1280];
+    const bool keep = backup != NULL;
+    if (!keep) {
+        /* A single rename is the fast path and needs no rollback. */
+        if (rename_over(temporary, path) == 0) return true;
+        if (errno != EEXIST) return false;
+        int n = snprintf(aside, sizeof(aside), "%s.old", path);
+        if (n <= 0 || (size_t)n >= sizeof(aside)) return false;
+        backup = aside;
     }
-    bool had_previous = replace_rename(path, backup) == 0;
-    if (!had_previous) {
-        if (errno == ENOENT) return replace_rename(temporary, path) == 0;
-        (void) remove(backup);
-        had_previous = replace_rename(path, backup) == 0;
-        if (!had_previous && errno != ENOENT) return false;
+    /* Never rotate a generation on behalf of a missing or non-regular
+       staged file. Refuse to move directories out of the way. */
+    struct stat status;
+    if (stat(temporary, &status) != 0 || !S_ISREG(status.st_mode)) return false;
+    if (stat(path, &status) != 0)
+        return errno == ENOENT && rename(temporary, path) == 0;
+    if (!S_ISREG(status.st_mode)) {
+        /* An empty directory squatting on a disposable file name can be
+           repaired; never displace a directory that has contents. */
+        return !keep && S_ISDIR(status.st_mode) && rmdir(path) == 0 &&
+               rename(temporary, path) == 0;
     }
-    bool refuse_install = false;
 #ifndef __PSP__
-    /* A power loss right after the previous file moved aside. */
-    if (replace_fault(&tilefinch_test_faults()->replace_file_crash_after_backup))
-        return false;
-    refuse_install = replace_fault(
-        &tilefinch_test_faults()->replace_file_fail_install);
+    if (keep) replace_process_cut(TILEFINCH_REPLACE_BEFORE_ROTATION);
 #endif
-    if (!refuse_install && replace_rename(temporary, path) == 0) return true;
-    if (had_previous) (void) replace_rename(backup, path);
+    if (rename_over(path, backup) != 0) {
+        /* Only a confirmed target collision permits retiring the older
+           backup. In particular, an I/O error is not a collision. */
+        if (errno != EEXIST || unlink(backup) != 0) return false;
+#ifndef __PSP__
+        if (keep) replace_process_cut(TILEFINCH_REPLACE_AFTER_RETIRING_BACKUP);
+#endif
+        if (rename(path, backup) != 0) return false;
+    }
+    bool refuse = false;
+#ifndef __PSP__
+    if (keep) replace_process_cut(TILEFINCH_REPLACE_AFTER_ROTATION);
+    if (keep && replace_fault(&tilefinch_test_faults()->replace_file_crash_after_backup))
+        return false;
+    refuse = replace_fault(&tilefinch_test_faults()->replace_file_fail_install);
+#endif
+    if (!refuse && rename(temporary, path) == 0) {
+#ifndef __PSP__
+        if (keep) replace_process_cut(TILEFINCH_REPLACE_AFTER_INSTALL);
+#endif
+        if (!keep) (void) unlink(backup);
+        return true;
+    }
+    (void) rename(backup, path);
+    return false;
+}
+
+bool tilefinch_platform_replace_file_no_copy(const char *temporary,
+                                             const char *path)
+{
+    if (temporary == NULL || path == NULL) return false;
+    if (rename_over(temporary, path) == 0) return true;
+    if (errno != EEXIST || unlink(path) != 0) return false;
+#ifndef __PSP__
+    if (replace_fault(&tilefinch_test_faults()->replace_file_fail_install))
+        return false;
+#endif
+    return rename(temporary, path) == 0;
+}
+
+bool tilefinch_platform_finish_file(FILE *file, bool complete,
+                                   const char *temporary, const char *path,
+                                   const char *backup)
+{
+    if (file == NULL) return false;
+    if (ferror(file)) complete = false;
+    if (fclose(file) == 0 && complete &&
+        tilefinch_platform_replace_file(temporary, path, backup)) return true;
+    (void) unlink(temporary);
     return false;
 }
 
@@ -412,6 +463,12 @@ bool tilefinch_platform_media_capture_available(void)
         && (installed_services.media_capture_available == NULL
             || installed_services.media_capture_available(
                    installed_services.context));
+}
+
+bool tilefinch_platform_confirm_draft_loss(void)
+{
+    return installed_services.confirm_draft_loss != NULL
+        && installed_services.confirm_draft_loss(installed_services.context);
 }
 
 MediaCapturePermission tilefinch_platform_media_capture_permission(

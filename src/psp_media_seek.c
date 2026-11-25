@@ -88,8 +88,6 @@ bool psp_media_request_seek_with_resume(
     }
     if (!media->audio_only && psp_media_seek_reopens_backend(
             media->clock_us, target_us, preview)) {
-        if (media->last_resume_saved_us == UINT64_MAX)
-            media->last_resume_saved_us = 0;
         return psp_media_reopen_backward_seek(
             media, target_us, resume_playing);
     }
@@ -103,12 +101,6 @@ bool psp_media_request_seek_with_resume(
         }, "preview-committed");
     }
     psp_media_buffering_end(media, psp_media_internal_now_us(media));
-    if (!preview && media->last_resume_saved_us == UINT64_MAX) {
-        /* Replaying an ended stream is a new resume-recording interval. The
-           terminal sentinel belongs to the completed pass, not to the retained
-           decoder's entire lifetime. */
-        media->last_resume_saved_us = 0;
-    }
     media->job_target_us = target_us;
     /* Keep the committed marker visible while the decoder and range source
        seek. The state projection identifies this as seeking, so the
@@ -435,6 +427,7 @@ bool psp_media_seek_decode_pump(
         }
         media->have_frame = false;
         memset(&media->frame, 0, sizeof(media->frame));
+        psp_media_capture_resume_audio(media);
         uint64_t actual_us = 0;
         /* Software-decoded video seeks to the keyframe. Landing exactly on
            the target means decoding every reference picture from the

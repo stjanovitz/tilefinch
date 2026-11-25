@@ -601,10 +601,23 @@ def extract(run_dir, name=None, url=None, tags=None):
         if line.startswith("script-quota-skip"):
             if "script-quota" not in limits:
                 limits.append("script-quota")
+        # The realm can stop before its heap-rejections line prints; the
+        # page summary and an uncaught callback error still say why.
         if line.startswith("js-heap-reject ") or (
-                "heap-rejections=" in line and num(fields(line).get("heap-rejections")) > 0):
+                "heap-rejections=" in line and num(fields(line).get("heap-rejections")) > 0) or (
+                line.startswith("javascript summary=") and
+                "stopped at its memory limit" in line) or (
+                line.startswith("javascript-callback-errors ") and
+                "out of memory" in fields(line).get("last", "")):
             if "js-heap" not in limits:
                 limits.append("js-heap")
+        # Refused and stopped, apart from refused and kept running: the
+        # stop is the realm's fate (docs/engineering/SCRIPT_MEMORY.md,
+        # "Exhaustion"), a refusal alone is not.
+        if line.startswith("javascript summary=") and \
+                "stopped at its memory limit" in line:
+            if "js-heap-stop" not in limits:
+                limits.append("js-heap-stop")
     for e in exceptions:
         # Bare null is ambiguous: author code may throw it too. Allocation
         # refusals above independently establish a heap limit, including when

@@ -247,6 +247,15 @@ bool browser_profile_load(BrowserProfile *profile, const char *path);
 bool browser_profile_load_without_content_blocker_sites(
     BrowserProfile *profile, const char *path);
 bool browser_profile_save(const BrowserProfile *profile, const char *path);
+/* A load that could not read a profile generation (open, read or memory
+   failure) refuses every save, because that file may be newer than what
+   this run holds. */
+bool browser_profile_save_blocked(const BrowserProfile *profile);
+/* Reads the unread generations again. One now absent or damaged no longer
+   blocks; one that reads intact was never adopted, so saves stay refused
+   for the run and the next boot loads it. True when saving is allowed. */
+bool browser_profile_recheck_unread(
+    BrowserProfile *profile, const char *path);
 
 /* A 64-bit FNV-1a hash and the length of the profile body a save writes
    (everything before the END footer). Equal fingerprints mean a save would
@@ -664,6 +673,8 @@ bool browser_recovery_save(
     const char *path, const char *url, int scroll_y);
 bool browser_recovery_load(
     const char *path, BrowserRecoveryCheckpoint *checkpoint);
+/* Remove the checkpoint and its staging/rotation sidecars. Missing files
+   are success; a real removal error is reported. */
 bool browser_recovery_clear(const char *path);
 
 bool browser_profile_build_page(

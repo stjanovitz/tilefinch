@@ -92,8 +92,9 @@ profile, the engine may:
 - stop admitting more page scripts or resources;
 - keep the incumbent page when a candidate cannot complete;
 - reject an oversized page before layout;
-- retire the page realm after a fatal script-heap exhaustion while preserving
-  static content when safe.
+- stop the page realm when a refused allocation leaves it under 2 MiB it can
+  still obtain, however the page handled the error, while preserving static
+  content when safe ([Script memory](SCRIPT_MEMORY.md#exhaustion)).
 
 No pressure path selects by hostname, selector, or page content. Every cache
 has a fixed capacity and reports hit, miss, eviction, and admission behavior.

@@ -191,11 +191,69 @@ def check_user_css_before_load(lab, root):
     rebuilds = {r.name: extract.extract(str(r))["timing"]["full_relayouts"]
                 for r in (after, before)}
     assert rebuilds["banner-before"] == rebuilds["banner-after"] - 1, rebuilds
+    # Census runs set the sheets before the load by default, as the PSP app
+    # does; --user-css-after-load (USER_CSS_BEFORE_LOAD) restores the old
+    # order.
     args = census.lab_command("lab", {"url": "https://a.test/"}, str(root),
-                              [], 0, user_css_before_load=True)
+                              [], 0)
     assert "--user-css-before-load" in args and "--hide-cookie-banners" in args
-    assert "--user-css-before-load" not in census.lab_command(
-        "lab", {"url": "https://a.test/"}, str(root), [], 0)
+    # Census runs hide page ads as the PSP app does by default; older labs
+    # reject the option, so --show-page-ads (HIDE_PAGE_ADS) leaves it out.
+    assert "--hide-page-ads" in args
+    saved = census.HIDE_PAGE_ADS
+    census.HIDE_PAGE_ADS = False
+    try:
+        assert "--hide-page-ads" not in census.lab_command(
+            "lab", {"url": "https://a.test/"}, str(root), [], 0)
+    finally:
+        census.HIDE_PAGE_ADS = saved
+    saved = census.USER_CSS_BEFORE_LOAD
+    census.USER_CSS_BEFORE_LOAD = False
+    try:
+        assert "--user-css-before-load" not in census.lab_command(
+            "lab", {"url": "https://a.test/"}, str(root), [], 0)
+    finally:
+        census.USER_CSS_BEFORE_LOAD = saved
+
+
+AD_SLOT = """<!doctype html><html><head><title>ad slot</title></head><body>
+<div class="ad-slot-header" style="height:60px;background:#111"></div>
+<p>Article text below the reserved ad slot.</p>
+<div id="onetrust-banner-sdk" style="height:80px;background:#c00">We use
+cookies</div></body></html>
+"""
+
+
+def check_hide_page_ads(lab, root):
+    """--hide-page-ads adds the built-in page-ad sheet the PSP app applies by
+    default while content blocking is on (Hide page ads), before the
+    cookie-notice sheet, so a census frame can show what a PSP shows."""
+    (root / "ad-slot.html").write_text(AD_SLOT)
+    page = ["--fixture", str(root / "ad-slot.html"), "--content-blocker",
+            "basic"]
+    runs = {
+        "ads-bare": page,
+        "ads-cookies": page + ["--hide-cookie-banners"],
+        "ads-hidden": page + ["--hide-page-ads"],
+        "ads-both": page + ["--hide-page-ads", "--hide-cookie-banners"],
+        "ads-both-before": page + ["--hide-page-ads", "--hide-cookie-banners",
+                                   "--user-css-before-load"],
+    }
+    frames = {name: (run(lab, root, name, {}, False, args) / "frames" /
+                     "top.ppm").read_bytes() for name, args in runs.items()}
+    assert frames["ads-hidden"] != frames["ads-bare"], "ad slot not hidden"
+    assert frames["ads-both"] not in (frames["ads-hidden"],
+                                      frames["ads-cookies"]), \
+        "both sheets must apply together"
+    assert frames["ads-both-before"] == frames["ads-both"], \
+        "the sheets set before the load changed the page"
+    # Like the PSP setting, page-ad hiding needs content blocking on.
+    refused = subprocess.run(
+        [str(lab), "--fixture", str(root / "ad-slot.html"), "--hide-page-ads",
+         "--commands", str(root / "ads-bare" / "commands"),
+         "--no-loop-capture", "--output", str(root / "refused.ppm")],
+        capture_output=True, timeout=90)
+    assert refused.returncode == 2, refused.returncode
 
 
 def check_image_queue_frames(lab, root):
@@ -232,7 +290,14 @@ def check_null_exception_limits(root):
             ("", False),
             ("script-heap heap-rejections=0\n", False),
             ("script-heap heap-rejections=1\n", True),
-            ("js-heap-reject reason=budget\n", True)):
+            ("js-heap-reject reason=budget\n", True),
+            ('javascript summary="JavaScript stopped at its memory limit"\n', True),
+            ('javascript summary="ok"\n', False),
+            ('javascript-callback-errors uncaught=1 '
+             'last="timer callback: InternalError: out of memory"\n', True),
+            ('javascript-callback-errors uncaught=1 '
+             'last="timer callback: TypeError: x is null"\n', False),
+            ('javascript-callback-errors uncaught=0 last=""\n', False)):
         (run_dir / "lab.log").write_text(exception + evidence)
         record = extract.extract(str(run_dir))
         assert record["errors"]["exceptions"][0]["message"] == "null", record
@@ -242,7 +307,44 @@ def check_null_exception_limits(root):
     assert "js-heap" in extract.extract(str(run_dir))["limits"]
 
 
+def check_heap_stop_limit(root):
+    """js-heap-stop marks a realm stopped for memory; a refusal the realm
+    was kept through is js-heap alone."""
+    run_dir = root / "heap-stop"
+    run_dir.mkdir()
+    for evidence, refused, stopped in (
+            ("", False, False),
+            ("script-heap heap-rejections=3\n", True, False),
+            ('census-exception message="InternalError: out of memory" '
+             'where="app.js:1"\n', True, False),
+            ('javascript-callback-errors uncaught=1 '
+             'last="timer callback: InternalError: out of memory"\n',
+             True, False),
+            ("script-heap heap-rejections=3\n"
+             'javascript summary="JavaScript stopped at its memory limit"\n',
+             True, True),
+            ('javascript summary="JavaScript stopped at its memory limit"\n',
+             True, True)):
+        (run_dir / "lab.log").write_text(evidence)
+        limits = extract.extract(str(run_dir))["limits"]
+        assert ("js-heap" in limits) == refused, (evidence, limits)
+        assert ("js-heap-stop" in limits) == stopped, (evidence, limits)
+
+
+def check_settle_pumps():
+    """--settle-pumps adds loop frames after the visit's and before the idle
+    turns; without it the script is unchanged."""
+    plain = census.command_script("F", False, idle=300).splitlines()
+    assert not any(l.startswith("pump ") and l != census.TICKS
+                   for l in plain), plain
+    lines = census.command_script("F", False, idle=300,
+                                  settle_pumps=450).splitlines()
+    assert lines[:4] == ["status", census.TICKS, "pump 450 33", "idle 300"], lines
+    assert lines[4:] == plain[3:], (lines, plain)
+
+
 def main():
+    check_settle_pumps()
     assert classify.classify('https://aax-us-east-retail-direct.amazon.com/e/is/example/impb',
                              'https://www.amazon.com/') == 'ads'
     assert classify.classify('https://aax-us-east-retail-direct.amazon.com.example.test/app.js',
@@ -265,6 +367,7 @@ def main():
     with tempfile.TemporaryDirectory() as directory:
         root = pathlib.Path(directory)
         check_null_exception_limits(root)
+        check_heap_stop_limit(root)
         (root / "page.html").write_text(PAGE)
 
         # Switches unset: no ledger records, and the page sees no probe.
@@ -332,6 +435,7 @@ def main():
 
         check_focus_moves(lab, root)
         check_user_css_before_load(lab, root)
+        check_hide_page_ads(lab, root)
         check_image_queue_frames(lab, root)
 
 

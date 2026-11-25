@@ -68,6 +68,9 @@ typedef struct {
     int height;
     size_t bytes;
     uint64_t last_used;
+    /* A failed decode refused for memory: tried again when this much Budget
+       is free (0: failed for good). */
+    size_t retry_free_bytes;
     bool valid;
     bool failed;
 } DecodedImageCacheEntry;
@@ -80,12 +83,46 @@ typedef struct {
     int source_height;
     int width;
     int height;
+    /* The size of `pixels`: width x height, or a reduced decode painted
+       larger. */
+    int pixel_width;
+    int pixel_height;
     size_t bytes;
     uint64_t last_used;
+    /* Nonzero: the decode at width x height was refused for memory, and is
+       tried again when this much Budget is free (only once when `pixels`
+       holds a reduced decode). `pixels` is then a reduced decode or NULL. */
+    size_t retry_free_bytes;
+    /* Nonzero: the reduced decode failed too, and waits until this much is
+       free (SIZE_MAX: it failed for good). */
+    size_t reduced_retry_free_bytes;
     bool valid;
     bool failed;
     bool grayscale;
+    bool upgrade_tried;
 } ScaledImageCacheEntry;
+
+/* The one paint-time decode too large for the image caches above, kept for
+   the rest of its paint pass so every tile the picture covers paints from
+   one decode. Its key is a decoded-cache key (`full`) or a scaled-cache key.
+   It is freed when the pass ends, before any other decode, and under
+   pressure by tile_cache_reclaim_held_image; `borrowed` while a command
+   paints from it. */
+typedef struct {
+    const void *identity;
+    uint64_t serial;
+    unsigned char *pixels;
+    int source_width;
+    int source_height;
+    int width;
+    int height;
+    int pixel_width;
+    int pixel_height;
+    bool valid;
+    bool full;
+    bool grayscale;
+    bool borrowed;
+} HeldImageDecode;
 
 typedef enum {
     RENDER_IDLE_WORK_NONE = 0,
@@ -272,6 +309,11 @@ typedef struct {
     ScaledImageCacheEntry scaled_images[TILEFINCH_IMAGE_CACHE_ENTRIES];
     size_t decoded_image_cache_bytes;
     size_t scaled_image_cache_bytes;
+    HeldImageDecode held_image;
+    /* Whether a paint pass may hold a decode (tile_cache_hold_decodes). */
+    bool hold_decodes;
+    size_t held_image_hits;
+    size_t held_image_reclaims;
     GlyphCacheEntry *glyph_cache;
     size_t glyph_cache_capacity;
     size_t glyph_cache_count;
@@ -609,6 +651,20 @@ bool tile_cache_prefetch_satisfied(const TileCache *cache);
  * recreates any glyph, image, fixed-overlay, or overflow data it needs.
  */
 size_t tile_cache_reclaim_optional(TileCache *cache);
+/* Frees the paint pass's held decode (HeldImageDecode) unless a command is
+   painting from it, and returns the bytes released. It does not allocate,
+   so a Budget reclaim hook may call it; the pass decodes again if it needs
+   the picture. */
+size_t tile_cache_reclaim_held_image(TileCache *cache);
+/* Ends the current paint pass: frees its held decode (unless a command is
+   painting from it) even while bounded frame work is still pending. For a
+   caller that runs other page work between that work's slices. */
+void tile_cache_end_paint_pass(TileCache *cache);
+/* Lets paint passes hold a decode (off after tile_cache_init). Only for a
+   cache whose held decode the Budget's reclaim hook can free (see
+   browser_engine_reclaim_accelerators): any other would keep that memory
+   from allocations it could not reach. */
+void tile_cache_hold_decodes(TileCache *cache, bool enabled);
 bool tile_cache_run_idle_work(TileCache *cache, uint64_t budget_us,
                               size_t maximum_units);
 bool tile_cache_idle_work_pending(const TileCache *cache);

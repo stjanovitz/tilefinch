@@ -323,6 +323,29 @@ Use `--debug-log` when the question is which PSP call PPSSPP accepted or
 rejected. The wrapper launches PPSSPP through the macOS-safe path described in
 `AGENTS.md`.
 
+PPSSPP hands the PSP's sockets and name lookups to the host's real network,
+so a run is offline unless it is meant to be live. A start URL on HTTPS
+without `--trace`, or `--capture-trace`, makes a live run; a live scenario
+that starts on native HOME says so with `--allow-network`. Every other run
+(trace replay, native HOME, a loopback page) boots with the validation-only
+`validation_preconnect=0` key, which turns off the HOME tile's speculative
+preconnect (it would otherwise reach the provider once the emulated Wi-Fi is
+up), and always records the `-d` log. `tools/check_ppsspp_network.py` reads
+that log and fails the run on any `sceNetInet` connect or datagram, or
+resolver lookup, for an address other than loopback; its
+`ppsspp-network-check:` line is in each run's `network-check.txt`. The same
+check guards the offline modes of `scripts/run-ppsspp-network.sh` (signed
+update, fixtures, probes, trace replay, native HOME, `--local-fixture`) and
+every `scripts/run-ppsspp-device-cost.sh` run. It sees what the game asked
+PPSSPP to do, not PPSSPP's own traffic (such as the debugger's discovery
+registration under `TILEFINCH_PPSSPP_DEBUGGER_PORT`).
+
+A validation EBOOT also runs a boot self-test of the newlib scanf core the
+image aliases (`tilefinch_scanf_check`, `src/psp_newlib_shims.c`). The runner
+prints its `tilefinch-scanf-check: outcome=` line and fails the run when the
+outcome is `fail`. Newlib scans `"-0"` as `+0` with or without the alias, so
+that case is an `info=negative-zero` line, not a failure.
+
 On macOS every automated PPSSPP harness uses LaunchServices, including the
 input, network, crypto, and device-cost runners. They never fall back to direct
 `PPSSPPSDL` execution: when GUI registration is unavailable, the harness stops

@@ -146,6 +146,8 @@ void script_runtime_destroy(ScriptRuntime *runtime)
         runtime->host_event_constructor = JS_UNDEFINED;
         JS_FreeValue(runtime->context, runtime->host_trusted_event);
         runtime->host_trusted_event = JS_UNDEFINED;
+        JS_FreeValue(runtime->context, runtime->dom_share);
+        runtime->dom_share = JS_UNDEFINED;
         JS_FreeValue(runtime->context, runtime->viewport_resize_dispatch);
         runtime->viewport_resize_dispatch = JS_UNDEFINED;
 #ifdef JS_RT_XHR_DIAGNOSTICS

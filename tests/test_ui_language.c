@@ -199,12 +199,12 @@ int main(void)
     CHECK(TILEFINCH_UI_LANGUAGE_PORTUGUESE == 11);
     CHECK(TILEFINCH_UI_LANGUAGE_BENGALI == 12 && TILEFINCH_UI_LANGUAGE_ASSAMESE == 13);
     /* Hebrew comes last, so saved settings keep their numbers. It joined
-       in immutable v18; every language now reads v20. */
+       in immutable v18; every language now reads v21. */
     CHECK(TILEFINCH_UI_LANGUAGE_HEBREW == 14);
     CHECK(!strcmp(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_HEBREW)->code, "he"));
     CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_HEBREW)->glyphs
         == BROWSER_GLYPH_LANGUAGE_HEBREW);
-    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_HEBREW)->version == 20);
+    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_HEBREW)->version == 21);
     CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_HEBREW)->minimum_glyph_sequence == 1);
     /* Direction is a property of the language: Arabic and Hebrew read
        right to left, every other language (and an unknown one) does not. */
@@ -220,8 +220,8 @@ int main(void)
     CHECK(!strcmp(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_PORTUGUESE)->code, "pt"));
     CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_PORTUGUESE)->glyphs
         == BROWSER_GLYPH_LANGUAGE_EMBEDDED);
-    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_PORTUGUESE)->version == 20);
-    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_SPANISH)->version == 20);
+    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_PORTUGUESE)->version == 21);
+    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_SPANISH)->version == 21);
     char url[256];
     CHECK(!tilefinch_ui_language_url(0, url, sizeof(url)));
     CHECK(!tilefinch_ui_language_url(1, url, 4));
@@ -229,7 +229,7 @@ int main(void)
     /* The configured models repository (the default here), not a copy. */
     CHECK(tilefinch_ui_language_url(TILEFINCH_UI_LANGUAGE_SPANISH, url, sizeof(url))
           && !strcmp(url, "https://raw.githubusercontent.com/stjanovitz/"
-                          "tilefinch-models/main/translations/ui/v20/es.tful"));
+                          "tilefinch-models/main/translations/ui/v21/es.tful"));
     size_t length = 0;
     for (unsigned language = 1; language < TILEFINCH_UI_LANGUAGE_COUNT; language++) {
         const TilefinchUiLanguageSpec *spec = tilefinch_ui_language_spec(language);
@@ -280,7 +280,7 @@ int main(void)
             CHECK(!strcmp(tilefinch_ui_translation_text(t, "Subtitles"), "Legendas"));
         }
         if (language == TILEFINCH_UI_LANGUAGE_BENGALI || language == TILEFINCH_UI_LANGUAGE_ASSAMESE) {
-            CHECK(tilefinch_ui_language_spec(language)->version == 20);
+            CHECK(tilefinch_ui_language_spec(language)->version == 21);
             CHECK(!strcmp(tilefinch_ui_translation_text(t, "Bengali"), "বাংলা"));
             CHECK(!strcmp(tilefinch_ui_translation_text(t, "Assamese"), "অসমীয়া"));
         }
@@ -393,6 +393,11 @@ int main(void)
     /* The same holds for any entry a host rename also refuses to replace:
        an empty directory squatting on the catalog's name. */
     CHECK(unlink(path) == 0 && mkdir(path, 0700) == 0);
+    char occupant[1100];
+    snprintf(occupant, sizeof(occupant), "%s/keep", path);
+    CHECK(touch_file(path, "keep"));
+    CHECK(!tilefinch_ui_translation_install(&budget, &paths, last_language, bytes, length));
+    CHECK(present(path, "keep") && unlink(occupant) == 0);
     CHECK(tilefinch_ui_translation_install(&budget, &paths, last_language, bytes, length));
     CHECK(tilefinch_ui_translation_installed(&paths, last_language));
     CHECK(unlink(path) == 0);

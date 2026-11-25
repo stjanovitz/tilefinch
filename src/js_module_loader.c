@@ -1070,13 +1070,30 @@ static const ScriptImportMapEntry *runtime_import_map_match(
     return best;
 }
 
+/* A data: URL is no base for a relative URL and no referrer (Fetch strips
+   a local scheme's), so one too long for a URL buffer stands in as
+   "data:,": a data: module script may be any length, and its absolute
+   imports resolve as from a short one. */
+static const char *module_data_url_stand_in(const char *url, size_t limit)
+{
+    return url != NULL && strlen(url) >= limit
+        && strncasecmp(url, "data:", 5) == 0 ? "data:," : url;
+}
+
 static char *runtime_module_normalize(JSContext *context,
                                       const char *base_name,
                                       const char *module_name,
                                       void *opaque)
 {
+    /* QuickJS rejects import() with the pending exception when this
+       returns NULL, so every refusal throws: with none pending the promise
+       was rejected with the engine's uninitialized marker, which page code
+       then read as a TDZ ReferenceError. */
     ScriptRuntime *runtime = opaque;
-    if (runtime == NULL || module_name == NULL) return NULL;
+    if (runtime == NULL || module_name == NULL) {
+        JS_ThrowTypeError(context, "module loading is unavailable");
+        return NULL;
+    }
     size_t parent_index = base_name == NULL || base_name[0] == '<'
         ? SIZE_MAX : runtime_module_index_lookup(runtime, base_name);
     TilefinchCredentialsMode credentials =
@@ -1098,9 +1115,13 @@ static char *runtime_module_normalize(JSContext *context,
         selected_base = js_rt_bridge_calculated_base_url(&runtime->bridge);
     }
     if (selected_base == NULL) selected_base = runtime->document_url;
+    selected_base = module_data_url_stand_in(selected_base, sizeof(base));
     if (selected_policy == NULL) selected_policy = "";
     if (strlen(selected_base) >= sizeof(base)
-        || strlen(selected_policy) >= sizeof(policy)) return NULL;
+        || strlen(selected_policy) >= sizeof(policy)) {
+        JS_ThrowRangeError(context, "module base URL is too long");
+        return NULL;
+    }
     snprintf(base, sizeof(base), "%s", selected_base);
     snprintf(policy, sizeof(policy), "%s", selected_policy);
     char resolved[2048];
@@ -1141,6 +1162,7 @@ static char *runtime_module_normalize(JSContext *context,
             runtime, resolved, parent_index,
             parent_index == SIZE_MAX ? base : NULL, policy, credentials,
             NULL)) {
+        JS_ThrowRangeError(context, "module metadata limit exceeded");
         return NULL;
     }
     return js_strdup(context, resolved);
@@ -1185,6 +1207,7 @@ static JSModuleDef *runtime_module_load_record(JSContext *context,
     char referrer_policy[BROWSER_MODULE_REFERRER_POLICY_LIMIT];
     const char *entry_policy = js_rt_runtime_module_referrer_policy_text(
         entry->effective_referrer_policy);
+    referrer = module_data_url_stand_in(referrer, sizeof(referrer_url));
     if (strlen(entry->request_url) >= sizeof(request_url)
         || strlen(referrer) >= sizeof(referrer_url)
         || entry_policy == NULL

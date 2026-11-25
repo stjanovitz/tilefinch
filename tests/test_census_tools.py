@@ -113,7 +113,8 @@ class FinalUrlTests(unittest.TestCase):
         record = {"http_status": 200, "outcome_auto": "working"}
         args = argparse.Namespace(sites=str(sites), selectors=[], corpus=None,
                                   census=str(census_dir), force=False,
-                                  retry=True, lab="lab")
+                                  retry=True, lab="lab", idle=0,
+                                  settle_pumps=0)
         output = io.StringIO()
         with mock.patch.object(census, "run_page", fake_run_page), \
                 mock.patch.object(census.extract, "extract", return_value=record), \

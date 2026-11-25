@@ -859,15 +859,18 @@ static void psp_focus_feedback_published(const uint16_t *frame, const PspUiState
                render->overflow_direct_commands);
         for (uint8_t at = 0; at < psp_focus_feedback.superseded_count; at++) {
             uint64_t started_us = psp_focus_feedback.superseded[at].started_us;
-            uint64_t shown_us =
-                psp_focus_feedback.superseded[at].first_visible_us != 0
-                    ? psp_focus_feedback.superseded[at].first_visible_us
-                    : visible_us;
+            uint64_t press_visible_us =
+                psp_focus_feedback.superseded[at].first_visible_us;
+            uint64_t shown_us = press_visible_us != 0 ? press_visible_us
+                                                      : visible_us;
+            /* Keep the historical fallback for press-burst comparisons, but
+               don't present a replacement's frame as this press's own. */
             printf("tilefinch-scroll-feedback: action=%d elapsed=%lluus "
-                   "first-visible=%lluus superseded=1\n",
+                   "first-visible=%lluus superseded=1 visible-source=%s\n",
                    psp_focus_feedback.action,
                    (unsigned long long) (complete_us - started_us),
-                   (unsigned long long) (shown_us - started_us));
+                   (unsigned long long) (shown_us - started_us),
+                   press_visible_us != 0 ? "press" : "replacement");
         }
         psp_focus_feedback.superseded_count = 0;
         psp_focus_feedback.engine = NULL;

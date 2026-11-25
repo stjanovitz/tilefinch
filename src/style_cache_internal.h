@@ -3,6 +3,8 @@
 
 #include "tilefinch/style.h"
 
+#include <string.h>
+
 bool stylesheet_prepare_focus_rule_index(Stylesheet *sheet);
 bool style_node_focus_shadow_may_match(const Stylesheet *sheet, lxb_dom_node_t *node,
                                      bool outset);
@@ -249,9 +251,11 @@ bool style_retained_pseudo_absent(const Stylesheet *sheet,
    `of S` among siblings) also covers the changed element's subtree.
    Scoped invalidation then drops exactly the cached styles and retained
    rule lists of the elements whose match can move: anchors found by that
-   walk that carry the subject key, subjects under anchors found by it, and
-   by subject key alone otherwise. A rule that cannot be keyed or located
-   leaves the caller's full reset as the fallback. */
+   walk that carry the subject key, subjects under anchors found by it (for
+   a subject with no key outside the anchor's ancestors, under the anchor's
+   parent: the combinators after the anchor only descend or move among
+   siblings), and by subject key alone otherwise. A rule that cannot be
+   keyed or located leaves the caller's full reset as the fallback. */
 typedef struct StyleHasPlan StyleHasPlan;
 #define STYLE_HAS_PLAN_LIMIT 2048u
 #define STYLE_HAS_ROOT_LIMIT 16u
@@ -312,6 +316,8 @@ typedef void (*StyleHasDrop)(void *opaque, lxb_dom_node_t *node);
    bits, each token of a custom-property rule. False when some identity
    cannot be named. */
 typedef void (*StyleIdentityTokenVisit)(void *context, uint32_t hash);
+/* The sheet's partial [class]/[id] tests (style_sheet.c). */
+typedef struct StyleIdentityTests StyleIdentityTests;
 typedef struct {
     StyleIdentityTokenVisit nonlocal;
     StyleIdentityTokenVisit declares;
@@ -405,10 +411,13 @@ bool style_element_carries_any_key_unsorted(const lxb_dom_node_t *node,
    sibling's descendants rather than the siblings themselves, whose
    descendants re-key off their parent's style. `keys` name the children
    such a test can concern (accumulated over selectors): a current child
-   carrying one, or, for `predecessor` keys, the child that left. */
-#define STYLE_STRUCTURE_KEY_LIMIT 16u
+   carrying one, or, for `predecessor` keys, the child that left. Each key
+   comes with its selector's `subject`: the key every element the test can
+   restyle carries (its last compound's), 0 when that compound has none. */
+#define STYLE_STRUCTURE_KEY_LIMIT 128u
 typedef struct {
     uint32_t keys[STYLE_STRUCTURE_KEY_LIMIT];
+    uint32_t subjects[STYLE_STRUCTURE_KEY_LIMIT];
     bool predecessor[STYLE_STRUCTURE_KEY_LIMIT];
     uint8_t count;
     bool reaches;
@@ -434,6 +443,59 @@ typedef struct {
 } StyleTrailingKeys;
 void style_selector_trailing_keys(const char *selector, size_t length,
                                   StyleTrailingKeys *keys);
+/* What a selector's text holds, for the whole-sheet scans that run again
+   at each new sheet generation (the :has() rule index and plan, the
+   trailing and :has() argument keys, the structural custom-property
+   rules): ":has(" as written, ":has(" in any case (a superset of what
+   style_selector_has_argument_keys reads), a trailing test (what
+   style_selector_trailing_keys reads) and ":focus-within" as written.
+   KNOWN marks those bits filled. A custom-property rule also keeps a
+   sibling or positional test (style_selector_structural_text), filled
+   apart (STRUCTURAL_KNOWN) since only the structural-name scan reads it. */
+#define STYLE_SELECTOR_FACTS_KNOWN 1u
+#define STYLE_SELECTOR_FACTS_HAS 2u
+#define STYLE_SELECTOR_FACTS_HAS_ANY_CASE 4u
+#define STYLE_SELECTOR_FACTS_TRAILING 8u
+#define STYLE_SELECTOR_FACTS_FOCUS_WITHIN 16u
+#define STYLE_SELECTOR_FACTS_STRUCTURAL 32u
+#define STYLE_SELECTOR_FACTS_STRUCTURAL_KNOWN 64u
+uint8_t style_selector_text_facts(const char *selector);
+/* A sibling combinator or :nth-* anywhere (an an+b's '+' included), or
+   :first-, :last-, :only- or :empty as written. */
+bool style_selector_structural_text(const char *selector);
+static inline uint8_t style_rule_selector_facts(StyleRule *rule)
+{
+    if (rule->selector_facts == 0)
+        rule->selector_facts = style_selector_text_facts(rule->selector);
+    return rule->selector_facts;
+}
+static inline uint8_t style_custom_rule_selector_facts(StyleCustomRule *rule)
+{
+    if ((rule->selector_facts & STYLE_SELECTOR_FACTS_KNOWN) == 0)
+        rule->selector_facts |= style_selector_text_facts(rule->selector);
+    return rule->selector_facts & (STYLE_SELECTOR_FACTS_STRUCTURAL - 1u);
+}
+/* The facts `rule` shares with `previous` when both hold the same selector
+   text (declarations of one block): copied, not scanned again. */
+static inline void style_custom_rule_facts_from(
+    StyleCustomRule *rule, const StyleCustomRule *previous)
+{
+    if ((previous->selector_facts & ~rule->selector_facts) == 0
+        || previous->selector == NULL || rule->selector == NULL
+        || previous->selector_length != rule->selector_length
+        || memcmp(previous->selector, rule->selector,
+                  rule->selector_length) != 0) return;
+    rule->selector_facts |= previous->selector_facts;
+}
+static inline bool style_custom_rule_structural(StyleCustomRule *rule)
+{
+    if ((rule->selector_facts & STYLE_SELECTOR_FACTS_STRUCTURAL_KNOWN) == 0)
+        rule->selector_facts |= STYLE_SELECTOR_FACTS_STRUCTURAL_KNOWN
+            | (rule->selector != NULL
+               && style_selector_structural_text(rule->selector)
+               ? STYLE_SELECTOR_FACTS_STRUCTURAL : 0u);
+    return (rule->selector_facts & STYLE_SELECTOR_FACTS_STRUCTURAL) != 0;
+}
 /* What a :has() argument can see of a newly inserted subtree, without the
    :has() plan (which stops at STYLE_HAS_PLAN_LIMIT entries). A plain
    argument (every compound keyed, no positional, :empty or :blank test,
@@ -443,8 +505,9 @@ void style_selector_trailing_keys(const char *selector, size_t length,
    2048-bit Bloom sets. Any other argument can also change through the new
    subtree's position, so only at anchors related to it: the key of the
    compound holding the :has() goes into `anchors`, with the region its
-   argument reaches from there (STYLE_HAS_REGION_*). `any` when such an
-   anchor has no key, sits in a nested :has() argument, or the anchors
+   argument reaches from there (STYLE_HAS_REGION_*); `regions` is the union
+   of those regions, so a walk no anchor reads is skipped. `any` when such
+   an anchor has no key, sits in a nested :has() argument, or the anchors
    overflow. */
 #define STYLE_HAS_ARGUMENT_BLOOM_WORDS 64u
 #define STYLE_HAS_ANCHOR_LIMIT 64u
@@ -455,6 +518,7 @@ typedef struct {
     uint8_t anchor_regions[STYLE_HAS_ANCHOR_LIMIT];
     uint8_t anchor_count;
     bool any;
+    uint8_t regions;
 } StyleHasArgumentKeys;
 void style_selector_has_argument_keys(const char *selector, size_t length,
                                       StyleHasArgumentKeys *keys);
@@ -472,10 +536,14 @@ bool style_has_argument_keys_reach(const StyleHasArgumentKeys *keys,
                                    const lxb_dom_node_t *subtree,
                                    const lxb_dom_node_t *parent);
 /* Whether an element whose later siblings changed (`sibling`, under
-   `parent`) can carry a test of `keys`. */
-bool style_trailing_keys_reach(const StyleTrailingKeys *keys,
-                               const lxb_dom_node_t *sibling,
-                               const lxb_dom_node_t *parent);
+   `parent`) can carry a test of `keys`, in two halves: a key `sibling`
+   carries, or one `parent` or an ancestor carries. The parent half is the
+   same for every child of `parent`, so a walk over siblings asks it once.
+   Both are true when `keys` cannot tell. */
+bool style_trailing_keys_reach_sibling(const StyleTrailingKeys *keys,
+                                       const lxb_dom_node_t *sibling);
+bool style_trailing_keys_reach_parent(const StyleTrailingKeys *keys,
+                                      const lxb_dom_node_t *parent);
 /* Whether a tree change inside the document's `head` can move a :has()
    answer that styles an element outside it. An argument reads its anchor's
    descendants or later siblings, so such a change moves only answers

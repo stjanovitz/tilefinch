@@ -305,6 +305,9 @@
       return readable;
     }
     async pipeTo(destination, options = undefined) {
+      if (!(destination instanceof WritableStream))
+        throw new TypeError("Failed to execute 'pipeTo' on 'ReadableStream': "
+          + "parameter 1 is not of type 'WritableStream'.");
       return pipeStream(this, destination, validatePipe(this, destination, options));
     }
     getReader(options = {}) {

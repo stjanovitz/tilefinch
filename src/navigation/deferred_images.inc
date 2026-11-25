@@ -397,9 +397,10 @@ static bool navigation_viewport_images_due(const NavigationSession *session)
                 && page->viewport_images_moved)
             /* A queue at rest, holding what has no box yet, can wait for the
                reader for as long as the page is open. */
-            || (page->image_reveal_look && !page->image_continuation_pending))
+            || ((page->image_reveal_look || page->noscript_look)
+                && !page->image_continuation_pending))
         && !script_runtime_has_pending_mutations(page->runtime)
-        && (page->image_reveal_look
+        && (page->image_reveal_look || page->noscript_look
             || images_admission_scarce(&page->images, session->maximum_images,
                                        session->maximum_image_bytes,
                                        session->maximum_decoded_image_bytes))
@@ -410,7 +411,8 @@ bool navigation_background_resources_pending(
     const NavigationSession *session)
 {
     return session != NULL && session->page.loaded
-        && (navigation_web_font_fallback_pending(session)
+        && (session->page.static_layout_retry_pending
+            || navigation_web_font_fallback_pending(session)
             || navigation_viewport_images_due(session)
             || fonts_external_loader_pending(
                 &session->page.external_font_loader)
@@ -1104,6 +1106,24 @@ static bool navigation_publish_deferred_images(NavigationSession *session)
         navigation_image_event(session, "deferred-hold", 0, 0);
         return true;
     }
+    /* Pages that relayout provisionally show each batch in a fraction of a
+       second. Otherwise a batch the paint above could not show needs a full
+       relayout costing about what the committed layout cost: on a page this
+       large, seconds of blocked input per pair of images. Its images wait
+       for the page's next flow, and the queue ends here. */
+    if (!navigation_image_publication_allowed(session)) {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        char message[160];
+        snprintf(message, sizeof(message),
+                 "tilefinch-deferred-images: skipped targets=%zu work=%zu limit=%zu",
+                 page->deferred_image_count - page->deferred_image_cursor,
+                 page->layout.layout_work_units,
+                 session->maximum_publication_work_units);
+        tilefinch_platform_log_message(message);
+#endif
+        navigation_deferred_images_finish(session);
+        return false;
+    }
     navigation_image_trigger_note(session, "deferred");
     if (!navigation_relayout(session)) {
         session->performance.background_image_failures++;
@@ -1276,7 +1296,12 @@ static bool navigation_run_deferred_image(NavigationSession *session)
     if (page->deferred_image_job == NULL) {
         ImagePriorityTarget *current =
             &page->deferred_image_targets[page->deferred_image_cursor];
-        if (!navigation_deferred_target_live(page, current)) {
+        /* Memory refused its raster: no retry until memory frees up. */
+        if (!navigation_deferred_target_live(page, current)
+            || images_node_memory_refused(&page->images, current->node,
+                                          budget_remaining(session->budget))) {
+            current->retry_count = 0;
+            current->retry_delay = 0;
             page->deferred_image_cursor++;
             return true;
         }
@@ -1326,14 +1351,27 @@ static bool navigation_run_deferred_image(NavigationSession *session)
         } else {
             maximum_attempts = SIZE_MAX;
         }
-        /* The reader's position bounds this queue, not the image count. */
-        if (page->deferred_images_from_viewport) {
-            const ExternalImageStats *stats = &page->images.stats;
-            size_t spent = stats->attempted
-                - (stats->count_exempt <= stats->attempted
-                   ? stats->count_exempt : stats->attempted);
-            if (spent + 2u > maximum_attempts) maximum_attempts = spent + 2u;
+        const ExternalImageStats *stats = &page->images.stats;
+        size_t spent = stats->attempted
+            - (stats->count_exempt <= stats->attempted
+               ? stats->count_exempt : stats->attempted);
+        /* Past a spent count, the queue a commit planned would only start
+           refused batches, each with its retry, while the looks at the
+           reader's position it holds back wait. Nearest first, its head
+           off screen means nothing on screen is left in it: it gives way
+           to those looks, which find the rest as the reader reaches it. */
+        bool spent_plan = !page->deferred_images_from_viewport
+            && spent >= maximum_attempts;
+        if (spent_plan && navigation_deferred_image_distance(
+                              session, target, scroll_y, NULL, NULL) != 0) {
+            navigation_deferred_images_finish(session);
+            page->viewport_images_pending = true;
+            return true;
         }
+        /* The reader's position bounds this queue, and what is on screen of
+           a spent plan, not the image count. */
+        if ((page->deferred_images_from_viewport || spent_plan)
+            && spent + 2u > maximum_attempts) maximum_attempts = spent + 2u;
         size_t batch_count = 1u;
         if (target->retry_count == 0
             && page->deferred_image_cursor + 1u
@@ -1595,6 +1633,11 @@ static void navigation_admit_viewport_images(NavigationSession *session)
     int scroll_y = entry == NULL ? 0 : entry->scroll_y;
     bool moved = page->viewport_images_moved;
     bool reveal = page->image_reveal_look;
+    /* A look owed only to the <noscript> fallback takes nothing else: the
+       rest was looked for when it was last owed. */
+    bool fallbacks_only = page->noscript_look_only && !reveal && !moved;
+    page->noscript_look = false;
+    page->noscript_look_only = false;
     page->viewport_images_pending = false;
     page->viewport_images_moved = false;
     page->image_reveal_look = false;
@@ -1618,23 +1661,65 @@ static void navigation_admit_viewport_images(NavigationSession *session)
     bool more = false, queue_reached = false;
     if (reveal)
         navigation_queue_revealed_visuals(session, band_top, band_bottom, &more);
-    for (size_t i = 0; i < page->layout.node_box_count; i++) {
-        const LayoutNodeBox *box = &page->layout.node_boxes[i];
+    /* The boxes, and once fallbacks may be taken, the <img>s with no source
+       of their own that have no box, only an empty place on their line (an
+       inline fragment, 0 high), where the fallback would show. */
+    size_t boxes = page->layout.node_box_count;
+    size_t fragments = page->noscript_ready
+        ? layout_inline_fragment_count(&page->layout) : 0;
+    for (size_t i = 0; i < boxes + fragments; i++) {
+        LayoutNodeBox place;
+        const LayoutNodeBox *box = &place;
+        if (i < boxes) {
+            box = &page->layout.node_boxes[i];
+        } else {
+            const LayoutInlineFragment *fragment = layout_inline_fragment_at(
+                &page->layout, i - boxes);
+            if (!document_node_is_tag(fragment->node, LXB_TAG_IMG)
+                || layout_inline_fragment_first(&page->layout, fragment->node)
+                       != fragment
+                || layout_box_for_node(&page->layout, fragment->node) != NULL
+                || !image_noscript_fallback_shown(&page->stylesheet,
+                                                  fragment->node)) continue;
+            memset(&place, 0, sizeof(place));
+            place.node = fragment->node;
+            place.x = fragment->x;
+            place.y = fragment->y;
+        }
         int64_t top = box->y, bottom = top + box->height;
         if (box->node == NULL || bottom <= band_top || top >= band_bottom
             || box->node->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
         bool document_image = document_node_is_tag(box->node, LXB_TAG_IMG);
+        /* An unfilled placeholder's <noscript> image, an <img> taking one
+           or an empty box painting one, only once the reader has settled
+           (navigation_noscript_images_advance). */
+        size_t fallback_length = 0;
+        bool placeholder = !document_image
+            && image_noscript_placeholder_source(
+                   &page->stylesheet, box->node, &fallback_length) != NULL;
+        bool fallback = placeholder || (document_image
+            && image_noscript_fallback_shown(&page->stylesheet, box->node));
+        if (fallback ? !page->noscript_ready : fallbacks_only) continue;
         /* A revealed <img> with no size of its own has no height until it
            loads. */
         if ((box->width <= 0 || box->height <= 0)
-            && !(reveal && document_image)) continue;
-        if ((!document_image && !document_node_is_tag(box->node, LXB_TAG_SVG))
+            && !((reveal || fallback) && document_image)) continue;
+        if ((!document_image && !placeholder
+             && !document_node_is_tag(box->node, LXB_TAG_SVG))
             || images_find_node(&page->images, box->node) != NULL
-            || images_node_failed(&page->images, box->node)) continue;
+            || (!(fallback && document_image)
+                && images_node_failed(&page->images, box->node))
+            || images_node_memory_refused(&page->images, box->node,
+                                          budget_remaining(session->budget)))
+            continue;
         if (document_image) {
             size_t length = 0;
-            if (image_select_source(&page->stylesheet, box->node, &length)
-                    == NULL || length == 0) continue;
+            const char *source = image_select_source(&page->stylesheet,
+                                                     box->node, &length);
+            /* Its failure with no source came before the fallback. */
+            if (source == NULL || length == 0
+                || (fallback && images_node_source_failed(
+                        &page->images, box->node, source, length))) continue;
         }
         int64_t distance = bottom <= view_top ? view_top - bottom
             : top >= view_bottom ? top - view_bottom : 0;
@@ -1665,7 +1750,7 @@ static void navigation_admit_viewport_images(NavigationSession *session)
     size_t inline_count = 0, reached_count = 0;
     for (size_t i = 0; i < count; i++) {
         lxb_dom_node_t *node = found[i].node;
-        if (!document_node_is_tag(node, LXB_TAG_IMG)) {
+        if (document_node_is_tag(node, LXB_TAG_SVG)) {
             inline_svgs[inline_count++] = node;
             continue;
         }
@@ -1844,6 +1929,11 @@ static NavigationBackgroundWorkOutcome navigation_load_visual_batch(
 bool navigation_run_deferred_image_work(NavigationSession *session)
 {
     if (session == NULL || !session->page.loaded) return false;
+    /* A page with scripts pumps its scheduler on every runtime advance;
+       here a page without them ages the requests its image jobs parked. */
+    if (session->page.runtime == NULL)
+        (void) fetch_scheduler_release_parked(
+            session->page.resource_scheduler, false);
     if (!session->page.image_continuation_pending
         || session->page.deferred_image_targets == NULL) {
         /* The image units of a page-idle turn, one per call. A page whose
@@ -1862,25 +1952,6 @@ bool navigation_run_deferred_image_work(NavigationSession *session)
             navigation_admit_viewport_images(session);
         return outcome != NAVIGATION_BACKGROUND_WORK_HARD_FAILURE;
     }
-    /* Pages that relayout provisionally show each batch in a fraction of
-       a second and complete in preemptible idle work. */
-    if (!navigation_image_publication_allowed(session)) {
-        /* Every batch is published through a full relayout costing about
-           what the committed layout cost. On a page this large that is
-           seconds of blocked input per pair of images; keep the fallback
-           boxes and finish the queue instead. */
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-        char message[160];
-        snprintf(message, sizeof(message),
-                 "tilefinch-deferred-images: skipped targets=%zu work=%zu limit=%zu",
-                 session->page.deferred_image_count,
-                 session->page.layout.layout_work_units,
-                 session->maximum_publication_work_units);
-        tilefinch_platform_log_message(message);
-#endif
-        navigation_deferred_images_finish(session);
-        return true;
-    }
     return navigation_run_deferred_image(session);
 }
 
@@ -1895,6 +1966,13 @@ void navigation_test_refuse_next_background_font_relayout(void)
 static NavigationBackgroundWorkOutcome navigation_background_resources_turn(
     NavigationSession *session)
 {
+    if (session->page.static_layout_retry_pending) {
+        bool recovered = navigation_relayout_static_fallback(session);
+        /* Persistent pressure must not start a rebuild on every idle turn. */
+        session->page.static_layout_retry_pending = false;
+        return recovered ? NAVIGATION_BACKGROUND_WORK_SUCCESS
+                         : NAVIGATION_BACKGROUND_WORK_SOFT_REFUSAL;
+    }
     if (session->page.visual_image_publication_pending)
         return navigation_publish_visual_images(session);
     NavigationBackgroundWorkOutcome outcome =

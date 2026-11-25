@@ -1,6 +1,6 @@
 --- a/stb_image.h
 +++ b/stb_image.h
-@@ -1990,6 +1990,10 @@
+@@ -1990,6 +1990,16 @@
     int            jfif;
     int            app14_color_transform; // Adobe APP14 tag
     int            rgb;
@@ -8,15 +8,19 @@
 +   // (8 >> shift) square, so component planes are allocated reduced by
 +   // 2^shift in each dimension and the full-resolution planes never exist.
 +   int            tilefinch_scale_shift;
++   // Shorts per progressive coefficient block: 64, or at a reduced scale
++   // the (8 >> shift) square of low-frequency coefficients the reduced
++   // block is built from, then a 64-bit map of which coefficients are
++   // nonzero (refinement scans read a bit for each nonzero coefficient, so
++   // their positions must outlive their values).
++   int            tilefinch_coeff_stride;
  
     int scan_n, order[4];
     int restart_interval, todo;
-@@ -2944,6 +2948,32 @@
-    j->eob_run = 0;
-    // no more than 1<<31 MCUs if no restart_interal? that's plenty safe,
+@@ -2946,6 +2956,70 @@
     // since we don't even allow 1<<30 pixels
-+}
-+
+ }
+ 
 +// Tilefinch: store one IDCT block at component n, plane offset (x, y) in
 +// full-resolution samples (multiples of 8), reduced by tilefinch_scale_shift.
 +static void stbi__jpeg_idct_store(stbi__jpeg *z, int n, int x, int y, short data[64])
@@ -41,10 +45,50 @@
 +         }
 +      }
 +   }
- }
- 
++}
++
++// Tilefinch: a reduced progressive block is decoded in a full block that
++// holds the stored low-frequency values and 1 at every other nonzero
++// coefficient (refinement only tests and grows nonzero values, which stay
++// nonzero); afterwards the square and the nonzero map are stored back. A
++// block a first AC scan's EOB run skips is not touched, and stays in place.
++static short *stbi__jpeg_coeff_open(stbi__jpeg *z, int n, int bx, int by, short full[64])
++{
++   short *stored = z->img_comp[n].coeff + z->tilefinch_coeff_stride * (bx + by * z->img_comp[n].coeff_w);
++   int size = 8 >> z->tilefinch_scale_shift, i, u, v;
++   unsigned long long map;
++   if (z->tilefinch_coeff_stride == 64 || (z->eob_run && z->succ_high == 0 && z->spec_start != 0)) return stored;
++   memcpy(&map, stored + size*size, sizeof(map));
++   memset(full, 0, 64*sizeof(full[0]));
++   for (i=0; map != 0; i += 8, map >>= 8)
++      if (map & 255)
++         for (u=0; u < 8; ++u)
++            full[i + u] = (short) ((map >> u) & 1);
++   for (v=0; v < size; ++v)
++      for (u=0; u < size; ++u)
++         full[v*8 + u] = stored[v*size + u];
++   return full;
++}
++
++static void stbi__jpeg_coeff_close(stbi__jpeg *z, int n, int bx, int by, const short full[64])
++{
++   short *stored = z->img_comp[n].coeff + z->tilefinch_coeff_stride * (bx + by * z->img_comp[n].coeff_w);
++   int size = 8 >> z->tilefinch_scale_shift, i, u, v;
++   unsigned long long map;
++   if (full == stored) return;
++   memcpy(&map, stored + size*size, sizeof(map));
++   for (i=z->spec_start; i <= z->spec_end; ++i)
++      map |= (unsigned long long) (full[stbi__jpeg_dezigzag[i]] != 0) << stbi__jpeg_dezigzag[i];
++   memcpy(stored + size*size, &map, sizeof(map));
++   for (v=0; v < size; ++v)
++      for (u=0; u < size; ++u)
++         stored[v*size + u] = full[v*8 + u];
++}
++
  static int stbi__parse_entropy_coded_data(stbi__jpeg *z)
-@@ -2964,7 +2994,7 @@
+ {
+    stbi__jpeg_reset(z);
+@@ -2964,7 +3038,7 @@
              for (i=0; i < w; ++i) {
                 int ha = z->img_comp[n].ha;
                 if (!stbi__jpeg_decode_block(z, data, z->huff_dc+z->img_comp[n].hd, z->huff_ac+ha, z->fast_ac[ha], n, z->dequant[z->img_comp[n].tq])) return 0;
@@ -53,7 +97,7 @@
                 // every data block is an MCU, so countdown the restart interval
                 if (--z->todo <= 0) {
                    if (z->code_bits < 24) stbi__grow_buffer_unsafe(z);
-@@ -2992,7 +3022,7 @@
+@@ -2992,7 +3066,7 @@
                          int y2 = (j*z->img_comp[n].v + y)*8;
                          int ha = z->img_comp[n].ha;
                          if (!stbi__jpeg_decode_block(z, data, z->huff_dc+z->img_comp[n].hd, z->huff_ac+ha, z->fast_ac[ha], n, z->dequant[z->img_comp[n].tq])) return 0;
@@ -62,16 +106,57 @@
                       }
                    }
                 }
-@@ -3089,7 +3119,7 @@
+@@ -3019,7 +3093,7 @@
+          int h = (z->img_comp[n].y+7) >> 3;
+          for (j=0; j < h; ++j) {
              for (i=0; i < w; ++i) {
-                short *data = z->img_comp[n].coeff + 64 * (i + j * z->img_comp[n].coeff_w);
+-               short *data = z->img_comp[n].coeff + 64 * (i + j * z->img_comp[n].coeff_w);
++               short full[64], *data = stbi__jpeg_coeff_open(z, n, i, j, full);
+                if (z->spec_start == 0) {
+                   if (!stbi__jpeg_decode_block_prog_dc(z, data, &z->huff_dc[z->img_comp[n].hd], n))
+                      return 0;
+@@ -3028,6 +3102,7 @@
+                   if (!stbi__jpeg_decode_block_prog_ac(z, data, &z->huff_ac[ha], z->fast_ac[ha]))
+                      return 0;
+                }
++               stbi__jpeg_coeff_close(z, n, i, j, data);
+                // every data block is an MCU, so countdown the restart interval
+                if (--z->todo <= 0) {
+                   if (z->code_bits < 24) stbi__grow_buffer_unsafe(z);
+@@ -3050,9 +3125,10 @@
+                      for (x=0; x < z->img_comp[n].h; ++x) {
+                         int x2 = (i*z->img_comp[n].h + x);
+                         int y2 = (j*z->img_comp[n].v + y);
+-                        short *data = z->img_comp[n].coeff + 64 * (x2 + y2 * z->img_comp[n].coeff_w);
++                        short full[64], *data = stbi__jpeg_coeff_open(z, n, x2, y2, full);
+                         if (!stbi__jpeg_decode_block_prog_dc(z, data, &z->huff_dc[z->img_comp[n].hd], n))
+                            return 0;
++                        stbi__jpeg_coeff_close(z, n, x2, y2, data);
+                      }
+                   }
+                }
+@@ -3087,9 +3163,18 @@
+          int h = (z->img_comp[n].y+7) >> 3;
+          for (j=0; j < h; ++j) {
+             for (i=0; i < w; ++i) {
+-               short *data = z->img_comp[n].coeff + 64 * (i + j * z->img_comp[n].coeff_w);
++               STBI_SIMD_ALIGN(short, full[64]);
++               short *data = z->img_comp[n].coeff + z->tilefinch_coeff_stride * (i + j * z->img_comp[n].coeff_w);
++               if (z->tilefinch_coeff_stride != 64) {
++                  int size = 8 >> z->tilefinch_scale_shift, u, v;
++                  memset(full, 0, sizeof(full));
++                  for (v=0; v < size; ++v)
++                     for (u=0; u < size; ++u)
++                        full[v*8 + u] = data[v*size + u];
++                  data = full;
++               }
                 stbi__jpeg_dequantize(data, z->dequant[z->img_comp[n].tq]);
 -               z->idct_block_kernel(z->img_comp[n].data+z->img_comp[n].w2*j*8+i*8, z->img_comp[n].w2, data);
 +               stbi__jpeg_idct_store(z, n, i*8, j*8, data);
              }
           }
        }
-@@ -3334,7 +3364,9 @@
+@@ -3334,7 +3419,9 @@
        z->img_comp[i].coeff = 0;
        z->img_comp[i].raw_coeff = 0;
        z->img_comp[i].linebuf = NULL;
@@ -82,3 +167,21 @@
        if (z->img_comp[i].raw_data == NULL)
           return stbi__free_jpeg_components(z, i+1, stbi__err("outofmem", "Out of memory"));
        // align blocks for idct using mmx/sse
+@@ -3343,10 +3430,16 @@
+          // w2, h2 are multiples of 8 (see above)
+          z->img_comp[i].coeff_w = z->img_comp[i].w2 / 8;
+          z->img_comp[i].coeff_h = z->img_comp[i].h2 / 8;
+-         z->img_comp[i].raw_coeff = stbi__malloc_mad3(z->img_comp[i].w2, z->img_comp[i].h2, sizeof(short), 15);
++         z->tilefinch_coeff_stride = z->tilefinch_scale_shift == 0 ? 64
++            : (8 >> z->tilefinch_scale_shift) * (8 >> z->tilefinch_scale_shift) + 4;
++         z->img_comp[i].raw_coeff = stbi__malloc_mad3(z->img_comp[i].coeff_w, z->img_comp[i].coeff_h * z->tilefinch_coeff_stride, sizeof(short), 15);
+          if (z->img_comp[i].raw_coeff == NULL)
+             return stbi__free_jpeg_components(z, i+1, stbi__err("outofmem", "Out of memory"));
+          z->img_comp[i].coeff = (short*) (((size_t) z->img_comp[i].raw_coeff + 15) & ~15);
++         // Blocks no DC scan reaches (a stream cut short) decode as zero,
++         // never as leftover heap contents; reduced blocks are only partly
++         // written by the first DC scan.
++         memset(z->img_comp[i].coeff, 0, (size_t) z->img_comp[i].coeff_w * z->img_comp[i].coeff_h * z->tilefinch_coeff_stride * sizeof(short));
+       }
+    }
+ 

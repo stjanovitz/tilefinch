@@ -19,6 +19,7 @@ typedef struct DocumentControlState DocumentControlState;
 typedef struct DocumentNonceSlot DocumentNonceSlot;
 typedef struct DocumentNonceRegistry DocumentNonceRegistry;
 typedef struct DocumentAdoptedSheets DocumentAdoptedSheets;
+typedef struct ImageNoscriptStore ImageNoscriptStore;
 typedef struct DocumentRegisteredProperty {
     struct DocumentRegisteredProperty *next;
     const char *name;
@@ -209,6 +210,7 @@ typedef struct {
        page): <noscript> holds ordinary elements and renders. Documents built
        any other way keep the scripting-aware rule that hides it. */
     bool noscript_rendered;
+    bool noscript_present;
     /* A script realm has been given this document, so its element geometry
        can be read (getClientRects). Layouts of it record inline fragments
        only then; script-free pages never pay for the table. */
@@ -245,12 +247,17 @@ typedef struct {
     DocumentRegisteredProperty *registered_properties;
     uint16_t registered_property_count;
     struct DocumentCssomSheets *cssom_sheets;
+    /* Set once the page's own loaders have had their chance and its
+       <noscript> image fallback may fill the placeholders they left empty
+       (image_noscript_arm); NULL until then. */
+    ImageNoscriptStore *noscript_images;
     /* The document's character encoding (a TilefinchEncoding). Zero is
        UTF-8, the default for documents not built by a sniffing parser. */
     uint8_t encoding;
     /* The process-wide frame-container insertion count when this document's
        parse began; see document_frames_impossible(). */
     uint64_t frame_insertions_at_parse;
+    uint64_t noscript_insertions_seen;
     /* The process-wide <meta> insertion count at this document's last meta
        policy scan (document_apply_meta_csp). */
     uint64_t meta_insertions_seen;
@@ -473,6 +480,10 @@ bool document_parser_set_inert_script_policy(
 /* The HTML <script> element whose text the tokenizer is reading (its end
    tag not yet fed), or NULL. */
 lxb_dom_node_t *document_parser_open_script(const DocumentParser *parser);
+/* The tree builder's current node (the open element the next token is
+   inserted at, foster parenting aside), or NULL when no parse is running
+   or no element is open yet. */
+lxb_dom_node_t *document_parser_current_node(const DocumentParser *parser);
 bool document_parser_script_was_truncated(
     const DocumentParser *parser, const lxb_dom_node_t *script);
 /* Preserve the active HTML tree-builder model while discarding only future
@@ -761,6 +772,9 @@ void document_style_changed(void);
    document's parse began. A document whose insertions are not counted
    answers false. Lets frame walks skip pages without frames. */
 bool document_frames_impossible(const PocDocument *document);
+/* Cached presence test for the optional image fallback; notices insertions
+   after parse without walking an unchanged page when scrolling. */
+bool document_may_have_noscript(PocDocument *document);
 /* Lexbor writes between these do not advance the generation: the script
    bridge journals its own writes as mutation notes, and a probe that
    restores what it changed leaves nothing to see. Nesting is allowed. An
@@ -946,6 +960,8 @@ lxb_dom_node_t *document_flat_parent(lxb_dom_node_t *node);
    ancestor inertness but not its own inert attribute. Bounded, no allocation. */
 bool document_node_is_inert(lxb_dom_node_t *node);
 const char *document_control_value(lxb_dom_node_t *node, size_t *length);
+/* True only when a live text value differs from its captured default. */
+bool document_control_value_changed(lxb_dom_node_t *node);
 bool document_control_value_set(PocDocument *document, lxb_dom_node_t *node,
                                 const char *value, size_t length);
 bool document_control_value_snapshot(

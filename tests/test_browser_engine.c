@@ -338,6 +338,7 @@ static bool capture_provisional_present(
 #include "suites/youtube_provider_costs.inc"
 #include "suites/youtube_login_journey.inc"
 #include "suites/youtube_navigation_journey.inc"
+#include "suites/youtube_playlist_handoff.inc"
 #include "suites/youtube_memory_journey.inc"
 #include "suites/youtube_watch_next.inc"
 #include "suites/browser_engine_teardown.inc"
@@ -374,6 +375,11 @@ int main(int argc, char **argv)
         CHECK(test_history_disclosures_leave_room_for_form_state() == 0);
         return 0;
     }
+    if (argc == 2 && strcmp(argv[1], "--form-submission-only") == 0)
+        return test_declared_var_and_script_form_submission()
+            || test_native_form_submission_sends_script_entries()
+            || test_native_form_submission_large_bodies()
+            || test_form_submitter_overrides();
     if (argc == 2 && strcmp(argv[1], "--history-step-only") == 0)
         return test_native_history_step_cancels_idle_work();
     if (argc == 2 && strcmp(argv[1], "--page-media-only") == 0)
@@ -410,8 +416,20 @@ int main(int argc, char **argv)
             || test_youtube_rating_status_confirmation() || test_youtube_like_action()
             || test_youtube_like_canonical_link()
             || test_youtube_library_actions() || test_youtube_library_native_action();
+    if (argc == 2 && strcmp(argv[1], "--youtube-watch-timestamps") == 0)
+        return test_youtube_watch_timestamps();
     if (argc == 2 && strcmp(argv[1], "--youtube-navigation-journey") == 0)
-        return test_youtube_provider_layout_states() || test_youtube_filters_and_chapters();
+        return test_youtube_header_refresh_keeps_recommendation_focus()
+            || test_youtube_refresh_does_not_own_a_later_search_edit()
+            || test_youtube_refresh_defers_to_later_browsing()
+            || test_youtube_history_reordered_results()
+            || test_youtube_history_keeps_duplicate_playlist_occurrence()
+            || test_youtube_superseded_search_journey()
+            || test_youtube_interrupted_details()
+            || test_youtube_results_player_handoff()
+            || test_youtube_interrupted_playlist()
+            || test_youtube_signout_retires_ready_recommendations() || test_youtube_provider_layout_states()
+            || test_youtube_filters_and_chapters() || test_youtube_watch_timestamps();
     if (argc == 2 && strcmp(argv[1], "--youtube-provider-costs-only") == 0)
         return test_youtube_provider_costs();
     if (argc == 2 && strcmp(argv[1], "--youtube-memory-journey-only") == 0)
@@ -494,6 +512,15 @@ int main(int argc, char **argv)
             || test_given_up_deferred_batch_keeps_script_images()
             || test_filtered_page_fixed_images_publish_by_paint()
             || test_full_image_table_gives_far_aliases_up_to_a_scan();
+    if (argc == 2 && strcmp(argv[1], "--image-budget-only") == 0)
+        return test_spent_image_count_yields_to_the_reader()
+            || test_memory_refused_raster_is_fetched_once()
+            || test_given_up_image_fetch_is_adopted()
+            || test_removed_image_fetch_is_not_requested_again()
+            || test_finished_parked_response_is_released()
+            || test_svg_limit_recovers_when_its_constraint_changes()
+            || test_painted_size_svg_masks_fit_the_decoded_quota()
+            || test_svg_decode_limit_waits_for_decoded_bytes();
     if (argc == 2 && strcmp(argv[1], "--geometry-records-only") == 0)
         return test_computed_style_geometry_records();
     if (argc == 2 && strcmp(argv[1], "--computed-style-values-only") == 0)
@@ -502,9 +529,15 @@ int main(int argc, char **argv)
         return test_computed_style_tracks_container_geometry();
     if (argc == 2 && strcmp(argv[1], "--opacity-geometry-only") == 0)
         return test_opacity_geometry_snapshot_reuse();
+    if (argc == 2 && strcmp(argv[1], "--late-sheet-pressure-only") == 0)
+        return test_stylesheet_admission_takes_reuse_memory();
     if (argc == 2 && strcmp(argv[1], "--attribute-geometry-only") == 0)
         return test_inert_attribute_geometry_snapshot_reuse()
             || test_generated_expression_attribute_invalidates_geometry();
+    if (argc == 2 && strcmp(argv[1], "--hidden-geometry-only") == 0)
+        return test_hidden_subtree_geometry_snapshot_reuse();
+    if (argc == 2 && strcmp(argv[1], "--geometry-proof-only") == 0)
+        return test_geometry_read_proofs();
     if (argc == 2 && strcmp(argv[1], "--head-probe-only") == 0)
         return test_head_probe_style_read_skips_container_layout();
     if (argc == 2 && strcmp(argv[1], "--css-transitions-only") == 0) {
@@ -554,6 +587,12 @@ int main(int argc, char **argv)
             || test_raster_decode_checkpoints_borrow_render_shell();
     if (argc == 2 && strcmp(argv[1], "--interaction-journey-only") == 0)
         return test_loading_interaction_journey();
+    if (argc == 2 && strcmp(argv[1], "--article-layout-pressure-only") == 0)
+        return test_streamed_article_keeps_input_on_layout_pressure();
+    if (argc == 2 && strcmp(argv[1], "--preview-activation-only") == 0)
+        return test_preview_scroll_precedes_autofocus()
+            || test_preview_author_replaces_field()
+            || test_preview_focus_and_activation();
     if (argc == 2 && strcmp(argv[1], "--text-memory-only") == 0)
         return test_text_content_does_not_retain_scratch();
     if (argc == 2 && strcmp(argv[1], "--script-free-journey-only") == 0)
@@ -636,8 +675,17 @@ int main(int argc, char **argv)
     CHECK(test_relayout_image_load_while_deferred_decode_held() == 0);
     CHECK(test_given_up_deferred_batch_keeps_script_images() == 0);
     CHECK(test_filtered_page_fixed_images_publish_by_paint() == 0);
+    CHECK(test_positioned_card_images_publish_by_paint() == 0);
     CHECK(test_full_image_table_gives_far_aliases_up_to_a_scan() == 0);
-    CHECK(test_deferred_images_skip_oversized_pages() == 0);
+    CHECK(test_spent_image_count_yields_to_the_reader() == 0);
+    CHECK(test_memory_refused_raster_is_fetched_once() == 0);
+    CHECK(test_given_up_image_fetch_is_adopted() == 0);
+    CHECK(test_removed_image_fetch_is_not_requested_again() == 0);
+    CHECK(test_finished_parked_response_is_released() == 0);
+    CHECK(test_svg_limit_recovers_when_its_constraint_changes() == 0);
+    CHECK(test_painted_size_svg_masks_fit_the_decoded_quota() == 0);
+    CHECK(test_svg_decode_limit_waits_for_decoded_bytes() == 0);
+    CHECK(test_deferred_images_paint_on_oversized_pages() == 0);
     CHECK(test_same_document_and_script_free_defaults() == 0);
     CHECK(test_same_document_event_mutations_settle_immediately() == 0);
     CHECK(test_contenteditable_relayout_refusal_retires_shell() == 0);
@@ -674,7 +722,10 @@ int main(int argc, char **argv)
     CHECK(test_computed_style_resolved_values() == 0);
     CHECK(test_computed_style_tracks_container_geometry() == 0);
     CHECK(test_opacity_geometry_snapshot_reuse() == 0);
+    CHECK(test_stylesheet_admission_takes_reuse_memory() == 0);
     CHECK(test_inert_attribute_geometry_snapshot_reuse() == 0);
+    CHECK(test_hidden_subtree_geometry_snapshot_reuse() == 0);
+    CHECK(test_geometry_read_proofs() == 0);
     CHECK(test_generated_expression_attribute_invalidates_geometry() == 0);
     CHECK(test_head_probe_style_read_skips_container_layout() == 0);
     CHECK(test_inline_style_mutations_skip_stylesheet_rebuild() == 0);
@@ -715,11 +766,15 @@ int main(int argc, char **argv)
     CHECK(test_provisional_preview_retries_and_refreshes(false, true) == 0);
     CHECK(test_provisional_preview_empty_backoff() == 0);
     CHECK(test_large_static_page_commits_provisionally() == 0);
+    CHECK(test_streamed_article_keeps_input_on_layout_pressure() == 0);
     CHECK(test_scroll_noop_reports_unchanged() == 0);
     CHECK(test_bounded_focus_frontend_settles() == 0);
     CHECK(test_bounded_focus_pending_mutations_settle() == 0);
-    CHECK(test_preview_scrolls_ahead_during_load() == 0);
+    CHECK(test_preview_scrolls_ahead_during_load(false) == 0);
+    CHECK(test_preview_scrolls_ahead_during_load(true) == 0);
     CHECK(test_preview_focus_and_activation() == 0);
+    CHECK(test_preview_scroll_precedes_autofocus() == 0);
+    CHECK(test_preview_author_replaces_field() == 0);
     CHECK(test_preview_waits_out_style_run() == 0);
     CHECK(test_youtube_localized_watch_metadata() == 0);
     CHECK(test_youtube_lite_escaped_title_is_valid_utf8() == 0);
@@ -736,8 +791,19 @@ int main(int argc, char **argv)
     CHECK(test_youtube_rating_status_confirmation() == 0);
     CHECK(test_youtube_library_actions() == 0);
     CHECK(test_youtube_library_native_action() == 0);
+    CHECK(test_youtube_superseded_search_journey() == 0);
+    CHECK(test_youtube_interrupted_details() == 0);
+    CHECK(test_youtube_results_player_handoff() == 0);
+    CHECK(test_youtube_interrupted_playlist() == 0);
+    CHECK(test_youtube_history_reordered_results() == 0);
+    CHECK(test_youtube_history_keeps_duplicate_playlist_occurrence() == 0);
+    CHECK(test_youtube_refresh_does_not_own_a_later_search_edit() == 0);
+    CHECK(test_youtube_refresh_defers_to_later_browsing() == 0);
+    CHECK(test_youtube_header_refresh_keeps_recommendation_focus() == 0);
+    CHECK(test_youtube_signout_retires_ready_recommendations() == 0);
     CHECK(test_youtube_provider_layout_states() == 0);
     CHECK(test_youtube_filters_and_chapters() == 0);
+    CHECK(test_youtube_watch_timestamps() == 0);
     CHECK(test_youtube_watch_next_cards() == 0);
     CHECK(test_youtube_watch_commit_defers_avatar() == 0);
     CHECK(test_youtube_history_page() == 0);

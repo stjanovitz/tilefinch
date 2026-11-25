@@ -17,6 +17,8 @@
 #include "../src/js_runtime_internal.h"
 #include "../src/layout_internal.h"
 #include "../src/navigation_staging_policy.h"
+#include "../src/style_match_internal.h"
+#include "../src/psp_navigation_watchdog.h"
 #include "../src/tilefinch_test_faults.h"
 #include "tilefinch_test_clocks.h"
 #include "bootstrap_resident_probe.h"
@@ -1793,6 +1795,188 @@ static bool test_visible_lazy_pair_overlaps_transport_and_decode(void)
         && budget_categories_reconcile(&budget);
     if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
     return ok && clean;
+}
+
+/* The <noscript> image fallback (image_noscript_arm): a placeholder the
+   page's script leaves empty takes the one <img src> its <noscript> sibling
+   holds, after the load event and a settle period (at once when the realm
+   has stopped), as one request through the ordinary image queue. Script
+   never sees it: the DOM, currentSrc, natural size and load events stay as
+   the page left them. A placeholder its script fills requests nothing, and
+   a fallback that fails is not asked for again. The
+   pages are fixtures/http-noscript-images; requests count the page. The
+   probe reports through globalThis.pocSummary. */
+static void noscript_fallback_ticks(NavigationSession *navigation,
+                                    size_t ticks)
+{
+    for (size_t tick = 0; tick < ticks; tick++) {
+        (void) navigation_advance_runtime(navigation, 100, 8);
+        size_t pumps = 0;
+        while (navigation_background_resources_pending(navigation)
+               && pumps++ < 16u) {
+            if (!navigation_run_background_resources(navigation)) break;
+        }
+    }
+}
+
+static bool noscript_fallback_case(const char *page, const char *drawn_id,
+                                   bool cover, bool memory_stop,
+                                   const char *probe, const char *expected,
+                                   size_t expected_images,
+                                   bool failing)
+{
+    char error[256] = {0};
+    char url[96];
+    snprintf(url, sizeof(url), "https://noscript-images.test/%s", page);
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4)
+        && fetch_trace_replay_begin_response_keyed(
+               TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-noscript-images",
+               error, sizeof(error));
+    if (ready) {
+        navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 64 * 1024, 32 * 1024, 1000);
+        navigation_enable_external_resources(
+            &navigation, 2, 32 * 1024, 16 * 1024,
+            2, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
+        /* No memory-pressure growth: the 4 MiB limit is the limit. */
+        navigation.fixed_script_memory_limits = true;
+    }
+    bool loaded = ready && navigation_load_url(
+        &navigation, navigation_begin(&navigation), url, 64 * 1024, 1000,
+        480, NULL, NULL, true);
+    size_t pumps = 0;
+    while (loaded && navigation_background_resources_pending(&navigation)
+           && pumps++ < 16u) {
+        if (!navigation_run_background_resources(&navigation)) break;
+    }
+    FetchTraceReplayStats before = {0};
+    bool counted = loaded && fetch_trace_replay_stats(&before);
+    /* Five seconds of page clock in 100 ms ticks, the image queue run to
+       rest after each; then the reader moves away and back, settling at
+       each place, which looks again and must not ask again. */
+    FetchTraceReplayStats settled = {0};
+    if (counted) {
+        noscript_fallback_ticks(&navigation, 50u);
+        counted = fetch_trace_replay_stats(&settled);
+        (void) navigation_set_scroll(&navigation, 40);
+        noscript_fallback_ticks(&navigation, 20u);
+        (void) navigation_set_scroll(&navigation, 0);
+        noscript_fallback_ticks(&navigation, 20u);
+    }
+    FetchTraceReplayStats after = {0};
+    counted = counted && fetch_trace_replay_stats(&after);
+    bool stopped = navigation.page.runtime == NULL
+        && navigation.page.script_stop.reason
+               == NAVIGATION_SCRIPT_STOP_MEMORY;
+    bool drawn = drawn_id == NULL;
+    lxb_dom_node_t *root = loaded
+        ? lxb_dom_interface_node(navigation.page.document.html) : NULL;
+    lxb_dom_node_t *target = root == NULL || drawn_id == NULL
+        ? NULL : test_find_id(root, drawn_id);
+    const ImageResource *image = target == NULL
+        ? NULL : images_find_node(&navigation.page.images, target);
+    for (size_t i = 0; image != NULL && image_resource_available(image)
+         && i < navigation.page.layout.count; i++) {
+        const DrawCommand *command = &navigation.page.layout.commands[i];
+        /* A cover fills the placeholder's 40x20 box. */
+        if (command->type == DRAW_IMAGE && command->image == image
+            && command->width > 0 && command->height > 0
+            && (command->image_fit == LAYOUT_IMAGE_FIT_COVER) == cover
+            && (!cover || (command->width == 40 && command->height == 20)))
+            drawn = true;
+    }
+    ScriptResult result;
+    memset(&result, 0, sizeof(result));
+    bool evaluated = probe != NULL && navigation.page.runtime != NULL
+        && script_runtime_evaluate_diagnostic(
+               navigation.page.runtime, probe, "<noscript-images>",
+               &result);
+    bool probed = probe == NULL || (evaluated
+        && strcmp(result.summary, expected) == 0);
+    bool ok = counted && !navigation.page.document.noscript_rendered
+        && before.request_count == 1u
+        /* A failing fallback is the deferred queue's like any image's: one
+           retry (navigation_deferred_image_failed), the second of a pair
+           once more alone. Its failure is then kept, and no look asks
+           again. */
+        && (failing
+            ? after.request_count >= 1u + expected_images
+                && after.request_count <= 1u + 3u * expected_images
+            : after.request_count == 1u + expected_images)
+        && settled.request_count == after.request_count
+        && after.served_request_count == after.request_count
+        && after.unmatched_request_count == 0
+        && stopped == memory_stop && drawn && probed;
+    if (!ok) {
+        fprintf(stderr,
+                "noscript-fallback %s ready=%d loaded=%d before=%zu "
+                "settled=%zu requests=%zu served=%zu unmatched=%zu stopped=%d drawn=%d "
+                "image=%d summary=\"%s\" error=\"%s\" last=\"%s\" %s\n",
+                page, ready, loaded, before.request_count,
+                settled.request_count, after.request_count, after.served_request_count,
+                after.unmatched_request_count, stopped, drawn,
+                image != NULL && image_resource_available(image),
+                result.summary, result.error, navigation.last_error, error);
+    }
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_noscript_image_fallback_fills_empty_placeholders(void)
+{
+    /* Arming schedules a viewport scan. A document with no fallbacks must
+       never arm, but one inserted after parsing must still be noticed. */
+    static const char plain[] = "<!doctype html><body>Article";
+    static const char added[] = "<img><noscript><img src='cover.png'></noscript>";
+    Budget budget;
+    budget_init(&budget, 4 * MIB);
+    if (!budget_install_lexbor(&budget)) return false;
+    PocDocument doc = {0}, other = {0};
+    bool parsed = document_parse(&doc, &budget, plain, sizeof(plain) - 1u, 17);
+    bool other_parsed = parsed && document_parse(
+        &other, &budget, added, sizeof(added) - 1u, 17);
+    bool correct = other_parsed && image_noscript_arm(&other, NULL)
+        && !image_noscript_arm(&doc, NULL)
+        && doc.noscript_images == NULL
+        && document_set_element_inner_html(&doc, document_body_node(&doc),
+                                           added, sizeof(added) - 1u)
+        && image_noscript_arm(&doc, NULL);
+    if (other_parsed) document_destroy(&other);
+    if (parsed) document_destroy(&doc);
+    if (!budget_uninstall_lexbor(&budget) || budget.current != 0 || !correct)
+        return false;
+    return noscript_fallback_case(
+               "image.html", "a", false, false,
+               "const a=document.getElementById('a');"
+               "globalThis.pocSummary=String(a.getAttribute('src'))+'|'"
+               "+a.currentSrc+'|'"
+               "+a.naturalWidth+'|'+loads+'|'"
+               "+document.querySelector('noscript').textContent"
+               ".includes('&amp;')",
+               "null||0|0|true", 1u, false)
+        && noscript_fallback_case(
+               "cover.html", "b", true, false,
+               "const b=document.getElementById('b');"
+               "globalThis.pocSummary=b.childNodes.length+'|'"
+               "+getComputedStyle(b).backgroundImage",
+               "1|none", 1u, false)
+        && noscript_fallback_case("filled.html", NULL, false, false,
+                                  NULL, NULL, 2u, false)
+        && noscript_fallback_case("stopped.html", "d", false, true,
+                                  NULL, NULL, 1u, false)
+        && noscript_fallback_case("missing.html", NULL, false, false,
+                                  "globalThis.pocSummary=String(errors)",
+                                  "0", 2u, true);
 }
 
 /* Same-origin policy for canvas readback: pixels from a cross-origin image
@@ -6215,33 +6399,330 @@ static bool test_parser_scripts_see_requested_fragment(void)
     return ok;
 }
 
-/* The exhausted-realm check (page_lifecycle.inc) believes an error's text
-   only after a heap rejection; the text it accepts is QuickJS's
-   out-of-memory error, or the null exception QuickJS leaves when it cannot
-   allocate even that error. Other text, including
-   text that merely contains "null", is an ordinary author failure. */
-static bool test_null_exception_reads_as_out_of_memory(void)
+/* Many stylesheet sources: body <style> blocks, each followed by a
+   parser-blocking script that reads the computed style the blocks so far
+   give one element (per-component templates do this). The ready sheet
+   grows by continuation, a block at a time; every script and the
+   committed page must see the cascade a whole-sheet build gives. */
+typedef struct {
+    bool ok;
+    char summary[128];
+    uint32_t probe_color;
+    size_t builds;
+    size_t continuations;
+    size_t fallbacks;
+    size_t abandoned;
+    /* Preparations abandoned in a pump that left no ready sheet behind. */
+    size_t abandoned_released;
+} ManyStylesheetRun;
+
+/* A head script builds the (empty) sheet before the first source. Block i
+   of `styles` sets the probe to rgb(0, i >> 8, i & 255), counting from 1;
+   a checking script follows every `per_script` blocks and the last. */
+static char *many_stylesheet_document(size_t styles, size_t per_script)
 {
-    return script_error_reports_out_of_memory("InternalError: out of memory")
-        && script_error_reports_out_of_memory("null")
-        && !script_error_reports_out_of_memory("")
-        && !script_error_reports_out_of_memory(NULL)
-        && !script_error_reports_out_of_memory("nullish")
-        && !script_error_reports_out_of_memory(
-               "TypeError: cannot read property 'x' of null")
-        && !script_error_reports_out_of_memory("TypeError: Failed to fetch");
+    size_t capacity = 1024u + styles * 96u;
+    char *html = malloc(capacity);
+    if (html == NULL) return NULL;
+    size_t used = (size_t) snprintf(
+        html, capacity,
+        "<!doctype html><title>Many styles</title><script>"
+        "globalThis.seen=0;globalThis.wrong=0;"
+        "globalThis.check=function(b){var c=getComputedStyle("
+        "document.querySelector('.probe')).color;seen++;"
+        "if(c!=='rgb(0, '+(b>>8)+', '+(b&255)+')')wrong++;"
+        "pocSummary='seen='+seen+' wrong='+wrong+' last='+c}"
+        "</script><body><p class=\"probe\">probe</p>");
+    for (size_t i = 1; i <= styles && used < capacity; i++) {
+        used += (size_t) snprintf(
+            html + used, capacity - used,
+            "<style>.probe{color:rgb(0,%zu,%zu)}</style>", i >> 8, i & 255u);
+        if ((i % per_script == 0 || i == styles) && used < capacity)
+            used += (size_t) snprintf(html + used, capacity - used,
+                                      "<script>check(%zu)</script>", i);
+    }
+    if (used >= capacity) {
+        free(html);
+        return NULL;
+    }
+    return html;
 }
 
-/* The commit's stop rule for an inline script that ran the realm out of
-   memory: the realm is retired when the script's error reads as out of
-   memory, the heap refused an allocation, and under 256 KiB is left. The
-   page fills its heap to about 200 KiB short of the limit in steps that
-   never reach it (performance.memory reports the limit and use the rule
-   reads), then ends its script one of four ways: filling the rest until
-   the heap refuses (retired), letting go of what it held and asking for
-   more than the limit (refused with room left: kept), and a thrown null
-   or "out of memory" string with no refusal (both kept: the page's own
-   errors, however little room is left). */
+static ManyStylesheetRun run_many_stylesheet_load(
+    size_t styles, size_t per_script, bool prepare)
+{
+    ManyStylesheetRun run = {0};
+    char *html = many_stylesheet_document(styles, per_script);
+    ReferrerNavigationReplay fixture = {
+        .document_url = "https://many-styles.test/document",
+        .stylesheet_url = "https://unused.test/style.css",
+        .html = html, .css = "", .response_referrer_policy = "",
+        .stylesheet_request_policy = ""
+    };
+    if (!prepare) (void) setenv("TILEFINCH_DISABLE_STYLESHEET_PREPARE", "1", 1);
+    char directory[128] = {0}, error[256] = {0};
+    Budget budget;
+    budget_init(&budget, 32 * MIB);
+    bool lexbor_installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = html != NULL && lexbor_installed
+        && navigation_init(&navigation, &budget, 4)
+        && write_referrer_navigation_replay(directory, &fixture)
+        && fetch_trace_replay_begin(directory, error, sizeof(error));
+    if (ready) {
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 1024, 256 * 1024, 64 * 1024, 1000);
+        navigation_enable_external_resources(
+            &navigation, 2, 256 * 1024, 128 * 1024,
+            2, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    NavigationLoad *load = ready ? navigation_load_begin_url(
+        &navigation, generation, fixture.document_url, 256 * 1024, 1000,
+        480, NULL, NULL, true) : NULL;
+    /* A one-microsecond parser quota: every preparation pump takes one
+       step. */
+    NavigationLoadQuota quota = {
+        .fetch = {
+            .maximum_body_callbacks = 1,
+            .maximum_body_bytes = 512,
+            .maximum_time_us = 1
+        },
+        .maximum_parser_body_bytes = 512,
+        .maximum_parser_time_us = 1
+    };
+    for (size_t i = 0; load != NULL && i < 200000; i++) {
+        if (navigation_load_status(load) != NAVIGATION_LOAD_PENDING) break;
+        size_t abandoned_before =
+            navigation.performance.blocking_stylesheet_prepare_abandoned;
+        (void) navigation_load_pump(load, &quota);
+        if (navigation.performance.blocking_stylesheet_prepare_abandoned
+                != abandoned_before
+            && !navigation_test_load_blocking_stylesheet_ready(load))
+            run.abandoned_released++;
+    }
+    /* The commit itself is not under test: finish it in one go. */
+    bool loaded = load != NULL && finish_bounded(load, NULL);
+    run.ok = loaded && navigation.page.loaded;
+    snprintf(run.summary, sizeof(run.summary), "%s",
+             navigation.page.script_result.summary);
+    run.probe_color = loaded
+        ? layout_text_color(&navigation.page.layout, "probe") : UINT32_MAX;
+    run.builds = navigation.performance.blocking_stylesheet_builds;
+    run.continuations =
+        navigation.performance.blocking_stylesheet_continuations;
+    run.fallbacks =
+        navigation.performance.blocking_stylesheet_continuation_fallbacks;
+    run.abandoned =
+        navigation.performance.blocking_stylesheet_prepare_abandoned;
+    if (!run.ok)
+        fprintf(stderr, "many-styles load: status=%d error=\"%s\" %s\n",
+                load == NULL ? -1 : (int) navigation_load_status(load),
+                navigation.last_error, error);
+    navigation_load_destroy(load);
+    if (ready) fetch_trace_end();
+    if (lexbor_installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    run.ok = run.ok && clean;
+    if (directory[0]) remove_referrer_navigation_replay(directory);
+    free(html);
+    (void) unsetenv("TILEFINCH_DISABLE_STYLESHEET_PREPARE");
+    return run;
+}
+
+static void report_many_stylesheet_run(const char *name,
+                                       const ManyStylesheetRun *run)
+{
+    fprintf(stderr,
+            "%s ok=%d summary=\"%s\" color=%06x builds=%zu "
+            "continuations=%zu fallbacks=%zu abandoned=%zu released=%zu\n",
+            name, run->ok, run->summary, (unsigned) run->probe_color,
+            run->builds, run->continuations, run->fallbacks, run->abandoned,
+            run->abandoned_released);
+}
+
+/* A hundred sources, each followed by a script: the sheet grows by one
+   continuation per script, not a rebuild per script past the first 64. */
+static bool test_many_body_styles_continue_the_blocking_sheet(void)
+{
+    ManyStylesheetRun run = run_many_stylesheet_load(100, 1, true);
+    bool ok = run.ok
+        && strcmp(run.summary, "seen=100 wrong=0 last=rgb(0, 0, 100)") == 0
+        && run.probe_color == 0x000064u
+        && run.builds <= 2 && run.abandoned == 0 && run.fallbacks == 0
+        && run.continuations >= 90;
+    if (!ok) report_many_stylesheet_run("many-body-styles", &run);
+    return ok;
+}
+
+/* Past the 512 sources the continuation tracks, each changed checkpoint
+   rebuilds; the preparation that finds the overflow leaves the ready sheet
+   to the checkpoint instead of destroying it. (A script after every four
+   blocks: a document runs at most 256 scripts.) */
+static bool test_stylesheet_overflow_keeps_the_ready_sheet(void)
+{
+    ManyStylesheetRun run = run_many_stylesheet_load(520, 4, true);
+    bool ok = run.ok
+        && strcmp(run.summary, "seen=130 wrong=0 last=rgb(0, 2, 8)") == 0
+        && run.probe_color == 0x000208u
+        && run.abandoned >= 1 && run.abandoned_released == 0
+        && run.builds <= 2 + (520 - 512) / 4 && run.fallbacks == 0
+        && run.continuations >= 120;
+    if (!ok) report_many_stylesheet_run("stylesheet-overflow", &run);
+    return ok;
+}
+
+/* More new sources at one checkpoint than one append takes: the prepared
+   append takes them in runs; the checkpoint itself (preparation off)
+   rebuilds. Both give the whole cascade. */
+static bool test_long_stylesheet_suffix_keeps_the_cascade(void)
+{
+    ManyStylesheetRun prepared = run_many_stylesheet_load(70, 70, true);
+    ManyStylesheetRun checkpoint = run_many_stylesheet_load(70, 70, false);
+    static const char expected[] = "seen=1 wrong=0 last=rgb(0, 0, 70)";
+    bool ok = prepared.ok && checkpoint.ok
+        && strcmp(prepared.summary, expected) == 0
+        && strcmp(checkpoint.summary, expected) == 0
+        && prepared.probe_color == 0x000046u
+        && checkpoint.probe_color == 0x000046u
+        && prepared.builds == 1 && prepared.continuations >= 1
+        && prepared.abandoned == 0 && prepared.fallbacks == 0
+        && checkpoint.builds == 2;
+    if (!ok) {
+        report_many_stylesheet_run("long-suffix prepared", &prepared);
+        report_many_stylesheet_run("long-suffix checkpoint", &checkpoint);
+    }
+    return ok;
+}
+
+/* The PSP stall watchdog's counter. Once the transport has delivered the
+   document, progress_units stops while the parser works through it;
+   parser_progress_units moves with every byte parsed and script run, so a
+   watchdog fed both keeps the load alive where progress_units alone
+   would cancel it. */
+static bool test_parser_progress_moves_after_delivery(void)
+{
+    char html[2048];
+    size_t used = (size_t) snprintf(
+        html, sizeof(html),
+        "<!doctype html><title>Parser progress</title>"
+        "<script>globalThis.n=0</script><body>");
+    for (size_t i = 0; i < 16 && used < sizeof(html); i++)
+        used += (size_t) snprintf(html + used, sizeof(html) - used,
+                                  "<script>n++</script><p>line</p>");
+    if (used >= sizeof(html) - 64) return false;
+    snprintf(html + used, sizeof(html) - used,
+             "<script>pocSummary='n='+n</script>");
+    ReferrerNavigationReplay fixture = {
+        .document_url = "https://parser-progress.test/document",
+        .stylesheet_url = "https://unused.test/style.css",
+        .html = html, .css = "", .response_referrer_policy = "",
+        .stylesheet_request_policy = ""
+    };
+    char directory[128] = {0}, error[256] = {0};
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool lexbor_installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = lexbor_installed
+        && navigation_init(&navigation, &budget, 4)
+        && write_referrer_navigation_replay(directory, &fixture)
+        && fetch_trace_replay_begin(directory, error, sizeof(error));
+    if (ready) {
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 64, 32 * 1024, 16 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    NavigationLoad *load = ready ? navigation_load_begin_url(
+        &navigation, generation, fixture.document_url, 64 * 1024, 1000,
+        480, NULL, NULL, true) : NULL;
+    /* The transport delivers the whole document at once; the parser takes
+       it 32 bytes a pump. */
+    NavigationLoadQuota quota = {
+        .fetch = {
+            .maximum_body_callbacks = 64,
+            .maximum_body_bytes = 64 * 1024,
+            .maximum_time_us = 1000000
+        },
+        .maximum_parser_body_bytes = 32,
+        .maximum_parser_time_us = 1000000
+    };
+    /* Three seconds of PSP time per pump. */
+    const uint64_t pump_us = 3000000u;
+    PspNavigationWatchdog combined, transport_only;
+    uint64_t now_us = 1000u;
+    NavigationLoadMetrics metrics = {0};
+    (void) navigation_load_metrics(load, &metrics);
+    psp_navigation_watchdog_start(
+        &combined, now_us,
+        metrics.progress_units + metrics.parser_progress_units);
+    psp_navigation_watchdog_start(&transport_only, now_us,
+                                  metrics.progress_units);
+    bool combined_expired = false, transport_only_expired = false;
+    bool parser_went_back = false;
+    size_t frozen_pumps = 0, parser_moved = 0;
+    for (size_t i = 0; load != NULL && i < 50; i++) {
+        if (navigation_load_status(load) != NAVIGATION_LOAD_PENDING) break;
+        NavigationLoadMetrics before = {0}, after = {0};
+        (void) navigation_load_metrics(load, &before);
+        (void) navigation_load_pump(load, &quota);
+        (void) navigation_load_metrics(load, &after);
+        now_us += pump_us;
+        if (after.parser_progress_units < before.parser_progress_units)
+            parser_went_back = true;
+        if (after.response_received
+            && after.progress_units == before.progress_units) {
+            frozen_pumps++;
+            if (after.parser_progress_units > before.parser_progress_units)
+                parser_moved++;
+        }
+        combined_expired = psp_navigation_watchdog_expired(
+            &combined, now_us,
+            after.progress_units + after.parser_progress_units)
+            || combined_expired;
+        transport_only_expired = psp_navigation_watchdog_expired(
+            &transport_only, now_us, after.progress_units)
+            || transport_only_expired;
+    }
+    bool loaded = load != NULL && finish_bounded(load, &quota);
+    bool ok = loaded && navigation.page.loaded
+        && strcmp(navigation.page.script_result.summary, "n=16") == 0
+        && !parser_went_back && frozen_pumps >= 12
+        && parser_moved + 2 >= frozen_pumps
+        && transport_only_expired && !combined_expired;
+    if (!ok)
+        fprintf(stderr,
+                "parser-progress loaded=%d summary=\"%s\" frozen=%zu "
+                "moved=%zu back=%d expired=%d/%d error=\"%s\"\n",
+                loaded, navigation.page.script_result.summary, frozen_pumps,
+                parser_moved, parser_went_back, combined_expired,
+                transport_only_expired, navigation.last_error);
+    navigation_load_destroy(load);
+    if (ready) fetch_trace_end();
+    if (lexbor_installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    if (directory[0]) remove_referrer_navigation_replay(directory);
+    return ok && clean;
+}
+
+/* The memory rule at commit for an inline script near the realm's limit:
+   the realm is stopped when the heap refused an allocation and, collected,
+   it can obtain under 2 MiB (docs/engineering/SCRIPT_MEMORY.md,
+   "Exhaustion"). The page fills its heap to about 200 KiB short of the
+   limit in steps that never reach it (performance.memory reports the limit
+   and use), then ends its script one of four ways: filling the rest until
+   the heap refuses (stopped), letting go of what it held and asking for
+   more than the limit (refused with room left once collected: kept), and a
+   thrown null or "out of memory" string with no refusal (both kept: the
+   page's own errors, however little room is left). */
 static bool test_commit_stop_rule_needs_refusal_and_little_room(void)
 {
     static const char fill[] =
@@ -6267,10 +6748,14 @@ static bool test_commit_stop_rule_needs_refusal_and_little_room(void)
         NavigationSession navigation = {0};
         bool ready = installed && navigation_init(&navigation, &budget, 4);
         if (ready) {
-            navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+            /* The device realm. Once collected, the kept ending must leave
+               more than the 2 MiB rule beside the resident bootstrap
+               (about 2 MiB itself): a 4 MiB realm left under one 4 KiB
+               arena step to spare. */
+            navigation_enable_scripts(&navigation, 5 * MIB, 1000);
             navigation_enable_document_scripts(&navigation, 4, 64 * 1024,
                                                 32 * 1024, 1000);
-            /* No memory-pressure growth: the 4 MiB limit is the limit. */
+            /* No memory-pressure growth: the 5 MiB limit is the limit. */
             navigation.fixed_script_memory_limits = true;
         }
         char html[1024];
@@ -6302,6 +6787,58 @@ static bool test_commit_stop_rule_needs_refusal_and_little_room(void)
         all_ok = all_ok && ok;
     }
     return all_ok;
+}
+
+/* Startup memory on the device-sized realm: the heap a committed page with
+   one trivial inline script holds once collected: the resident bootstrap
+   (test probes included) and what the commit made. The stop-rule test
+   above runs at 5 MiB for its policy, which leaves this unchecked; at
+   4 MiB it caught such growth by accident. Measured at 2,100,776 bytes on
+   2026-11-20 (main a3d2b75a). The bound adds 32 KiB, about 1.5%: growth
+   that size in the eager bootstrap or in what a commit makes trips it,
+   while a few KiB of layout or allocator movement does not. Raise it only
+   for growth that is meant, and say why here. */
+#define STARTUP_MEMORY_MEASURED_BYTES 2100776u
+#define STARTUP_MEMORY_LIMIT_BYTES \
+    (STARTUP_MEMORY_MEASURED_BYTES + 32u * 1024u)
+static bool test_commit_startup_memory_is_bounded(void)
+{
+    static const char html[] =
+        "<body><p>kept</p><script>globalThis.started=1</script></body>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 5 * MIB, 1000);
+        navigation_enable_document_scripts(&navigation, 4, 64 * 1024,
+                                            32 * 1024, 1000);
+        navigation.fixed_script_memory_limits = true;
+    }
+    bool loaded = ready && navigation_commit_html(
+        &navigation, navigation_begin(&navigation),
+        "https://startup-memory.test/", html, sizeof(html) - 1u, 480, NULL,
+        NULL, true);
+    ScriptRuntime *runtime = navigation.page.runtime;
+    size_t used = 0;
+    if (loaded && runtime != NULL) {
+        (void) script_runtime_collect_and_trim(runtime);
+        used = script_runtime_heap_used(runtime);
+    }
+    printf("startup memory: used=%zu limit=%u\n", used,
+           (unsigned) STARTUP_MEMORY_LIMIT_BYTES);
+    bool ok = loaded && runtime != NULL && used != 0
+        && used <= STARTUP_MEMORY_LIMIT_BYTES;
+    if (!ok)
+        fprintf(stderr, "startup memory loaded=%d runtime=%d used=%zu "
+                "limit=%u error=%s\n", loaded, runtime != NULL, used,
+                (unsigned) STARTUP_MEMORY_LIMIT_BYTES,
+                navigation.page.script_result.error);
+    if (installed) navigation_destroy(&navigation);
+    ok = ok && budget.current == 0;
+    if (installed) ok = budget_uninstall_lexbor(&budget) && ok;
+    return ok;
 }
 
 /* After a promoted candidate session is moved, the realm's node-retirement
@@ -6555,5 +7092,6 @@ static bool prior_page(NavigationSession *navigation)
 #include "suites/navigation_style_scope.inc"
 #include "suites/navigation_svg_retarget.inc"
 #include "suites/navigation_streaming.inc"
+#include "suites/navigation_stream_growth.inc"
 #include "suites/navigation_runtime.inc"
 #include "suites/navigation_runner.inc"

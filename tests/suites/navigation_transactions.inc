@@ -318,7 +318,12 @@ static bool test_late_script_oom_reveals_staged_page_shell(void)
     return ok && clean;
 }
 
-static bool test_caught_large_allocation_retires_staged_page_shell(void)
+/* A task that hides the page's shell and then catches one oversized
+   allocation refusal, with the heap otherwise free: the realm is kept (the
+   memory rule judges what the realm can obtain, not what the page shows),
+   and the refusal it leaves is what the frontend's Basic view offer reads
+   (browser_engine_page_memory_recovery_due). */
+static bool test_caught_large_allocation_keeps_staged_page_realm(void)
 {
     static const char html[] =
         "<!doctype html><title>Caught OOM survivor</title>"
@@ -327,7 +332,7 @@ static bool test_caught_large_allocation_retires_staged_page_shell(void)
         "paragraph remains useful after an author task catches one oversized "
         "allocation refusal while nominal heap headroom still remains."
         "</p></main><script>setTimeout(()=>{document.body.className='staged';"
-        "try{new ArrayBuffer(8*1024*1024);globalThis.pocSummary='missed'}"
+        "try{new ArrayBuffer(16*1024*1024);globalThis.pocSummary='missed'}"
         "catch(error){globalThis.pocSummary='caught'}},1)</script></body>";
     Budget budget;
     budget_init(&budget, 16 * MIB);
@@ -336,7 +341,7 @@ static bool test_caught_large_allocation_retires_staged_page_shell(void)
     bool ready = lexbor_installed
         && navigation_init(&navigation, &budget, 4);
     if (ready) {
-        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
+        navigation_enable_scripts(&navigation, 8 * MIB, 1000);
         navigation_enable_document_scripts(
             &navigation, 4, 64 * 1024, 32 * 1024, 1000);
         /* Exercises exhaustion itself: keep the configured heap fixed. */
@@ -346,14 +351,14 @@ static bool test_caught_large_allocation_retires_staged_page_shell(void)
     bool committed = ready && navigation_commit_html(
         &navigation, generation, "https://caught-oom.test/", html,
         sizeof(html) - 1u, 480, NULL, NULL, true);
-    bool retired = committed
+    bool advanced = committed
         && navigation_advance_runtime(&navigation, 2, 4);
-    bool ok = retired && navigation.page.runtime == NULL
-        && navigation.page.stylesheet.static_custom_element_fallback
-        && navigation.page.layout.count != 0
-        && navigation.page.script_result.error[0] == '\0'
-        && strstr(navigation.page.script_result.summary,
-                  "JavaScript stopped") != NULL;
+    bool ok = advanced && navigation.page.runtime != NULL
+        && !navigation.page.script_memory_limited
+        && !navigation.page.stylesheet.static_custom_element_fallback
+        && navigation_layout_is_visually_blank(&navigation.page.layout)
+        && script_runtime_heap_rejections(navigation.page.runtime) != 0u
+        && strcmp(navigation.page.script_result.summary, "caught") == 0;
     if (ready) navigation_destroy(&navigation);
     bool clean = budget.current == 0
         && budget_active_allocations(&budget, NULL) == 0
@@ -370,7 +375,7 @@ static bool test_caught_large_allocation_keeps_visible_runtime(void)
         "continues to paint useful text and must keep its healthy JavaScript "
         "runtime when author code catches one oversized allocation refusal."
         "</p></main><script>setTimeout(()=>{"
-        "try{new ArrayBuffer(8*1024*1024)}catch(error){"
+        "try{new ArrayBuffer(16*1024*1024)}catch(error){"
         "globalThis.pocSummary='caught-visible'}},1)</script></body>";
     Budget budget;
     budget_init(&budget, 16 * MIB);
@@ -379,7 +384,7 @@ static bool test_caught_large_allocation_keeps_visible_runtime(void)
     bool ready = lexbor_installed
         && navigation_init(&navigation, &budget, 4);
     if (ready) {
-        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
+        navigation_enable_scripts(&navigation, 8 * MIB, 1000);
         navigation_enable_document_scripts(
             &navigation, 4, 64 * 1024, 32 * 1024, 1000);
         /* Exercises exhaustion itself: keep the configured heap fixed. */
@@ -414,7 +419,7 @@ static bool test_caught_allocation_keeps_gradient_presentation(void)
         "main{display:none}</style><body><main><h1>Retained report</h1>"
         "<p>This hidden semantic report must not replace an already visible "
         "gradient merely because a later optional allocation is refused.</p>"
-        "</main><script>setTimeout(()=>{try{new ArrayBuffer(8*1024*1024)}"
+        "</main><script>setTimeout(()=>{try{new ArrayBuffer(16*1024*1024)}"
         "catch(error){globalThis.pocSummary='caught-gradient'}},1)"
         "</script></body>";
     Budget budget;
@@ -424,7 +429,7 @@ static bool test_caught_allocation_keeps_gradient_presentation(void)
     bool ready = lexbor_installed
         && navigation_init(&navigation, &budget, 4);
     if (ready) {
-        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
+        navigation_enable_scripts(&navigation, 8 * MIB, 1000);
         navigation_enable_document_scripts(
             &navigation, 4, 64 * 1024, 32 * 1024, 1000);
         /* Exercises exhaustion itself: keep the configured heap fixed. */
@@ -462,7 +467,7 @@ static bool test_caught_allocation_keeps_bounded_reader_runtime(void)
     static const char suffix[] =
         "</main><script>setTimeout(()=>{"
         "document.body.className='staged';"
-        "try{new ArrayBuffer(8*1024*1024)}catch(error){"
+        "try{new ArrayBuffer(16*1024*1024)}catch(error){"
         "globalThis.pocSummary='caught-bounded'}},1)</script></body>";
     /* More paragraphs than the extraction bound this budget's free room
        allows (one node per KiB above the reserve, Basic view's rule). */
@@ -489,7 +494,7 @@ static bool test_caught_allocation_keeps_bounded_reader_runtime(void)
     bool ready = lexbor_installed
         && navigation_init(&navigation, &budget, 4);
     if (ready) {
-        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
+        navigation_enable_scripts(&navigation, 8 * MIB, 1000);
         navigation_enable_document_scripts(
             &navigation, 4, 64 * 1024, 32 * 1024, 1000);
         /* Exercises exhaustion itself: keep the configured heap fixed. */
@@ -549,7 +554,7 @@ static bool test_caught_large_allocation_does_not_reveal_raw_app_shell(void)
         "your private account preferences from this interactive form.</p>"
         "<button>Continue</button></form></div><script>setTimeout(()=>{"
         "document.body.className='staged';"
-        "try{new ArrayBuffer(8*1024*1024)}catch(error){"
+        "try{new ArrayBuffer(16*1024*1024)}catch(error){"
         "globalThis.pocSummary='caught-raw'}},1)</script></body>";
     Budget budget;
     budget_init(&budget, 16 * MIB);
@@ -558,7 +563,7 @@ static bool test_caught_large_allocation_does_not_reveal_raw_app_shell(void)
     bool ready = lexbor_installed
         && navigation_init(&navigation, &budget, 4);
     if (ready) {
-        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
+        navigation_enable_scripts(&navigation, 8 * MIB, 1000);
         navigation_enable_document_scripts(
             &navigation, 4, 64 * 1024, 32 * 1024, 1000);
         /* Exercises exhaustion itself: keep the configured heap fixed. */
@@ -575,8 +580,6 @@ static bool test_caught_large_allocation_does_not_reveal_raw_app_shell(void)
         && navigation.page.layout.link_count == 0u
         && navigation.page.layout.control_count == 0u
         && !navigation.page.stylesheet.static_custom_element_fallback
-        && navigation.page.reader_analysis.prepared
-        && navigation.page.reader_analysis.kind == READER_PAGE_RAW
         && strcmp(navigation.page.script_result.summary, "caught-raw") == 0;
     if (ready) navigation_destroy(&navigation);
     bool clean = budget.current == 0
@@ -592,7 +595,8 @@ static bool test_caught_large_allocation_does_not_reveal_raw_app_shell(void)
    carries a large data script, as xe.com's does, so only a script-free copy
    fits the snapshot bound. `tear_down` false is the control: the same
    refusal with the page left intact keeps its realm. */
-static bool memory_rescue_page_run(bool tear_down, bool *rescued_out,
+static bool memory_rescue_page_run(bool tear_down, bool hoard,
+                                   bool *rescued_out,
                                    bool *runtime_kept_out,
                                    bool *content_out, bool *data_gone_out,
                                    bool *copy_released_out)
@@ -614,7 +618,13 @@ static bool memory_rescue_page_run(bool tear_down, bool *rescued_out,
         "\"}</script><script>setTimeout(()=>{let keep=[];"
         "try{for(;;)keep.push(new ArrayBuffer(256*1024))}catch(error){}"
         "keep=null;globalThis.pocSummary='kept'},1)</script></body>";
-    const char *suffix = tear_down ? teardown_suffix : control_suffix;
+    static const char caught_stop_suffix[] =
+        "\"}</script><script>setTimeout(()=>{globalThis.kept=[];"
+        "try{for(let i=0;i<64;i++)kept.push(new ArrayBuffer(256*1024))}"
+        "catch(error){kept.pop();kept.pop();document.body.textContent=''}"
+        "globalThis.pocSummary='caught-and-torn-down'},1)</script></body>";
+    const char *suffix = hoard ? caught_stop_suffix
+        : tear_down ? teardown_suffix : control_suffix;
     size_t suffix_length = strlen(suffix);
     /* Past the 256 KiB body snapshot bound with its scripts. */
     const size_t filler = 300u * 1024u;
@@ -646,6 +656,11 @@ static bool memory_rescue_page_run(bool tear_down, bool *rescued_out,
     size_t links_before = committed ? navigation.page.layout.link_count : 0;
     size_t rejections_before = committed && navigation.page.runtime != NULL
         ? script_runtime_heap_rejections(navigation.page.runtime) : 0;
+    /* Leave ample page Budget for a snapshot but not ample heap for a keep.
+       The buffers released in the catch leave room to mutate the body. */
+    if (hoard && committed && navigation.page.runtime != NULL)
+        script_runtime_enable_heap_growth(navigation.page.runtime, 5 * MIB,
+                                           512u * 1024u);
     bool advanced = committed;
     for (int tick = 0; advanced && tick < 3; tick++)
         advanced = navigation_advance_runtime(&navigation, 2, 4);
@@ -670,10 +685,10 @@ static bool memory_rescue_page_run(bool tear_down, bool *rescued_out,
     bool ok = committed && advanced && refused;
     if (!ok || (tear_down && !*rescued_out)) {
         fprintf(stderr,
-                "memory rescue tear-down=%d committed=%d advanced=%d "
+                "memory rescue tear-down=%d hoard=%d committed=%d advanced=%d "
                 "refused=%d rescued=%d runtime=%p links=%zu/%zu "
                 "commands=%zu summary=\"%s\" error=\"%s\"\n",
-                tear_down, committed, advanced, refused, *rescued_out,
+                tear_down, hoard, committed, advanced, refused, *rescued_out,
                 (void *) navigation.page.runtime, links_before,
                 navigation.page.layout.link_count,
                 navigation.page.layout.count,
@@ -692,7 +707,19 @@ static bool test_memory_exhaustion_restores_torn_down_server_page(void)
 {
     bool rescued = false, runtime_kept = true, content = false;
     bool data_gone = false, released = false;
-    bool ran = memory_rescue_page_run(true, &rescued, &runtime_kept,
+    bool ran = memory_rescue_page_run(true, false, &rescued, &runtime_kept,
+                                      &content, &data_gone, &released);
+    return ran && rescued && !runtime_kept && content && data_gone
+        && released;
+}
+
+/* The caught refusal completes the callback normally but leaves the realm
+   too full to keep. Retirement must publish the already captured body. */
+static bool test_caught_memory_stop_restores_torn_down_server_page(void)
+{
+    bool rescued = false, runtime_kept = true, content = false;
+    bool data_gone = false, released = false;
+    bool ran = memory_rescue_page_run(true, true, &rescued, &runtime_kept,
                                       &content, &data_gone, &released);
     return ran && rescued && !runtime_kept && content && data_gone
         && released;
@@ -702,7 +729,7 @@ static bool test_memory_refusal_keeps_intact_page_and_realm(void)
 {
     bool rescued = true, runtime_kept = false, content = false;
     bool data_gone = true, released = false;
-    bool ran = memory_rescue_page_run(false, &rescued, &runtime_kept,
+    bool ran = memory_rescue_page_run(false, false, &rescued, &runtime_kept,
                                       &content, &data_gone, &released);
     return ran && !rescued && runtime_kept && content && !data_gone
         && released;
@@ -1064,10 +1091,13 @@ static bool frame_oom_ignore_message(void *opaque, ScriptRuntime *source,
                                      const char *json,
                                      const char *target_origin,
                                      const char *task_kind,
-                                     uint64_t task_sequence)
+                                     uint64_t task_sequence,
+                                     const uint8_t *key_bytes,
+                                     size_t key_length)
 {
     (void) opaque; (void) source; (void) target_frame_handle; (void) json;
     (void) target_origin; (void) task_kind; (void) task_sequence;
+    (void) key_bytes; (void) key_length;
     return false;
 }
 
@@ -1250,6 +1280,92 @@ static bool test_remote_frame_local_replacement(void)
         }
     }
     return all_ok;
+}
+
+/* While a managed challenge frame works, the page's idle realm gives back
+   the garbage its own automatic collection has not reached, before the
+   frame runs, when the page Budget is short. An ordinary frame, or a page
+   with room, leaves the parent's collection to its own pacing. The parent
+   still gets the frame's message afterwards. */
+static bool challenge_frame_collect_case(const char *frame_url, bool pressure,
+                                         size_t *freed_out)
+{
+    static const char parent_script[] =
+        "addEventListener('message',function(e){globalThis.got=e.data;});";
+    static const char child_html[] =
+        "<!doctype html><body><p>Child</p>"
+        "<script>parent.postMessage('done','*');</script></body>";
+    /* Keep the cycles reachable until construction has finished. Otherwise
+       an ordinary GC mid-loop can reclaim most of the fixture before the
+       navigation turn whose reclamation this test is measuring. */
+    static const char garbage[] =
+        "(function(){var roots=[];for(var i=0;i<1200;i++){var o={i:i,"
+        "pad:[i,i,i,i,i,i,i,i,i,i,i,i]};o.self=o;roots.push(o);}})();";
+    char html[512];
+    snprintf(html, sizeof(html),
+             "<!doctype html><body><p>Checking</p><script>%s</script>"
+             "<iframe src='%s'></iframe></body>", parent_script, frame_url);
+    Budget budget;
+    NavigationSession navigation = {0};
+    bool installed = false;
+    bool ready = frame_oom_session_init(&budget, &navigation, &installed);
+    /* Room for the garbage under the parent's own collection threshold. */
+    if (ready) navigation_enable_scripts(&navigation, 8 * MIB, 1000);
+    ScriptResult probe = {0};
+    bool ok = ready && frame_completion_oom_commit(
+            &navigation, html, strlen(html), NULL)
+        && navigation_test_complete_frame(
+            &navigation, &navigation.page.frames[0], 200, child_html,
+            sizeof(child_html) - 1u)
+        && navigation.page.frames[0].runtime != NULL;
+    ScriptRuntime *parent = ok ? navigation.page.runtime : NULL;
+    /* Start the measurement just after a real collection so the dirty
+       interval is independent of the bootstrap's last automatic GC. */
+    if (ok) (void) script_runtime_collect_and_trim(parent);
+    size_t clean_heap = ok ? script_runtime_heap_used(parent) : 0;
+    ok = ok && script_runtime_evaluate_diagnostic(
+        parent, garbage, "challenge-collect-test", &probe);
+    size_t dirty_heap = ok ? script_runtime_heap_used(parent) : 0;
+    /* Under a quarter of the Budget free, or plenty. */
+    void *ballast = NULL;
+    size_t free_bytes = budget_remaining(&budget);
+    size_t leave = pressure ? budget.limit / 8u : budget.limit / 2u;
+    if (ok && free_bytes > leave)
+        ballast = budget_malloc(&budget, free_bytes - leave);
+    ok = ok && dirty_heap > clean_heap + 256u * 1024u
+        && (free_bytes <= leave || ballast != NULL)
+        && navigation_advance_runtime(&navigation, 16, 4);
+    size_t after_heap = ok ? script_runtime_heap_used(parent) : 0;
+    ok = ok && script_runtime_evaluate_diagnostic(
+        parent, "if(globalThis.got!=='done')throw Error('no message');",
+        "challenge-collect-test", &probe);
+    *freed_out = ok && dirty_heap > after_heap ? dirty_heap - after_heap : 0;
+    if (!ok)
+        fprintf(stderr, "challenge collect %s pressure=%d: clean=%zu "
+                "dirty=%zu after=%zu error=\"%s\"\n", frame_url, pressure,
+                clean_heap, dirty_heap, after_heap, probe.error);
+    budget_free(&budget, ballast);
+    return frame_oom_session_clean(&budget, &navigation, ready, installed)
+        && ok;
+}
+
+static bool test_challenge_frame_collects_idle_parent(void)
+{
+    static const char platform[] =
+        "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/"
+        "turnstile/f/av0/rch/x/0x4AAAA/light/fbE/new/normal?lang=auto";
+    static const char ordinary[] = "https://frame-oom.test/child";
+    size_t challenge = 0, unrelated = 0, roomy = 0;
+    bool ok = challenge_frame_collect_case(platform, true, &challenge)
+        && challenge_frame_collect_case(ordinary, true, &unrelated)
+        && challenge_frame_collect_case(platform, false, &roomy);
+    if (!ok || challenge < 256u * 1024u || unrelated > 64u * 1024u
+        || roomy > 64u * 1024u) {
+        fprintf(stderr, "challenge collect: ok=%d challenge=%zu "
+                "ordinary=%zu roomy=%zu\n", ok, challenge, unrelated, roomy);
+        return false;
+    }
+    return true;
 }
 
 static bool frame_completion_window_state_failure_keeps_page(unsigned failure)
@@ -1671,6 +1787,8 @@ static bool test_child_realm_caught_refusal_keeps_realm(void)
     NavigationSession navigation = {0};
     bool ready = frame_oom_session_init(&budget, &navigation,
                                         &lexbor_installed);
+    /* Room for the 2 MiB the memory rule keeps a realm with. */
+    if (ready) navigation_enable_scripts(&navigation, 8 * MIB, 1000);
     bool committed = ready && frame_completion_oom_commit(
         &navigation, html, sizeof(html) - 1u, NULL);
     bool completed = committed && navigation_test_complete_frame(
@@ -1695,6 +1813,362 @@ static bool test_child_realm_caught_refusal_keeps_realm(void)
     return kept && clean;
 }
 
+/* The memory rule (docs/engineering/SCRIPT_MEMORY.md, "Exhaustion"): after
+   a refused allocation the realm is judged at the next task boundary by the
+   heap it can still obtain once collected, never by how the refusal reached
+   the page. Each fixture runs one `act` on one surface:
+   - a timer;
+   - a promise reaction (a rejection);
+   - an async function (a rejection);
+   - a click listener (reported as an uncaught listener error);
+   - the page's own try/catch (nothing reported);
+   - a timer after a load-time script threw an unrelated TypeError.
+   The page also schedules a later timer that records it ran. */
+typedef enum {
+    MEMORY_SURFACE_TIMER,
+    MEMORY_SURFACE_REACTION,
+    MEMORY_SURFACE_ASYNC,
+    MEMORY_SURFACE_LISTENER,
+    MEMORY_SURFACE_CAUGHT,
+    MEMORY_SURFACE_AFTER_ERROR,
+    MEMORY_SURFACE_COUNT
+} MemorySurface;
+
+static const char *const memory_surface_names[MEMORY_SURFACE_COUNT] = {
+    "timer", "reaction", "async", "listener", "caught", "after-error"
+};
+
+/* Hoards 64 KiB buffers it keeps reachable until the heap refuses. */
+#define MEMORY_ACT_HOARD \
+    "globalThis.hoard=null;for(;;)hoard={b:new ArrayBuffer(65536),n:hoard}"
+/* One request far past the heap limit; nothing else is held. */
+#define MEMORY_ACT_OVERSIZED "globalThis.big=new ArrayBuffer(64<<20)"
+/* Fills the heap with garbage it drops when the heap refuses. */
+#define MEMORY_ACT_TRANSIENT \
+    "let held=null;for(;;)held={b:new ArrayBuffer(65536),n:held}"
+
+typedef struct {
+    bool ran;       /* committed, and every turn and the click succeeded */
+    bool stopped;   /* realm stopped for memory, with its summary */
+    bool layout;    /* the server-rendered text is still laid out */
+    bool later;     /* the realm is alive and its later timer ran */
+} MemoryRuleOutcome;
+
+static bool memory_rule_run(MemorySurface surface, const char *act,
+                            unsigned pad_kib, size_t heap_limit,
+                            MemoryRuleOutcome *outcome)
+{
+    static const char *const schedules[MEMORY_SURFACE_COUNT] = {
+        "setTimeout(act,1)",
+        "setTimeout(()=>Promise.resolve().then(act),1)",
+        "setTimeout(async()=>{await null;act()},1)",
+        "document.getElementById('go').addEventListener('click',act)",
+        "setTimeout(()=>{try{act()}catch(error){}},1)",
+        "setTimeout(act,1)"
+    };
+    *outcome = (MemoryRuleOutcome) {0};
+    char html[2048];
+    int length = snprintf(html, sizeof(html),
+        "<!doctype html><title>Memory rule</title><body><main><h1>"
+        "Survivor heading</h1><p>This server-rendered paragraph stays "
+        "readable whatever the page's scripts do with their heap.</p>"
+        "</main><button id=go>Go</button>%s"
+        "<script>globalThis.pad=new ArrayBuffer(%u*1024)</script>"
+        "<script>globalThis.later=0;const act=()=>{%s};%s;"
+        "setTimeout(()=>{globalThis.later=1},40)</script></body>",
+        surface == MEMORY_SURFACE_AFTER_ERROR
+            ? "<script>window[window.missingQueueName]('start')</script>"
+            : "",
+        pad_kib, act, schedules[surface]);
+    if (length <= 0 || (size_t) length >= sizeof(html)) return false;
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool lexbor_installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = lexbor_installed
+        && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, heap_limit, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 64 * 1024, 32 * 1024, 1000);
+        /* The limit is the limit (a heap_limit above the 16 MiB Budget is
+           refused by the Budget instead). */
+        navigation_set_fixed_script_memory_limits(&navigation, true);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool ok = ready && navigation_commit_html(
+        &navigation, generation, "https://memory-rule.test/", html,
+        (size_t) length, 480, NULL, NULL, true)
+        && navigation.page.runtime != NULL;
+    if (ok && surface == MEMORY_SURFACE_LISTENER)
+        ok = navigation_dispatch_event(&navigation, "#go", "click");
+    for (unsigned turn = 0; ok && turn < 6u
+         && navigation.page.runtime != NULL; turn++)
+        ok = navigation_advance_runtime(&navigation, 16, 4);
+    outcome->ran = ok;
+    outcome->stopped = ok && navigation.page.runtime == NULL
+        && navigation.page.script_memory_limited
+        && navigation.page.script_stop.reason == NAVIGATION_SCRIPT_STOP_MEMORY
+        && strcmp(navigation.page.script_result.summary,
+                  "JavaScript stopped at its memory limit") == 0;
+    outcome->layout = ok && frame_oom_layout_has_text(&navigation, "Survivor");
+    ScriptResult probe = {0};
+    outcome->later = ok && navigation.page.runtime != NULL
+        && !navigation.page.script_memory_limited
+        && script_runtime_evaluate_diagnostic(
+               navigation.page.runtime,
+               "if(globalThis.later!==1)throw Error('later timer missing')",
+               "memory-rule-test", &probe);
+    if (!ok)
+        fprintf(stderr, "memory rule %s: run failed runtime=%p "
+                "summary=\"%s\" error=\"%.120s\" last=\"%.160s\"\n",
+                memory_surface_names[surface],
+                (void *) navigation.page.runtime,
+                navigation.page.script_result.summary,
+                navigation.page.script_result.error, navigation.last_error);
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return clean;
+}
+
+static bool memory_rule_report(const char *name, MemorySurface surface,
+                               unsigned pad_kib, bool clean, bool ok,
+                               const MemoryRuleOutcome *outcome)
+{
+    if (!clean || !ok)
+        fprintf(stderr, "memory rule %s surface=%s pad=%uK: clean=%d ran=%d "
+                "stopped=%d layout=%d later=%d\n", name,
+                memory_surface_names[surface], pad_kib, clean, outcome->ran,
+                outcome->stopped, outcome->layout, outcome->later);
+    return clean && ok;
+}
+
+/* A page that fills its heap with what it keeps is stopped with its layout
+   kept, on every surface. (Before the rule only the timer and the earlier-
+   error timer stopped; the others kept a full realm running.) */
+static bool test_memory_rule_hoard_stops_on_every_surface(void)
+{
+    bool all_ok = true;
+    for (int surface = 0; surface < MEMORY_SURFACE_COUNT; surface++) {
+        MemoryRuleOutcome outcome;
+        bool clean = memory_rule_run((MemorySurface) surface,
+                                     MEMORY_ACT_HOARD, 0, 8 * MIB, &outcome);
+        all_ok &= memory_rule_report(
+            "hoard", (MemorySurface) surface, 0, clean,
+            outcome.ran && outcome.stopped && outcome.layout, &outcome);
+    }
+    return all_ok;
+}
+
+/* One request past the limit, refused with the heap otherwise free, keeps
+   the realm on every surface, and a later timer still runs. (Before, the
+   timer surfaces stopped it.) */
+static bool test_memory_rule_oversized_request_kept_on_every_surface(void)
+{
+    bool all_ok = true;
+    for (int surface = 0; surface < MEMORY_SURFACE_COUNT; surface++) {
+        MemoryRuleOutcome outcome;
+        bool clean = memory_rule_run((MemorySurface) surface,
+                                     MEMORY_ACT_OVERSIZED, 0, 8 * MIB,
+                                     &outcome);
+        all_ok &= memory_rule_report(
+            "oversized", (MemorySurface) surface, 0, clean,
+            outcome.ran && !outcome.stopped && outcome.layout
+                && outcome.later, &outcome);
+    }
+    return all_ok;
+}
+
+/* A transient peak: the page fills the heap with garbage, is refused and
+   drops it. Collected at the boundary the heap is free again, so the realm
+   is kept on every surface. (Before, the timer surfaces stopped it.) */
+static bool test_memory_rule_transient_peak_kept(void)
+{
+    bool all_ok = true;
+    for (int surface = 0; surface < MEMORY_SURFACE_COUNT; surface++) {
+        MemoryRuleOutcome outcome;
+        bool clean = memory_rule_run((MemorySurface) surface,
+                                     MEMORY_ACT_TRANSIENT, 0, 8 * MIB,
+                                     &outcome);
+        all_ok &= memory_rule_report(
+            "transient", (MemorySurface) surface, 0, clean,
+            outcome.ran && !outcome.stopped && outcome.layout
+                && outcome.later, &outcome);
+    }
+    return all_ok;
+}
+
+/* Which operation first meets the limit moves with every byte of heap in
+   front of it. The hoarding timer here catches its refusal and then asks
+   for 16 KiB more: whether that fits depends on the few KiB the hoard left,
+   so before the rule the realm was kept at most paddings (the catch fit)
+   and stopped at the rest (it threw). Padding the heap from 0 to 64 KiB in
+   1 KiB steps now gives one outcome: stopped, layout kept. */
+static bool test_memory_rule_padding_invariant(void)
+{
+    static const char act[] =
+        "globalThis.hoard=null;try{for(;;)hoard={b:new ArrayBuffer(65536),"
+        "n:hoard}}catch(error){globalThis.note=new ArrayBuffer(16384)}";
+    bool all_ok = true;
+    unsigned stopped = 0, kept = 0;
+    for (unsigned pad = 0; pad <= 64u; pad++) {
+        MemoryRuleOutcome outcome;
+        bool clean = memory_rule_run(MEMORY_SURFACE_TIMER, act, pad, 8 * MIB,
+                                     &outcome);
+        if (outcome.stopped) stopped++;
+        else kept++;
+        all_ok &= memory_rule_report(
+            "padding", MEMORY_SURFACE_TIMER, pad, clean,
+            outcome.ran && outcome.stopped && outcome.layout, &outcome);
+    }
+    if (!all_ok)
+        fprintf(stderr, "memory rule padding: stopped=%u kept=%u\n",
+                stopped, kept);
+    return all_ok;
+}
+
+/* A heap limit (24 MiB) above what the 16 MiB page Budget can back: the
+   Budget refuses first. The hoard is stopped and the oversized request (a
+   15 MiB buffer, under the limit, past the Budget's free memory) is kept,
+   on every surface, as for the realm's own limit. (Before, a Budget refusal
+   was never a heap rejection: every one of these realms kept running.) */
+static bool test_memory_rule_budget_refusal_as_heap_refusal(void)
+{
+    bool all_ok = true;
+    for (int surface = 0; surface < MEMORY_SURFACE_COUNT; surface++) {
+        MemoryRuleOutcome outcome;
+        bool clean = memory_rule_run((MemorySurface) surface,
+                                     MEMORY_ACT_HOARD, 0, 24 * MIB, &outcome);
+        all_ok &= memory_rule_report(
+            "budget hoard", (MemorySurface) surface, 0, clean,
+            outcome.ran && outcome.stopped && outcome.layout, &outcome);
+        clean = memory_rule_run((MemorySurface) surface,
+                                "globalThis.big=new ArrayBuffer(15<<20)", 0,
+                                24 * MIB, &outcome);
+        all_ok &= memory_rule_report(
+            "budget oversized", (MemorySurface) surface, 0, clean,
+            outcome.ran && !outcome.stopped && outcome.layout
+                && outcome.later, &outcome);
+    }
+    return all_ok;
+}
+
+/* A realm kept twice with under twice the stop headroom (4 MiB) left is
+   stopped at the third such refusal: it is living at its limit. A 5 MiB
+   heap leaves about 3 MiB after the bootstrap, short of that, when an
+   oversized request is refused; an 8 MiB heap leaves about 6 MiB and keeps
+   the realm through any number. (A 6 MiB heap sat within about 80 KB of
+   the 4 MiB line, so the bootstrap's own size decided the case.) Each refusal is one click on a listener that asks for 64 MiB.
+   (Before, a listener's refusal never stopped a realm.) */
+static bool memory_guard_case(size_t heap_limit, unsigned *stopped_at)
+{
+    static const char html[] =
+        "<!doctype html><title>Memory guard</title><body><main><h1>"
+        "Survivor heading</h1><p>This paragraph stays when the realm is "
+        "stopped at its third refusal near its limit.</p></main>"
+        "<button id=go>Go</button><script>globalThis.clicks=0;"
+        "document.getElementById('go').addEventListener('click',()=>{"
+        "clicks++;globalThis.big=new ArrayBuffer(64<<20)})</script></body>";
+    *stopped_at = 0;
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool lexbor_installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = lexbor_installed
+        && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, heap_limit, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 64 * 1024, 32 * 1024, 1000);
+        navigation_set_fixed_script_memory_limits(&navigation, true);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool ok = ready && navigation_commit_html(
+        &navigation, generation, "https://memory-guard.test/", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true);
+    for (unsigned click = 1; ok && click <= 5u && *stopped_at == 0; click++) {
+        ok = navigation_dispatch_event(&navigation, "#go", "click")
+            && navigation_advance_runtime(&navigation, 16, 4);
+        if (ok && navigation.page.runtime == NULL) *stopped_at = click;
+    }
+    ok = ok && frame_oom_layout_has_text(&navigation, "Survivor")
+        && (*stopped_at == 0
+            || (navigation.page.script_memory_limited
+                && navigation.page.script_stop.reason
+                       == NAVIGATION_SCRIPT_STOP_MEMORY));
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_memory_rule_third_low_keep_stops(void)
+{
+    unsigned tight = 0, roomy = 0;
+    bool tight_ok = memory_guard_case(5 * MIB, &tight);
+    bool roomy_ok = memory_guard_case(8 * MIB, &roomy);
+    bool ok = tight_ok && roomy_ok && tight == 3u && roomy == 0u;
+    if (!ok)
+        fprintf(stderr, "memory guard: 5 MiB ok=%d stopped at click %u, "
+                "8 MiB ok=%d stopped at click %u\n", tight_ok, tight,
+                roomy_ok, roomy);
+    return ok;
+}
+
+static size_t memory_rule_count_reclaim(void *opaque, size_t needed)
+{
+    size_t *calls = opaque;
+    if (needed != 0) (*calls)++;
+    return 0;
+}
+
+/* A realm with very little space under its hard ceiling cannot be kept by
+   reclaiming optional caches, even when there's plenty of page Budget. */
+static bool test_memory_rule_hard_ceiling_does_not_reclaim(void)
+{
+    static const char html[] =
+        "<!doctype html><body><p>Survivor</p><script>setTimeout(()=>{"
+        "try{new ArrayBuffer(64<<20)}catch(error){}},1)</script></body>";
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 3u * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 64 * 1024, 32 * 1024, 1000);
+        navigation_set_fixed_script_memory_limits(&navigation, true);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool ok = ready && navigation_commit_html(
+        &navigation, generation, "https://memory-ceiling.test/", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true)
+        && navigation.page.runtime != NULL;
+    size_t calls = 0;
+    budget_set_reclaim_hook(&budget, memory_rule_count_reclaim, &calls);
+    ok = ok && navigation_advance_runtime(&navigation, 16, 4)
+        && navigation.page.runtime == NULL
+        && navigation.page.script_stop.reason == NAVIGATION_SCRIPT_STOP_MEMORY
+        && frame_oom_layout_has_text(&navigation, "Survivor")
+        && calls == 0;
+    if (!ok)
+        fprintf(stderr, "memory ceiling: reclaim calls=%zu stop reason=%u\n",
+                calls, (unsigned) navigation.page.script_stop.reason);
+    budget_set_reclaim_hook(&budget, NULL, NULL);
+    return frame_oom_session_clean(&budget, &navigation, ready, installed)
+        && ok;
+}
+
+#undef MEMORY_ACT_HOARD
+#undef MEMORY_ACT_OVERSIZED
+#undef MEMORY_ACT_TRANSIENT
+
 /* A script that page code inserts takes the response of a matching
    <link rel=preload as=script> instead of fetching it again (HTML "consume
    a preloaded resource"): same URL, request mode and credentials mode, and
@@ -1718,7 +2192,7 @@ static bool offer_test_preload(NavigationSession *navigation, Budget *budget,
         mode == TILEFINCH_REQUEST_MODE_CORS
             ? TILEFINCH_CREDENTIALS_SAME_ORIGIN
             : TILEFINCH_CREDENTIALS_INCLUDE,
-        integrity, body, length, url, "text/javascript");
+        integrity, body, length, url, "text/javascript", 0);
     browser_shared_body_release(body);
     return offered;
 }
@@ -2268,7 +2742,7 @@ static bool test_authored_oom_text_does_not_trigger_static_recovery(void)
     return ok && clean;
 }
 
-static bool test_late_oom_static_relayout_refusal_is_transactional(void)
+static bool late_oom_static_relayout_refusal_case(bool refuse_retry)
 {
     static const char html[] =
         "<!doctype html><style>body.staged{display:none}main{color:#123456}"
@@ -2321,11 +2795,24 @@ static bool test_late_oom_static_relayout_refusal_is_transactional(void)
         && navigation.page.layout.count == 0
         && navigation.canvas_paint_damage_pending;
     budget_clear_failure_injection(&budget);
-    bool recovered = retained_after_refusal
-        && navigation_relayout(&navigation)
-        && navigation.page.loaded
-        && navigation.page.layout.count != 0
-        && !navigation.canvas_paint_damage_pending;
+    if (refuse_retry) navigation_test_refuse_next_static_fallback_layout();
+    bool scheduled = retained_after_refusal && navigation_background_resources_pending(&navigation);
+    NavigationBackgroundWorkOutcome outcome = navigation_run_background_resources(&navigation);
+    bool recovered = scheduled && navigation.page.loaded && !navigation.page.static_layout_retry_pending
+        && (refuse_retry
+            ? outcome == NAVIGATION_BACKGROUND_WORK_SOFT_REFUSAL
+                && navigation.page.layout.count == 0 && navigation.canvas_paint_damage_pending
+                && budget.injected_failure_count == injected_after + 1
+            : outcome == NAVIGATION_BACKGROUND_WORK_SUCCESS
+                && navigation.page.layout.count != 0 && !navigation.canvas_paint_damage_pending);
+    if (refuse_retry && recovered) {
+        /* A transient refusal may still recover by explicit relayout, but
+           a permanently cramped page must not spin on the idle worker. */
+        size_t builds = navigation.incremental_relayouts;
+        (void) navigation_run_background_resources(&navigation);
+        recovered = navigation.incremental_relayouts == builds && navigation.page.layout.count == 0
+            && navigation_relayout(&navigation) && navigation.page.layout.count != 0;
+    }
     if (!(committed && staged && retired && retained_after_refusal
           && recovered)) {
         fprintf(stderr,
@@ -2345,6 +2832,12 @@ static bool test_late_oom_static_relayout_refusal_is_transactional(void)
     if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
     return committed && staged && retired && retained_after_refusal
         && recovered && clean;
+}
+
+static bool test_late_oom_static_relayout_refusal_is_transactional(void)
+{
+    return late_oom_static_relayout_refusal_case(false)
+        && late_oom_static_relayout_refusal_case(true);
 }
 
 static bool test_candidate_cancel_preserves_late_incumbent_dom(void)

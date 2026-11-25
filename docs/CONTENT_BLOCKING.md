@@ -144,8 +144,12 @@ ins.adsbygoogle
 .sponsored .promoted .promotedlink
 [data-ad] [data-ad-slot] [data-ad-client]
 [data-csa-c-slot-id^="adplacements:"]
-[aria-label="advertisement"] [aria-label="sponsored"]
+[aria-label="advertisement" i] [aria-label="sponsored" i]
 ```
+
+The two `aria-label` markers match the whole label in any letter case
+("Advertisement", "SPONSORED"); a longer label such as "Advertisement
+settings" is not hidden.
 
 It also hides class tokens beginning with `ad-slot-` or `ad-banner-`, at any
 position in a whitespace-separated class list. The families deliberately

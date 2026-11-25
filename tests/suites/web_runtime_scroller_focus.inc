@@ -502,6 +502,135 @@ static int test_scroller_focus_stuck_sticky_hits(void)
     return 0;
 }
 
+/* An app shell one screen tall keeps its content in one inner scroller.
+   With nothing focused or hovered, scroll presses the document cannot take
+   reach the scroller that shows most of the screen; a sidebar parked off
+   screen and a small box do not qualify. */
+static int test_scroller_reach_app_shell(void)
+{
+    puts("test: scroll presses reach the inner scroller of a page that "
+         "cannot scroll");
+    Budget budget;
+    budget_init(&budget, 32 * MIB);
+    budget_install_lexbor(&budget);
+    static const char html[] =
+        "<!doctype html><meta name=viewport content='width=device-width'>"
+        "<style>html,body{margin:0;height:100%;overflow:hidden}"
+        "header{height:40px}"
+        "#side{position:fixed;left:-320px;top:0;width:320px;height:100%;"
+        "overflow:auto}#side div{height:3000px}"
+        "#note{position:absolute;right:0;top:0;width:100px;height:30px;"
+        "overflow:auto}#note div{height:300px}"
+        "#main{position:absolute;top:40px;left:0;right:0;bottom:0;"
+        "overflow:auto}#main div{height:1000px}</style>"
+        "<header>Header</header><nav id=side><div>Menu</div></nav>"
+        "<div id=note><div>Note</div></div>"
+        "<main id=main><div>Content</div></main>";
+    static ScrollerFocusPage page;
+    CHECK(scroller_focus_open(&page, &budget, html));
+    const LayoutNodeBox *main_box = scroller_focus_box(&page, "main");
+    const LayoutNodeBox *side = scroller_focus_box(&page, "side");
+    const LayoutNodeBox *note = scroller_focus_box(&page, "note");
+    CHECK(main_box != NULL && side != NULL && note != NULL
+          && main_box->client_height == 232
+          && main_box->content_height > main_box->client_height
+          && scroller_focus_scroll(&page) == 0);
+    /* 232 visible; keep an eighth (29) as overlap. */
+    CHECK(controller_scroll_page(&page.controller, 1, 272));
+    if (main_box->scroll_y != 203)
+        fprintf(stderr, "app shell main=%d side=%d note=%d page=%d\n",
+                main_box->scroll_y, side->scroll_y, note->scroll_y,
+                scroller_focus_scroll(&page));
+    CHECK(main_box->scroll_y == 203 && side->scroll_y == 0
+          && note->scroll_y == 0 && scroller_focus_scroll(&page) == 0);
+    CHECK(controller_scroll_by(&page.controller, 50, 272)
+          && main_box->scroll_y == 253);
+    CHECK(controller_scroll_page(&page.controller, -1, 272)
+          && main_box->scroll_y == 50);
+    CHECK(controller_scroll_page(&page.controller, -1, 272)
+          && main_box->scroll_y == 0);
+    /* At its top the scroller has nowhere to go: nothing moves. */
+    (void) controller_scroll_page(&page.controller, -1, 272);
+    CHECK(main_box->scroll_y == 0 && scroller_focus_scroll(&page) == 0);
+    navigation_destroy(&page.navigation);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+/* A document that can scroll takes the presses first; at its end, a
+   scroller filling most of the screen takes the rest. */
+static int test_scroller_reach_after_document_end(void)
+{
+    puts("test: scroll presses reach a large inner scroller once the "
+         "document is at its end");
+    Budget budget;
+    budget_init(&budget, 32 * MIB);
+    budget_install_lexbor(&budget);
+    static const char html[] =
+        "<!doctype html><meta name=viewport content='width=device-width'>"
+        "<style>body{margin:0}#intro{height:140px}"
+        "#list{height:260px;overflow:auto}#list div{height:2000px}</style>"
+        "<div id=intro>Intro</div><div id=list><div>Rows</div></div>";
+    static ScrollerFocusPage page;
+    CHECK(scroller_focus_open(&page, &budget, html));
+    const LayoutNodeBox *list = scroller_focus_box(&page, "list");
+    CHECK(list != NULL && list->y == 140 && list->client_height == 260);
+    /* The document moves to its end (400 - 272) and the list stays. */
+    CHECK(controller_scroll_page(&page.controller, 1, 272)
+          && scroller_focus_scroll(&page) == 128 && list->scroll_y == 0);
+    /* The screen now shows all 260 rows of the list: keep 32 as overlap. */
+    CHECK(controller_scroll_page(&page.controller, 1, 272));
+    if (list->scroll_y != 228)
+        fprintf(stderr, "document end list=%d page=%d\n", list->scroll_y,
+                scroller_focus_scroll(&page));
+    CHECK(list->scroll_y == 228 && scroller_focus_scroll(&page) == 128);
+    /* Up moves the document first, while it can. */
+    CHECK(controller_scroll_page(&page.controller, -1, 272)
+          && scroller_focus_scroll(&page) < 128 && list->scroll_y == 228);
+    navigation_destroy(&page.navigation);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+static int test_scroller_page_remainder_reaches_app_shell(void)
+{
+    puts("test: page press passes only the unconsumed delta to the app shell");
+    Budget budget;
+    budget_init(&budget, 32 * MIB);
+    budget_install_lexbor(&budget);
+    static const char html[] =
+        "<!doctype html><meta name=viewport content='width=device-width'>"
+        "<style>body{margin:0}"
+        "#small{width:100px;height:90px;overflow:auto}"
+        "#small div{height:210px}"
+        "#main{position:fixed;top:90px;left:0;right:0;bottom:0;overflow:auto}"
+        "#main div{height:1000px}</style>"
+        "<div id=small><div><a id=link href='#small'>Small</a></div></div>"
+        "<main id=main><div>Content</div></main>";
+    static ScrollerFocusPage page;
+    CHECK(scroller_focus_open(&page, &budget, html));
+    const LayoutNodeBox *small = scroller_focus_box(&page, "small");
+    const LayoutNodeBox *main_box = scroller_focus_box(&page, "main");
+    CHECK(small != NULL && main_box != NULL && main_box->client_height == 182
+          && small->content_height - small->client_height == 120);
+    CHECK(controller_focus_node(&page.controller,
+                                scroller_focus_node(&page, "link"))
+          && small->scroll_y == 0);
+    /* A 238px page: the focused scroller takes 120, so only 118 reach main. */
+    CHECK(controller_scroll_page(&page.controller, 1, 272));
+    if (small->scroll_y != 120 || main_box->scroll_y != 118)
+        fprintf(stderr, "partial page press: small=%d main=%d document=%d\n",
+                small->scroll_y, main_box->scroll_y, scroller_focus_scroll(&page));
+    CHECK(small->scroll_y == 120 && main_box->scroll_y == 118
+          && scroller_focus_scroll(&page) == 0);
+    CHECK(controller_scroll_page(&page.controller, -1, 272)
+          && small->scroll_y == 0 && main_box->scroll_y == 0
+          && scroller_focus_scroll(&page) == 0);
+    navigation_destroy(&page.navigation);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
 static int test_scroller_focus(void)
 {
     CHECK(test_scroller_focus_fixed_overlay() == 0);
@@ -511,5 +640,8 @@ static int test_scroller_focus(void)
     CHECK(test_scroller_focus_pointer() == 0);
     CHECK(test_scroller_focus_hits_match_exact_path() == 0);
     CHECK(test_scroller_focus_stuck_sticky_hits() == 0);
+    CHECK(test_scroller_reach_app_shell() == 0);
+    CHECK(test_scroller_reach_after_document_end() == 0);
+    CHECK(test_scroller_page_remainder_reaches_app_shell() == 0);
     return 0;
 }

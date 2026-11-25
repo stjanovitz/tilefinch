@@ -88,6 +88,31 @@ BOOTSTRAP_SOURCE(browser_bootstrap_frame_clone, "frame-clone.js",
 BOOTSTRAP_SOURCE(browser_bootstrap_webgl_interfaces, "webgl-interfaces.js",
                  "<browser-webgl-interfaces>",
                  browser_bootstrap_webgl_interfaces_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_geometry, "geometry.js",
+                 "<browser-geometry>", browser_bootstrap_geometry_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_validation, "validation.js",
+                 "<browser-validation>",
+                 browser_bootstrap_validation_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_detached_documents,
+                 "detached-documents.js", "<browser-detached-documents>",
+                 browser_bootstrap_detached_documents_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_dom_attributes,
+                 "dom-attributes.js", "<browser-dom-attributes>",
+                 browser_bootstrap_dom_attributes_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_subtle_crypto,
+                 "subtle-crypto.js", "<browser-subtle-crypto>",
+                 browser_bootstrap_subtle_crypto_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_event_source,
+                 "event-source.js", "<browser-event-source>",
+                 browser_bootstrap_event_source_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_file_reader,
+                 "file-reader.js", "<browser-file-reader>",
+                 browser_bootstrap_file_reader_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_multiplayer,
+                 "multiplayer.js", "<browser-multiplayer>",
+                 browser_bootstrap_multiplayer_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_gpu, "gpu.js", "<browser-gpu>",
+                 browser_bootstrap_gpu_bytecode)
 BOOTSTRAP_DIAGNOSTIC(browser_dpu_diagnostic, "dpu-diagnostic.js",
                      "<dpu-diagnostic>")
 BOOTSTRAP_DIAGNOSTIC(browser_eval_source_diagnostic,
@@ -96,10 +121,13 @@ BOOTSTRAP_DIAGNOSTIC(browser_eval_source_diagnostic,
    evaluate steps of runtime_bootstrap_sequence). The generator pins the
    atoms they name, so they run from ROM in place (README.md). Other modules
    share those atoms and relocate only their own: listing one here would
-   keep its atoms resident in every realm whether it loads or not. The one
-   exception is frame-clone.js, moved out of platform.js for source
-   headroom: its few dozen atoms cost no measurable resident heap, and
-   pinned it loads in about 9 KiB instead of 13 KiB (2026-11-14). */
+   keep its atoms resident in every realm whether it loads or not. The
+   exceptions are modules moved out of an eager module for source headroom
+   (frame-clone.js, validation.js and detached-documents.js from
+   platform.js, geometry.js from dom.js): their atoms were the eager
+   module's, so pinning them costs no resident heap, and pinned they run
+   from ROM (frame-clone.js loads in about 9 KiB instead of 13 KiB;
+   2026-11-14). */
 BOOTSTRAP_PINNED_ATOMS(browser_bootstrap_cssom)
 BOOTSTRAP_PINNED_ATOMS(browser_bootstrap)
 BOOTSTRAP_PINNED_ATOMS(browser_bootstrap_frames)
@@ -110,4 +138,7 @@ BOOTSTRAP_PINNED_ATOMS(browser_bootstrap_scheduler)
 BOOTSTRAP_PINNED_ATOMS(browser_bootstrap_hardening)
 /* Lazy; see above. */
 BOOTSTRAP_PINNED_ATOMS(browser_bootstrap_frame_clone)
+BOOTSTRAP_PINNED_ATOMS(browser_bootstrap_geometry)
+BOOTSTRAP_PINNED_ATOMS(browser_bootstrap_validation)
+BOOTSTRAP_PINNED_ATOMS(browser_bootstrap_detached_documents)
 #undef BOOTSTRAP_PINNED_ATOMS

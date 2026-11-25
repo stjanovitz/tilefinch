@@ -5954,6 +5954,25 @@ bool stylesheet_resolve_named_grid_lines(
     return resolved;
 }
 
+/* A fixed-point percentage (hundredths) or flex (thousandths) without
+   trailing fractional zeros: 10%, 12.5%, 1.25fr. */
+static void format_grid_scaled(char *token, size_t size, unsigned value,
+                               bool percent)
+{
+    unsigned scale = percent ? 100u : 1000u, digits = percent ? 2u : 3u;
+    const char *suffix = percent ? "%" : "fr";
+    unsigned remainder = value % scale;
+    if (remainder == 0) {
+        snprintf(token, size, "%u%s", value / scale, suffix);
+        return;
+    }
+    char fractional[4];
+    snprintf(fractional, sizeof(fractional), "%0*u", (int) digits, remainder);
+    while (digits > 1u && fractional[digits - 1u] == '0')
+        fractional[--digits] = '\0';
+    snprintf(token, size, "%u.%s%s", value / scale, fractional, suffix);
+}
+
 static bool append_grid_track_token(
     char *output, size_t capacity, size_t *used,
     uint8_t type, unsigned value, unsigned minimum, bool automatic_minimum)
@@ -5962,22 +5981,8 @@ static bool append_grid_track_token(
     if (type == GRID_TRACK_FIXED) {
         snprintf(token, sizeof(token), "%upx", value);
     } else if (type == GRID_TRACK_PERCENT || type == GRID_TRACK_FLEX) {
-        unsigned scale = type == GRID_TRACK_PERCENT ? 100u : 1000u;
-        unsigned digits = type == GRID_TRACK_PERCENT ? 2u : 3u;
-        const char *suffix = type == GRID_TRACK_PERCENT ? "%" : "fr";
-        unsigned remainder = value % scale;
-        if (remainder == 0) {
-            snprintf(token, sizeof(token), "%u%s", value / scale, suffix);
-        } else {
-            char fractional[4];
-            snprintf(fractional, sizeof(fractional), "%0*u",
-                     (int) digits, remainder);
-            while (digits > 1u && fractional[digits - 1u] == '0') {
-                fractional[--digits] = '\0';
-            }
-            snprintf(token, sizeof(token), "%u.%s%s",
-                     value / scale, fractional, suffix);
-        }
+        format_grid_scaled(token, sizeof(token), value,
+                           type == GRID_TRACK_PERCENT);
     } else if (value == GRID_TRACK_MIN_CONTENT_VALUE) {
         snprintf(token, sizeof(token), "min-content");
     } else if (value == GRID_TRACK_MAX_CONTENT_VALUE) {
@@ -5993,9 +5998,10 @@ static bool append_grid_track_token(
             && type != GRID_TRACK_FIXED)) {
         char wrapped[96];
         if (minimum & GRID_TRACK_PERCENT_MINIMUM) {
-            minimum &= ~GRID_TRACK_PERCENT_MINIMUM;
-            snprintf(wrapped, sizeof(wrapped), "minmax(%u.%02u%%,%s)",
-                     minimum / 100u, minimum % 100u, token);
+            char floor[24];
+            format_grid_scaled(floor, sizeof(floor),
+                               minimum & ~GRID_TRACK_PERCENT_MINIMUM, true);
+            snprintf(wrapped, sizeof(wrapped), "minmax(%s,%s)", floor, token);
         } else {
             snprintf(wrapped, sizeof(wrapped), "minmax(%upx,%s)", minimum, token);
         }

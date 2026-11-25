@@ -95,6 +95,14 @@ are kept in `build-preset-psp-validation/perf-journeys-latest/<journey>/`.
       supervisor queued during page work and replayed afterwards.
     - A press that a later one replaced before its frame completed is
       reported too (`superseded=1`), when its replacement completes.
+      `visible-source=press` means that press had its own recorded first
+      frame; `visible-source=replacement` means the delay is to the
+      replacement's first frame instead. Both feed the historical
+      `scroll.first_visible_*` and `scroll.complete_*` metrics unchanged.
+      `scroll.direct_first_visible_*` and
+      `scroll.replacement_first_visible_*` report the two kinds separately.
+      Old superseded records without the source count only in the historical
+      metrics because they don't distinguish the two kinds.
     - A press that cannot move the page (at its edge, or on a page that
       does not scroll) owes no frame and draws none. It is reported at
       once (`noop=1`), timed from the press to that report. These stay out
@@ -140,6 +148,8 @@ are kept in `build-preset-psp-validation/perf-journeys-latest/<journey>/`.
 and never raises one. A regression is fixed. If a slower number is the right
 trade, raise that row by hand in the same commit, and give the reason in the
 commit message. This is the same rule the fidelity floors follow.
+Every commit that moves a baseline lists its rows old → new in its message,
+so `git log -p tests/perf-baselines.tsv` is each row's history.
 `--record` rewrites the baselines of the journeys it ran. Use it for a new
 journey, or for a deliberate reset explained in its commit message.
 A metric with no baseline row is printed (`no baseline`) but not gated, so a
@@ -150,6 +160,72 @@ Tolerances are set when a baseline is recorded. Load and layout times repeat
 exactly under trace replay, so they get 2-5%. Frame composition and latency
 tails move a few percent with emulated-thread interleaving, so they get
 10-15%, with a small absolute floor.
+
+A few scroll tails repeat exactly for one build but move by whole frames
+whenever unrelated code shifts the emulated threads' interleaving: every
+`scroll.*` row of `article-scroll-during-load` and `www-reddit-load`, and
+`press-during-preview`'s `scroll.complete_p95_ms`. Those rows keep their
+value and carry a wider tolerance instead: the largest value measured on any
+build from 0.1.53 to the re-baseline, less the baseline, plus one 60 Hz frame
+(16.7 ms). A rise inside that band is the known spread; one past it is a
+regression like any other.
+
+The journeys run offline (see
+[the PPSSPP runner](INPUT_SCRIPT_REFERENCE.md#ppsspp)): every run records
+PPSSPP's `-d` log for the network check. That log does not change a
+journey's metrics, which repeat exactly with or without it.
+
+### Rows set by hand
+
+The last reset set these rows by hand. Each had drifted above its limit over
+several releases with no single change to fix, so the value is the one the
+validation build of `main` measures, twice and identically, and the
+tolerance follows the recording rule. The scroll tails above keep their
+value and widen their tolerance. `ia-search`'s `sheets.top.full_relayouts`
+is an exact count: its second whole-sheet rebuild is part of the
+baseline, so a third fails.
+
+| Journey | Metric | Old value | Old tolerance | New value | New tolerance |
+|---|---|---|---|---|---|
+| `article-scroll-during-load` | `scroll.complete_max_ms` | 560.8 | 56.1 | 560.8 | 340.1 |
+| `article-scroll-during-load` | `scroll.complete_p95_ms` | 186.4 | 18.6 | 186.4 | 165.5 |
+| `article-scroll-during-load` | `scroll.first_visible_max_ms` | 410.7 | 41.1 | 410.7 | 173.2 |
+| `bbc-home-load` | `load.initial.first_content_ms` | 2793 | 55.9 | 2926 | 58.5 |
+| `bbc-home-load` | `load.initial.first_present_ms` | 2529 | 50.6 | 2663 | 53.3 |
+| `bbc-home-load` | `load.initial.preview_reach_ms` | 3631 | 72.6 | 3784 | 75.7 |
+| `bbc-home-load` | `load.initial.reading_hint_ms` | 2529 | 50.6 | 2663 | 53.3 |
+| `bbc-home-load-night` | `load.initial.first_content_ms` | 2876 | 57.5 | 2993 | 59.9 |
+| `bbc-home-load-night` | `load.initial.first_present_ms` | 2608 | 52.2 | 2735 | 54.7 |
+| `bbc-home-load-night` | `load.initial.preview_reach_ms` | 3735 | 74.7 | 3856 | 77.1 |
+| `chatgpt-ask` | `control.activation_max_ms` | 950.2 | 95 | 1141.8 | 114.2 |
+| `ia-search` | `load.initial.first_content_ms` | 5087 | 101.7 | 5228 | 104.6 |
+| `ia-search` | `load.initial.first_present_ms` | 4511 | 90.2 | 4873 | 97.5 |
+| `ia-search` | `load.initial.loaded_ms` | 5087 | 101.7 | 5228 | 104.6 |
+| `ia-search` | `load.initial.preview_reach_ms` | 4511 | 90.2 | 4873 | 97.5 |
+| `ia-search` | `load.phase.script_ms` | 3875 | 77.5 | 4197 | 83.9 |
+| `ia-search` | `scroll.complete_max_ms` | 166.8 | 16.7 | 450.6 | 45.1 |
+| `ia-search` | `scroll.complete_p95_ms` | 166.8 | 16.7 | 450.6 | 45.1 |
+| `ia-search` | `scroll.first_visible_p50_ms` | 33.4 | 5 | 50.2 | 5.0 |
+| `ia-search` | `sheets.top.full_relayouts` | 1 | 0 | 2 | 0.0 |
+| `press-during-preview` | `load.phase.parse_ms` | 894 | 20 | 919 | 20.0 |
+| `press-during-preview` | `scroll.complete_p95_ms` | 152.3 | 15.2 | 152.3 | 88.3 |
+| `press-during-preview` | `scroll.first_visible_p95_ms` | 35.5 | 5 | 47.8 | 5.0 |
+| `press-during-preview` | `scroll.preview_first_visible_max_ms` | 24.8 | 5 | 32.7 | 5.0 |
+| `press-during-preview` | `scroll.preview_first_visible_p50_ms` | 22.9 | 5 | 32.7 | 5.0 |
+| `press-during-preview` | `scroll.preview_first_visible_p95_ms` | 24.8 | 5 | 32.7 | 5.0 |
+| `wiki-revisit` | `load.phase.parse_ms` | 890 | 20 | 916 | 20.0 |
+| `wiki-revisit-night` | `load.phase.parse_ms` | 890 | 20 | 916 | 20.0 |
+| `www-reddit-load` | `load.initial.first_content_ms` | 1000 | 20 | 1145 | 22.9 |
+| `www-reddit-load` | `load.initial.first_present_ms` | 862 | 20 | 1026 | 20.5 |
+| `www-reddit-load` | `load.initial.loaded_ms` | 1000 | 20 | 1145 | 22.9 |
+| `www-reddit-load` | `load.initial.preview_reach_ms` | 862 | 20 | 1026 | 20.5 |
+| `www-reddit-load` | `load.phase.script_ms` | 66 | 20 | 101 | 20.0 |
+| `www-reddit-load` | `scroll.complete_max_ms` | 50.1 | 5 | 50.1 | 83.4 |
+| `www-reddit-load` | `scroll.complete_p50_ms` | 33.4 | 5 | 33.4 | 50.1 |
+| `www-reddit-load` | `scroll.complete_p95_ms` | 50.1 | 5 | 50.1 | 83.4 |
+| `www-reddit-load` | `scroll.first_visible_max_ms` | 50.1 | 5 | 50.1 | 33.4 |
+| `www-reddit-load` | `scroll.first_visible_p50_ms` | 33.4 | 5 | 33.4 | 25.1 |
+| `www-reddit-load` | `scroll.first_visible_p95_ms` | 50.1 | 5 | 50.1 | 33.4 |
 
 ## Traces
 

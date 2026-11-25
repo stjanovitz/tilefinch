@@ -62,3 +62,17 @@ bool fetch_resolve_url(const char *base_url, const char *reference,
     return tilefinch_url_resolve(base_url, reference, output, output_size);
 }
 
+bool fetch_result_was_redirected(const FetchResult *result,
+                                 const char *request_url)
+{
+    if (result->redirected) return true;
+    if (result->effective_url[0] == '\0' || request_url == NULL)
+        return false;
+    char effective[TILEFINCH_URL_SERIALIZED_LIMIT];
+    char requested[TILEFINCH_URL_SERIALIZED_LIMIT];
+    return !tilefinch_url_normalize(result->effective_url, effective,
+                                    sizeof(effective))
+        || !tilefinch_url_normalize(request_url, requested,
+                                    sizeof(requested))
+        || strcmp(effective, requested) != 0;
+}

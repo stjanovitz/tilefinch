@@ -82,8 +82,15 @@ void translate_table_cell_contents(LayoutDocument *layout,
 }
 
 
+static bool table_is_html_cell(const lxb_dom_node_t *cell)
+{
+    return cell != NULL && cell->ns == LXB_NS_HTML
+        && (document_node_is_tag(cell, LXB_TAG_TD) || document_node_is_tag(cell, LXB_TAG_TH));
+}
+
 size_t table_cell_span(lxb_dom_node_t *cell)
 {
+    if (!table_is_html_cell(cell)) return 1;
     size_t length = 0;
     const char *text = document_attribute(cell, "colspan", &length);
     if (text == NULL || length == 0 || length > 4) return 1;
@@ -98,6 +105,7 @@ size_t table_cell_span(lxb_dom_node_t *cell)
 
 size_t table_cell_row_span(lxb_dom_node_t *cell)
 {
+    if (!table_is_html_cell(cell)) return 1;
     size_t length = 0;
     const char *text = document_attribute(cell, "rowspan", &length);
     if (text == NULL || length == 0 || length > 5) return 1;
@@ -186,6 +194,7 @@ static bool table_build_placements(
     TableCellPlacement *placements = NULL;
     size_t count = 0, capacity = 0, columns = 0;
     size_t declared_columns = table_declared_column_count(table);
+    size_t reach = declared_columns;
     uint8_t occupied[16] = {0};
     FlatItemIterator rows;
     FlatItem row;
@@ -251,7 +260,8 @@ static bool table_build_placements(
                     .cell = cell,
                     .column = (uint8_t) column,
                     .column_span = (uint8_t) span,
-                    .row_span = (uint8_t) row_span
+                    .row_span = (uint8_t) row_span,
+                    .row_column_span = (uint8_t) span
                 };
             }
             for (size_t i = 0; i < span; i++) {
@@ -259,7 +269,24 @@ static bool table_build_placements(
             }
             cursor = column + span;
             if (cursor > columns) columns = cursor;
+            if (column >= reach) reach = column + 1;
         }
+    }
+    /* An auto-layout table has no column past the last one a cell starts
+       in or a <col> makes, as in Chromium, which gives a column no cell
+       starts in no width: a colspan=1000 cell over two columns makes a
+       table two columns wide. A fixed layout keeps the first row's
+       columns. */
+    if (!(table_style->table_layout_fixed && table_style->has_width)
+        && columns > reach) {
+        for (size_t i = 0; i < count; i++) {
+            TableCellPlacement *placement = &placements[i];
+            if (placement->column_span > reach - placement->column) {
+                placement->column_span =
+                    (uint8_t) (reach - placement->column);
+            }
+        }
+        columns = reach;
     }
     *placements_out = placements;
     *placement_count_out = count;
@@ -293,6 +320,85 @@ static const TableCellPlacement *table_find_placement(
     return NULL;
 }
 
+/* The CSS Tables 3 column constraints beside each column's maximum
+   (`preferred`) and content minimum (`minimum`): which columns a cell
+   covers (`seen`), which have a fixed width (`constrained`, whose maximum
+   is then the fixed width, never their minimum), and which have a
+   percentage width (`percent_columns`, the largest raw percentage in
+   hundredths of a percent in `percent`). A row also keeps its first
+   spanning cells, which are distributed once every row is merged. */
+typedef struct {
+    uint16_t percent[16];
+    uint16_t seen;
+    uint16_t constrained;
+    uint16_t percent_columns;
+    uint8_t span_count;
+    TableSpanCell spans[LAYOUT_TABLE_ROW_SPAN_CELLS];
+} TableColumnFloors;
+
+/* A width that is a pure percentage (no length part), in hundredths of a
+   percent of the table grid. */
+static bool table_width_points(const Stylesheet *sheet,
+                               const ComputedStyle *style, uint16_t *points)
+{
+    if (!style->has_width || !style->width_percent
+        || style->width_max_content) return false;
+    int at = resolve_declared_length(sheet, style->width, true, 10000);
+    int twice = resolve_declared_length(sheet, style->width, true, 20000);
+    int linear = twice - 2 * at;
+    if (linear < -1 || linear > 1) return false;
+    *points = at > 65535 ? 65535 : (uint16_t) at;
+    return true;
+}
+
+/* Merge one cell's (or col's, or row's) contribution into column `i`, as
+   Chromium does: minimums take the largest; a fixed-width contribution's
+   maximum replaces an auto column's, and auto maximums do not raise a
+   fixed column's. */
+static void table_column_encompass(int preferred[16], int minimum[16],
+                                   TableColumnFloors *floors, size_t i,
+                                   int min, int max, bool constrained,
+                                   bool percent, uint16_t points)
+{
+    uint16_t bit = (uint16_t) (1u << i);
+    if ((floors->seen & bit) == 0) {
+        minimum[i] = min;
+        preferred[i] = max;
+        if (constrained) floors->constrained |= bit;
+    } else {
+        if (min > minimum[i]) minimum[i] = min;
+        bool column_constrained = (floors->constrained & bit) != 0;
+        if (column_constrained == constrained) {
+            if (max > preferred[i]) preferred[i] = max;
+        } else if (constrained) {
+            preferred[i] = max;
+            floors->constrained |= bit;
+        }
+    }
+    if (preferred[i] < minimum[i]) preferred[i] = minimum[i];
+    floors->seen |= bit;
+    if (percent) {
+        floors->percent_columns |= bit;
+        if (points > floors->percent[i]) floors->percent[i] = points;
+    }
+}
+
+/* Split a cell's minimum and maximum evenly over the `span` columns from
+   `column` (a spanning cell past the ones a row or table keeps). */
+static void table_span_even(int preferred[16], int minimum[16],
+                            TableColumnFloors *floors, size_t column,
+                            size_t span, int min, int max, bool constrained,
+                            bool percent, uint16_t points)
+{
+    int per_track = (max + (int) span - 1) / (int) span;
+    int floor_per_track = (min + (int) span - 1) / (int) span;
+    for (size_t i = 0; i < span; i++) {
+        table_column_encompass(preferred, minimum, floors, column + i,
+                               floor_per_track, per_track, constrained,
+                               percent, (uint16_t) (points / span));
+    }
+}
+
 static void table_measure_row(LayoutContext *context, lxb_dom_node_t *row,
                               const ComputedStyle *row_parent,
                               int available_width, bool border_collapse,
@@ -301,6 +407,7 @@ static void table_measure_row(LayoutContext *context, lxb_dom_node_t *row,
                               size_t placement_count,
                               int preferred[16],
                               int minimum[16],
+                              TableColumnFloors *floors,
                               size_t *column_count)
 {
     size_t column = 0;
@@ -316,7 +423,7 @@ static void table_measure_row(LayoutContext *context, lxb_dom_node_t *row,
             placements, placement_count, cell);
         if (placement != NULL) {
             column = placement->column;
-            span = placement->column_span;
+            span = placement->row_column_span;
         }
         if (column >= 16) break;
         if (span > 16 - column) span = 16 - column;
@@ -324,8 +431,18 @@ static void table_measure_row(LayoutContext *context, lxb_dom_node_t *row,
         int floor = 0;
         intrinsic_text_widths(
             context, cell, &row_style, available_width, &wanted, &floor);
-        resolve_padding(context->sheet, &cell_style, available_width);
-        if (cell_style.has_width) {
+        uint16_t points = 0;
+        bool percent = table_width_points(context->sheet, &cell_style,
+                                          &points);
+        bool fixed = cell_style.has_width && !percent
+                     && !cell_style.width_max_content;
+        if (fixed) {
+            /* The min-content measure of a fixed-width cell is its width;
+               the column minimum is its content's. Its width is the
+               column maximum. */
+            floor = intrinsic_min_text_width_internal(
+                context, cell, &row_style, available_width, true);
+            resolve_padding(context->sheet, &cell_style, available_width);
             int authored = resolve_declared_length(
                 context->sheet, cell_style.width,
                 cell_style.width_percent, available_width);
@@ -333,9 +450,9 @@ static void table_measure_row(LayoutContext *context, lxb_dom_node_t *row,
                 authored += cell_style.padding.left + cell_style.padding.right
                             + cell_style.border.left + cell_style.border.right;
             }
-            if (authored > wanted) wanted = authored;
-            if (authored > floor) floor = authored;
+            wanted = authored;
         }
+        if (wanted < floor) wanted = floor;
         if (border_collapse) {
             /* Only the inward half of a collapsed border belongs to the
                column track. Apply this after authored-width handling too:
@@ -345,22 +462,26 @@ static void table_measure_row(LayoutContext *context, lxb_dom_node_t *row,
                           + cell_style.border.right / 2;
             wanted = wanted > outward ? wanted - outward : 0;
             floor = floor > outward ? floor - outward : 0;
-        } else if (span > 1 && border_spacing_x != 0) {
-            int internal = (int) border_spacing_x * ((int) span - 1);
-            wanted = wanted > internal ? wanted - internal : 0;
-            floor = floor > internal ? floor - internal : 0;
         }
-        if (wanted < (int) span * 8) wanted = (int) span * 8;
-        if (floor < (int) span * 8) floor = (int) span * 8;
-        int per_track = (wanted + (int) span - 1) / (int) span;
-        int floor_per_track = (floor + (int) span - 1) / (int) span;
-        for (size_t i = 0; i < span; i++) {
-            if (per_track > preferred[column + i]) {
-                preferred[column + i] = per_track;
+        /* A spanning cell waits until every single-column cell is merged
+           (table_distribute_spans), which takes off the spacing between
+           its columns once the table's columns are known. Its fixed width
+           only raises its columns' maximums, as in Chromium: it never
+           makes them fixed columns, which an auto cell in another row
+           could then no longer widen. */
+        if (span > 1 && floors->span_count < LAYOUT_TABLE_ROW_SPAN_CELLS) {
+            floors->spans[floors->span_count++] = (TableSpanCell) {
+                .minimum = floor, .maximum = wanted, .points = points,
+                .column = (uint8_t) column, .span = (uint8_t) span
+            };
+        } else {
+            if (!border_collapse && span > 1) {
+                int internal = (int) border_spacing_x * ((int) span - 1);
+                wanted = wanted > internal ? wanted - internal : 0;
+                floor = floor > internal ? floor - internal : 0;
             }
-            if (floor_per_track > minimum[column + i]) {
-                minimum[column + i] = floor_per_track;
-            }
+            table_span_even(preferred, minimum, floors, column, span, floor,
+                            wanted, fixed && span == 1, percent, points);
         }
         column += span;
     }
@@ -426,8 +547,7 @@ static bool table_collapsed_boundaries(
     LayoutContext *context, lxb_dom_node_t *table,
     const ComputedStyle *table_style, int boundaries[17],
     const TableCellPlacement *placements, size_t placement_count,
-    lxb_dom_node_t **first_row, lxb_dom_node_t **last_row,
-    int *top_gutter, int *bottom_gutter)
+    lxb_dom_node_t **first_row, int *top_gutter, int *bottom_gutter)
 {
     if (!table_style->table_border_collapse) return false;
     int first_width[17] = {0};
@@ -455,7 +575,6 @@ static bool table_collapsed_boundaries(
             if (first_row != NULL) *first_row = row.node;
             if (top_gutter != NULL) *top_gutter = row_top;
         }
-        if (last_row != NULL) *last_row = row.node;
         if (bottom_gutter != NULL) *bottom_gutter = row_bottom;
         measured_rows++;
     }
@@ -476,7 +595,8 @@ static size_t table_row_cache_home(lxb_dom_node_t *row, int available_width)
 
 static bool table_row_cache_get(LayoutContext *context, lxb_dom_node_t *row,
                                 int available_width, int preferred[16],
-                                int minimum[16], size_t *column_count)
+                                int minimum[16], TableColumnFloors *floors,
+                                size_t *column_count)
 {
     if (context->reuse == NULL || context->container_live) return false;
     if (context->reuse->table_rows == NULL) {
@@ -492,6 +612,12 @@ static bool table_row_cache_get(LayoutContext *context, lxb_dom_node_t *row,
             && entry->available_width == available_width) {
             memcpy(preferred, entry->preferred, sizeof(entry->preferred));
             memcpy(minimum, entry->minimum, sizeof(entry->minimum));
+            memcpy(floors->percent, entry->percent, sizeof(entry->percent));
+            floors->seen = entry->seen;
+            floors->constrained = entry->constrained;
+            floors->percent_columns = entry->percent_columns;
+            floors->span_count = entry->span_count;
+            memcpy(floors->spans, entry->spans, sizeof(entry->spans));
             *column_count = entry->count;
             entry->stamp = ++context->reuse->clock;
             context->reuse->stats.table_row_hits++;
@@ -505,7 +631,9 @@ static bool table_row_cache_get(LayoutContext *context, lxb_dom_node_t *row,
 static void table_row_cache_put(LayoutContext *context, lxb_dom_node_t *row,
                                 int available_width,
                                 const int preferred[16],
-                                const int minimum[16], size_t column_count)
+                                const int minimum[16],
+                                const TableColumnFloors *floors,
+                                size_t column_count)
 {
     if (context->reuse == NULL) return;
     if (context->reuse->table_rows == NULL) {
@@ -526,7 +654,11 @@ static void table_row_cache_put(LayoutContext *context, lxb_dom_node_t *row,
                       & (LAYOUT_REUSE_TABLE_ROW_CAPACITY - 1u);
         LayoutReuseTableRowEntry *entry =
             &context->reuse->table_rows[slot];
-        if (entry->row == NULL || entry->row == row) {
+        /* A row measured at two widths (an auto-width table's own width,
+           then its columns) keeps an entry for each. */
+        if (entry->row == NULL
+            || (entry->row == row
+                && entry->available_width == available_width)) {
             replacement = slot;
             break;
         }
@@ -541,23 +673,33 @@ static void table_row_cache_put(LayoutContext *context, lxb_dom_node_t *row,
         .row = row,
         .available_width = available_width,
         .count = column_count,
+        .seen = floors->seen,
+        .constrained = floors->constrained,
+        .percent_columns = floors->percent_columns,
+        .span_count = floors->span_count,
         .stamp = ++context->reuse->clock
     };
+    memcpy(entry->spans, floors->spans, sizeof(entry->spans));
     memcpy(entry->preferred, preferred, sizeof(entry->preferred));
     memcpy(entry->minimum, minimum, sizeof(entry->minimum));
+    memcpy(entry->percent, floors->percent, sizeof(entry->percent));
 }
 
 static void table_merge_row(const int row_preferred[16],
                             const int row_minimum[16],
+                            const TableColumnFloors *row_floors,
                             size_t row_column_count, int preferred[16],
-                            int minimum[16], size_t *column_count)
+                            int minimum[16], TableColumnFloors *floors,
+                            size_t *column_count)
 {
     if (row_column_count > 16) row_column_count = 16;
     for (size_t i = 0; i < row_column_count; i++) {
-        if (row_preferred[i] > preferred[i]) {
-            preferred[i] = row_preferred[i];
-        }
-        if (row_minimum[i] > minimum[i]) minimum[i] = row_minimum[i];
+        if (((row_floors->seen >> i) & 1u) == 0) continue;
+        table_column_encompass(
+            preferred, minimum, floors, i, row_minimum[i], row_preferred[i],
+            ((row_floors->constrained >> i) & 1u) != 0,
+            ((row_floors->percent_columns >> i) & 1u) != 0,
+            row_floors->percent[i]);
     }
     if (row_column_count > *column_count) {
         *column_count = row_column_count;
@@ -582,29 +724,38 @@ static size_t table_bounded_span_attribute(
 static void table_apply_column_constraint(
     LayoutContext *context, ComputedStyle *style, int available_width,
     size_t column, size_t span, int preferred[16], int minimum[16],
-    size_t *column_count)
+    TableColumnFloors *floors, size_t *column_count)
 {
     if (column >= 16) return;
     if (span > 16 - column) span = 16 - column;
     if (column + span > *column_count) *column_count = column + span;
     if (!style->has_width || style->width_max_content) return;
-    int authored = resolve_declared_length(
+    uint16_t points = 0;
+    bool percent = floors != NULL
+                   && table_width_points(context->sheet, style, &points);
+    int width = percent ? 0 : resolve_declared_length(
         context->sheet, style->width, style->width_percent, available_width);
-    if (authored < 0) authored = 0;
-    int previous = 0;
+    if (width < 0) width = 0;
+    /* A col (or colgroup) that spans columns gives each of them its
+       width, as HTML's column model and Chromium do. */
     for (size_t i = 0; i < span; i++) {
-        int next = tilefinch_mul_div_int(authored, (int) i + 1, (int) span);
-        int width = next - previous;
+        if (floors != NULL) {
+            /* A col's width constrains the column's maximum, not its
+               minimum. */
+            table_column_encompass(preferred, minimum, floors, column + i,
+                                   0, width, !percent, percent, points);
+            continue;
+        }
         if (width > preferred[column + i]) preferred[column + i] = width;
         if (width > minimum[column + i]) minimum[column + i] = width;
-        previous = next;
     }
 }
 
 static void table_measure_columns(
     LayoutContext *context, lxb_dom_node_t *table,
     const ComputedStyle *table_style, int available_width,
-    int preferred[16], int minimum[16], size_t *column_count)
+    int preferred[16], int minimum[16], TableColumnFloors *floors,
+    size_t *column_count)
 {
     size_t column = 0;
     for (lxb_dom_node_t *child = table->first_child;
@@ -619,11 +770,12 @@ static void table_measure_columns(
             size_t span = table_bounded_span_attribute(child, "span");
             table_apply_column_constraint(
                 context, &group_style, available_width, column, span,
-                preferred, minimum, column_count);
+                preferred, minimum, floors, column_count);
             column += span;
             continue;
         }
-        size_t group_start = column;
+        /* A colgroup's width is the width of each of its columns that
+           has none of its own. */
         bool have_columns = false;
         for (lxb_dom_node_t *col = child->first_child;
              col != NULL && column < 16; col = col->next) {
@@ -634,24 +786,129 @@ static void table_measure_columns(
             ComputedStyle col_style = layout_style_for_node(
                 context, col, &group_style);
             table_apply_column_constraint(
-                context, &col_style, available_width, column, span,
-                preferred, minimum, column_count);
+                context, col_style.has_width ? &col_style : &group_style,
+                available_width, column, span, preferred, minimum, floors,
+                column_count);
             column += span;
         }
         if (!have_columns) {
-            column += table_bounded_span_attribute(child, "span");
-            if (column > 16) column = 16;
+            size_t span = table_bounded_span_attribute(child, "span");
+            table_apply_column_constraint(
+                context, &group_style, available_width, column, span,
+                preferred, minimum, floors, column_count);
+            column += span;
         }
-        table_apply_column_constraint(
-            context, &group_style, available_width, group_start,
-            column - group_start, preferred, minimum, column_count);
+    }
+}
+
+static void table_distribute(const int minimum[16], const int maximum[16],
+                             const TableColumnFloors *floors, size_t count,
+                             int target, int widths[16], bool *squeezed);
+
+/* A table's spanning cells, one per column and span with the largest
+   minimum and maximum; cells past the limit split evenly. */
+#define TABLE_SPAN_CELL_LIMIT 16u
+
+static void table_note_span(TableSpanCell spans[TABLE_SPAN_CELL_LIMIT],
+                            size_t *count, const TableSpanCell *cell,
+                            int preferred[16], int minimum[16],
+                            TableColumnFloors *floors)
+{
+    for (size_t i = 0; i < *count; i++) {
+        TableSpanCell *same = &spans[i];
+        if (same->column != cell->column || same->span != cell->span) {
+            continue;
+        }
+        if (cell->minimum > same->minimum) same->minimum = cell->minimum;
+        if (cell->maximum > same->maximum) same->maximum = cell->maximum;
+        if (cell->points > same->points) same->points = cell->points;
+        return;
+    }
+    if (*count < TABLE_SPAN_CELL_LIMIT) {
+        /* Keep equal-length spans in column order when they are spread.
+           An overlapping span sees the widths left by earlier spans. */
+        size_t i = *count;
+        for (; i > 0 && spans[i - 1].column > cell->column; i--) {
+            spans[i] = spans[i - 1];
+        }
+        spans[i] = *cell;
+        (*count)++;
+        return;
+    }
+    table_span_even(preferred, minimum, floors, cell->column, cell->span,
+                    cell->minimum, cell->maximum, false, cell->points != 0,
+                    cell->points);
+}
+
+/* Spanning cells after the single-column ones, as in Chromium: smallest
+   span first, ties by starting column. Each cell's minimum and then its
+   maximum spread over its columns by the guesses table_distribute makes
+   for a whole table, which raise the columns' minimums and maximums.
+   A 200px cell over 60px and
+   100px columns makes them 75 and 125; a 100px cell over 30px and 300px
+   columns leaves them. A percentage cell first gives the part of its
+   percentage its percentage columns do not hold to its other columns, in
+   proportion to their maximums, which makes them percentage columns. */
+static void table_distribute_spans(const TableSpanCell *spans, size_t count,
+                                   int preferred[16], int minimum[16],
+                                   TableColumnFloors *floors)
+{
+    for (size_t length = 1; length <= 16; length++) {
+        for (size_t s = 0; s < count; s++) {
+            if (spans[s].span != length) continue;
+            size_t start = spans[s].column;
+            int *low = minimum + start, *high = preferred + start;
+            int surplus = spans[s].points;
+            long long others = 0;
+            int free_columns = 0;
+            for (size_t i = 0; i < length; i++) {
+                if ((floors->percent_columns >> (start + i)) & 1u) {
+                    surplus -= floors->percent[start + i];
+                } else {
+                    others += high[i];
+                    free_columns++;
+                }
+            }
+            for (size_t i = 0; surplus > 0 && i < length; i++) {
+                uint16_t bit = (uint16_t) (1u << (start + i));
+                if (floors->percent_columns & bit) continue;
+                floors->percent[start + i] = (uint16_t) (others > 0
+                    ? surplus * (long long) high[i] / others
+                    : surplus / free_columns);
+                floors->percent_columns |= bit;
+            }
+            /* Only the spanned columns' marks: a fixed or percentage
+               column past the span would take the room. */
+            unsigned mask = (1u << length) - 1u;
+            TableColumnFloors part = {
+                .constrained =
+                    (uint16_t) ((floors->constrained >> start) & mask),
+                .percent_columns =
+                    (uint16_t) ((floors->percent_columns >> start) & mask)
+            };
+            memcpy(part.percent, floors->percent + start,
+                   length * sizeof(part.percent[0]));
+            int widths[16];
+            bool squeezed;
+            /* The widths never fall below the minimums, so the first
+               spread writes the new minimums in place. */
+            table_distribute(low, high, &part, length, spans[s].minimum,
+                             low, &squeezed);
+            table_distribute(low, high, &part, length, spans[s].maximum,
+                             widths, &squeezed);
+            for (size_t i = 0; i < length; i++) {
+                if (widths[i] > high[i]) high[i] = widths[i];
+            }
+            floors->seen |= (uint16_t) (mask << start);
+        }
     }
 }
 
 static bool table_measure_rows(LayoutContext *context, lxb_dom_node_t *table,
                                const ComputedStyle *table_style,
                                int available_width, int preferred[16],
-                               int minimum[16], size_t *column_count,
+                               int minimum[16], TableColumnFloors *floors,
+                               size_t *column_count,
                                bool collapsed_geometry,
                                const TableCellPlacement *placements,
                                size_t placement_count, bool has_row_spans)
@@ -666,6 +923,11 @@ static bool table_measure_rows(LayoutContext *context, lxb_dom_node_t *table,
     FlatItemIterator rows;
     FlatItem row;
     size_t measured_rows = 0;
+    TableSpanCell spans[TABLE_SPAN_CELL_LIMIT];
+    size_t span_count = 0;
+    /* Rows measure (and the row cache keeps) the spans their cells give
+       them; the table's columns (table_build_placements) cut them. */
+    size_t limit = *column_count;
     flat_iterator_init(&rows, context, table, table_style);
     while (flat_iterator_next(&rows, &row)) {
         if (row.anonymous_text
@@ -678,25 +940,55 @@ static bool table_measure_rows(LayoutContext *context, lxb_dom_node_t *table,
         if (!layout_cooperate(context, row.node)) return false;
         int row_preferred[16] = {0};
         int row_minimum[16] = {0};
+        TableColumnFloors row_floors = {0};
         size_t row_column_count = 0;
         if (has_row_spans || !table_row_cache_get(
                 context, row.node, available_width, row_preferred,
-                row_minimum, &row_column_count)) {
+                row_minimum, &row_floors, &row_column_count)) {
             table_measure_row(
                 context, row.node, &row.parent_style, available_width,
                 collapsed_geometry, spacing_x, placements, placement_count,
-                row_preferred, row_minimum, &row_column_count);
+                row_preferred, row_minimum, &row_floors, &row_column_count);
             if (context->cancelled) return false;
             if (!has_row_spans) {
                 table_row_cache_put(
                     context, row.node, available_width, row_preferred,
-                    row_minimum, row_column_count);
+                    row_minimum, &row_floors, row_column_count);
             }
         }
+        if (row_column_count > limit) row_column_count = limit;
         table_merge_row(
-            row_preferred, row_minimum, row_column_count, preferred,
-            minimum, column_count);
+            row_preferred, row_minimum, &row_floors, row_column_count,
+            preferred, minimum, floors, column_count);
+        for (size_t i = 0; i < row_floors.span_count; i++) {
+            TableSpanCell cell = row_floors.spans[i];
+            if (cell.column >= limit) continue;
+            if (cell.span > limit - cell.column) {
+                cell.span = (uint8_t) (limit - cell.column);
+            }
+            int internal = (int) spacing_x * (cell.span - 1);
+            cell.minimum = cell.minimum > internal
+                ? cell.minimum - internal : 0;
+            cell.maximum = cell.maximum > internal
+                ? cell.maximum - internal : 0;
+            table_note_span(spans, &span_count, &cell, preferred, minimum,
+                            floors);
+        }
         measured_rows++;
+    }
+    table_distribute_spans(spans, span_count, preferred, minimum, floors);
+    /* Every column a cell starts in is at least 8 wide, but an empty cell
+       weighs nothing when a spanning cell is spread, as in Chromium. A
+       column no cell starts in (one a <col> or a span makes) keeps only
+       what its col or spanning cells give it, which Chromium gives no
+       width. */
+    unsigned starts = 0;
+    for (size_t i = 0; i < placement_count; i++) {
+        starts |= 1u << placements[i].column;
+    }
+    for (size_t i = 0; i < *column_count; i++) {
+        if (((starts >> i) & 1u) && minimum[i] < 8) minimum[i] = 8;
+        if (preferred[i] < minimum[i]) preferred[i] = minimum[i];
     }
     return true;
 }
@@ -749,6 +1041,10 @@ static void table_measure_anonymous_row(
     *column_count = cells;
 }
 
+static long long table_grid_maximum(const int preferred[16],
+                                    const TableColumnFloors *floors,
+                                    size_t count, int available);
+
 int table_intrinsic_width(LayoutContext *context, lxb_dom_node_t *table,
                           const ComputedStyle *table_style,
                           int available_width)
@@ -757,6 +1053,7 @@ int table_intrinsic_width(LayoutContext *context, lxb_dom_node_t *table,
         || available_width <= 0) return 0;
     int preferred[16] = {0};
     int minimum[16] = {0};
+    TableColumnFloors floors = {0};
     int boundaries[17] = {0};
     size_t count = 0;
     TableCellPlacement *placements = NULL;
@@ -769,16 +1066,16 @@ int table_intrinsic_width(LayoutContext *context, lxb_dom_node_t *table,
     }
     table_measure_columns(
         context, table, table_style, available_width,
-        preferred, minimum, &count);
+        preferred, minimum, &floors, &count);
     bool collapsed_geometry = table_collapsed_boundaries(
         context, table, table_style, boundaries, placements, placement_count,
-        NULL, NULL, NULL, NULL);
+        NULL, NULL, NULL);
     if (context->cancelled) {
         budget_free(context->layout->budget, placements);
         return 0;
     }
     if (!table_measure_rows(context, table, table_style, available_width,
-                            preferred, minimum, &count,
+                            preferred, minimum, &floors, &count,
                             collapsed_geometry, placements, placement_count,
                             has_row_spans)) {
         budget_free(context->layout->budget, placements);
@@ -806,9 +1103,10 @@ int table_intrinsic_width(LayoutContext *context, lxb_dom_node_t *table,
                 width, (int) paint->table_spacing_x * ((int) count + 1));
         }
     }
-    for (size_t i = 0; i < count; i++) {
-        width = layout_add_coordinate(width, preferred[i]);
-    }
+    long long grid = table_grid_maximum(preferred, &floors, count,
+                                        available_width);
+    width = layout_add_coordinate(
+        width, grid > INT_MAX ? INT_MAX : (int) grid);
     for (lxb_dom_node_t *child = table->first_child; child != NULL;
          child = child->next) {
         if (child->type != LXB_DOM_NODE_TYPE_ELEMENT
@@ -831,7 +1129,7 @@ static bool table_fixed_first_row_tracks(
     size_t column_constraints = 0;
     table_measure_columns(
         context, table, table_style, available_width,
-        column_preferred, column_minimum, &column_constraints);
+        column_preferred, column_minimum, NULL, &column_constraints);
     FlatItemIterator rows;
     FlatItem row;
     flat_iterator_init(&rows, context, table, table_style);
@@ -927,6 +1225,185 @@ static bool table_fixed_first_row_tracks(
     return false;
 }
 
+/* Spread `room` over `count` columns in proportion to `weight` (cumulative,
+   so the parts sum to `room`), adding each part to `widths`. */
+static void table_spread(int room, const long long weight[16], size_t count,
+                         int widths[16])
+{
+    long long total = 0;
+    for (size_t i = 0; i < count; i++) total += weight[i];
+    if (room <= 0 || total <= 0) return;
+    /* Weights can each approach INT_MAX; keep room * seen in range. */
+    int shift = 0;
+    while ((total >> shift) > INT_MAX) shift++;
+    total = 0;
+    for (size_t i = 0; i < count; i++) total += weight[i] >> shift;
+    if (total <= 0) return;
+    long long seen = 0;
+    int given = 0;
+    for (size_t i = 0; i < count; i++) {
+        seen += weight[i] >> shift;
+        int part = (int) ((long long) room * seen / total);
+        widths[i] = layout_add_coordinate(widths[i], part - given);
+        given = part;
+    }
+}
+
+/* Column percentages cut at 100% in column order (Chromium): a column
+   whose percentage would take the grid past 100% keeps only what is left,
+   down to none, and stays a percentage column. Returns the points left. */
+static int table_column_points(const TableColumnFloors *floors,
+                               size_t count, int points[16])
+{
+    int left = 10000;
+    for (size_t i = 0; i < count; i++) {
+        points[i] = 0;
+        if (((floors->percent_columns >> i) & 1u) == 0) continue;
+        int kept = floors->percent[i] < left ? floors->percent[i] : left;
+        points[i] = kept;
+        left -= kept;
+    }
+    return left;
+}
+
+/* The grid's maximum width for an auto-width table: the columns'
+   maximums, widened so each percentage column can have its percentage at
+   its maximum and the other columns the rest at theirs (CSS Tables 3 and
+   Chromium). Percentages that leave the other columns nothing fill
+   `available`. */
+static long long table_grid_maximum(const int preferred[16],
+                                    const TableColumnFloors *floors,
+                                    size_t count, int available)
+{
+    int points[16];
+    int left = table_column_points(floors, count, points);
+    long long total = 0;
+    long long others = 0;
+    long long estimate = 0;
+    for (size_t i = 0; i < count; i++) {
+        total += preferred[i];
+        if (((floors->percent_columns >> i) & 1u) == 0) {
+            others += preferred[i];
+        } else if (points[i] > 0) {
+            long long needed = (long long) preferred[i] * 10000 / points[i];
+            if (needed > estimate) estimate = needed;
+        }
+    }
+    if (floors->percent_columns != 0 && others > 0) {
+        long long needed = left > 0 ? others * 10000 / left
+                                    : (long long) available;
+        if (needed > estimate) estimate = needed;
+    }
+    return estimate > total ? estimate : total;
+}
+
+/* Spread `room` over the columns of `group` in proportion to `weight`, or
+   evenly when no column of the group has weight. */
+static void table_spread_group(int room, const long long weight[16],
+                               uint16_t group, size_t count, int widths[16])
+{
+    long long part[16] = {0};
+    long long total = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (((group >> i) & 1u) == 0) continue;
+        part[i] = weight[i] > 0 ? weight[i] : 0;
+        total += part[i];
+    }
+    if (total == 0) {
+        for (size_t i = 0; i < count; i++) part[i] = (group >> i) & 1u;
+    }
+    table_spread(room, part, count, widths);
+}
+
+/* CSS Tables 3 width distribution for an auto-layout table, as Chromium
+   implements it. Every column has a content minimum and a maximum (a fixed
+   column's width, else its max-content). Four guesses grow from all
+   minimums: percentage columns to their percentage of the grid, then fixed
+   columns to their widths, then auto columns to their max-content. The
+   grid's width falls between two guesses, and the columns that grow in
+   that step share the room in proportion to what each still asks for.
+   Past every maximum, the auto columns take the rest in proportion to
+   their maximums, else the fixed columns, else the percentage columns by
+   percentage. A grid narrower than every minimum overflows at them.
+   `squeezed` is set when fixed columns end below their widths. */
+static void table_distribute(const int minimum[16], const int maximum[16],
+                             const TableColumnFloors *floors, size_t count,
+                             int target, int widths[16], bool *squeezed)
+{
+    int points[16];
+    (void) table_column_points(floors, count, points);
+    uint16_t percent = floors->percent_columns;
+    uint16_t fixed = (uint16_t) (floors->constrained & ~percent);
+    uint16_t automatic = 0;
+    long long guess_minimum = 0, guess_percent = 0, guess_specified = 0;
+    long long guess_maximum = 0;
+    int percent_width[16] = {0};
+    long long percent_weight[16] = {0}, grow_weight[16] = {0};
+    long long max_weight[16] = {0}, point_weight[16] = {0};
+    for (size_t i = 0; i < count; i++) {
+        uint16_t bit = (uint16_t) (1u << i);
+        int low = minimum[i];
+        int high = maximum[i] > low ? maximum[i] : low;
+        widths[i] = low;
+        guess_minimum += low;
+        max_weight[i] = high;
+        if (percent & bit) {
+            int wanted = tilefinch_mul_div_int(target, points[i], 10000);
+            percent_width[i] = wanted > low ? wanted : low;
+            percent_weight[i] = percent_width[i] - low;
+            point_weight[i] = points[i];
+            guess_percent += percent_width[i];
+            guess_specified += percent_width[i];
+            guess_maximum += percent_width[i];
+        } else if (fixed & bit) {
+            grow_weight[i] = high - low;
+            guess_percent += low;
+            guess_specified += high;
+            guess_maximum += high;
+        } else {
+            automatic |= bit;
+            grow_weight[i] = high - low;
+            guess_percent += low;
+            guess_specified += low;
+            guess_maximum += high;
+        }
+    }
+    *squeezed = target < guess_specified;
+    if (target <= guess_minimum) return;
+    if (target <= guess_percent) {
+        table_spread_group((int) (target - guess_minimum), percent_weight,
+                           percent, count, widths);
+        return;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if ((percent >> i) & 1u) widths[i] = percent_width[i];
+    }
+    if (target <= guess_specified) {
+        table_spread_group((int) (target - guess_percent), grow_weight,
+                           fixed, count, widths);
+        return;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if ((fixed >> i) & 1u) widths[i] = (int) max_weight[i];
+    }
+    if (target <= guess_maximum) {
+        table_spread_group((int) (target - guess_specified), grow_weight,
+                           automatic, count, widths);
+        return;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if ((automatic >> i) & 1u) widths[i] = (int) max_weight[i];
+    }
+    int room = (int) (target - guess_maximum);
+    if (automatic != 0) {
+        table_spread_group(room, max_weight, automatic, count, widths);
+    } else if (fixed != 0) {
+        table_spread_group(room, max_weight, fixed, count, widths);
+    } else {
+        table_spread_group(room, point_weight, percent, count, widths);
+    }
+}
+
 /* A slot for `table`'s tracks: a free one, else the least recently used
    slot whose table does not enclose `table`. Slots of enclosing tables are
    still in use by their rows, so they are never taken; NULL when every slot
@@ -980,6 +1457,7 @@ const TableTracks *table_tracks_for_table(
     if (tracks == NULL) return NULL;
     int preferred[16] = {0};
     int minimum[16] = {0};
+    TableColumnFloors floors = {0};
     int boundaries[17] = {0};
     size_t count = 0;
     bool has_row_spans = false;
@@ -1004,19 +1482,18 @@ const TableTracks *table_tracks_for_table(
     tracks->has_row_spans = has_row_spans;
     table_measure_columns(
         context, table, table_style, available_width,
-        preferred, minimum, &count);
-    lxb_dom_node_t *first_row = NULL, *last_row = NULL;
+        preferred, minimum, &floors, &count);
+    lxb_dom_node_t *first_row = NULL;
     int top_gutter = 0, bottom_gutter = 0;
     bool collapsed_geometry = table_collapsed_boundaries(
         context, table, table_style, boundaries, tracks->placements,
-        tracks->placement_count, &first_row, &last_row,
-        &top_gutter, &bottom_gutter);
+        tracks->placement_count, &first_row, &top_gutter, &bottom_gutter);
     if (context->cancelled) {
         table_tracks_release(context, tracks);
         return NULL;
     }
     if (!table_measure_rows(context, table, table_style, available_width,
-                            preferred, minimum, &count,
+                            preferred, minimum, &floors, &count,
                             collapsed_geometry, tracks->placements,
                             tracks->placement_count, has_row_spans)) {
         table_tracks_release(context, tracks);
@@ -1032,7 +1509,6 @@ const TableTracks *table_tracks_for_table(
     tracks->collapsed_right_gutter =
         collapsed_geometry ? boundaries[count] : 0;
     tracks->first_row = first_row;
-    tracks->last_row = last_row;
     tracks->collapsed_top_gutter =
         collapsed_geometry ? top_gutter : 0;
     tracks->collapsed_bottom_gutter =
@@ -1048,76 +1524,16 @@ const TableTracks *table_tracks_for_table(
                context, table, table_style, grid_available, tracks)) {
         return tracks;
     }
-    /* Column minimums can each approach INT_MAX (a percentage width of a
-       huge measured cell), so their sum is kept wide. */
-    long long reserved = 0;
-    for (size_t i = 0; i < count; i++) {
-        if (minimum[i] < 8) minimum[i] = 8;
-        if (preferred[i] < minimum[i]) preferred[i] = minimum[i];
-        reserved += minimum[i];
-    }
-    int distributable = grid_available > reserved
-                        ? (int) (grid_available - reserved) : 0;
-    long long weight_total = 0;
-    for (size_t i = 0; i < count; i++) {
-        int weight = preferred[i] > minimum[i]
-                     ? preferred[i] - minimum[i] : 1;
-        weight_total += weight;
-    }
-    long long weight_seen = 0;
-    int pixels_seen = 0;
-    for (size_t i = 0; i < count; i++) {
-        int weight = preferred[i] > minimum[i]
-                     ? preferred[i] - minimum[i] : 1;
-        weight_seen += weight;
-        int pixels = 0;
-        if (weight_total > 0) {
-            pixels = weight_total <= INT_MAX && weight_seen <= INT_MAX
-                ? tilefinch_mul_div_int(
-                      distributable, (int) weight_seen,
-                      (int) weight_total)
-                : (int) ((long long) distributable * weight_seen
-                         / weight_total);
-        }
-        tracks->widths[i] = minimum[i] + pixels - pixels_seen;
-        pixels_seen = pixels;
-    }
+    table_distribute(minimum, preferred, &floors, count, grid_available,
+                     tracks->widths, &tracks->squeezed);
     return tracks;
 }
 
-static lxb_dom_node_t *table_ancestor(const lxb_dom_node_t *node)
-{
-    lxb_dom_node_t *table = node == NULL ? NULL : node->parent;
-    while (table != NULL && !document_node_is_tag(table, LXB_TAG_TABLE)) {
-        table = table->parent;
-    }
-    return table;
-}
-
-const TableTracks *table_tracks_for_row(
-    LayoutContext *context, lxb_dom_node_t *row, int available_width)
-{
-    lxb_dom_node_t *table = table_ancestor(row);
-    if (table == NULL) return NULL;
-    for (size_t i = 0; i < context->table_track_count; i++) {
-        if (context->table_tracks[i].table == table
-            && context->table_tracks[i].available_width == available_width) {
-            context->table_tracks[i].last_use = ++context->table_track_clock;
-            return &context->table_tracks[i];
-        }
-    }
-    return NULL;
-}
-
-/* The first track set of the cell's table, or NULL. */
 static const TableTracks *table_tracks_for_cell(
     const LayoutContext *context, const lxb_dom_node_t *cell)
 {
-    lxb_dom_node_t *table = context == NULL ? NULL : table_ancestor(cell);
-    for (size_t i = 0; table != NULL && i < context->table_track_count; i++) {
-        if (context->table_tracks[i].table == table) return &context->table_tracks[i];
-    }
-    return NULL;
+    return context && cell && cell->parent == context->placing_table_row
+        ? context->placing_row_tracks : NULL;
 }
 
 bool table_cell_uses_collapsed_geometry(

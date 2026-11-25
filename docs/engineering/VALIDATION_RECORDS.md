@@ -994,10 +994,12 @@ any `.gcda` a run wrote into `run-N/pgo/`.
 `scripts/train-quickjs-pgo.sh BUILD OUT_DIR perf/traces [--bench-weight W]`
 replays the `chatgpt-ask` scenario (and optionally the js-bench kernels, merged at weight
 W with `psp-gcov-tool`) and writes `OUT_DIR` with a `PROVENANCE` file
-holding the engine build's fingerprint (sources, headers, compiler, flags);
+holding the engine build's fingerprint (sources, headers, compiler, flags)
+and its source directory;
 `-DPSP_BROWSER_QUICKJS_PGO_USE=OUT_DIR` builds with it and refuses a profile
-trained on any other engine build. Training runs under PPSSPP only, never
-on a device. PPSSPP replays the journey deterministically: the same build
+trained on any other engine build or from another checkout path
+([Release process](../RELEASE_PROCESS.md), step 2). Training runs under
+PPSSPP only, never on a device. PPSSPP replays the journey deterministically: the same build
 and trace give identical counters, and the PGO build is byte-identical.
 
 ## Thread CPU from page script

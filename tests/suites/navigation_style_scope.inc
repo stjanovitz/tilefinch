@@ -288,7 +288,39 @@ static bool test_style_scope_matches_cold_cache(void)
         "globalThis.ra=a.attachShadow({mode:'open'});ra.innerHTML='<slot></slot>';"
         "ra.adoptedStyleSheets=[s];"
         STYLE_SCOPE_TARGETS("") "</script>";
+    /* Components that keep a <style> in each instance's root (no adopted
+       sheets): the custom rule index groups those rules by tree, so a
+       change to one tree's rules or classes must still reach exactly the
+       elements the full cascade gives it. */
+    static const char shadow_style_setup[] =
+        "<style>.warm{--tone:rgb(9,9,0)}</style>" STYLE_SCOPE_HELD "<script>"
+        "for(const id of ['o1','o2','a','al','alb','b','bl','blb','o3'])"
+        "globalThis[id]=document.getElementById(id);"
+        "const css='<style>:host{--tone:rgb(7,0,0)}.in{color:var(--tone)}"
+        "::slotted(span){--tone:rgb(0,7,0)}.hot{--tone:rgb(0,9,0)}</style>';"
+        "globalThis.ra=a.attachShadow({mode:'open'});"
+        "ra.innerHTML=css+'<slot></slot><div class=in id=ain>x</div>';"
+        "globalThis.rb=b.attachShadow({mode:'open'});"
+        "rb.innerHTML=css+'<slot></slot><div class=in id=bin>y</div>';"
+        STYLE_SCOPE_TARGETS(",ra.getElementById('ain'),"
+                            "rb.getElementById('bin')") "</script>";
     const StyleScopeCase cases[] = {
+        {"a shadow tree gains a <style> declaring a custom property",
+         shadow_style_setup,
+         "const st=document.createElement('style');"
+         "st.textContent='.in{--tone:rgb(0,0,9)}';rb.appendChild(st)",
+         "rgb(0, 0, 9)", false},
+        {"a shadow tree's <style> is removed", shadow_style_setup,
+         "rb.querySelector('style').remove()", NULL, false},
+        {"a shadow tree's <style> text changes", shadow_style_setup,
+         "rb.querySelector('style').textContent="
+         "':host{--tone:rgb(0,0,8)}.in{color:var(--tone)}'",
+         "rgb(0, 0, 8)", false},
+        {"a class inside one shadow tree changes", shadow_style_setup,
+         "rb.getElementById('bin').className='in hot'", "rgb(0, 9, 0)",
+         false},
+        {"a host's class changes", shadow_style_setup,
+         "b.className='warm'", "rgb(9, 9, 0)", false},
         /* archive.org's results grid: a component upgrades an element the
            page already read, attaching a shadow root that adopts the
            component's held sheet. */

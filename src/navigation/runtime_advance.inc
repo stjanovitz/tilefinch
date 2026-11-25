@@ -1,5 +1,5 @@
-/* Blank-page recovery, the per-frame runtime advance, and
-   script-initiated navigation. */
+/* The blank-layout predicate, memory rescue, the per-frame runtime advance,
+   and script-initiated navigation. */
 
 bool navigation_layout_is_visually_blank(
     const LayoutDocument *layout)
@@ -36,154 +36,6 @@ bool navigation_layout_is_visually_blank(
     return true;
 }
 
-static bool navigation_recovery_semantic_element(lxb_dom_node_t *node)
-{
-    return node_name_is(node, "main") || node_name_is(node, "article")
-        || node_name_is(node, "section") || node_name_is(node, "p")
-        || node_name_is(node, "li") || node_name_is(node, "blockquote")
-        || node_name_is(node, "pre") || node_name_is(node, "table")
-        || node_name_is(node, "details") || node_name_is(node, "h1")
-        || node_name_is(node, "h2") || node_name_is(node, "h3")
-        || node_name_is(node, "h4") || node_name_is(node, "h5")
-        || node_name_is(node, "h6");
-}
-
-static bool navigation_recovery_excluded_element(lxb_dom_node_t *node)
-{
-    if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT)
-        return false;
-    size_t length = 0;
-    const char *aria_hidden = document_attribute(
-        node, "aria-hidden", &length);
-    return node_name_is(node, "script") || node_name_is(node, "style")
-        || node_name_is(node, "template") || node_name_is(node, "noscript")
-        || node_name_is(node, "svg") || node_name_is(node, "dialog")
-        || node_name_is(node, "nav") || node_name_is(node, "aside")
-        || node_name_is(node, "footer") || node_name_is(node, "form")
-        || lxb_dom_element_has_attribute(
-               lxb_dom_interface_element(node),
-               (const lxb_char_t *) "hidden", 6u)
-        || lxb_dom_element_has_attribute(
-               lxb_dom_interface_element(node),
-               (const lxb_char_t *) "inert", 5u)
-        || (aria_hidden != NULL && length == 4u
-            && strncasecmp(aria_hidden, "true", 4u) == 0);
-}
-
-/* This is evidence for static recovery, not a visibility override. Count a
-   bounded amount of prose inside semantic content, excluding navigation,
-   forms, dialogs, and authored hidden/inert subtrees. The subsequent style
-   fallback remains responsible for its narrow, content-shaped reveal rules. */
-static bool navigation_document_has_bounded_retained_content(
-    PocDocument *document)
-{
-    lxb_dom_node_t *root = document_body_node(document);
-    if (root == NULL) return false;
-    enum { RETAINED_TEXT_SCAN_LIMIT = 8192 };
-    size_t text_bytes = 0, semantic_text_bytes = 0, inspected_bytes = 0;
-    lxb_dom_node_t *node = root->first_child;
-    for (size_t visited = 0; node != NULL && visited < 1024u; visited++) {
-        bool skip_children = false;
-        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
-            skip_children = navigation_recovery_excluded_element(node);
-        } else if (node->type == LXB_DOM_NODE_TYPE_TEXT) {
-            size_t length = 0;
-            const char *text = document_text_data(node, &length);
-            bool semantic = false;
-            lxb_dom_node_t *ancestor = node->parent;
-            for (size_t depth = 0;
-                 ancestor != NULL && ancestor != root && depth < 64u;
-                 depth++, ancestor = ancestor->parent) {
-                if (navigation_recovery_semantic_element(ancestor)) {
-                    semantic = true;
-                    break;
-                }
-            }
-            for (size_t at = 0; text != NULL && at < length
-                 && inspected_bytes < RETAINED_TEXT_SCAN_LIMIT; at++) {
-                inspected_bytes++;
-                if (isspace((unsigned char) text[at])) continue;
-                if (text_bytes != SIZE_MAX) text_bytes++;
-                if (semantic && semantic_text_bytes != SIZE_MAX)
-                    semantic_text_bytes++;
-                if (text_bytes >= 128u && semantic_text_bytes >= 96u)
-                    return true;
-                /* Plain server-rendered prose frequently uses only divs.
-                   Enough bounded non-whitespace text is useful recovery
-                   evidence even without an article/main/p ancestor. */
-                if (text_bytes >= 512u) return true;
-            }
-            if (inspected_bytes == RETAINED_TEXT_SCAN_LIMIT) return false;
-        }
-        if (!skip_children && node->first_child != NULL) {
-            node = node->first_child;
-            continue;
-        }
-        while (node != root && node->next == NULL) node = node->parent;
-        node = node == root ? NULL : node->next;
-    }
-    return false;
-}
-
-static bool navigation_blank_recovery_has_useful_content(
-    NavigationSession *session)
-{
-    if (session == NULL) return false;
-    bool retained = navigation_document_has_bounded_retained_content(
-        &session->page.document);
-    ReaderDocumentAnalysis analysis = session->page.reader_analysis;
-    if (analysis.prepared
-        && (analysis.bounded_out || analysis.extraction_truncated)) {
-        return false;
-    }
-    /* Avoid allocating a Reader clone on the ordinary complete-prose path:
-       this predicate runs inside the allocator-refusal recovery boundary,
-       where little memory is left. Conservatively decline documents beyond
-       the extractor's floor (whole-document nodes and body text against
-       what any extraction may emit), which holds however short memory is;
-       the frontend may still offer an explicit Reader attempt later. */
-    if (retained) {
-        if (session->page.document.node_count > READER_EXTRACT_NODE_FLOOR
-            || session->page.document.body_text_length
-                   > READER_EXTRACT_BYTE_FLOOR) {
-            return false;
-        }
-        return true;
-    }
-    /* A RAW analysis may have been cached before a late author mutation.
-       RAW installs no markers or clone, so it is safe to analyze the settled
-       document once more at this rare allocator-failure boundary. */
-    bool analyzed_for_recovery =
-        !analysis.prepared || analysis.kind == READER_PAGE_RAW;
-    if (analyzed_for_recovery) {
-        analysis = (ReaderDocumentAnalysis) {0};
-        if (!reader_document_prepare_complete_with_stylesheet(
-                &session->page.document, &session->page.stylesheet,
-                &analysis)) {
-            analysis = (ReaderDocumentAnalysis) {
-                .prepared = true,
-                .bounded_out = true
-            };
-        }
-        session->page.reader_analysis = analysis;
-    }
-    /* Realm retirement is permanent. A bounded prefix can establish useful
-       prose without proving that the uninspected tail is not a form or app
-       shell, so never make that irreversible transition from a truncated
-       extraction. Complete retained semantic text remains a valid fallback
-       even when its score is below Reader's ARTICLE threshold. */
-    if (analysis.bounded_out || analysis.extraction_truncated) {
-        if (analyzed_for_recovery) {
-            /* This strict preflight installed no tree. Leave explicit Reader
-               free to perform its separately permitted shortened extraction
-               later rather than caching analysis-only as presentation-ready. */
-            session->page.reader_analysis.prepared = false;
-        }
-        return false;
-    }
-    return analysis.kind != READER_PAGE_RAW;
-}
-
 /* A committed page whose realm was refused memory during this turn and
    whose body ended degraded (most of its text or every action gone): an app
    that ran out of memory tore the server-rendered page down. Put the body
@@ -204,7 +56,7 @@ static bool navigation_rescue_exhausted_page(NavigationSession *session,
         && navigation_restore_server_body_if_degraded(session, &rescue)) {
         session->page.script_degradation_observed = true;
         (void) navigation_relayout(session);
-        if (navigation_retire_exhausted_script_realms(session, true)) {
+        if (navigation_stop_script_realms_for_memory(session, true)) {
             session->page.script_memory_rescued = true;
             (void) navigation_relayout_static_fallback(session);
         }
@@ -227,11 +79,79 @@ size_t navigation_page_late_compile_memory_refusals(const NavigationPage *page)
     return total > at_commit ? total - at_commit : 0u;
 }
 
+/* The <noscript> image fallback (image_noscript_arm) waits for the page's
+   own script to fill its placeholders: this much page time after the load
+   event with no startup script still queued, and, since lazy loaders fill
+   what scrolls into view, the reader this long at one position before a
+   look takes fallbacks there. A page whose realm has stopped (or never ran)
+   fills nothing more, and waits for neither. */
+#define NAVIGATION_NOSCRIPT_SETTLE_MS 2000u
+#define NAVIGATION_NOSCRIPT_STILL_MS 1000u
+
+static void navigation_noscript_images_advance(NavigationSession *session,
+                                               unsigned elapsed_ms)
+{
+    NavigationPage *page = &session->page;
+    if (page->document.noscript_rendered
+        || !session->external_resources_enabled) return;
+    /* Every sheet built for the document copies it; this one may predate. */
+    if (page->document.noscript_images != NULL)
+        page->stylesheet.noscript_images = page->document.noscript_images;
+    const NavigationEntry *entry = navigation_current(session);
+    int scroll_y = entry == NULL ? 0 : entry->scroll_y;
+    if (scroll_y != page->noscript_scroll_y) {
+        page->noscript_scroll_y = scroll_y;
+        page->noscript_still_ms = 0;
+        page->noscript_ready = false;
+    }
+    bool realm = page->runtime != NULL;
+    if (realm && script_runtime_has_pending_startup_scripts(page->runtime))
+        page->noscript_settle_ms = 0;
+    else if (page->noscript_settle_ms < NAVIGATION_NOSCRIPT_SETTLE_MS)
+        page->noscript_settle_ms += elapsed_ms < NAVIGATION_NOSCRIPT_SETTLE_MS
+            ? elapsed_ms : NAVIGATION_NOSCRIPT_SETTLE_MS;
+    if (page->noscript_still_ms < NAVIGATION_NOSCRIPT_STILL_MS)
+        page->noscript_still_ms += elapsed_ms < NAVIGATION_NOSCRIPT_STILL_MS
+            ? elapsed_ms : NAVIGATION_NOSCRIPT_STILL_MS;
+    if (page->noscript_ready
+        || (realm && (page->noscript_settle_ms < NAVIGATION_NOSCRIPT_SETTLE_MS
+                      || page->noscript_still_ms
+                             < NAVIGATION_NOSCRIPT_STILL_MS))
+        || !image_noscript_arm(&page->document, &page->stylesheet)) return;
+    page->noscript_ready = true;
+    page->noscript_look = true;
+    page->noscript_look_only = !page->viewport_images_pending;
+    page->viewport_images_pending = true;
+    page->viewport_look_witness.valid = false;
+}
+
+/* A managed challenge frame (the signals of navigation_script_heap_limit)
+   needs most of the page Budget, while the parent's realm idles between its
+   messages and may hold megabytes of garbage its own automatic collection
+   has not reached. When under a quarter of the Budget is free, the page's
+   other realms give that garbage back before the frame runs. */
+static void navigation_collect_for_challenge_frame(
+    NavigationSession *session, const NavigationFrame *running)
+{
+    if (session->budget == NULL
+        || budget_remaining(session->budget) >= session->budget->limit / 4u
+        || (strcmp(session->last_cf_mitigated, "challenge") != 0
+            && !navigation_url_is_challenge_platform(running->url)))
+        return;
+    (void) script_runtime_collect_idle(session->page.runtime);
+    for (size_t i = 0; i < session->page.frame_count; i++) {
+        const NavigationFrame *other = &session->page.frames[i];
+        if (other != running && other->loaded)
+            (void) script_runtime_collect_idle(other->runtime);
+    }
+}
+
 bool navigation_advance_runtime(NavigationSession *session,
                                 unsigned elapsed_ms,
                                 size_t callback_budget)
 {
     if (session == NULL || !session->page.loaded) return false;
+    navigation_noscript_images_advance(session, elapsed_ms);
     /* A declarative refresh runs on the page clock whether or not the page
        has an author realm. A page-script navigation already requested wins
        the tick; a deferring owner takes the refresh itself. */
@@ -253,6 +173,14 @@ bool navigation_advance_runtime(NavigationSession *session,
        work to advance. Treat that as a successful idle tick so the browser
        shell, background resources, scrolling, and navigation remain live. */
     if (session->page.runtime == NULL) return true;
+    /* A refusal since the last boundary (an input listener, a frame message
+       the page received, a stylesheet event) is judged before the page runs
+       more script. */
+    if (navigation_assess_script_memory(session, "turn")
+            == NAVIGATION_SCRIPT_MEMORY_STOPPED) {
+        (void) navigation_relayout_static_fallback(session);
+        return true;
+    }
     uint64_t runtime_started = navigation_now_us();
     size_t heap_rejections_before = script_runtime_heap_rejections(
         session->page.runtime);
@@ -301,13 +229,7 @@ bool navigation_advance_runtime(NavigationSession *session,
     if (!advanced) {
         capture_cached_script_error(session,
                                     session->page.script_result.error);
-        /*
-         * Once the authoritative document is committed, a later author task
-         * exhausting its bounded realm must not take the browser shell or
-         * readable page down with it. Parser-time failures still fail closed
-         * because their DOM may be incomplete; this path is safe to degrade
-         * to the already-committed static document.
-         */
+        /* A page the refusal tore down gets its server body back. */
         if (navigation_rescue_exhausted_page(
                 session, heap_rejections_before)) {
             session->performance.runtime_us += navigation_record_slice(
@@ -315,17 +237,32 @@ bool navigation_advance_runtime(NavigationSession *session,
                 callback_budget);
             return true;
         }
-        if (navigation_retire_exhausted_script_realms(session, false)) {
-            /* Retirement enables the static-content cascade after the last
-               script-driven layout may already have hidden the page shell.
-               Rebuild immediately while the old layout is still retained;
-               a refused rebuild leaves that committed layout usable. */
-            (void) navigation_relayout_static_fallback(session);
-            session->performance.runtime_us += navigation_record_slice(
-                session, NAVIGATION_SLICE_RUNTIME, runtime_started,
-                callback_budget);
-            return true;
-        }
+    }
+    /*
+     * Once the authoritative document is committed, a later author task
+     * exhausting its bounded realm must not take the browser shell or
+     * readable page down with it: the realm stops and the committed static
+     * document stays. Whether the turn failed does not enter into it.
+     */
+    NavigationScriptMemoryVerdict memory =
+        navigation_assess_script_memory(session, "advance");
+    if (memory == NAVIGATION_SCRIPT_MEMORY_STOPPED) {
+        /* Retirement enables the static-content cascade after the last
+           script-driven layout may already have hidden the page shell.
+           Rebuild immediately while the old layout is still retained;
+           a refused rebuild leaves that committed layout usable. */
+        (void) navigation_relayout_static_fallback(session);
+        session->performance.runtime_us += navigation_record_slice(
+            session, NAVIGATION_SLICE_RUNTIME, runtime_started,
+            callback_budget);
+        return true;
+    }
+    /* A realm kept after a refusal runs on: the exception that ended the
+       turn was the page's own. A turn the watchdog stopped for time stays
+       a failure. */
+    if (!advanced && memory == NAVIGATION_SCRIPT_MEMORY_KEPT
+        && !session->page.script_result.interrupted) advanced = true;
+    if (!advanced) {
 #if NAVIGATION_CAPABILITY_TRACES_COMPILED
         /* Lab error context (last_script_error_context is read only by the
            host lab): decode a generated function's source into it. */
@@ -456,6 +393,7 @@ bool navigation_advance_runtime(NavigationSession *session,
     for (size_t i = 0; i < session->page.frame_count; i++) {
         NavigationFrame *frame = &session->page.frames[i];
         if (!frame->loaded || frame->runtime == NULL) continue;
+        navigation_collect_for_challenge_frame(session, frame);
         uint64_t frame_script_started = navigation_now_us();
         bool frame_advanced = script_runtime_advance(
             frame->runtime, elapsed_ms, callback_budget,
@@ -473,10 +411,13 @@ bool navigation_advance_runtime(NavigationSession *session,
         if (navigation_retire_failed_document_refresh(
                 session, frame->runtime)) return false;
         /* A child realm that ran out of memory stops on its own; the page
-           and its other frames go on. */
-        if (navigation_stop_exhausted_frame_realm(session, frame,
-                                                  !frame_advanced))
-            continue;
+           and its other frames go on. One kept after a refusal runs on, as
+           the page's does. */
+        NavigationScriptMemoryVerdict frame_memory =
+            navigation_stop_exhausted_frame_realm(session, frame);
+        if (frame_memory == NAVIGATION_SCRIPT_MEMORY_STOPPED) continue;
+        if (!frame_advanced && frame_memory == NAVIGATION_SCRIPT_MEMORY_KEPT
+            && !frame->script_result.interrupted) frame_advanced = true;
         if (!frame_advanced) {
 #if NAVIGATION_CAPABILITY_TRACES_COMPILED
             /* reject_source_context is read only by the host lab. */
@@ -524,13 +465,15 @@ bool navigation_advance_runtime(NavigationSession *session,
         session->performance.advance_frames_us +=
             messages_started - frames_started;
     bool messages_delivered = navigation_deliver_frame_messages(session);
-    if (messages_delivered) navigation_stop_exhausted_frame_realms(session);
+    bool frames_refused = navigation_stop_exhausted_frame_realms(session);
     uint64_t messages_finished = navigation_now_us();
     if (messages_finished > messages_started)
         session->performance.advance_messages_us +=
             messages_finished - messages_started;
     if (!messages_delivered) {
-        if (navigation_retire_exhausted_script_realms(session, false)) {
+        NavigationScriptMemoryVerdict delivery_memory =
+            navigation_assess_script_memory(session, "messages");
+        if (delivery_memory == NAVIGATION_SCRIPT_MEMORY_STOPPED) {
             session->performance.frame_message_soft_failures++;
             (void) navigation_relayout_static_fallback(session);
             session->performance.runtime_us += navigation_record_slice(
@@ -538,10 +481,16 @@ bool navigation_advance_runtime(NavigationSession *session,
                 callback_budget);
             return true;
         }
-        snprintf(session->last_error, sizeof(session->last_error),
-                 "cross-frame message delivery failed: %.450s",
-                 session->page.script_result.error);
-        return false;
+        /* A realm refused during delivery and kept: the failure was its
+           author code's. */
+        if (delivery_memory == NAVIGATION_SCRIPT_MEMORY_UNREFUSED
+            && !frames_refused) {
+            snprintf(session->last_error, sizeof(session->last_error),
+                     "cross-frame message delivery failed: %.450s",
+                     session->page.script_result.error);
+            return false;
+        }
+        session->performance.frame_message_soft_failures++;
     }
     /* Retry completion tasks deferred by an incomplete checkpoint even if
        that checkpoint made no DOM changes. Keep this before navigation,
@@ -593,10 +542,8 @@ consume_script_navigation:
         !navigation_hold_image_changes(session, elapsed_ms)
         && script_runtime_consume_relayout(session->page.runtime);
     /* A page task may catch an actual QuickJS allocation refusal, leaving the
-       scheduler alive even though its last mutation hid the entire authored
-       shell. Distinguish that allocator fact from an author merely throwing
-       text containing "out of memory", and degrade only a blank, text-rich
-       committed page. */
+       scheduler alive even though its last mutation tore the server-rendered
+       body down (navigation_rescue_exhausted_page). */
     bool allocator_rejected =
         heap_rejections_after > heap_rejections_before;
     bool ok = true;
@@ -613,17 +560,11 @@ consume_script_navigation:
     }
     if (ok) (void) navigation_publish_script_scroll(session);
     /* Inspect the successfully settled layout, not the pre-mutation command
-       count. Only a real allocator rejection plus blank paint/control output
-       and bounded useful content may retire a realm. Hard relayout/security
-       failures still return above their ordinary fail-closed path. */
-    bool rescued = ok && allocator_rejected
-        && navigation_rescue_exhausted_page(session, heap_rejections_before);
-    if (!rescued && ok && allocator_rejected
-        && navigation_layout_is_visually_blank(&session->page.layout)
-        && navigation_blank_recovery_has_useful_content(session)
-        && navigation_retire_exhausted_script_realms(session, true)) {
-        (void) navigation_relayout_static_fallback(session);
-    }
+       count. Hard relayout/security failures still return above their
+       ordinary fail-closed path. */
+    if (ok && allocator_rejected)
+        (void) navigation_rescue_exhausted_page(session,
+                                                heap_rejections_before);
     /* An unused memory-rescue copy does not outlive its turn. */
     (void) script_runtime_take_memory_rescue(session->page.runtime, NULL);
     session->performance.runtime_us += navigation_record_slice(

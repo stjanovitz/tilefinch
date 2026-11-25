@@ -85,6 +85,7 @@ usage() {
         "--ge-present-probe draws synthetic video frames through the graphics engine and checks the pixels." \
         "--csc-order-probe sweeps the firmware colour-conversion mode words over one decoded picture (hardware only)." \
         "--media-range-probe opens both bounded range sources and reads across fragment boundaries with no decoder (needs the network)." \
+        "Offline modes (update, fixtures, probes, trace replay, native HOME, --local-fixture) boot with validation_preconnect=0, record PPSSPP's -d log, and fail on any non-loopback connect or name lookup (tools/check_ppsspp_network.py)." \
         "Results are copied beneath the selected PSP build directory."
 }
 
@@ -231,6 +232,18 @@ if [ -n "$trace_source" ]; then
     trace_name=replay
     expect_network=replay
 fi
+
+# PPSSPP hands the PSP's sockets and name lookups to the host's real
+# network. Only the live-page and live-media modes are meant to use it; every
+# other mode runs offline: its boot turns the HOME tile's speculative
+# preconnect off, and the emulator's -d syscall log must show no traffic past
+# loopback.
+network_offline=0
+case "$expect_network" in
+    update|ge-present|raster|fixture|csc-order|replay|warmup)
+        network_offline=1 ;;
+esac
+[ "$local_fixture" -eq 0 ] || network_offline=1
 
 if [ "$build" -eq 1 ] && [ "$build_dir_overridden" -eq 0 ]; then
     # Keep the ordinary PSP build and its user-facing EBOOT quiet. Validation
@@ -686,6 +699,9 @@ fi
 if [ "$test_trace_keyed" -eq 1 ]; then
     printf 'trace_keyed=1\n' >>"$config_path"
 fi
+if [ "$network_offline" -eq 1 ] && [ "$trace_name" = none ]; then
+    printf 'validation_preconnect=0\n' >>"$config_path"
+fi
 
 # PPSSPP hardware renderers keep graphics-engine output in a host framebuffer
 # object and never write it back into emulated PSP memory: with -d the log
@@ -802,7 +818,9 @@ trap cleanup EXIT HUP INT TERM
 
 printf 'PPSSPP network smoke: %s\n' "$url"
 debug_flag=
-[ "${PPSSPP_DEBUG_LOG:-0}" -eq 1 ] && debug_flag=-d
+if [ "${PPSSPP_DEBUG_LOG:-0}" -eq 1 ] || [ "$network_offline" -eq 1 ]; then
+    debug_flag=-d
+fi
 : >"$emulator_stdout"
 : >"$emulator_stderr"
 
@@ -936,6 +954,19 @@ do
 done
 
 validation="$result_dir/tilefinch-validation.txt"
+if [ "$network_offline" -eq 1 ]; then
+    python3 "$root/tools/check_ppsspp_network.py" "$result_dir/ppsspp.log" \
+        >"$result_dir/network-check.txt" 2>&1 || {
+        cat "$result_dir/network-check.txt" >&2
+        printf 'FAIL: this offline run reached past loopback (or left no -d log); see %s\n' \
+            "$result_dir" >&2
+        exit 1
+    }
+    cat "$result_dir/network-check.txt"
+fi
+if [ -f "$validation" ]; then
+    grep '^tilefinch-scanf-check: outcome=' "$validation" || true
+fi
 if [ "$emulator_status" -ne 0 ]; then
     printf 'PPSSPP exited with status %s; see %s\n' \
         "$emulator_status" "$result_dir" >&2

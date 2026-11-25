@@ -145,11 +145,18 @@ static bool lite_chapter_seconds(const YoutubeLiteSpan *value, unsigned *seconds
    answer or an arbitrary service URL. All links bind to this video's ID. */
 static const char *lite_chapter_next(YoutubeLiteWatch *watch, const YoutubeLiteSpan *scope)
 {
-    YoutubeLiteSpan object, other, value;
-    bool found = lite_json_key(scope, "chapterRenderer", NULL, &object);
-    if (lite_json_key(scope, "macroMarkersListItemRenderer", NULL, &other)
-        && (!found || other.start < object.start)) { object = other; found = true; }
-    if (!found) return NULL;
+    static const YoutubeLiteRendererKey keys[] = {
+        LITE_KEY("chapterRenderer"), LITE_KEY("macroMarkersListItemRenderer")
+    };
+    YoutubeLiteSpan object, value;
+    size_t kind;
+    const char *at = scope->start, *payload;
+    for (;;) {
+        at = lite_next_key(scope, at, keys, 2, &kind, &payload);
+        if (!at) return NULL;
+        if (lite_json_span(payload, scope->end, &object)) break;
+        at++;
+    }
     unsigned seconds = 0;
     char title[MEDIA_CHAPTER_TITLE_CAPACITY] = {0};
     bool valid = lite_json_member(&object, "timeRangeStartMillis", &value)

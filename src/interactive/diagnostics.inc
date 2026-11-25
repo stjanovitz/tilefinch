@@ -20,7 +20,7 @@ static void usage(const char *program)
             "[--no-external-resources] "
             "[--no-progressive-first-paint] [--relayout-preview-us N] "
             "[--pending-load] [--pending-load-page-downs N] "
-            "[--wpt-test-rendered] [--hide-cookie-banners] "
+            "[--wpt-test-rendered] [--hide-cookie-banners] [--hide-page-ads] "
             "[--user-css-before-load] [--reader-mode] "
             "[--script-timeout-ms N] [--parser-script-time-limit-ms N] "
             "[--probe-script FILE] "

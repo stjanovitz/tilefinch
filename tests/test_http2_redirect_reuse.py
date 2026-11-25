@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
-"""An aborted HTTP/2 redirect stream must leave its connection usable.
+"""Aborted HTTP/2 streams must leave their connection usable.
 
-The transport stops reading a redirect at its headers and follows Location
-on the same easy handle. With the macOS system libcurl (8.7.1) that abort
-broke the shared HTTP/2 connection: the next stream decoded shifted HPACK
-fields ("Invalid HTTP header field was received ... [:status], [302]") and
-every later request on it failed. This runs http2_redirect_probe against a
-loopback HTTP/2 server and checks both the results and that the redirect
-hops really shared one connection.
+redirect case: the transport stops reading a redirect at its headers and
+follows Location on the same easy handle. With the macOS system libcurl
+(8.7.1) that abort broke the shared HTTP/2 connection: the next stream
+decoded shifted HPACK fields ("Invalid HTTP header field was received ...
+[:status], [302]") and every later request on it failed.
 
-usage: test_http2_redirect_reuse.py PROBE NODE
+error case: a 404 the transport rejects (the request does not allow HTTP
+errors) did the same with that libcurl: later streams decoded header names
+from the wrong HPACK table entry ("content-length: <another field's
+value>", a misnamed or foreign Set-Cookie).
+
+This runs the case's probe (http2_redirect_probe or http2_error_reuse_probe)
+against a loopback HTTP/2 server and checks both the results and that the
+later streams really shared a connection with the aborted one.
+
+usage: test_http2_redirect_reuse.py PROBE NODE [redirect|error]
 """
 
 from __future__ import annotations
@@ -58,11 +65,36 @@ def make_certificates(directory: Path) -> None:
          "-extfile", str(config), "-extensions", "leaf"], **quiet)
 
 
+def redirect_reused(streams: list[list[str]]) -> bool:
+    targets = [fields for fields in streams if fields[4] == "/target"]
+    # Each /target follows an aborted or drained redirect stream; it shows
+    # the stream's effect only when it shares a connection with earlier
+    # streams. The last redirect's body is over the drain bound, so its
+    # transfer is aborted and libcurl closes that connection: its /target
+    # may open a new one.
+    return len(targets) == 4 and all(int(fields[2]) > 1
+                                     for fields in targets[:3])
+
+
+def error_reused(streams: list[list[str]]) -> bool:
+    # The scheduler's five requests (two of them rejected 404s) must share
+    # one connection: the probe's checks of /fields then show any HPACK
+    # desynchronization. The synchronous transport's five that follow need
+    # not reuse a connection; they check its rejection of the 404s.
+    return len(streams) == 10 and all(fields[1] == streams[0][1]
+                                      for fields in streams[:5])
+
+
+CHECKS = {"redirect": redirect_reused, "error": error_reused}
+
+
 def main() -> int:
-    if len(sys.argv) != 3:
+    if len(sys.argv) not in (3, 4) or (
+            len(sys.argv) == 4 and sys.argv[3] not in CHECKS):
         print(__doc__)
         return 2
     probe, node = sys.argv[1], sys.argv[2]
+    check = CHECKS[sys.argv[3] if len(sys.argv) == 4 else "redirect"]
     if not node or shutil.which(node) is None:
         print("SKIP: node was not found when CMake configured this tree")
         return SKIP
@@ -115,15 +147,8 @@ def main() -> int:
         return 1
     streams = [line.split() for line in log.splitlines()
                if line.startswith("stream ")]
-    targets = [fields for fields in streams if fields[4] == "/target"]
-    # Each /target follows an aborted or drained redirect stream; it shows
-    # the stream's effect only when it shares a connection with earlier
-    # streams. The last redirect's body is over the drain bound, so its
-    # transfer is aborted and libcurl closes that connection: its /target
-    # may open a new one.
-    if len(targets) != 4 or not all(int(fields[2]) > 1
-                                    for fields in targets[:3]):
-        print("FAIL: redirect hops did not reuse a connection:\n" + log)
+    if not check(streams):
+        print("FAIL: later streams did not reuse a connection:\n" + log)
         return 1
     print("PASS")
     return 0

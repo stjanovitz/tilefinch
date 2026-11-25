@@ -143,7 +143,14 @@ static int test_cosmetic_class_families(void)
     static const struct { const char *attribute; bool hidden; } slots[] = {
         {"data-csa-c-slot-id=\"adplacements:detail:mobile\"", true},
         {"data-csa-c-slot-id=\"content:detail:mobile\"", false},
-        {"data-csa-c-slot-id=\"not-adplacements:detail\"", false}
+        {"data-csa-c-slot-id=\"not-adplacements:detail\"", false},
+        /* An ad label matches in any letter case, as pages write it. */
+        {"aria-label=\"advertisement\"", true},
+        {"aria-label=\"Advertisement\"", true},
+        {"aria-label=\"ADVERTISEMENT\"", true},
+        {"aria-label=\"Sponsored\"", true},
+        {"aria-label=\"Advertisement settings\"", false},
+        {"aria-label=\"Sponsored by our readers\"", false}
     };
     size_t class_count = sizeof(cases) / sizeof(cases[0]);
     for (size_t i = 0; i < class_count + sizeof(slots) / sizeof(slots[0]); i++) {

@@ -1,0 +1,212 @@
+Remove the unreachable blocking Atomics.wait path.
+
+diff --git a/quickjs.c b/quickjs.c
+index 11202f8a2..68c2baefd 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -506,7 +506,6 @@ struct JSRuntime {
+     /* timestamp for internal use in module evaluation */
+     int64_t module_async_evaluation_next_timestamp;
+ 
+-    BOOL can_block : 8; /* TRUE if Atomics.wait can block */
+     /* used to allocate, free and clone SharedArrayBuffers */
+     JSSharedArrayBufferFunctions sab_funcs;
+     /* see JS_SetStripInfo() */
+@@ -2944,11 +2943,6 @@ void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque)
+     rt->interrupt_opaque = opaque;
+ }
+ 
+-void JS_SetCanBlock(JSRuntime *rt, BOOL can_block)
+-{
+-    rt->can_block = can_block;
+-}
+-
+ void JS_SetSharedArrayBufferFunctions(JSRuntime *rt,
+                                       const JSSharedArrayBufferFunctions *sf)
+ {
+@@ -72591,17 +72585,6 @@ static JSValue js_atomics_isLockFree(JSContext *ctx,
+     return JS_NewBool(ctx, ret);
+ }
+ 
+-typedef struct JSAtomicsWaiter {
+-    struct list_head link;
+-    BOOL linked;
+-    pthread_cond_t cond;
+-    int32_t *ptr;
+-} JSAtomicsWaiter;
+-
+-static pthread_mutex_t js_atomics_mutex = PTHREAD_MUTEX_INITIALIZER;
+-static struct list_head js_atomics_waiter_list =
+-    LIST_HEAD_INIT(js_atomics_waiter_list);
+-
+ #if defined(__aarch64__)
+ static inline void cpu_pause(void)
+ {
+@@ -72653,136 +72636,50 @@ static JSValue js_atomics_wait(JSContext *ctx,
+     int64_t v;
+     int32_t v32;
+     uint64_t idx;
+-    void *ptr;
+-    int64_t timeout;
+-    struct timespec ts;
+-    JSAtomicsWaiter waiter_s, *waiter;
+-    int ret, size_log2, res;
++    int size_log2;
+     double d;
+ 
+     p = js_atomics_get_buf(ctx, argv[0], argv[1], &idx, 2);
+     if (!p)
+         return JS_EXCEPTION;
++    /* Tilefinch: no agent may suspend (upstream's JS_SetCanBlock, which
++       nothing called, is gone with the waiter list), so after its
++       argument checks Atomics.wait always throws, as the specification
++       requires when AgentCanSuspend() is false. The value and timeout
++       are converted only for their errors and side effects. */
+     size_log2 = typed_array_size_log2(p->class_id);
+-    ptr = p->u.array.u.uint8_ptr + ((uintptr_t)idx << size_log2);
+-    
+-    /* 'argv[0]' is a SharedArrayBuffer so it cannot be detached nor reduced */
+     if (size_log2 == 3) {
+         if (JS_ToBigInt64(ctx, &v, argv[2]))
+             return JS_EXCEPTION;
+     } else {
+         if (JS_ToInt32(ctx, &v32, argv[2]))
+             return JS_EXCEPTION;
+-        v = v32;
+     }
+     if (JS_ToFloat64(ctx, &d, argv[3]))
+         return JS_EXCEPTION;
+-    /* must use INT64_MAX + 1 because INT64_MAX cannot be exactly represented as a double */
+-    if (isnan(d) || d >= 0x1p63)
+-        timeout = INT64_MAX;
+-    else if (d < 0)
+-        timeout = 0;
+-    else
+-        timeout = (int64_t)d;
+-    if (!ctx->rt->can_block)
+-        return JS_ThrowTypeError(ctx, "cannot block in this thread");
+-
+-    /* XXX: inefficient if large number of waiters, should hash on
+-       'ptr' value */
+-    /* XXX: use Linux futexes when available ? */
+-    pthread_mutex_lock(&js_atomics_mutex);
+-    if (size_log2 == 3) {
+-        res = *(int64_t *)ptr != v;
+-    } else {
+-        res = *(int32_t *)ptr != v;
+-    }
+-    if (res) {
+-        pthread_mutex_unlock(&js_atomics_mutex);
+-        return JS_AtomToString(ctx, JS_ATOM_not_equal);
+-    }
+-
+-    waiter = &waiter_s;
+-    waiter->ptr = ptr;
+-    pthread_cond_init(&waiter->cond, NULL);
+-    waiter->linked = TRUE;
+-    list_add_tail(&waiter->link, &js_atomics_waiter_list);
+-
+-    if (timeout == INT64_MAX) {
+-        pthread_cond_wait(&waiter->cond, &js_atomics_mutex);
+-        ret = 0;
+-    } else {
+-        /* XXX: use clock monotonic */
+-        clock_gettime(CLOCK_REALTIME, &ts);
+-        ts.tv_sec += timeout / 1000;
+-        ts.tv_nsec += (timeout % 1000) * 1000000;
+-        if (ts.tv_nsec >= 1000000000) {
+-            ts.tv_nsec -= 1000000000;
+-            ts.tv_sec++;
+-        }
+-        ret = pthread_cond_timedwait(&waiter->cond, &js_atomics_mutex,
+-                                     &ts);
+-    }
+-    if (waiter->linked)
+-        list_del(&waiter->link);
+-    pthread_mutex_unlock(&js_atomics_mutex);
+-    pthread_cond_destroy(&waiter->cond);
+-    if (ret == ETIMEDOUT) {
+-        return JS_AtomToString(ctx, JS_ATOM_timed_out);
+-    } else {
+-        return JS_AtomToString(ctx, JS_ATOM_ok);
+-    }
++    (void)v;
++    (void)v32;
++    (void)d;
++    return JS_ThrowTypeError(ctx, "cannot block in this thread");
+ }
+ 
+ static JSValue js_atomics_notify(JSContext *ctx,
+                                  JSValueConst this_obj,
+                                  int argc, JSValueConst *argv)
+ {
+-    struct list_head *el, *el1, waiter_list;
+-    int32_t count, n;
++    int count;
+     uint64_t idx;
+-    int size_log2;
+-    void *ptr;
+-    JSAtomicsWaiter *waiter;
+-    JSArrayBuffer *abuf;
+-    JSObject *p;
+-    
+-    p = js_atomics_get_buf(ctx, argv[0], argv[1], &idx, 1);
+-    if (!p)
++
++    if (!js_atomics_get_buf(ctx, argv[0], argv[1], &idx, 1))
+         return JS_EXCEPTION;
+-    size_log2 = typed_array_size_log2(p->class_id);
+-    
+-    if (JS_IsUndefined(argv[2])) {
+-        count = INT32_MAX;
+-    } else {
++    /* Tilefinch: Atomics.wait never blocks, so no agent is waiting; the
++       count is still converted for its errors and side effects. */
++    if (!JS_IsUndefined(argv[2])) {
+         if (JS_ToInt32Clamp(ctx, &count, argv[2], 0, INT32_MAX, 0))
+             return JS_EXCEPTION;
++        (void)count;
+     }
+-
+-    n = 0;
+-    abuf = p->u.typed_array->buffer->u.array_buffer;
+-    if (abuf->shared && count > 0) {
+-        /* 'argv[0]' is a SharedArrayBuffer so it cannot be detached nor reduced */
+-        ptr = p->u.array.u.uint8_ptr + ((uintptr_t)idx << size_log2);
+-        pthread_mutex_lock(&js_atomics_mutex);
+-        init_list_head(&waiter_list);
+-        list_for_each_safe(el, el1, &js_atomics_waiter_list) {
+-            waiter = list_entry(el, JSAtomicsWaiter, link);
+-            if (waiter->ptr == ptr) {
+-                list_del(&waiter->link);
+-                waiter->linked = FALSE;
+-                list_add_tail(&waiter->link, &waiter_list);
+-                n++;
+-                if (n >= count)
+-                    break;
+-            }
+-        }
+-        list_for_each(el, &waiter_list) {
+-            waiter = list_entry(el, JSAtomicsWaiter, link);
+-            pthread_cond_signal(&waiter->cond);
+-        }
+-        pthread_mutex_unlock(&js_atomics_mutex);
+-    }
+-    return JS_NewInt32(ctx, n);
++    return JS_NewInt32(ctx, 0);
+ }
+ 
+ static const JSCFunctionListEntry js_atomics_funcs[] = {
+diff --git a/quickjs.h b/quickjs.h
+index e87bd513b..a317430d2 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1019,8 +1019,6 @@ void JS_SetHostPromiseRejectionTracker(JSRuntime *rt, JSHostPromiseRejectionTrac
+ /* return != 0 if the JS code needs to be interrupted */
+ typedef int JSInterruptHandler(JSRuntime *rt, void *opaque);
+ void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque);
+-/* if can_block is TRUE, Atomics.wait() can be used */
+-void JS_SetCanBlock(JSRuntime *rt, JS_BOOL can_block);
+ /* select which debug info is stripped from the compiled code */
+ #define JS_STRIP_SOURCE (1 << 0) /* strip source code */
+ #define JS_STRIP_DEBUG  (1 << 1) /* strip all debug info including source code */

@@ -26,6 +26,14 @@ typedef struct {
     uint64_t start_attempt_ns;
 } ScriptImagePreload;
 
+typedef struct ScriptImageDecodeTickets {
+    /* Only outstanding decode() waiters have tickets. A canceled ticket
+       stays occupied (negative handle) until its own waiter releases it:
+       returning to the same URL cannot revive it. No wrapper is retained. */
+    long handles[16];
+    unsigned count;
+} ScriptImageDecodeTickets;
+
 typedef struct ScriptImagePreloads {
     ImageResources images;
     ImagePriorityLoadJob *job;
@@ -76,8 +84,22 @@ static void image_preloads_compact(ScriptImagePreloads *loads)
 {
     if (loads->job != NULL || !loads->orphans) return;
     lxb_dom_node_t *orphan = NULL;
-    images_discard_nodes(&loads->images, &orphan, 1u);
+    images_discard_nodes(&loads->images, &orphan, 1u, SCRIPT_IMAGE_PRELOAD_LIMIT);
     loads->orphans = false;
+}
+
+static void image_preload_detach_entries(ScriptImagePreloads *loads, lxb_dom_node_t *node)
+{
+    for (size_t i = 0; i < loads->images.count; i++)
+        if (loads->images.items[i].node == node) {
+            loads->images.items[i].node = NULL;
+            loads->orphans = true;
+        }
+    for (size_t i = 0; i < loads->images.failure_count; i++)
+        if (loads->images.failures[i].node == node) {
+            loads->images.failures[i].node = NULL;
+            loads->orphans = true;
+        }
 }
 
 static void image_preload_clear(ScriptRuntime *runtime, size_t at)
@@ -92,13 +114,9 @@ static void image_preload_clear(ScriptRuntime *runtime, size_t at)
         image_preload_cancel_job(runtime);
     lxb_dom_node_t *node = slot->node;
     if (node != NULL && loads->job == NULL) {
-        images_discard_nodes(&loads->images, &node, 1u);
+        images_discard_nodes(&loads->images, &node, 1u, SCRIPT_IMAGE_PRELOAD_LIMIT);
     } else if (node != NULL) {
-        for (size_t i = 0; i < loads->images.count; i++) {
-            if (loads->images.items[i].node != node) continue;
-            loads->images.items[i].node = NULL;
-            loads->orphans = true;
-        }
+        image_preload_detach_entries(loads, node);
     }
     JSValue owner = slot->owner;
     *slot = (ScriptImagePreload) {.owner = JS_UNDEFINED};
@@ -107,6 +125,8 @@ static void image_preload_clear(ScriptRuntime *runtime, size_t at)
 
 static void image_preloads_destroy(ScriptRuntime *runtime)
 {
+    budget_free(runtime->budget, runtime->image_decode_tickets);
+    runtime->image_decode_tickets = NULL;
     ScriptImagePreloads *loads = runtime->image_preloads;
     if (loads == NULL) return;
     image_preload_cancel_job(runtime);
@@ -291,6 +311,34 @@ static ScriptImagePreloads *image_preloads_open(ScriptRuntime *runtime)
     return runtime->image_preloads;
 }
 
+/* 4: acquire, 5: still current?, 6: release. Zero is not a ticket. */
+int js_rt_image_decode_ticket(DomBridge *bridge, long handle, int op, int ticket)
+{
+    ScriptRuntime *runtime = bridge->host;
+    ScriptImageDecodeTickets *waiters = runtime->image_decode_tickets;
+    if (op == 4) {
+        if (!waiters) {
+            waiters = budget_calloc_category(runtime->budget,
+                BUDGET_CATEGORY_JAVASCRIPT, 1u, sizeof(*waiters));
+            if (!waiters) return 0;
+            runtime->image_decode_tickets = waiters;
+        }
+        for (int i = 0; i < 16; i++) if (!waiters->handles[i]) {
+            waiters->handles[i] = handle;
+            waiters->count++;
+            return i + 1;
+        }
+    } else if (waiters && ticket > 0 && ticket <= 16) {
+        long *current = &waiters->handles[ticket - 1];
+        if (op == 5) return *current == handle;
+        if (op == 6 && (*current == handle || *current == -handle)) {
+            *current = 0;
+            waiters->count--;
+        }
+    }
+    return 0;
+}
+
 /* The live wrapper of `handle`, held until its task (undefined without
    one). Never reconstruct author state from a handle. */
 static JSValue image_preload_owner(ScriptRuntime *runtime, long handle)
@@ -331,7 +379,8 @@ static void image_queue_page_failures(ScriptRuntime *runtime,
         uint64_t hash = images->failures[i].source_hash;
         if (node == NULL) continue;
         size_t length = 0;
-        const char *source = image_select_source(
+        /* Never the <noscript> fallback's failure: script never saw it. */
+        const char *source = image_select_author_source(
             bridge->stylesheet, node, &length);
         if (image_source_hash(source, length) != hash
             || ((source == NULL || length == 0)
@@ -384,6 +433,8 @@ static size_t image_preload_slot_take(ScriptRuntime *runtime)
     return at;
 }
 
+static size_t runtime_image_load_find(const ScriptRuntime *, long, size_t *);
+
 bool js_rt_image_preload_changed(DomBridge *bridge, lxb_dom_node_t *node)
 {
     if (bridge == NULL || bridge->host == NULL || node == NULL
@@ -391,7 +442,37 @@ bool js_rt_image_preload_changed(DomBridge *bridge, lxb_dom_node_t *node)
     ScriptRuntime *runtime = bridge->host;
     ScriptImagePreloads *loads = runtime->image_preloads;
     size_t at = SIZE_MAX;
+    ScriptImageDecodeTickets *waiters = runtime->image_decode_tickets;
+    bool has_records = runtime->image_load_state_count || (waiters && waiters->count)
+        || (loads && loads->error_count);
+    long h = has_records ? (long) js_rt_bridge_find_node_handle(bridge, node) : 0;
+    /* Same URL does not mean the same request after an intervening swap. */
+    bool connected = bridge_node_is_connected(node);
+    const ImageResource *old = connected
+        ? images_find_node(bridge->images, node) : NULL;
+    if (old && old->source_hash)
+        bridge->images->items[old - bridge->images->items].request_replaced = true;
+    if (h > 0 && runtime->image_load_state_count) {
+        size_t hint = 0, i = runtime_image_load_find(runtime, h, &hint);
+        if (i < runtime->image_load_state_count) {
+            ScriptImageLoadState *s = &runtime->image_load_states[i];
+            if (s->pending) runtime->image_load_pending--;
+            *s = (ScriptImageLoadState){.handle = h};
+        }
+    }
+    if (h > 0 && waiters && waiters->count)
+        for (size_t i = 0; i < 16; i++)
+            if (waiters->handles[i] == h) waiters->handles[i] = -h;
     if (loads != NULL) {
+        for (size_t i = 0; h > 0 && i < loads->error_count; i++) {
+            size_t j = loads->error_head + i;
+            if (loads->errors[j].handle != h) continue;
+            JS_FreeValue(runtime->context, loads->errors[j].owner);
+            memmove(loads->errors + j, loads->errors + j + 1,
+                    (--loads->error_count - i) * sizeof(*loads->errors));
+            if (!loads->error_count) loads->error_head = 0;
+            break;
+        }
         image_preload_forget_broken(runtime, node);
         for (size_t i = 0; i < loads->slot_capacity; i++) {
             if (script_runtime_node_handle_resolve(runtime, loads->slots[i].handle)
@@ -404,7 +485,7 @@ bool js_rt_image_preload_changed(DomBridge *bridge, lxb_dom_node_t *node)
     bool empty = source == NULL || source_length == 0;
     /* A connected image with a source loads through the page's table. */
     if (empty ? !image_preload_empty_source_errs(node)
-              : bridge_node_is_connected(node)) return true;
+              : connected) return true;
     /* Hold the actual wrapper until its completion task. A raw native pin
        would not retain its event handlers/expandos and can overlap another
        native owner's pin. */
@@ -436,6 +517,14 @@ void js_rt_image_preload_forget_released(DomBridge *bridge)
 {
     ScriptRuntime *runtime = bridge == NULL ? NULL : bridge->host;
     ScriptImagePreloads *loads = runtime == NULL ? NULL : runtime->image_preloads;
+    ScriptImageDecodeTickets *waiters = runtime ? runtime->image_decode_tickets : NULL;
+    if (waiters && waiters->count) for (size_t i = 0; i < 16; i++) {
+        long h = waiters->handles[i];
+        if (h && !js_rt_bridge_node_slot_for_handle(bridge, h > 0 ? h : -h, NULL)) {
+            waiters->handles[i] = 0;
+            waiters->count--;
+        }
+    }
     if (loads == NULL) return;
     /* A slot whose handle no longer resolves names a node that is gone or
        about to be freed, and its address may be reused by a new image
@@ -450,11 +539,7 @@ void js_rt_image_preload_forget_released(DomBridge *bridge)
             continue;
         if (loads->job != NULL && loads->active == i)
             image_preload_cancel_job(runtime);
-        for (size_t at = 0; at < loads->images.count; at++) {
-            if (loads->images.items[at].node != slot->node) continue;
-            loads->images.items[at].node = NULL;
-            loads->orphans = true;
-        }
+        image_preload_detach_entries(loads, slot->node);
         slot->node = NULL;
     }
 }

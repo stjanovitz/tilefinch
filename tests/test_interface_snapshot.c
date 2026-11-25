@@ -22,8 +22,13 @@
    zone.js-style patch misses, rejection-hook.js the window realm's
    rejection tracker calling a page function, lazy-namespace*.js a page's
    own namespace object (also one the module could not replace) marked as
-   an interface when the module loads. Every realm ends with the
-   ownership teardown check. */
+   an interface when the module loads, lazy-factory.js a page's function
+   standing in for a lazy module's factory (the feature still works),
+   lazy-iterator-hooks.js the page's NodeIterator hooks taking the
+   traversal module's place (live iterators still follow removals),
+   private-globals.js the private natives and setters the bootstrap
+   deletes before page script that page script can still name. Every
+   realm ends with the ownership teardown check. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -148,7 +153,8 @@ int main(int argc, char **argv)
         "lazy-global-polyfill.js",
         "key-path.js", "lazy-wrapped-setter.js", "lazy-namespace.js",
         "lazy-namespace-nc.js", "lazy-host-globals.js", "async-callbacks.js",
-        "rejection-hook.js"};
+        "rejection-hook.js", "lazy-factory.js", "lazy-iterator-hooks.js",
+        "private-globals.js"};
     const size_t always_zero = 17;
     char *workload = read_file("workload.js");
     if (workload == NULL) return 1;

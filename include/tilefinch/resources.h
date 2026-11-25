@@ -76,6 +76,9 @@ typedef struct {
 
 typedef struct {
     Budget *budget;
+    /* The top-level page's URL when this is a child frame's ledger, the
+       site its requests' cookies are judged by; NULL: the document's own. */
+    const char *top_level_url;
     StylesheetDocumentResource items[STYLESHEET_DOCUMENT_RESOURCE_LIMIT];
     /* Completion belongs to the link, not just its shared response URL:
        media and integrity can admit one preload while refusing another. */
@@ -237,6 +240,13 @@ typedef struct ImageCanvasNativeSurface {
 /* The most entries an ImageResources table tracks (one per image node,
    shared-source aliases included). */
 #define IMAGE_TRACKED_NODE_LIMIT 192u
+/* A table's image work (ExternalImageStats.work) may reach this many times
+   its image count before replaced images stop returning their slots. Eight
+   lets every image of the count (24 on the PSP) be replaced seven times by
+   a fresh download or decode: 192 on the PSP, the tracked-node table's size.
+   Past it, each further replacement keeps its slot, so a page cycling new
+   or failing sources starts at most one count more. */
+#define IMAGE_SWAP_WORK_FACTOR 8u
 /* Elements above a node whose inherited style can be resolved by itself. */
 #define IMAGE_SUBTREE_ANCESTOR_LIMIT 64u
 
@@ -287,16 +297,26 @@ typedef struct ImageResource {
        frame has been completed yet). The storage is ImageResources'. */
     bool canvas_frame_open;
     bool canvas_frame_published;
+    /* A source mutation retired this IMG request. Its old pixels may still
+       paint, but don't complete the new request until publication. */
+    bool request_replaced;
     const unsigned char *canvas_held_frame;
     /* A no-CORS image whose final response origin differs from the owning
        document may be painted, but it taints any canvas that consumes it. */
     bool cross_origin;
-    /* An admitted SVG reused without a fetch or decode does not spend
-       another network/decode attempt. Preserve its accounting on retirement. */
-    bool reused_raster_count_exempt;
+    /* Its admission spent no slot of the image count: an admitted SVG
+       reused without a fetch or decode, or a short data: URL. Retiring it
+       returns none. */
+    bool count_exempt_surface;
     /* Publishing this resource dropped its element's failure record for the
        same source; a rollback that discards it restores the record. */
     bool recovered_failure;
+    /* An SVG whose root gives no width and height, only a viewBox: it has
+       a ratio but no natural size. An auto-sized background or mask layer
+       contains that ratio in its area (layout_image_auto_size), and
+       source_width x source_height is only the viewBox's size. It sits
+       in the alignment gap before pseudo. */
+    bool no_natural_size;
     PseudoElement pseudo;
     bool owns_pixels;
     bool owns_encoded;
@@ -353,6 +373,11 @@ typedef struct ImageResource {
 #define IMAGE_SVG_KEPT_PARSE_BYTES (96u * 1024u)
 struct ImageSvgParse;
 
+/* At most this many elements are remembered for a raster that memory
+   refused to decode (ImageResources.memory_refusals). */
+#define IMAGE_MEMORY_REFUSAL_LIMIT 8u
+#define IMAGE_SVG_LIMIT_RECALL 8u
+
 typedef enum {
     IMAGE_CANVAS_COMMIT_REFUSED = 0,
     IMAGE_CANVAS_COMMIT_CREATED,
@@ -366,8 +391,15 @@ typedef struct {
     /* Attempts the image-count cap does not charge: small rasters that never
        touch the network (inline-SVG icons, short data: URLs). They remain in
        `attempted` and are still charged to the decoded/encoded byte quotas;
-       the count cap applies to attempted - count_exempt. */
+       the count cap applies to attempted - count_exempt. An element whose
+       image is replaced or discarded returns its attempt, so this counts
+       the slots live images and failures hold. */
     size_t count_exempt;
+    /* Counted attempts that started a fetch or a decode (a decoded-cache
+       hit starts neither), never returned; a full rebuild starts it afresh
+       with the count. Once it reaches IMAGE_SWAP_WORK_FACTOR times the image
+       count, a replaced or discarded image no longer returns its slot. */
+    size_t work;
     size_t loaded;
     size_t failed;
     size_t unsupported;
@@ -521,10 +553,36 @@ typedef struct ImageResources {
            the hash. */
         uint32_t serial;
         uint64_t source_hash;
+        /* The failed attempt spent a slot of the image count, which a
+           change of the element's source can return. */
+        bool charged;
     } *failures;
     size_t failure_count;
     size_t failure_capacity;
     uint32_t failure_serial;
+    /* Elements whose fetched raster the Budget refused to decode (the
+       decode's working memory did not fit). Such an element has no entry
+       and no failure, so every look at the reader's position fetched it
+       again. Each record holds the free Budget bytes another try needs:
+       the refused allocation's charge plus the temporary request memory
+       reclaimed at teardown. The oldest record gives way to a new one. */
+    struct ImageMemoryRefusal {
+        const lxb_dom_node_t *node;
+        size_t retry_free_bytes;
+    } memory_refusals[IMAGE_MEMORY_REFUSAL_LIMIT];
+    uint8_t memory_refusal_next;
+    /* SVG responses refused after fetching are neither loaded nor failed.
+       Suppress the same refusal until its limiting resource (Budget or
+       decoded quota) improves. If target sizing can help, a different
+       paint target may also retry. The oldest record gives way to a new
+       one. */
+    struct ImageSvgLimitRecall {
+        uint64_t url_hash;
+        size_t retry_room;
+        uint32_t target_key;
+        bool budget_limited;
+    } svg_limit_recalls[IMAGE_SVG_LIMIT_RECALL];
+    uint8_t svg_limit_recall_next;
     bool priority_staged;
     /* Lent for one pass of loading (images_set_layout_boxes): element boxes
        from the page's last layout, so a CSS background raster is decoded at
@@ -536,6 +594,9 @@ typedef struct ImageResources {
        instead of rasterizing the same markup again. Never kept: a table
        emptied or rebuilt drops it. */
     const struct ImageResources *preview_rasters;
+    /* As StylesheetDocumentResources' top_level_url, for a child frame's
+       table. */
+    const char *top_level_url;
 } ImageResources;
 
 /* A layout's element boxes lent to image loading (tilefinch/layout.h). */
@@ -968,9 +1029,16 @@ bool images_refresh_external_nodes_reusing_layout_styles(
     int viewport_width);
 /* Allocation-free rollback for trusted native DOM transactions. Removes
    resources owned by the exact nodes, transferring shared backing ownership
-   to retained aliases before releasing anything. */
+   to retained aliases before releasing anything. Their slots of the image
+   count `maximum_count` go back while the table's work allows
+   (ExternalImageStats.work); zero returns none. */
 void images_discard_nodes(
-    ImageResources *images, lxb_dom_node_t *const *nodes, size_t node_count);
+    ImageResources *images, lxb_dom_node_t *const *nodes, size_t node_count,
+    size_t maximum_count);
+/* For a source change, forget only stale failure records and return their
+   charged slots while work permits, without disturbing live resources. */
+void images_discard_stale_failures(
+    ImageResources *images, const Stylesheet *sheet, size_t maximum_count);
 /* Whether this page has been, or now would be, refused an image by a bound
    the page cannot outgrow: the tracked-node table, the image count or a byte
    quota. Only then does an image's distance from the reader decide whether
@@ -1085,6 +1153,16 @@ const ImageResource *images_find_node(const ImageResources *images,
 /* Its current source failed: only a new source is worth another request. */
 bool images_node_failed(const ImageResources *images,
                         const lxb_dom_node_t *node);
+/* Whether `source` is the one that failed: an <img> whose recorded failure
+   was another source (none, before its <noscript> fallback) may try it. */
+bool images_node_source_failed(const ImageResources *images,
+                               const lxb_dom_node_t *node,
+                               const char *source, size_t length);
+/* Memory refused its raster, and `free_bytes` free Budget bytes are not yet
+   enough to try again (ImageResources.memory_refusals). */
+bool images_node_memory_refused(const ImageResources *images,
+                                const lxb_dom_node_t *node,
+                                size_t free_bytes);
 const ImageResource *images_find_mask_node(const ImageResources *images,
                                            const lxb_dom_node_t *node);
 const ImageResource *images_find_background_node(const ImageResources *images,
@@ -1110,6 +1188,30 @@ uint64_t image_current_source_hash(const Stylesheet *stylesheet,
                                    lxb_dom_node_t *node);
 /* The same hash for a source already selected (image_select_source). */
 uint64_t image_source_hash(const char *source, size_t length);
+/* The <noscript> image fallback. A placeholder the page's own script left
+   empty (an <img> with no usable source, or an empty element) whose next
+   sibling is a <noscript> holding one <img src> takes that source, once
+   image_noscript_arm has armed the document: image_select_source answers
+   it for the <img>, image_noscript_placeholder_source for the empty
+   element, which paints it as a cover background without touching the DOM.
+   Script never sees it (image_select_author_source). The store arming
+   allocates is the document's (document_destroy releases it). */
+bool image_noscript_arm(PocDocument *document, Stylesheet *sheet);
+void image_noscript_release(PocDocument *document);
+/* The decoded src of the one <img> in the <noscript> right after `node`,
+   whether or not the fallback applies; owned by the DOM or the store. */
+const char *image_noscript_markup_source(ImageNoscriptStore *store,
+                                         lxb_dom_node_t *node,
+                                         size_t *length);
+const char *image_noscript_placeholder_source(const Stylesheet *stylesheet,
+                                              lxb_dom_node_t *node,
+                                              size_t *length);
+/* image_select_source as page script sees it: never the fallback. */
+const char *image_select_author_source(const Stylesheet *stylesheet,
+                                       lxb_dom_node_t *node, size_t *length);
+/* Whether image_select_source answers the fallback for `node` (an <img>). */
+bool image_noscript_fallback_shown(const Stylesheet *stylesheet,
+                                   lxb_dom_node_t *node);
 /* Empty sources and encoded one-pixel sentinels, not arbitrary data images.
    Simplified views share the loader's placeholder/lazy-source decision. */
 bool image_source_is_placeholder(const char *source, size_t length);
@@ -1220,6 +1322,9 @@ bool images_canvas_frame_publish(ImageResources *images,
 bool images_release_canvas(ImageResources *images, Budget *budget,
                            lxb_dom_node_t *node);
 bool image_resource_available(const ImageResource *image);
+/* What layout reads from the table, folded: equal fingerprints say a
+   build would size and place every image as before. */
+uint32_t images_layout_fingerprint(const ImageResources *images);
 /* A decoded publication may briefly outlive an author source mutation. */
 bool image_resource_source_current(const Stylesheet *sheet,
                                     const ImageResource *image);

@@ -137,9 +137,9 @@ static void navigation_stream_add_preload_url(
     }
 }
 
-/* Puts a classic script request in the document's map of preloaded
-   resources, keyed with its element's integrity metadata (NULL or empty:
-   none). */
+/* Puts a script request in the document's map of preloaded resources (a
+   module's: its module map), keyed with its element's integrity metadata
+   (NULL or empty: none). */
 static void navigation_stream_map_script_preload(
     NavigationDocumentStream *stream, NavigationPreload *preload,
     const char *integrity, size_t integrity_length)
@@ -235,7 +235,7 @@ static void navigation_stream_discover_preload(
             && seen->credentials == credentials
             && strcmp(seen->url, resolved) == 0) added = seen;
     }
-    if (added == NULL || !script || module) return;
+    if (added == NULL || !script) return;
     size_t integrity_length = 0;
     const char *integrity = document_attribute(node, "integrity",
                                                &integrity_length);
@@ -280,7 +280,7 @@ static void navigation_stream_offer_preloaded_script(
         (void) script_runtime_offer_preloaded_script(
             stream->runtime, preload->url, mode, preload->credentials,
             preload->integrity, result->shared_body, result->length,
-            response_url, result->content_type);
+            response_url, result->content_type, preload->csp_policies);
         return;
     }
     if (stream->optional_work_shed || preload->held_body != NULL
@@ -346,23 +346,43 @@ static void navigation_stream_offer_held_preloads(
                 held.held_body, held.held_length,
                 held.held_response_url == NULL
                     ? preload->url : held.held_response_url,
-                held.held_content_type);
+                held.held_content_type, preload->csp_policies);
         browser_shared_body_release(held.held_body);
         budget_free(stream->session == NULL ? NULL : stream->session->budget,
                     held.held_response_url);
     }
 }
 
-/* A <link rel=preload as=script> still in flight when parsing ends goes
-   to the realm (script_runtime_adopt_preload_request) instead of being
-   cancelled: HTML keeps fetching a preload, and its consumer waits for the
-   response rather than fetching the URL again. Its request runs on the
-   page's scheduler, under the request's own timeout. */
+/* Hands request_id to runtime's map: a module preload to its module
+   entries, which check the request's initiator and top-level URL. */
+static bool navigation_preload_hand_to_realm(
+    const NavigationDocumentStream *stream, ScriptRuntime *runtime,
+    FetchScheduler *scheduler, uint64_t request_id,
+    const NavigationPreload *preload)
+{
+    return preload->module
+        ? script_runtime_adopt_module_preload_request(
+              runtime, scheduler, request_id, preload->url,
+              preload->credentials, preload->csp_grant, preload->csp_policies,
+              preload->integrity, stream->document_url, stream->document_url)
+        : script_runtime_adopt_preload_request(
+              runtime, scheduler, request_id, preload->url,
+              preload->cors ? TILEFINCH_REQUEST_MODE_CORS
+                            : TILEFINCH_REQUEST_MODE_NO_CORS,
+              preload->credentials, preload->csp_grant, preload->csp_policies,
+              preload->integrity);
+}
+
+/* A <link rel=preload as=script>, <link rel=modulepreload> or scanned
+   <script type=module src> still in flight when parsing ends goes to the
+   realm (script_runtime_adopt_preload_request) instead of being cancelled:
+   HTML keeps fetching a preload, and its consumer waits for the response
+   rather than fetching the URL again. Its request runs on the page's
+   scheduler, under the request's own timeout. */
 static bool navigation_stream_adopt_preload(NavigationDocumentStream *stream,
                                             NavigationPreload *preload)
 {
-    if (stream->optional_work_shed || !preload->map_entry
-        || preload->module) return false;
+    if (stream->optional_work_shed || !preload->map_entry) return false;
     /* No realm yet (no parser-blocking script ran): the page's realm takes
        the request at commit (navigation_stream_hand_preloads_to_realm). */
     if (stream->runtime == NULL) {
@@ -372,13 +392,9 @@ static bool navigation_stream_adopt_preload(NavigationDocumentStream *stream,
         preload->complete = true;
         return true;
     }
-    if (!script_runtime_adopt_preload_request(
-               stream->runtime, stream->scheduler, preload->request_id,
-               preload->url,
-               preload->cors ? TILEFINCH_REQUEST_MODE_CORS
-                             : TILEFINCH_REQUEST_MODE_NO_CORS,
-               preload->credentials, preload->csp_grant,
-               preload->integrity)) return false;
+    if (!navigation_preload_hand_to_realm(
+            stream, stream->runtime, stream->scheduler, preload->request_id,
+            preload)) return false;
     preload->request_id = 0;
     preload->complete = true;
     return true;
@@ -402,12 +418,8 @@ static void navigation_stream_hand_preloads_to_realm(
         /* A scheduler other than the stream's lost the request with the
            stream's scheduler. */
         if (scheduler == NULL || scheduler != stream->scheduler) continue;
-        if (runtime != NULL && script_runtime_adopt_preload_request(
-                runtime, scheduler, request_id, preload->url,
-                preload->cors ? TILEFINCH_REQUEST_MODE_CORS
-                              : TILEFINCH_REQUEST_MODE_NO_CORS,
-                preload->credentials, preload->csp_grant,
-                preload->integrity)) continue;
+        if (runtime != NULL && navigation_preload_hand_to_realm(
+                stream, runtime, scheduler, request_id, preload)) continue;
         (void) fetch_scheduler_cancel(
             scheduler, request_id,
             "speculative preload ended at navigation commit");
@@ -670,8 +682,9 @@ static void navigation_stream_preload_scan_tag(
                    element's fetch, and a <link rel=preload> the parser
                    reaches later finds it there whether or not it has
                    completed (one entry per key, as Chromium's preload
-                   list keeps both). */
-                if (cors && !module && stream->preload_count > before)
+                   list keeps both). A module's request is kept for the
+                   module script's fetch the same way. */
+                if (cors && stream->preload_count > before)
                     navigation_stream_map_script_preload(
                         stream, &stream->preloads[before], integrity,
                         integrity_length);
@@ -1065,6 +1078,11 @@ static bool navigation_stream_cache_preload(
         && !script_module_mime_type_allowed(result->content_type)) {
         return false;
     }
+    /* A cache hit skips the redirect-time CSP checks: a redirected module
+       response, whose hops the preload's grant (or a policy older than a
+       later <meta>) admitted, is left to each fetch of its own. */
+    if (preload->module && fetch_result_was_redirected(result, preload->url))
+        return false;
     TilefinchResourceGrant resource_grant = {0};
     if (!preload->module
         && !fetch_resource_grant_create(
@@ -1772,6 +1790,8 @@ static void navigation_stream_launch_preloads(
             stream->scheduler, preload->url, request,
             preload->maximum_bytes, preload_timeout_ms);
         preload->launched = true;
+        preload->csp_policies = (uint8_t) stream->parser->document
+            .content_security_policy.policy_count;
         if (preload->request_id == 0) {
             preload->complete = true;
             session->preloads_deferred++;

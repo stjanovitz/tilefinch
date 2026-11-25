@@ -644,9 +644,16 @@ bool psp_input_script_advance_with_page(
         && step->kind == (uint8_t) PSP_INPUT_SCRIPT_STEP_PRESS
         && (script->step_remaining % 2u) != 0u;
     if (!ready && !step->advance_while_busy && !pending_tap_release) {
-        script->stalled_ticks++;
-        if (script->stall_limit != 0
-            && script->stalled_ticks >= script->stall_limit) {
+        if (script->stalled_ticks++ == 0)
+            script->stall_started_us = script->now_us;
+        uint64_t limit = script->stall_limit;
+        uint64_t busy_us = script->now_us > script->stall_started_us
+            ? script->now_us - script->stall_started_us : 0;
+        bool expired = script->now_us != 0
+            ? busy_us >= limit * PSP_INPUT_SCRIPT_NOMINAL_FRAME_US
+              || script->stalled_ticks >= limit * 4u
+            : script->stalled_ticks >= limit;
+        if (limit != 0 && expired) {
             script->stalled = true;
             script->finished = true;
             return false;
